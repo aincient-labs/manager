@@ -175,6 +175,9 @@ main {
   margin-top: 4px;
 }
 .advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -187,11 +190,13 @@ main {
 .advanced > summary::-webkit-details-marker {
   display: none;
 }
-.advanced > summary::before {
-  content: "▸ ";
+.advanced > summary .chev {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.12s steps(3);
 }
-.advanced[open] > summary::before {
-  content: "▾ ";
+.advanced[open] > summary .chev {
+  transform: rotate(90deg);
 }
 .advanced > summary:hover {
   color: var(--ink);
