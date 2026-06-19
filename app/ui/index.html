@@ -7,12 +7,52 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <!-- Icon sprite — Lucide geometry (24-grid, stroke 2, round), monochrome via
+         currentColor, per brand.md §2.5. Referenced with <svg class="ic"><use/>. -->
+    <svg width="0" height="0" class="sprite" aria-hidden="true" focusable="false">
+      <symbol id="i-open" viewBox="0 0 24 24">
+        <path d="M15 3h6v6" /><path d="M10 14 21 3" />
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      </symbol>
+      <symbol id="i-login" viewBox="0 0 24 24">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
+        <polyline points="10 17 15 12 10 7" /><line x1="15" x2="3" y1="12" y2="12" />
+      </symbol>
+      <symbol id="i-key" viewBox="0 0 24 24">
+        <path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 1 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z" />
+        <circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
+      </symbol>
+      <symbol id="i-power" viewBox="0 0 24 24">
+        <path d="M12 2v10" /><path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+      </symbol>
+      <symbol id="i-download" viewBox="0 0 24 24">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+        <polyline points="7 10 12 15 17 10" /><line x1="12" x2="12" y1="15" y2="3" />
+      </symbol>
+      <symbol id="i-backup" viewBox="0 0 24 24">
+        <ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M3 5V19A9 3 0 0 0 21 19V5" />
+        <path d="M3 12A9 3 0 0 0 21 12" />
+      </symbol>
+      <symbol id="i-restore" viewBox="0 0 24 24">
+        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" />
+      </symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24">
+        <path d="M3 6h18" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+        <line x1="10" x2="10" y1="11" y2="17" /><line x1="14" x2="14" y1="11" y2="17" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+      </symbol>
+    </svg>
+
     <header class="topbar">
       <div class="rainbow"></div>
       <div class="brand">
         <!-- AIncient chip mark — currentColor frame + fixed spectrum bands.
-             Master: docs/brand-assets/aincient/aincient.svg (chip portion). -->
-        <!-- viewBox fully contains the chip (bounds x[16,272] y[0,256]) with even padding. -->
+             Master: docs/brand-assets/aincient/aincient.svg (chip portion).
+             viewBox fully contains the chip (bounds x[16,272] y[0,256]) with even padding. -->
         <svg class="chip" viewBox="0 -16 288 288" role="img" aria-label="AIncient" xmlns="http://www.w3.org/2000/svg">
           <defs>
             <filter id="aincient-chip-contrast" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">
@@ -69,40 +109,83 @@
             <input id="install-port" type="number" value="41221" min="1" max="65535" />
           </label>
         </div>
-        <button class="btn primary" data-action="install">Install</button>
+        <button class="btn primary" data-action="install">
+          <svg class="ic"><use href="#i-download" /></svg>Install
+        </button>
       </section>
 
       <!-- Main -->
       <section id="screen-main" class="screen hidden">
+        <!-- Status + lifecycle -->
         <div class="card status">
-          <div class="status-row">
-            <span id="status-dot" class="dot"></span>
-            <span id="status-text" class="status-text">—</span>
+          <div class="status-head">
+            <div class="status-row">
+              <span id="status-dot" class="dot"></span>
+              <span id="status-text" class="status-text">—</span>
+            </div>
+            <button class="btn small" id="btn-startstop" data-action="startstop">
+              <svg class="ic"><use href="#i-power" /></svg><span id="startstop-label">Start</span>
+            </button>
           </div>
-          <a id="console-url" class="console-link" data-action="open" href="#">http://localhost:41221/</a>
-          <p id="login-line" class="muted login hidden"></p>
+          <a id="console-url" class="console-link" data-action="open" href="#">http://localhost:41221/aincient</a>
         </div>
 
         <div id="update-banner" class="banner hidden">
           <span id="update-text">An update is available.</span>
-          <button class="btn small" data-action="update">Update</button>
+          <button class="btn small" data-action="update">
+            <svg class="ic"><use href="#i-download" /></svg>Update
+          </button>
         </div>
 
-        <div class="actions">
-          <button class="btn" data-action="open">Open console</button>
-          <button class="btn" id="btn-startstop" data-action="startstop">Start</button>
-          <button class="btn" data-action="backup">Back up</button>
-        </div>
-
-        <div class="card">
-          <h3>Restore from backup</h3>
-          <div class="restore-row">
-            <select id="backup-select"><option value="">No backups yet</option></select>
-            <button class="btn small" data-action="restore" disabled>Restore</button>
+        <!-- Console: things you do WITH the running site -->
+        <section class="group">
+          <h3 class="group-label">Console</h3>
+          <div class="action-grid">
+            <button class="btn" data-action="open">
+              <svg class="ic"><use href="#i-open" /></svg>Open console
+            </button>
+            <button class="btn" data-action="login">
+              <svg class="ic"><use href="#i-login" /></svg>Login
+            </button>
+            <button class="btn" data-action="reset-password">
+              <svg class="ic"><use href="#i-key" /></svg>Reset password
+            </button>
           </div>
-        </div>
+          <div id="creds" class="creds hidden">
+            <code id="creds-text"></code>
+            <button class="btn small" data-action="copy-creds">
+              <svg class="ic"><use href="#i-copy" /></svg>Copy
+            </button>
+          </div>
+        </section>
 
-        <button class="btn danger ghost" data-action="reinstall">Reinstall (wipes all data)</button>
+        <!-- Infrastructure: backup / restore (data lifecycle) -->
+        <section class="group">
+          <h3 class="group-label">Data &amp; backups</h3>
+          <div class="action-grid two">
+            <button class="btn" data-action="backup">
+              <svg class="ic"><use href="#i-backup" /></svg>Back up
+            </button>
+            <div class="restore-row">
+              <select id="backup-select"><option value="">No backups yet</option></select>
+              <button class="btn small" data-action="restore" disabled>
+                <svg class="ic"><use href="#i-restore" /></svg>Restore
+              </button>
+            </div>
+          </div>
+
+          <!-- Destructive actions live behind a disclosure. -->
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <p class="muted">
+              Reinstalling deletes the database, files, and admin password, then installs a
+              fresh appliance. This cannot be undone.
+            </p>
+            <button class="btn danger" data-action="reinstall">
+              <svg class="ic"><use href="#i-trash" /></svg>Reinstall (wipes all data)
+            </button>
+          </details>
+        </section>
       </section>
     </main>
 
@@ -118,13 +201,30 @@
       <p id="busy-msg">Working…</p>
     </div>
 
-    <!-- Confirm modal -->
+    <!-- Confirm modal (optionally requires typing a word to proceed) -->
     <div id="confirm" class="overlay hidden">
       <div class="modal">
         <p id="confirm-msg"></p>
+        <label id="confirm-typecheck" class="confirm-type hidden">
+          <span>Type <b id="confirm-word">confirm</b> to continue</span>
+          <input id="confirm-input" type="text" autocomplete="off" spellcheck="false" />
+        </label>
         <div class="modal-actions">
           <button class="btn" data-action="confirm-no">Cancel</button>
-          <button class="btn danger" data-action="confirm-yes">Confirm</button>
+          <button class="btn danger" id="confirm-yes" data-action="confirm-yes">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Reset-password modal -->
+    <div id="reset-pw" class="overlay hidden">
+      <div class="modal">
+        <h3 class="modal-title">Reset admin password</h3>
+        <p class="muted">Set a new password for the <code>admin</code> account.</p>
+        <input id="reset-pw-input" type="password" class="modal-input" placeholder="New password" autocomplete="new-password" />
+        <div class="modal-actions">
+          <button class="btn" data-action="reset-pw-cancel">Cancel</button>
+          <button class="btn primary" data-action="reset-pw-submit">Set password</button>
         </div>
       </div>
     </div>

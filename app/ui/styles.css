@@ -34,6 +34,7 @@
   --danger: #f35045;
   --radius: 2px; /* sharp */
   --shadow: 2px 2px 0 var(--border-strong); /* hard offset, never a blur */
+  --maxw: 720px; /* centred column — content never stretches edge-to-edge */
   font-family: "Schibsted Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
     sans-serif;
 }
@@ -69,11 +70,28 @@ body {
   height: 4px;
   background: linear-gradient(90deg, #f35045 0 25%, #fba100 25% 50%, #01cb8b 50% 75%, #8257e9 75% 100%);
 }
+.sprite {
+  position: absolute;
+}
+/* Icon — Lucide geometry, monochrome via currentColor (brand.md §2.5). */
+.ic {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .brand {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 14px 20px;
+  max-width: var(--maxw);
+  margin: 0 auto;
 }
 .brand .chip {
   width: 24px;
@@ -92,11 +110,97 @@ body {
 
 main {
   padding: 20px;
+  max-width: var(--maxw);
+  margin: 0 auto;
 }
 .screen {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+/* Action groups — a pixel section label over a set of related actions. */
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.group-label {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--muted);
+  margin: 4px 0 0;
+}
+.action-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.action-grid.two {
+  grid-template-columns: 1fr 1.4fr;
+}
+
+/* Status card head — state on the left, lifecycle toggle on the right. */
+.status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Revealed admin credentials (the Login action). */
+.creds {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+.creds code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  flex: 1;
+  word-break: break-all;
+}
+
+/* Advanced disclosure — destructive actions stay folded away. */
+.advanced {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 4px;
+}
+.advanced > summary {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.advanced > summary::-webkit-details-marker {
+  display: none;
+}
+.advanced > summary::before {
+  content: "▸ ";
+}
+.advanced[open] > summary::before {
+  content: "▾ ";
+}
+.advanced > summary:hover {
+  color: var(--ink);
+}
+.advanced p {
+  margin: 12px 0;
+}
+.advanced .btn {
+  width: 100%;
 }
 .hidden {
   display: none !important;
@@ -205,6 +309,10 @@ main {
    that collapses on press (the element physically presses down). */
 .btn {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   border: 1px solid var(--border-strong);
   background: var(--card);
   color: var(--ink);
@@ -365,6 +473,47 @@ select:focus {
   font-size: 14px;
   line-height: 1.5;
   font-weight: 400;
+}
+.modal-title {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0 0 12px;
+}
+.modal-input,
+.confirm-type input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--card);
+  color: var(--ink);
+}
+.modal-input:focus,
+.confirm-type input:focus {
+  outline: 2px solid var(--violet);
+  outline-offset: 1px;
+}
+.modal-input {
+  margin-bottom: 18px;
+}
+.confirm-type {
+  display: block;
+  margin: 0 0 18px;
+}
+.confirm-type span {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.confirm-type b {
+  color: var(--danger);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .modal-actions {
   display: flex;

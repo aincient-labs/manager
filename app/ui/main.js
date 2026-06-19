@@ -21,17 +21,36 @@ function busy(on, msg) {
 }
 
 // In-page confirm (the webview blocks native confirm() without the dialog plugin).
-function confirmModal(msg) {
+// Pass { requireText: "confirm" } to gate a destructive action behind a typed word.
+function confirmModal(msg, opts = {}) {
   return new Promise((resolve) => {
+    const requireText = opts.requireText || null;
+    const yes = $("confirm-yes");
+    const input = $("confirm-input");
     $("confirm-msg").textContent = msg;
+    if (requireText) {
+      $("confirm-word").textContent = requireText;
+      input.value = "";
+      $("confirm-typecheck").classList.remove("hidden");
+      yes.disabled = true;
+      input.oninput = () => {
+        yes.disabled = input.value.trim().toLowerCase() !== requireText.toLowerCase();
+      };
+    } else {
+      $("confirm-typecheck").classList.add("hidden");
+      yes.disabled = false;
+    }
     $("confirm").classList.remove("hidden");
+    if (requireText) setTimeout(() => input.focus(), 0);
     const done = (val) => {
       $("confirm").classList.add("hidden");
-      $("confirm-yes").onclick = null;
+      yes.onclick = null;
       $("confirm-no").onclick = null;
+      input.oninput = null;
+      yes.disabled = false;
       resolve(val);
     };
-    $("confirm-yes").onclick = () => done(true);
+    yes.onclick = () => done(true);
     $("confirm-no").onclick = () => done(false);
   });
 }
@@ -84,7 +103,7 @@ function renderStatus(status) {
   const url = status.console_url;
   $("console-url").textContent = url;
   $("console-url").href = url;
-  $("btn-startstop").textContent = status.running ? "Stop" : "Start";
+  $("startstop-label").textContent = status.running ? "Stop" : "Start";
 }
 
 async function refreshUpdate() {
@@ -102,23 +121,10 @@ async function refreshUpdate() {
   }
 }
 
-async function refreshLogin(status) {
-  const line = $("login-line");
-  if (!status.running) {
-    line.classList.add("hidden");
-    return;
-  }
-  try {
-    const pw = await invoke("admin_password");
-    if (pw) {
-      line.textContent = `admin / ${pw}`;
-      line.classList.remove("hidden");
-    } else {
-      line.classList.add("hidden");
-    }
-  } catch {
-    line.classList.add("hidden");
-  }
+// Credentials are revealed on demand via the Login action, not shown by default.
+// Just fold them away whenever the appliance isn't running.
+function refreshLogin(status) {
+  if (!status.running) $("creds").classList.add("hidden");
 }
 
 async function refreshBackups() {
@@ -154,6 +160,49 @@ const actions = {
 
   open: () => invoke("open_console").catch((e) => showError(String(e))),
 
+  // Reveal (toggle) the admin credentials so the user can log in to the console.
+  login: async () => {
+    const creds = $("creds");
+    if (!creds.classList.contains("hidden")) {
+      creds.classList.add("hidden");
+      return;
+    }
+    try {
+      const pw = await invoke("admin_password");
+      $("creds-text").textContent = pw
+        ? `admin / ${pw}`
+        : "Password unavailable — reset it below to set a new one.";
+      creds.classList.remove("hidden");
+    } catch (e) {
+      showError(String(e));
+    }
+  },
+
+  "copy-creds": async () => {
+    try {
+      await navigator.clipboard.writeText($("creds-text").textContent);
+    } catch {
+      /* clipboard may be unavailable in the webview — ignore */
+    }
+  },
+
+  "reset-password": () => {
+    $("reset-pw-input").value = "";
+    $("reset-pw").classList.remove("hidden");
+    setTimeout(() => $("reset-pw-input").focus(), 0);
+  },
+
+  "reset-pw-cancel": () => $("reset-pw").classList.add("hidden"),
+
+  "reset-pw-submit": () => {
+    const password = $("reset-pw-input").value;
+    if (!password.trim()) return;
+    $("reset-pw").classList.add("hidden");
+    return runOp("Setting the admin password…", () =>
+      invoke("set_admin_password", { password })
+    );
+  },
+
   install: () => {
     const key = $("install-key").value.trim() || null;
     const port = parseInt($("install-port").value, 10) || null;
@@ -166,7 +215,7 @@ const actions = {
     runOp("Updating — snapshotting, migrating, health-checking…", () => invoke("do_update")),
 
   startstop: async () => {
-    const running = $("btn-startstop").textContent === "Stop";
+    const running = $("startstop-label").textContent === "Stop";
     return runOp(running ? "Stopping…" : "Starting…", () =>
       invoke(running ? "do_stop" : "do_start")
     );
@@ -187,7 +236,8 @@ const actions = {
   reinstall: async () => {
     const ok = await confirmModal(
       "Reinstall DELETES all data (database, files, admin password) and installs fresh. " +
-        "This cannot be undone. Continue?"
+        "This cannot be undone.",
+      { requireText: "confirm" }
     );
     if (!ok) return;
     return runOp("Reinstalling from scratch…", () => invoke("do_reinstall", { key: null }));

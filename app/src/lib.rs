@@ -67,6 +67,15 @@ async fn admin_password() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
+async fn set_admin_password(password: String) -> Result<(), String> {
+    if password.trim().is_empty() {
+        return Err("password cannot be empty".into());
+    }
+    let s = stack()?;
+    blocking(move || ops::set_admin_password(&s, &password).map_err(err)).await
+}
+
+#[tauri::command]
 async fn do_install(
     key: Option<String>,
     image: Option<String>,
@@ -148,6 +157,7 @@ pub fn run() {
             get_update,
             list_backups,
             admin_password,
+            set_admin_password,
             do_install,
             do_update,
             do_backup,

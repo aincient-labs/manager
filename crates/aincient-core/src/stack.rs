@@ -130,8 +130,10 @@ impl Stack {
             .unwrap_or(DEFAULT_PORT)
     }
 
+    /// URL of the AIncient **console** (the chat workspace at `/aincient`), not the
+    /// bare site root — this is what "open console" should land on.
     pub fn console_url(&self) -> String {
-        format!("http://localhost:{}/", self.http_port())
+        format!("http://localhost:{}/aincient", self.http_port())
     }
 
     pub fn image(&self) -> String {
@@ -258,7 +260,7 @@ mod tests {
 
         assert_eq!(ts.0.env_get("ANTHROPIC_API_KEY").as_deref(), Some("sk-test"));
         assert_eq!(ts.0.http_port(), 8080);
-        assert_eq!(ts.0.console_url(), "http://localhost:8080/");
+        assert_eq!(ts.0.console_url(), "http://localhost:8080/aincient");
     }
 
     #[test]
