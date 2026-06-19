@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AIncient Manager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="rainbow"></div>
+      <div class="brand">
+        <span class="flask">⚗</span>
+        <h1>AIncient&nbsp;Manager</h1>
+      </div>
+    </header>
+
+    <main id="view">
+      <!-- Loading -->
+      <section id="screen-loading" class="screen">
+        <div class="spinner"></div>
+        <p class="muted">Checking your setup…</p>
+      </section>
+
+      <!-- Docker not ready -->
+      <section id="screen-docker" class="screen hidden">
+        <div class="card warn">
+          <h2>Docker isn't ready</h2>
+          <p id="docker-msg" class="muted"></p>
+          <a class="link" href="https://www.docker.com/products/docker-desktop/" target="_blank" rel="noreferrer">Get Docker Desktop →</a>
+        </div>
+        <button class="btn" data-action="recheck">Re-check</button>
+      </section>
+
+      <!-- Not installed -->
+      <section id="screen-install" class="screen hidden">
+        <div class="card">
+          <h2>Install AIncient CMS</h2>
+          <p class="muted">
+            This downloads the AIncient appliance and starts it locally. First boot takes a
+            minute or two.
+          </p>
+          <label class="field">
+            <span>Anthropic API key <em>(optional)</em></span>
+            <input id="install-key" type="password" placeholder="sk-…  — or add it later in onboarding" />
+          </label>
+          <label class="field">
+            <span>Console port</span>
+            <input id="install-port" type="number" value="41221" min="1" max="65535" />
+          </label>
+        </div>
+        <button class="btn primary" data-action="install">Install</button>
+      </section>
+
+      <!-- Main -->
+      <section id="screen-main" class="screen hidden">
+        <div class="card status">
+          <div class="status-row">
+            <span id="status-dot" class="dot"></span>
+            <span id="status-text" class="status-text">—</span>
+          </div>
+          <a id="console-url" class="console-link" data-action="open" href="#">http://localhost:41221/</a>
+          <p id="login-line" class="muted login hidden"></p>
+        </div>
+
+        <div id="update-banner" class="banner hidden">
+          <span id="update-text">An update is available.</span>
+          <button class="btn small" data-action="update">Update</button>
+        </div>
+
+        <div class="actions">
+          <button class="btn" data-action="open">Open console</button>
+          <button class="btn" id="btn-startstop" data-action="startstop">Start</button>
+          <button class="btn" data-action="backup">Back up</button>
+        </div>
+
+        <div class="card">
+          <h3>Restore from backup</h3>
+          <div class="restore-row">
+            <select id="backup-select"><option value="">No backups yet</option></select>
+            <button class="btn small" data-action="restore" disabled>Restore</button>
+          </div>
+        </div>
+
+        <button class="btn danger ghost" data-action="reinstall">Reinstall (wipes all data)</button>
+      </section>
+    </main>
+
+    <!-- Error banner -->
+    <div id="error" class="error hidden">
+      <span id="error-text"></span>
+      <button class="x" data-action="dismiss-error">×</button>
+    </div>
+
+    <!-- Busy overlay -->
+    <div id="busy" class="overlay hidden">
+      <div class="spinner light"></div>
+      <p id="busy-msg">Working…</p>
+    </div>
+
+    <!-- Confirm modal -->
+    <div id="confirm" class="overlay hidden">
+      <div class="modal">
+        <p id="confirm-msg"></p>
+        <div class="modal-actions">
+          <button class="btn" data-action="confirm-no">Cancel</button>
+          <button class="btn danger" data-action="confirm-yes">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

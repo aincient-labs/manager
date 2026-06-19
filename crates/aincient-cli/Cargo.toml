@@ -1,0 +1,19 @@
+[package]
+name = "aincient-cli"
+description = "The `aincient` command — install, update, back up, and manage your AIncient CMS appliance."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "aincient"
+path = "src/main.rs"
+
+[dependencies]
+aincient-core = { path = "../aincient-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
