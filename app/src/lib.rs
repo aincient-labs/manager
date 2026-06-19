@@ -84,7 +84,7 @@ async fn do_install(
     let s = stack()?;
     blocking(move || {
         let opts = InstallOptions {
-            anthropic_api_key: key,
+            ai_key: key,
             image,
             http_port: port,
         };
@@ -121,7 +121,7 @@ async fn do_reinstall(key: Option<String>) -> Result<(), String> {
     let s = stack()?;
     blocking(move || {
         let opts = InstallOptions {
-            anthropic_api_key: key,
+            ai_key: key,
             ..Default::default()
         };
         ops::reinstall(&s, &opts).map_err(err)

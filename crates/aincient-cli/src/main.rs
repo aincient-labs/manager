@@ -39,7 +39,7 @@ enum Command {
     },
     /// Install the appliance (or upgrade in place if already installed).
     Install {
-        /// Anthropic API key (otherwise add it later in onboarding).
+        /// AI provider API key (otherwise add it later in onboarding).
         #[arg(long, value_name = "KEY")]
         key: Option<String>,
         /// Image tag to run.
@@ -108,6 +108,32 @@ enum Command {
         #[arg(long, value_name = "NEW")]
         set: Option<String>,
     },
+    /// Inspect or change the AI model bound to each AIncient role.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// List each role and the provider/model it's bound to.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bind a role (reasoning|task|fast) to a provider and model.
+    Set {
+        /// The role to bind: reasoning, task, or fast.
+        role: String,
+        /// A provider plugin id (e.g. anthropic, openai, ollama).
+        #[arg(long, value_name = "ID")]
+        provider: String,
+        /// A model id offered by that provider.
+        #[arg(long, value_name = "MODEL")]
+        model: String,
+    },
 }
 
 fn main() {
@@ -141,7 +167,7 @@ fn run() -> Result<()> {
         Command::Status { json } => status(&stack, json),
         Command::Install { key, image, port } => {
             let opts = InstallOptions {
-                anthropic_api_key: key,
+                ai_key: key,
                 image,
                 http_port: port,
             };
@@ -187,7 +213,7 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             let opts = InstallOptions {
-                anthropic_api_key: key,
+                ai_key: key,
                 ..Default::default()
             };
             ops::reinstall(&stack, &opts)?;
@@ -256,7 +282,48 @@ fn run() -> Result<()> {
                 Ok(())
             }
         },
+        Command::Model { command } => match command {
+            ModelCommand::List { json } => model_list(&stack, json),
+            ModelCommand::Set {
+                role,
+                provider,
+                model,
+            } => {
+                ops::model_set(&stack, &role, &provider, &model)?;
+                println!(
+                    "{} {role} → {provider}:{model}",
+                    style::success("Bound")
+                );
+                Ok(())
+            }
+        },
     }
+}
+
+fn model_list(stack: &Stack, json: bool) -> Result<()> {
+    let roles = ops::model_list(stack)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&roles)?);
+        return Ok(());
+    }
+    if roles.is_empty() {
+        println!(
+            "{}",
+            style::warn("No model roles yet — connect AI through onboarding first.")
+        );
+        return Ok(());
+    }
+    for r in roles {
+        let binding = if r.provider.is_empty() || r.model.is_empty() {
+            style::warn("(not set)").to_string()
+        } else {
+            style::url(&format!("{}:{}", r.provider, r.model))
+        };
+        let star = if r.is_default() { " *" } else { "" };
+        println!("  {} {}{star}", style::heading(&format!("{:<10}", r.role)), binding);
+    }
+    println!("\n  * = default role (what the console inherits)");
+    Ok(())
 }
 
 fn doctor() -> Result<()> {

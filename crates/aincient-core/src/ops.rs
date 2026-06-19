@@ -54,6 +54,25 @@ pub struct Backup {
     pub modified_unix: u64,
 }
 
+/// One AIncient model role and its binding, as `drush aincient:model-list` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRole {
+    pub role: String,
+    pub label: String,
+    pub provider: String,
+    pub model: String,
+    /// "yes" when this is the default role the console inherits, else "".
+    #[serde(default)]
+    pub default: String,
+}
+
+impl ModelRole {
+    /// Whether this is the default role the chat console inherits.
+    pub fn is_default(&self) -> bool {
+        self.default == "yes"
+    }
+}
+
 #[derive(Deserialize)]
 struct PsEntry {
     #[serde(rename = "Service", default)]
@@ -326,6 +345,33 @@ pub fn set_admin_password(stack: &Stack, password: &str) -> Result<()> {
         .args(DRUSH)
         .args(["user:password", "admin", password]);
     run_capture(c, "set the admin password").map(|_| ())
+}
+
+/// List the AIncient model roles and their bindings.
+///
+/// Shells `drush aincient:model-list --format=json` inside the `app` container —
+/// the same source of truth the console form and onboarding write.
+pub fn model_list(stack: &Stack) -> Result<Vec<ModelRole>> {
+    ensure_running(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["aincient:model-list", "--format=json"]);
+    let out = run_capture(c, "list the model roles")?;
+    serde_json::from_str(out.trim()).context("could not parse the model-list output")
+}
+
+/// Bind a model role to a provider + model, then project it onto the framework.
+///
+/// Shells `drush aincient:model-set <role> <provider> <model>`; drush validates
+/// the role + provider and returns a non-zero exit on a bad binding.
+pub fn model_set(stack: &Stack, role: &str, provider: &str, model: &str) -> Result<()> {
+    ensure_running(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["aincient:model-set", role, provider, model]);
+    run_capture(c, "set the model role").map(|_| ())
 }
 
 /// Build (but don't run) a `docker compose logs` command, so callers choose how
