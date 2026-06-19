@@ -38,7 +38,7 @@ same `compose.yaml` + `.env` the `docker/install.sh` bootstrapper writes.
 cargo build            # build the workspace
 cargo test             # run unit tests
 cargo clippy           # lint
-cargo run -p aincient-cli -- doctor   # run the CLI
+cargo run -p aincient -- doctor       # run the CLI
 cargo run -p aincient-manager         # launch the GUI
 ```
 

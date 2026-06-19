@@ -10,7 +10,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-repository = "https://github.com/aincient-labs/cms"
+repository = "https://github.com/aincient-labs/manager"
+homepage = "https://github.com/aincient-labs/manager"
 authors = ["AIncient Labs"]
 rust-version = "1.82"
 
@@ -21,4 +22,9 @@ serde_json = "1"
 
 [profile.release]
 strip = true
+lto = "thin"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
 lto = "thin"
