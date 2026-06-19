@@ -1,5 +1,6 @@
-/* Schibsted Grotesk (OFL) — bundled locally, not CDN'd (Tauri runs offline).
-   Single variable woff2 covers the 400–700 weight axis. */
+/* Fonts (OFL) — bundled locally, not CDN'd (Tauri runs offline).
+   Schibsted Grotesk = body/UI (variable 400–700); Press Start 2P = arcade
+   display for the wordmark + small labels (app tier, brand.md §3.3). */
 @font-face {
   font-family: "Schibsted Grotesk";
   font-style: normal;
@@ -7,21 +8,32 @@
   font-display: swap;
   src: url("fonts/schibsted-grotesk.woff2") format("woff2");
 }
+@font-face {
+  font-family: "Press Start 2P";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/press-start-2p.woff2") format("woff2");
+}
 
 :root {
-  /* Marketing-tier "calm paper" palette — docs/brand.md §4.1. Violet is the
-     signature primary; mint/green is demoted to the success semantic only. */
+  /* App-tier "arcade-crisp paper" — light neobrutalist (brand.md §3.2/§3.3).
+     Violet is the dominant accent; mint = success only; flat fills + hard ink
+     offset shadows do the lifting (no gradients, no soft shadows). */
   --violet: #8257e9;
   --violet-dark: #6c3ccd;
   --success: #01cb8b;
   --ink: #1a1916;
+  --border-strong: #302e28; /* near-ink sprite outline + hard shadow source */
   --muted: #6b675f;
   --bg: #faf9f6;
   --card: #ffffff;
-  --border: #e7e4dd;
+  --surface-2: #f1efe9; /* subtle hover fill */
+  --border: #e7e4dd; /* hairline */
   --warn: #fba100;
   --danger: #f35045;
-  --radius: 12px;
+  --radius: 2px; /* sharp */
+  --shadow: 2px 2px 0 var(--border-strong); /* hard offset, never a blur */
   font-family: "Schibsted Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
     sans-serif;
 }
@@ -37,12 +49,20 @@ body {
   min-height: 100vh;
 }
 
-/* Top bar with the rainbow-flask brand nod. */
+/* Press Start 2P display label — uppercase arcade micro-type. */
+.pixel {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+}
+
+/* Top bar with the four-band brand spectrum stripe. */
 .topbar {
   position: sticky;
   top: 0;
-  background: #fff;
-  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  border-bottom: 1px solid var(--border-strong);
 }
 /* The four-band brand spectrum — hard colour stops, not a blend (brand.md §2.6). */
 .rainbow {
@@ -52,7 +72,7 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   padding: 14px 20px;
 }
 .brand .chip {
@@ -62,10 +82,12 @@ body {
   color: var(--ink);
 }
 .brand h1 {
-  font-size: 16px;
-  font-weight: 700;
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  font-size: 12px;
+  font-weight: 400;
   margin: 0;
-  letter-spacing: -0.01em;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
 }
 
 main {
@@ -82,8 +104,9 @@ main {
 
 .card {
   background: var(--card);
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius);
+  box-shadow: var(--shadow);
   padding: 18px;
 }
 .card h2 {
@@ -91,11 +114,15 @@ main {
   font-size: 16px;
 }
 .card h3 {
-  margin: 0 0 12px;
-  font-size: 14px;
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0 0 14px;
+  font-size: 10px;
+  line-height: 1.5;
 }
 .card.warn {
-  border-color: #fcd9a8;
+  border-color: var(--warn);
   background: #fffaf2;
 }
 
@@ -123,26 +150,30 @@ main {
 .dot {
   width: 10px;
   height: 10px;
-  border-radius: 50%;
+  border-radius: 0; /* square pixel dot */
   background: var(--muted);
   flex: none;
 }
 .dot.up {
   background: var(--success);
-  box-shadow: 0 0 0 4px rgba(1, 203, 139, 0.18);
+  box-shadow: 0 0 0 3px rgba(1, 203, 139, 0.2);
 }
 .dot.down {
   background: #cbd5e1;
 }
 .status-text {
-  font-weight: 600;
-  font-size: 15px;
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  line-height: 1.4;
 }
 .console-link {
   display: inline-block;
-  margin-top: 8px;
+  margin-top: 10px;
   color: var(--violet-dark);
   font-size: 13px;
+  font-weight: 600;
   text-decoration: none;
 }
 .console-link:hover {
@@ -161,45 +192,49 @@ main {
   justify-content: space-between;
   gap: 12px;
   background: #f3eefe;
-  border: 1px solid #d8c9f7;
+  border: 1px solid var(--border-strong);
   color: var(--violet-dark);
   border-radius: var(--radius);
+  box-shadow: var(--shadow);
   padding: 12px 14px;
   font-size: 13px;
   font-weight: 600;
 }
 
-/* Buttons */
+/* Buttons — flat fill, sharp corners, 1px sprite outline, hard offset shadow
+   that collapses on press (the element physically presses down). */
 .btn {
   appearance: none;
-  border: 1px solid var(--border);
-  background: #fff;
+  border: 1px solid var(--border-strong);
+  background: var(--card);
   color: var(--ink);
-  border-radius: 10px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
   padding: 11px 14px;
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: border-color 0.12s, background 0.12s, transform 0.05s;
+  transition: background 0.12s, transform 0.04s, box-shadow 0.04s;
 }
 .btn:hover {
-  border-color: #cbd5e1;
+  background: var(--surface-2);
 }
 .btn:active {
-  transform: translateY(1px);
+  transform: translate(2px, 2px);
+  box-shadow: 0 0 0 var(--border-strong);
 }
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+  box-shadow: var(--shadow);
+  transform: none;
 }
 .btn.primary {
   background: var(--violet);
-  border-color: var(--violet);
   color: #fff;
 }
 .btn.primary:hover {
   background: var(--violet-dark);
-  border-color: var(--violet-dark);
 }
 .btn.small {
   padding: 8px 12px;
@@ -207,19 +242,22 @@ main {
 }
 .btn.danger {
   color: var(--danger);
-  border-color: #f3c2c2;
 }
 .btn.danger:hover {
   background: #fef2f2;
 }
 .btn.ghost {
   background: transparent;
+  box-shadow: none;
+}
+.btn.ghost:active {
+  transform: translateY(1px);
 }
 
 .actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 12px;
 }
 
 /* Form fields */
@@ -228,23 +266,37 @@ main {
   margin-top: 14px;
 }
 .field span {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   display: block;
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  margin-bottom: 8px;
 }
 .field em {
+  font-family: "Schibsted Grotesk", sans-serif;
+  text-transform: none;
+  letter-spacing: 0;
   color: var(--muted);
+  font-size: 12px;
   font-weight: 400;
 }
 .field input,
 select {
   width: 100%;
   padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
   font-size: 14px;
   font-family: inherit;
+  background: var(--card);
+  color: var(--ink);
+}
+.field input:focus,
+select:focus {
+  outline: 2px solid var(--violet);
+  outline-offset: 1px;
 }
 
 .restore-row {
@@ -262,9 +314,10 @@ select {
   right: 16px;
   bottom: 16px;
   background: #fef2f2;
-  border: 1px solid #f3c2c2;
+  border: 1px solid var(--danger);
   color: #991b1b;
-  border-radius: 10px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
   padding: 12px 14px;
   font-size: 13px;
   display: flex;
@@ -285,7 +338,7 @@ select {
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(17, 24, 39, 0.55);
+  background: rgba(26, 25, 22, 0.55);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -299,9 +352,11 @@ select {
   font-weight: 600;
 }
 .modal {
-  background: #fff;
+  background: var(--card);
   color: var(--ink);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius);
+  box-shadow: var(--shadow);
   padding: 22px;
   width: min(360px, 86vw);
 }
@@ -317,14 +372,14 @@ select {
   justify-content: flex-end;
 }
 
-/* Spinner */
+/* Spinner — arcade stepped rotation (steps(), no easing; brand.md §3.3). */
 .spinner {
   width: 28px;
   height: 28px;
   border: 3px solid var(--border);
   border-top-color: var(--violet);
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin 0.9s steps(12) infinite;
   margin: 0 auto;
 }
 .spinner.light {
