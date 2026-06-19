@@ -11,6 +11,8 @@ use aincient_core::{ops, InstallOptions, Stack};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod style;
+
 #[derive(Parser)]
 #[command(
     name = "aincient",
@@ -109,10 +111,25 @@ enum Command {
 }
 
 fn main() {
+    // `NO_COLOR` is authoritative (no-color.org): force colour off so it wins even
+    // over `CLICOLOR_FORCE`, which `supports-color` would otherwise let take priority.
+    if std::env::var_os("NO_COLOR").is_some() {
+        owo_colors::set_override(false);
+    }
     if let Err(err) = run() {
-        eprintln!("error: {err:#}");
+        eprintln!("{} {err:#}", style::error("error:"));
         std::process::exit(1);
     }
+}
+
+/// A success banner: a spectrum rule (when colour is on) over a mint headline and the
+/// violet console URL. Used at the end of install/reinstall/update.
+fn done_banner(headline: &str, url: &str) {
+    println!();
+    if let Some(rule) = style::spectrum_rule() {
+        println!("{rule}");
+    }
+    println!("{} Console: {}", style::success(headline), style::url(url));
 }
 
 fn run() -> Result<()> {
@@ -129,19 +146,19 @@ fn run() -> Result<()> {
                 http_port: port,
             };
             ops::install(&stack, &opts)?;
-            println!("\nInstalled. Console: {}", stack.console_url());
+            done_banner("Installed.", &stack.console_url());
             show_login(&stack);
             Ok(())
         }
         Command::Update => {
             ops::update(&stack)?;
-            println!("\nUpdate complete. Console: {}", stack.console_url());
+            done_banner("Update complete.", &stack.console_url());
             Ok(())
         }
         Command::CheckUpdate { json } => check_update(&stack, json),
         Command::Backup { label } => {
             let path = ops::backup(&stack, label.as_deref())?;
-            println!("Backup written to {}", path.display());
+            println!("{} {}", style::success("Backup written to"), path.display());
             Ok(())
         }
         Command::Backups => list_backups(&stack),
@@ -153,11 +170,11 @@ fn run() -> Result<()> {
                 ),
                 yes,
             )? {
-                println!("Aborted.");
+                println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
             ops::restore(&stack, &file)?;
-            println!("Restore complete.");
+            println!("{}", style::success("Restore complete."));
             Ok(())
         }
         Command::Reinstall { key, yes } => {
@@ -166,7 +183,7 @@ fn run() -> Result<()> {
                  fresh. Continue?",
                 yes,
             )? {
-                println!("Aborted.");
+                println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
             let opts = InstallOptions {
@@ -174,18 +191,22 @@ fn run() -> Result<()> {
                 ..Default::default()
             };
             ops::reinstall(&stack, &opts)?;
-            println!("\nReinstalled. Console: {}", stack.console_url());
+            done_banner("Reinstalled.", &stack.console_url());
             show_login(&stack);
             Ok(())
         }
         Command::Start => {
             ops::start(&stack)?;
-            println!("Started. Console: {}", stack.console_url());
+            println!(
+                "{} Console: {}",
+                style::success("Started."),
+                style::url(&stack.console_url())
+            );
             Ok(())
         }
         Command::Stop => {
             ops::stop(&stack)?;
-            println!("Stopped.");
+            println!("{}", style::success("Stopped."));
             Ok(())
         }
         Command::Down { wipe, yes } => {
@@ -195,11 +216,18 @@ fn run() -> Result<()> {
                     yes,
                 )?
             {
-                println!("Aborted.");
+                println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
             ops::down(&stack, wipe)?;
-            println!("{}", if wipe { "Removed and wiped." } else { "Removed (data kept)." });
+            println!(
+                "{}",
+                style::success(if wipe {
+                    "Removed and wiped."
+                } else {
+                    "Removed (data kept)."
+                })
+            );
             Ok(())
         }
         Command::Logs { follow, service } => {
@@ -214,7 +242,7 @@ fn run() -> Result<()> {
         Command::Password { set } => match set {
             Some(pw) => {
                 ops::set_admin_password(&stack, &pw)?;
-                println!("Admin password updated.");
+                println!("{}", style::success("Admin password updated."));
                 Ok(())
             }
             None => {
@@ -238,11 +266,15 @@ fn doctor() -> Result<()> {
     line("Compose plugin", pf.compose_available);
     match pf.problem() {
         Some(msg) => {
-            println!("\n{msg}");
+            println!("\n{}", style::warn(&msg));
             std::process::exit(1);
         }
         None => {
-            println!("\nReady to run AIncient.");
+            println!();
+            if let Some(rule) = style::spectrum_rule() {
+                println!("{rule}");
+            }
+            println!("{}", style::success("Ready to run AIncient."));
             Ok(())
         }
     }
@@ -257,10 +289,13 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     line("Installed", st.installed);
     line("Running", st.running);
     line("Console reachable", st.reachable);
-    println!("  Console:  {}", st.console_url);
+    println!("  Console:  {}", style::url(&st.console_url));
     println!("  Image:    {}", st.image);
     if !st.installed {
-        println!("\nNot installed yet — run `aincient install`.");
+        println!(
+            "\n{}",
+            style::warn("Not installed yet — run `aincient install`.")
+        );
     }
     Ok(())
 }
@@ -272,11 +307,22 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
         return Ok(());
     }
     match check.update_available {
-        Some(true) => println!("An update is available for {}.\nRun `aincient update`.", check.image),
-        Some(false) => println!("You're on the latest {}.", check.image),
-        None => println!(
-            "Couldn't reach the registry to compare {} (are you logged in?).",
+        Some(true) => println!(
+            "{} for {}.\nRun `aincient update`.",
+            style::heading("An update is available"),
             check.image
+        ),
+        Some(false) => println!(
+            "{} {}.",
+            style::success("You're on the latest"),
+            check.image
+        ),
+        None => println!(
+            "{}",
+            style::warn(&format!(
+                "Couldn't reach the registry to compare {} (are you logged in?).",
+                check.image
+            ))
         ),
     }
     Ok(())
@@ -285,11 +331,18 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
 fn list_backups(stack: &Stack) -> Result<()> {
     let backups = ops::list_backups(stack);
     if backups.is_empty() {
-        println!("No backups yet. Create one with `aincient backup`.");
+        println!(
+            "{}",
+            style::warn("No backups yet. Create one with `aincient backup`.")
+        );
         return Ok(());
     }
     for b in backups {
-        println!("  {}  ({:.1} MB)", b.name, b.size_bytes as f64 / 1_048_576.0);
+        println!(
+            "  {}  ({:.1} MB)",
+            b.name,
+            b.size_bytes as f64 / 1_048_576.0
+        );
     }
     Ok(())
 }
@@ -312,5 +365,5 @@ fn confirm(prompt: &str, assume_yes: bool) -> Result<bool> {
 }
 
 fn line(label: &str, ok: bool) {
-    println!("  [{}] {label}", if ok { "x" } else { " " });
+    println!("  {} {label}", style::mark(ok));
 }

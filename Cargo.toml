@@ -19,6 +19,9 @@ rust-version = "1.82"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Restrained brand colour for CLI output; `supports-colors` auto-disables on
+# non-TTY / NO_COLOR via the `supports-color` crate.
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 [profile.release]
 strip = true
