@@ -10,7 +10,26 @@
     <header class="topbar">
       <div class="rainbow"></div>
       <div class="brand">
-        <span class="flask">⚗</span>
+        <!-- AIncient chip mark — currentColor frame + fixed spectrum bands.
+             Master: docs/brand-assets/aincient/aincient.svg (chip portion). -->
+        <svg class="chip" viewBox="16 16 240 240" role="img" aria-label="AIncient" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <filter id="aincient-chip-contrast" color-interpolation-filters="sRGB" x="0" y="0" width="100%" height="100%">
+              <feColorMatrix type="matrix" values="0.2126 0.7152 0.0722 0 0 0.2126 0.7152 0.0722 0 0 0.2126 0.7152 0.0722 0 0 0 0 0 1 0" />
+              <feComponentTransfer>
+                <feFuncR type="discrete" tableValues="1 0" />
+                <feFuncG type="discrete" tableValues="1 0" />
+                <feFuncB type="discrete" tableValues="1 0" />
+              </feComponentTransfer>
+            </filter>
+          </defs>
+          <path fill="currentColor" filter="url(#aincient-chip-contrast)" d="M 48,16 v 16 h -16 v 16 h -16 v 192 h 16 v 16 h 16 v 16 h 192 v -16 h 16 v -16 h 16 v -192 h -16 v -16 h -16 v -16 z" />
+          <path fill="#f35045" d="M 64,48 v 16 h -16 v 32 h 192 v -32 h -16 v -16 z" />
+          <rect fill="#fba100" x="48" y="96" width="192" height="48" />
+          <rect fill="#01cb8b" x="48" y="144" width="192" height="48" />
+          <path fill="#8257e9" d="M 48,192 v 32 h 16 v 16 h 160 v -16 h 16 v -32 z" />
+          <path fill="currentColor" d="M 48,16 v 16 h -16 v 16 h -16 v 192 h 16 v 16 h 16 v 16 h 192 v -16 h 16 v -16 h 16 v -192 h -16 v -16 h -16 v -16 z m 16,16 h 160 v 16 h 16 v 16 h 16 v 160 h -16 v 16 h -16 v 16 h -160 v -16 h -16 v -16 h -16 v -160 h 16 v -16 h 16 z" />
+        </svg>
         <h1>AIncient&nbsp;Manager</h1>
       </div>
     </header>
