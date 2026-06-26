@@ -1,6 +1,6 @@
 [package]
-name = "aincient"
-description = "The `aincient` command — install, update, back up, and manage your AIncient CMS appliance."
+name = "atelier"
+description = "The `atelier` command — install, update, back up, and manage your Atelier CMS appliance."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "aincient"
+name = "atelier"
 path = "src/main.rs"
 
 [dependencies]

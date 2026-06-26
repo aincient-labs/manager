@@ -33,7 +33,7 @@ impl Preflight {
         if !self.docker_installed {
             Some(
                 "Docker isn't installed. Install Docker Desktop (Mac/Windows) or Docker \
-                 Engine (Linux), then try again. AIncient runs as a container, so Docker is \
+                 Engine (Linux), then try again. Atelier runs as a container, so Docker is \
                  required."
                     .to_string(),
             )

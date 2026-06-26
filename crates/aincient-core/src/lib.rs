@@ -1,14 +1,14 @@
-//! `aincient-core` — the lifecycle engine for an AIncient CMS appliance.
+//! `aincient-core` — the lifecycle engine for an Atelier CMS appliance.
 //!
 //! One crate owns every operation the front-ends expose (install, update,
-//! check-update, backup, restore, status, …). The [`aincient` CLI] and the Tauri
+//! check-update, backup, restore, status, …). The [`atelier` CLI] and the Tauri
 //! manager GUI both depend on this crate directly, so there is exactly one
 //! implementation of the behaviour and no shelling between the two.
 //!
-//! Everything operates on a [`Stack`] — a `~/.aincient` directory holding the same
+//! Everything operates on a [`Stack`] — a `~/.atelier` directory holding the same
 //! `compose.yaml` + `.env` the `docker/install.sh` bootstrapper writes.
 //!
-//! [`aincient` CLI]: ../aincient/index.html
+//! [`atelier` CLI]: ../atelier/index.html
 
 pub mod docker;
 pub mod ops;

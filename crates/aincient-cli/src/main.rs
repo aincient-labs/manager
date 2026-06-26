@@ -1,4 +1,4 @@
-//! `aincient` — the command-line front door to an AIncient CMS appliance.
+//! `atelier` — the command-line front door to an Atelier CMS appliance.
 //!
 //! A thin presentation layer over [`aincient_core`]: it parses arguments, confirms
 //! destructive actions, and formats output. All behaviour lives in the core crate,
@@ -15,12 +15,12 @@ mod style;
 
 #[derive(Parser)]
 #[command(
-    name = "aincient",
+    name = "atelier",
     version,
-    about = "Install and manage your AIncient CMS appliance.",
-    long_about = "Install and manage your AIncient CMS appliance.\n\nAIncient runs as a \
+    about = "Install and manage your Atelier CMS appliance.",
+    long_about = "Install and manage your Atelier CMS appliance.\n\nAtelier runs as a \
                   Docker container; this command lays down and drives that stack \
-                  (default ~/.aincient, override with AINCIENT_HOME)."
+                  (default ~/.atelier, override with ATELIER_HOME)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -57,7 +57,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Back up the database to ~/.aincient/backups.
+    /// Back up the database to ~/.atelier/backups.
     Backup {
         /// A label folded into the filename.
         #[arg(long)]
@@ -108,7 +108,7 @@ enum Command {
         #[arg(long, value_name = "NEW")]
         set: Option<String>,
     },
-    /// Inspect or change the AI model bound to each AIncient role.
+    /// Inspect or change the AI model bound to each Atelier role.
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -276,7 +276,7 @@ fn run() -> Result<()> {
                     Some(pw) => println!("admin / {pw}"),
                     None => println!(
                         "No saved initial password (it was likely changed, or you pinned one at \
-                         install). Set a new one with: aincient password --set <new>"
+                         install). Set a new one with: atelier password --set <new>"
                     ),
                 }
                 Ok(())
@@ -341,7 +341,7 @@ fn doctor() -> Result<()> {
             if let Some(rule) = style::spectrum_rule() {
                 println!("{rule}");
             }
-            println!("{}", style::success("Ready to run AIncient."));
+            println!("{}", style::success("Ready to run Atelier."));
             Ok(())
         }
     }
@@ -361,7 +361,7 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     if !st.installed {
         println!(
             "\n{}",
-            style::warn("Not installed yet — run `aincient install`.")
+            style::warn("Not installed yet — run `atelier install`.")
         );
     }
     Ok(())
@@ -375,7 +375,7 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
     }
     match check.update_available {
         Some(true) => println!(
-            "{} for {}.\nRun `aincient update`.",
+            "{} for {}.\nRun `atelier update`.",
             style::heading("An update is available"),
             check.image
         ),
@@ -400,7 +400,7 @@ fn list_backups(stack: &Stack) -> Result<()> {
     if backups.is_empty() {
         println!(
             "{}",
-            style::warn("No backups yet. Create one with `aincient backup`.")
+            style::warn("No backups yet. Create one with `atelier backup`.")
         );
         return Ok(());
     }

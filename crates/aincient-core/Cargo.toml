@@ -1,6 +1,6 @@
 [package]
 name = "aincient-core"
-description = "Lifecycle engine for an AIncient CMS appliance — shared by the aincient CLI and the Tauri manager."
+description = "Lifecycle engine for an Atelier CMS appliance — shared by the atelier CLI and the Tauri manager."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

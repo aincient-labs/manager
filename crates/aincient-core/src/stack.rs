@@ -1,7 +1,8 @@
-//! Location and on-disk layout of an AIncient appliance stack.
+//! Location and on-disk layout of an Atelier appliance stack.
 //!
-//! The stack is a directory (default `~/.aincient`, override with `AINCIENT_HOME`)
-//! holding a `compose.yaml` + `.env` — the same pair `docker/install.sh` writes.
+//! The stack is a directory (default `~/.atelier`, override with `ATELIER_HOME`;
+//! a legacy `~/.aincient` is still honoured if present) holding a `compose.yaml`
+//! + `.env` — the same pair `docker/install.sh` writes.
 //! The manager owns this directory so the CLI and GUI converge on one source of truth.
 
 use std::collections::BTreeMap;
@@ -75,13 +76,28 @@ pub struct InstallOptions {
 }
 
 impl Stack {
-    /// Resolve the stack directory from `AINCIENT_HOME` or `~/.aincient`.
+    /// Resolve the stack directory.
+    ///
+    /// Precedence: `ATELIER_HOME`, then the legacy `AINCIENT_HOME` (so existing
+    /// environments keep working). With neither set, default to `~/.atelier` —
+    /// but if that doesn't yet exist and a legacy `~/.aincient` does, adopt the
+    /// legacy directory so beta installs aren't orphaned.
     pub fn locate() -> Result<Self> {
-        let home = match std::env::var_os("AINCIENT_HOME") {
+        let env_override = std::env::var_os("ATELIER_HOME")
+            .or_else(|| std::env::var_os("AINCIENT_HOME"));
+        let home = match env_override {
             Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .context("could not determine your home directory")?
-                .join(".aincient"),
+            None => {
+                let base = dirs::home_dir()
+                    .context("could not determine your home directory")?;
+                let new = base.join(".atelier");
+                let legacy = base.join(".aincient");
+                if !new.exists() && legacy.exists() {
+                    legacy
+                } else {
+                    new
+                }
+            }
         };
         Ok(Self { home })
     }

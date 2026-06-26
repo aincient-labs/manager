@@ -414,7 +414,7 @@ pub fn open_console(stack: &Stack) -> Result<()> {
 fn ensure_installed(stack: &Stack) -> Result<()> {
     if !stack.exists() {
         bail!(
-            "no AIncient stack found at {} — run `aincient install` first",
+            "no Atelier stack found at {} — run `atelier install` first",
             stack.home.display()
         );
     }
@@ -425,7 +425,7 @@ fn ensure_running(stack: &Stack) -> Result<()> {
     ensure_installed(stack)?;
     preflight().require()?;
     if !status(stack).running {
-        bail!("the appliance isn't running — start it with `aincient start`");
+        bail!("the appliance isn't running — start it with `atelier start`");
     }
     Ok(())
 }
