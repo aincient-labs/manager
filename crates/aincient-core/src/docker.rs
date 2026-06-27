@@ -4,7 +4,10 @@
 //! as a user would. This keeps behaviour identical to `install.sh` and avoids a
 //! heavy API-client dependency.
 
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -104,6 +107,58 @@ pub fn run_inherited(mut cmd: Command, action: &str) -> Result<()> {
         bail!("failed to {action} (docker exited with {status})");
     }
     Ok(())
+}
+
+/// Run to completion, forwarding every stdout/stderr line to `sink` as it
+/// arrives, and fail on a non-zero exit. The streaming counterpart to
+/// [`run_inherited`]: same use (long, chatty ops like pull/up) but the output is
+/// relayed line-by-line instead of inheriting the terminal — so a GUI can show a
+/// live log feed. Both pipes are drained on their own threads so neither blocks
+/// the other.
+pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str)) -> Result<()> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let stdout = child.stdout.take().map(|s| spawn_reader(s, tx.clone()));
+    let stderr = child.stderr.take().map(|s| spawn_reader(s, tx.clone()));
+    // Drop our own sender so `rx` closes once both reader threads finish.
+    drop(tx);
+
+    for line in rx {
+        sink(&line);
+    }
+    if let Some(h) = stdout {
+        let _ = h.join();
+    }
+    if let Some(h) = stderr {
+        let _ = h.join();
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+    if !status.success() {
+        bail!("failed to {action} (docker exited with {status})");
+    }
+    Ok(())
+}
+
+/// Forward each line of a child pipe to the shared channel until it closes.
+fn spawn_reader<R: Read + Send + 'static>(
+    pipe: R,
+    tx: mpsc::Sender<String>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// Run, capture stdout, and fail with stderr on a non-zero exit.

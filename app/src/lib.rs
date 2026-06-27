@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use aincient_core::{ops, Backup, InstallOptions, Preflight, Stack, Status, UpdateCheck};
+use aincient_core::{ops, Backup, InstallOptions, Preflight, Reporter, Stack, Stage, Status, UpdateCheck};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 /// Locate the stack, surfacing errors as strings for the webview.
 fn stack() -> Result<Stack, String> {
@@ -16,6 +18,58 @@ fn stack() -> Result<Stack, String> {
 /// Render an anyhow error (with its context chain) as a single string.
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
+}
+
+/// A progress update pushed to the webview as an `op-progress` event during a
+/// long lifecycle op. The frontend advances a progress bar from `fraction` and
+/// appends `message` to a live log feed.
+#[derive(Clone, Serialize)]
+struct ProgressEvent {
+    /// `"stage"` — a milestone that advances the bar; `"log"` — a passed-through
+    /// docker line that only appends to the feed.
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<Stage>,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fraction: Option<f32>,
+}
+
+/// Relays core lifecycle progress to the webview. Lives on the blocking worker
+/// thread; `AppHandle::emit` is thread-safe, so events reach the UI as they
+/// happen rather than all at once when the op returns.
+struct EventReporter {
+    app: AppHandle,
+}
+
+impl Reporter for EventReporter {
+    fn captures_output(&self) -> bool {
+        true
+    }
+
+    fn stage(&mut self, stage: Stage, message: &str, fraction: Option<f32>) {
+        let _ = self.app.emit(
+            "op-progress",
+            ProgressEvent {
+                kind: "stage",
+                stage: Some(stage),
+                message: message.to_string(),
+                fraction,
+            },
+        );
+    }
+
+    fn log(&mut self, line: &str) {
+        let _ = self.app.emit(
+            "op-progress",
+            ProgressEvent {
+                kind: "log",
+                stage: None,
+                message: line.to_string(),
+                fraction: None,
+            },
+        );
+    }
 }
 
 /// Run a blocking closure off the UI thread and await its result.
@@ -61,22 +115,18 @@ fn list_backups() -> Result<Vec<Backup>, String> {
 }
 
 #[tauri::command]
-async fn admin_password() -> Result<Option<String>, String> {
-    let s = stack()?;
-    blocking(move || Ok(ops::admin_password(&s))).await
-}
-
-#[tauri::command]
-async fn set_admin_password(password: String) -> Result<(), String> {
+async fn set_admin_password(app: AppHandle, password: String) -> Result<(), String> {
     if password.trim().is_empty() {
         return Err("password cannot be empty".into());
     }
     let s = stack()?;
-    blocking(move || ops::set_admin_password(&s, &password).map_err(err)).await
+    blocking(move || ops::set_admin_password(&s, &password, &mut EventReporter { app }).map_err(err))
+        .await
 }
 
 #[tauri::command]
 async fn do_install(
+    app: AppHandle,
     key: Option<String>,
     image: Option<String>,
     port: Option<u16>,
@@ -88,22 +138,30 @@ async fn do_install(
             image,
             http_port: port,
         };
-        ops::install(&s, &opts).map_err(err)
+        // `install` reports each phase (and holds until Drupal serves) through the
+        // reporter, so the UI's progress bar/log only finish on real readiness —
+        // not the instant the container starts.
+        ops::install(&s, &opts, &mut EventReporter { app }).map_err(err)?;
+        Ok(())
     })
     .await
 }
 
 #[tauri::command]
-async fn do_update() -> Result<(), String> {
+async fn do_update(app: AppHandle) -> Result<(), String> {
     let s = stack()?;
-    blocking(move || ops::update(&s).map_err(err)).await
+    blocking(move || {
+        ops::update(&s, &mut EventReporter { app }).map_err(err)?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-async fn do_backup(label: Option<String>) -> Result<String, String> {
+async fn do_backup(app: AppHandle, label: Option<String>) -> Result<String, String> {
     let s = stack()?;
     blocking(move || {
-        ops::backup(&s, label.as_deref())
+        ops::backup(&s, label.as_deref(), &mut EventReporter { app })
             .map(|p: PathBuf| p.to_string_lossy().into_owned())
             .map_err(err)
     })
@@ -111,40 +169,54 @@ async fn do_backup(label: Option<String>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn do_restore(path: String) -> Result<(), String> {
+async fn do_restore(app: AppHandle, path: String) -> Result<(), String> {
     let s = stack()?;
-    blocking(move || ops::restore(&s, std::path::Path::new(&path)).map_err(err)).await
+    blocking(move || {
+        ops::restore(&s, std::path::Path::new(&path), &mut EventReporter { app }).map_err(err)
+    })
+    .await
 }
 
 #[tauri::command]
-async fn do_reinstall(key: Option<String>) -> Result<(), String> {
+async fn do_reinstall(app: AppHandle, key: Option<String>) -> Result<(), String> {
     let s = stack()?;
     blocking(move || {
         let opts = InstallOptions {
             ai_key: key,
             ..Default::default()
         };
-        ops::reinstall(&s, &opts).map_err(err)
+        ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
+        Ok(())
     })
     .await
 }
 
 #[tauri::command]
-async fn do_start() -> Result<(), String> {
+async fn do_start(app: AppHandle) -> Result<(), String> {
     let s = stack()?;
-    blocking(move || ops::start(&s).map_err(err)).await
+    blocking(move || {
+        ops::start(&s, &mut EventReporter { app }).map_err(err)?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-async fn do_stop() -> Result<(), String> {
+async fn do_stop(app: AppHandle) -> Result<(), String> {
     let s = stack()?;
-    blocking(move || ops::stop(&s).map_err(err)).await
+    blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
 }
 
 #[tauri::command]
 fn open_console() -> Result<(), String> {
     let s = stack()?;
     ops::open_console(&s).map_err(err)
+}
+
+#[tauri::command]
+fn open_login() -> Result<(), String> {
+    let s = stack()?;
+    ops::open_login(&s).map_err(err)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -156,7 +228,6 @@ pub fn run() {
             get_status,
             get_update,
             list_backups,
-            admin_password,
             set_admin_password,
             do_install,
             do_update,
@@ -166,6 +237,7 @@ pub fn run() {
             do_start,
             do_stop,
             open_console,
+            open_login,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the AIncient Manager");

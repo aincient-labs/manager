@@ -158,6 +158,56 @@ fn done_banner(headline: &str, url: &str) {
     println!("{} Console: {}", style::success(headline), style::url(url));
 }
 
+/// Like [`done_banner`], but for when the stack started yet the console hasn't
+/// answered within the wait window — it's most likely still booting, not broken.
+fn pending_banner(headline: &str, url: &str) {
+    println!();
+    println!("{} Console: {}", style::warn(headline), style::url(url));
+    println!(
+        "{}",
+        style::warn(
+            "It's taking longer than usual to come up. Give it another minute, then reload \
+             — or watch it boot with `atelier logs -f app`."
+        )
+    );
+}
+
+/// Renders core lifecycle progress on the terminal: a headline as each stage
+/// begins, then heartbeat dots while the console finishes booting. Docker's own
+/// output streams underneath untouched (we don't capture it — `captures_output`
+/// stays false), so `pull`/`up` keep their familiar live progress.
+#[derive(Default)]
+struct CliReporter {
+    last: Option<ops::Stage>,
+    /// True when the current line was left open (no trailing newline) for dots.
+    open_line: bool,
+}
+
+impl ops::Reporter for CliReporter {
+    fn stage(&mut self, stage: ops::Stage, message: &str, _fraction: Option<f32>) {
+        // A repeated Booting stage is a poll tick — show a heartbeat dot.
+        if self.last == Some(stage) && stage == ops::Stage::Booting {
+            print!(".");
+            std::io::stdout().flush().ok();
+            return;
+        }
+        if self.open_line {
+            println!();
+            self.open_line = false;
+        }
+        self.last = Some(stage);
+        match stage {
+            ops::Stage::Ready => println!("{}", style::success(message)),
+            ops::Stage::Booting => {
+                print!("{} ", style::heading(message));
+                std::io::stdout().flush().ok();
+                self.open_line = true;
+            }
+            _ => println!("{}", style::heading(message)),
+        }
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let stack = Stack::locate()?;
@@ -171,19 +221,25 @@ fn run() -> Result<()> {
                 image,
                 http_port: port,
             };
-            ops::install(&stack, &opts)?;
-            done_banner("Installed.", &stack.console_url());
+            if ops::install(&stack, &opts, &mut CliReporter::default())? {
+                done_banner("Installed.", &stack.console_url());
+            } else {
+                pending_banner("Installed — still finishing first boot.", &stack.console_url());
+            }
             show_login(&stack);
             Ok(())
         }
         Command::Update => {
-            ops::update(&stack)?;
-            done_banner("Update complete.", &stack.console_url());
+            if ops::update(&stack, &mut CliReporter::default())? {
+                done_banner("Update complete.", &stack.console_url());
+            } else {
+                pending_banner("Update applied — still finishing boot.", &stack.console_url());
+            }
             Ok(())
         }
         Command::CheckUpdate { json } => check_update(&stack, json),
         Command::Backup { label } => {
-            let path = ops::backup(&stack, label.as_deref())?;
+            let path = ops::backup(&stack, label.as_deref(), &mut ops::Silent)?;
             println!("{} {}", style::success("Backup written to"), path.display());
             Ok(())
         }
@@ -199,7 +255,7 @@ fn run() -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            ops::restore(&stack, &file)?;
+            ops::restore(&stack, &file, &mut ops::Silent)?;
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
@@ -216,22 +272,28 @@ fn run() -> Result<()> {
                 ai_key: key,
                 ..Default::default()
             };
-            ops::reinstall(&stack, &opts)?;
-            done_banner("Reinstalled.", &stack.console_url());
+            if ops::reinstall(&stack, &opts, &mut CliReporter::default())? {
+                done_banner("Reinstalled.", &stack.console_url());
+            } else {
+                pending_banner("Reinstalled — still finishing first boot.", &stack.console_url());
+            }
             show_login(&stack);
             Ok(())
         }
         Command::Start => {
-            ops::start(&stack)?;
-            println!(
-                "{} Console: {}",
-                style::success("Started."),
-                style::url(&stack.console_url())
-            );
+            if ops::start(&stack, &mut CliReporter::default())? {
+                println!(
+                    "{} Console: {}",
+                    style::success("Started."),
+                    style::url(&stack.console_url())
+                );
+            } else {
+                pending_banner("Started — still finishing boot.", &stack.console_url());
+            }
             Ok(())
         }
         Command::Stop => {
-            ops::stop(&stack)?;
+            ops::stop(&stack, &mut ops::Silent)?;
             println!("{}", style::success("Stopped."));
             Ok(())
         }
@@ -267,7 +329,7 @@ fn run() -> Result<()> {
         }
         Command::Password { set } => match set {
             Some(pw) => {
-                ops::set_admin_password(&stack, &pw)?;
+                ops::set_admin_password(&stack, &pw, &mut ops::Silent)?;
                 println!("{}", style::success("Admin password updated."));
                 Ok(())
             }

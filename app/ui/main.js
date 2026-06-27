@@ -2,6 +2,7 @@
 // reached through Tauri commands. This file only orchestrates screens and input.
 
 const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
 const screens = ["loading", "docker", "install", "main"];
@@ -13,11 +14,6 @@ function showScreen(name) {
 function showError(msg) {
   $("error-text").textContent = msg;
   $("error").classList.remove("hidden");
-}
-
-function busy(on, msg) {
-  $("busy-msg").textContent = msg || "Working…";
-  $("busy").classList.toggle("hidden", !on);
 }
 
 // In-page confirm (the webview blocks native confirm() without the dialog plugin).
@@ -55,16 +51,85 @@ function confirmModal(msg, opts = {}) {
   });
 }
 
-// Wrap a long op: show the busy overlay, run, surface errors, then refresh.
-async function runOp(msg, fn) {
-  busy(true, msg);
+// Pixel labels for each core Stage, shown in the progress sub-status / feed.
+const STAGE_LABELS = {
+  preflight: "Checking Docker",
+  scaffold: "Preparing",
+  pull: "Downloading image",
+  starting: "Starting containers",
+  booting: "Booting the console",
+  ready: "Ready",
+};
+
+let lastStage = null;
+// Whether this op reported a numeric fraction (a phased op like install/update),
+// so it owns the bar — vs. an indeterminate op (backup/stop/…) we finish green.
+let sawFraction = false;
+
+function progressReset(title) {
+  $("progress-title").textContent = title;
+  $("progress-fill").style.width = "0%";
+  $("progress-fill").classList.remove("done");
+  $("progressbar").classList.add("indeterminate"); // until a fraction arrives
+  $("progress-stage").textContent = "Working…";
+  $("progress-log").textContent = "";
+  lastStage = null;
+  sawFraction = false;
+}
+
+// Settle the bar to a full mint "done" — for indeterminate ops that finished OK.
+function progressFinish() {
+  $("progressbar").classList.remove("indeterminate");
+  $("progress-fill").style.width = "100%";
+  $("progress-fill").classList.add("done");
+  $("progress-stage").textContent = "Done.";
+}
+
+function appendLog(line) {
+  const log = $("progress-log");
+  log.textContent += (log.textContent ? "\n" : "") + line;
+  log.scrollTop = log.scrollHeight;
+}
+
+// Apply one op-progress event: advance the bar, update the sub-status, and feed
+// the log. A numeric fraction switches the bar to determinate (and mint at 1.0);
+// repeated ticks update the live status without spamming the feed; each new phase
+// and every passed-through docker line get a feed line.
+function progressUpdate(p) {
+  if (typeof p.fraction === "number") {
+    sawFraction = true;
+    $("progressbar").classList.remove("indeterminate");
+    $("progress-fill").style.width = `${Math.round(p.fraction * 100)}%`;
+    if (p.fraction >= 1) $("progress-fill").classList.add("done");
+  }
+  if (p.kind === "log") {
+    if (p.message.trim()) appendLog(p.message);
+    return;
+  }
+  // A stage milestone.
+  $("progress-stage").textContent = p.message; // live, e.g. "Booting… (12s)"
+  if (p.stage !== lastStage) {
+    appendLog(`▸ ${STAGE_LABELS[p.stage] || p.message}`);
+    lastStage = p.stage;
+  }
+}
+
+// Wrap any long op in the progress panel: stream its phases/steps via op-progress
+// events, then refresh. Phased ops (install/update/start) drive the bar with
+// fractions; the rest run an indeterminate bar that settles green on success.
+async function runProgressOp(title, fn) {
+  progressReset(title);
+  $("progress").classList.remove("hidden");
+  const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
   try {
     await fn();
+    if (!sawFraction) progressFinish();
     await refresh();
   } catch (e) {
     showError(String(e));
   } finally {
-    busy(false);
+    unlisten();
+    $("progress").classList.add("hidden");
   }
 }
 
@@ -86,7 +151,6 @@ async function refresh() {
   showScreen("main");
   // Best-effort, non-blocking enrichment.
   refreshUpdate();
-  refreshLogin(status);
   refreshBackups();
 }
 
@@ -119,12 +183,6 @@ async function refreshUpdate() {
   } catch {
     $("update-banner").classList.add("hidden");
   }
-}
-
-// Credentials are revealed on demand via the Login action, not shown by default.
-// Just fold them away whenever the appliance isn't running.
-function refreshLogin(status) {
-  if (!status.running) $("creds").classList.add("hidden");
 }
 
 async function refreshBackups() {
@@ -160,31 +218,10 @@ const actions = {
 
   open: () => invoke("open_console").catch((e) => showError(String(e))),
 
-  // Reveal (toggle) the admin credentials so the user can log in to the console.
-  login: async () => {
-    const creds = $("creds");
-    if (!creds.classList.contains("hidden")) {
-      creds.classList.add("hidden");
-      return;
-    }
-    try {
-      const pw = await invoke("admin_password");
-      $("creds-text").textContent = pw
-        ? `admin / ${pw}`
-        : "Password unavailable — reset it below to set a new one.";
-      creds.classList.remove("hidden");
-    } catch (e) {
-      showError(String(e));
-    }
-  },
-
-  "copy-creds": async () => {
-    try {
-      await navigator.clipboard.writeText($("creds-text").textContent);
-    } catch {
-      /* clipboard may be unavailable in the webview — ignore */
-    }
-  },
+  // Send the operator straight to Drupal's /user/login form in their browser.
+  // The manager never displays the admin password; if they've forgotten it,
+  // "Reset password" below sets a new one.
+  login: () => invoke("open_login").catch((e) => showError(String(e))),
 
   "reset-password": () => {
     $("reset-pw-input").value = "";
@@ -198,7 +235,7 @@ const actions = {
     const password = $("reset-pw-input").value;
     if (!password.trim()) return;
     $("reset-pw").classList.add("hidden");
-    return runOp("Setting the admin password…", () =>
+    return runProgressOp("Setting the admin password", () =>
       invoke("set_admin_password", { password })
     );
   },
@@ -206,22 +243,21 @@ const actions = {
   install: () => {
     const key = $("install-key").value.trim() || null;
     const port = parseInt($("install-port").value, 10) || null;
-    return runOp("Installing — this can take a couple of minutes…", () =>
+    return runProgressOp("Installing AIncient CMS", () =>
       invoke("do_install", { key, image: null, port })
     );
   },
 
-  update: () =>
-    runOp("Updating — snapshotting, migrating, health-checking…", () => invoke("do_update")),
+  update: () => runProgressOp("Updating", () => invoke("do_update")),
 
   startstop: async () => {
     const running = $("startstop-label").textContent === "Stop";
-    return runOp(running ? "Stopping…" : "Starting…", () =>
+    return runProgressOp(running ? "Stopping" : "Starting", () =>
       invoke(running ? "do_stop" : "do_start")
     );
   },
 
-  backup: () => runOp("Backing up the database…", () => invoke("do_backup", { label: null })),
+  backup: () => runProgressOp("Backing up", () => invoke("do_backup", { label: null })),
 
   restore: async () => {
     const path = $("backup-select").value;
@@ -230,7 +266,7 @@ const actions = {
       "Restore will REPLACE the current database with this backup. Continue?"
     );
     if (!ok) return;
-    return runOp("Restoring the database…", () => invoke("do_restore", { path }));
+    return runProgressOp("Restoring", () => invoke("do_restore", { path }));
   },
 
   reinstall: async () => {
@@ -240,7 +276,7 @@ const actions = {
       { requireText: "confirm" }
     );
     if (!ok) return;
-    return runOp("Reinstalling from scratch…", () => invoke("do_reinstall", { key: null }));
+    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall", { key: null }));
   },
 };
 

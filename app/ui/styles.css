@@ -47,7 +47,15 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  min-height: 100vh;
+  /* A fixed-chrome desktop window: the page itself never scrolls (so the
+     webview never paints whole-page scrollbars or rubber-bands on flush
+     content). Only the content region below the topbar scrolls, and only when
+     it genuinely overflows. */
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 /* Press Start 2P display label — uppercase arcade micro-type. */
@@ -58,10 +66,9 @@ body {
   line-height: 1.5;
 }
 
-/* Top bar with the four-band brand spectrum stripe. */
+/* Top bar with the four-band brand spectrum stripe — fixed chrome, never scrolls. */
 .topbar {
-  position: sticky;
-  top: 0;
+  flex: none;
   background: var(--card);
   border-bottom: 1px solid var(--border-strong);
 }
@@ -109,6 +116,12 @@ body {
 }
 
 main {
+  flex: 1 1 auto;
+  min-height: 0; /* let the flex child shrink so its own scroll engages */
+  overflow-y: auto; /* scroll the content region only when it overflows */
+  overflow-x: hidden; /* never horizontally */
+  overscroll-behavior: contain;
+  width: 100%;
   padding: 20px;
   max-width: var(--maxw);
   margin: 0 auto;
@@ -149,23 +162,6 @@ main {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-}
-
-/* Revealed admin credentials (the Login action). */
-.creds {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-}
-.creds code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 13px;
-  flex: 1;
-  word-break: break-all;
 }
 
 /* Advanced disclosure — destructive actions stay folded away. */
@@ -418,6 +414,7 @@ select:focus {
 }
 .restore-row select {
   flex: 1;
+  min-width: 0; /* allow the select to shrink; long backup names clip, not push */
 }
 
 /* Error banner */
@@ -536,12 +533,101 @@ select:focus {
   animation: spin 0.9s steps(12) infinite;
   margin: 0 auto;
 }
-.spinner.light {
-  border-color: rgba(255, 255, 255, 0.3);
-  border-top-color: #fff;
-}
 @keyframes spin {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* Progress panel — a chrome-themed card (brand spectrum stripe + hard offset
+   shadow) holding a stepped progress bar over a live log feed. Shown for the
+   long lifecycle ops so the user watches each phase instead of staring at a
+   single line of overlay text. */
+.progress-panel {
+  background: var(--card);
+  color: var(--ink);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  width: min(440px, 90vw);
+  overflow: hidden; /* clip the spectrum stripe to the sharp corners */
+}
+.progress-body {
+  padding: 20px;
+}
+.progress-panel .modal-title {
+  margin: 0 0 14px;
+}
+
+/* The bar — flat violet fill on a sunken track, advanced in arcade steps (no
+   smooth easing), turning mint the moment the console is ready. */
+.progressbar {
+  height: 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.progressbar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--violet);
+  transition: width 0.3s steps(8), background 0.2s;
+  /* Stepped blink (no easing) so a long phase still reads as "working" even
+     while the bar's width is parked — e.g. during the image pull. */
+  animation: pulse 1.1s steps(2) infinite;
+}
+.progressbar-fill.done {
+  background: var(--success);
+  animation: none;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Indeterminate mode — for ops with no measurable progress (backup, restore,
+   stop, password): a flat violet block sweeps the track in arcade steps until
+   the op settles to a full mint bar. */
+.progressbar.indeterminate .progressbar-fill {
+  width: 40%;
+  animation: indeterminate 1.2s steps(6) infinite;
+}
+@keyframes indeterminate {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(280%);
+  }
+}
+
+/* Live sub-status (e.g. "Booting… (12s)") in the arcade micro-type. */
+.progress-stage {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--muted);
+  margin: 12px 0;
+  min-height: 16px;
+}
+
+/* The log feed — monospace, scrollable, pinned to the latest line. */
+.progress-log {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 0;
+  height: 152px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

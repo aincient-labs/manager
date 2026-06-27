@@ -153,6 +153,12 @@ impl Stack {
         format!("http://localhost:{}/aincient", self.http_port())
     }
 
+    /// URL of Drupal's login form. "Login" sends the operator straight here to
+    /// sign in themselves — the manager never displays the admin password.
+    pub fn login_url(&self) -> String {
+        format!("http://localhost:{}/user/login", self.http_port())
+    }
+
     pub fn image(&self) -> String {
         self.env_get("AINCIENT_IMAGE")
             .unwrap_or_else(|| DEFAULT_IMAGE.to_string())
