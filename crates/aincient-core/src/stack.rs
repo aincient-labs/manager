@@ -41,7 +41,6 @@ services:
     environment:
       DATABASE_URL: mysql://aincient:${DB_PASSWORD:-aincient}@db/aincient
       HASH_SALT: ${HASH_SALT:?set HASH_SALT in .env}
-      AINCIENT_AI_KEY: ${AINCIENT_AI_KEY:-}
       AINCIENT_TRUSTED_HOSTS: ${AINCIENT_TRUSTED_HOSTS:-}
       AINCIENT_ADMIN_PASS: ${ADMIN_PASS:-}
     ports:
@@ -65,10 +64,6 @@ pub struct Stack {
 /// Options for scaffolding a fresh stack.
 #[derive(Debug, Default, Clone)]
 pub struct InstallOptions {
-    /// Provider-neutral AI API key (the `AINCIENT_AI_KEY` bootstrap seed).
-    /// `None` leaves it blank — the in-app onboarding wizard then prompts for a
-    /// provider + credential on first run.
-    pub ai_key: Option<String>,
     /// Override image tag (defaults to [`DEFAULT_IMAGE`]).
     pub image: Option<String>,
     /// Override console port (defaults to [`DEFAULT_PORT`]).
@@ -165,8 +160,8 @@ impl Stack {
     }
 
     /// Lay down `compose.yaml` + `.env` if absent. Never clobbers an existing
-    /// `.env` (preserves `HASH_SALT`/`AINCIENT_AI_KEY`); reconciles the image
-    /// and port tunables on a re-run, mirroring `install.sh`.
+    /// `.env` (preserves `HASH_SALT`); reconciles the image and port tunables on
+    /// a re-run, mirroring `install.sh`.
     pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<()> {
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
@@ -182,10 +177,8 @@ impl Stack {
         let env_path = self.env_path();
 
         if !env_path.is_file() {
-            let key = opts.ai_key.clone().unwrap_or_default();
             let contents = format!(
                 "HASH_SALT={salt}\n\
-                 AINCIENT_AI_KEY={key}\n\
                  AINCIENT_IMAGE={image}\n\
                  HTTP_PORT={port}\n\
                  ADMIN_PASS=\n",
@@ -197,11 +190,6 @@ impl Stack {
             let mut env = self.read_env();
             env.insert("AINCIENT_IMAGE".to_string(), image.clone());
             env.insert("HTTP_PORT".to_string(), port.to_string());
-            if let Some(key) = &opts.ai_key {
-                if !key.is_empty() {
-                    env.insert("AINCIENT_AI_KEY".to_string(), key.clone());
-                }
-            }
             let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
             write_private(&env_path, &body)?;
         }
@@ -268,20 +256,19 @@ mod tests {
         assert!(env.get("HASH_SALT").unwrap().chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(env.get("AINCIENT_IMAGE").map(String::as_str), Some(DEFAULT_IMAGE));
         assert_eq!(env.get("HTTP_PORT").map(String::as_str), Some("41221"));
-        assert_eq!(env.get("AINCIENT_AI_KEY").map(String::as_str), Some(""));
+        // No AI key is written — a provider is connected via in-app onboarding.
+        assert_eq!(env.get("AINCIENT_AI_KEY"), None);
     }
 
     #[test]
-    fn scaffold_records_provided_key_and_port() {
+    fn scaffold_records_provided_port() {
         let ts = TempStack::new();
         let opts = InstallOptions {
-            ai_key: Some("sk-test".into()),
             image: None,
             http_port: Some(8080),
         };
         ts.0.ensure_scaffold(&opts).unwrap();
 
-        assert_eq!(ts.0.env_get("AINCIENT_AI_KEY").as_deref(), Some("sk-test"));
         assert_eq!(ts.0.http_port(), 8080);
         assert_eq!(ts.0.console_url(), "http://localhost:8080/aincient");
     }
@@ -290,24 +277,18 @@ mod tests {
     fn re_scaffold_preserves_secrets_but_reconciles_tunables() {
         let ts = TempStack::new();
         let stack = &ts.0;
-        ts.0.ensure_scaffold(&InstallOptions {
-            ai_key: Some("sk-secret".into()),
-            ..Default::default()
-        })
-        .unwrap();
+        ts.0.ensure_scaffold(&InstallOptions::default()).unwrap();
         let salt = stack.env_get("HASH_SALT").unwrap();
 
-        // Re-run pointing at a new image + port, supplying no key.
+        // Re-run pointing at a new image + port.
         stack
             .ensure_scaffold(&InstallOptions {
-                ai_key: None,
                 image: Some("ghcr.io/aincient-labs/cms:v2".into()),
                 http_port: Some(9000),
             })
             .unwrap();
 
         assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must be preserved");
-        assert_eq!(stack.env_get("AINCIENT_AI_KEY").as_deref(), Some("sk-secret"));
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/cms:v2");
         assert_eq!(stack.http_port(), 9000);
     }

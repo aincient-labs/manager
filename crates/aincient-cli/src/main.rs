@@ -39,9 +39,6 @@ enum Command {
     },
     /// Install the appliance (or upgrade in place if already installed).
     Install {
-        /// AI provider API key (otherwise add it later in onboarding).
-        #[arg(long, value_name = "KEY")]
-        key: Option<String>,
         /// Image tag to run.
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
@@ -75,8 +72,6 @@ enum Command {
     },
     /// Wipe all data and install from scratch (destructive).
     Reinstall {
-        #[arg(long, value_name = "KEY")]
-        key: Option<String>,
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -215,9 +210,8 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Doctor => doctor(),
         Command::Status { json } => status(&stack, json),
-        Command::Install { key, image, port } => {
+        Command::Install { image, port } => {
             let opts = InstallOptions {
-                ai_key: key,
                 image,
                 http_port: port,
             };
@@ -259,7 +253,7 @@ fn run() -> Result<()> {
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
-        Command::Reinstall { key, yes } => {
+        Command::Reinstall { yes } => {
             if !confirm(
                 "Reinstall will DELETE all data (database, files, admin password) and install \
                  fresh. Continue?",
@@ -268,10 +262,7 @@ fn run() -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            let opts = InstallOptions {
-                ai_key: key,
-                ..Default::default()
-            };
+            let opts = InstallOptions::default();
             if ops::reinstall(&stack, &opts, &mut CliReporter::default())? {
                 done_banner("Reinstalled.", &stack.console_url());
             } else {

@@ -241,10 +241,9 @@ const actions = {
   },
 
   install: () => {
-    const key = $("install-key").value.trim() || null;
     const port = parseInt($("install-port").value, 10) || null;
     return runProgressOp("Installing AIncient CMS", () =>
-      invoke("do_install", { key, image: null, port })
+      invoke("do_install", { image: null, port })
     );
   },
 
@@ -276,7 +275,7 @@ const actions = {
       { requireText: "confirm" }
     );
     if (!ok) return;
-    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall", { key: null }));
+    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"));
   },
 };
 

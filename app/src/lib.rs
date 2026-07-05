@@ -127,14 +127,12 @@ async fn set_admin_password(app: AppHandle, password: String) -> Result<(), Stri
 #[tauri::command]
 async fn do_install(
     app: AppHandle,
-    key: Option<String>,
     image: Option<String>,
     port: Option<u16>,
 ) -> Result<(), String> {
     let s = stack()?;
     blocking(move || {
         let opts = InstallOptions {
-            ai_key: key,
             image,
             http_port: port,
         };
@@ -178,13 +176,10 @@ async fn do_restore(app: AppHandle, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn do_reinstall(app: AppHandle, key: Option<String>) -> Result<(), String> {
+async fn do_reinstall(app: AppHandle) -> Result<(), String> {
     let s = stack()?;
     blocking(move || {
-        let opts = InstallOptions {
-            ai_key: key,
-            ..Default::default()
-        };
+        let opts = InstallOptions::default();
         ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
         Ok(())
     })
