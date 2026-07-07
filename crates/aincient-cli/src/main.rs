@@ -54,7 +54,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Back up the database to ~/.atelier/backups.
+    /// Back up the database and uploaded files to ~/.atelier/backups as a
+    /// portable .tar.gz snapshot.
     Backup {
         /// A label folded into the filename.
         #[arg(long)]
@@ -62,9 +63,10 @@ enum Command {
     },
     /// List backups taken on this host.
     Backups,
-    /// Restore the database from a backup file (destructive).
+    /// Restore from a backup file (destructive). A .tar.gz snapshot restores the
+    /// database and files; a legacy .sql/.sql.gz dump restores the database only.
     Restore {
-        /// Path to a `.sql.gz` (or `.sql`) backup.
+        /// Path to a `.tar.gz` snapshot (or a legacy `.sql`/`.sql.gz` dump).
         file: PathBuf,
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
@@ -241,7 +243,8 @@ fn run() -> Result<()> {
         Command::Restore { file, yes } => {
             if !confirm(
                 &format!(
-                    "Restore will REPLACE the current database with {}. Continue?",
+                    "Restore will REPLACE the current database (and files, for a .tar.gz \
+                     snapshot) with {}. Continue?",
                     file.display()
                 ),
                 yes,

@@ -262,7 +262,7 @@ const actions = {
     const path = $("backup-select").value;
     if (!path) return;
     const ok = await confirmModal(
-      "Restore will REPLACE the current database with this backup. Continue?"
+      "Restore will REPLACE the current database and files with this snapshot. Continue?"
     );
     if (!ok) return;
     return runProgressOp("Restoring", () => invoke("do_restore", { path }));

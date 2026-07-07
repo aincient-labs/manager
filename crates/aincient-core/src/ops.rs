@@ -324,10 +324,17 @@ pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> 
     install(stack, opts, r)
 }
 
-/// Back up the database to the host, reusing converge's snapshot format
-/// (`drush sql:dump --gzip`). Returns the path to the created archive.
+/// The uploaded-files tree inside the `app` container — the `files:` volume from
+/// `compose.yaml`, holding user uploads and generated image derivatives.
+const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
+
+/// Back up the whole appliance to a single portable `.tar.gz` snapshot on the
+/// host: the database (`drush sql:dump --gzip`, converge's format) **plus** the
+/// uploaded-files tree, alongside a `manifest.json`. Self-contained, so the
+/// archive can be shared over the wire and [`restore`]d onto another host.
+/// Returns the path to the created archive.
 pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Result<PathBuf> {
-    r.stage(Stage::Working, "Backing up the database…", None);
+    r.stage(Stage::Working, "Backing up the database and files…", None);
     ensure_running(stack)?;
     std::fs::create_dir_all(stack.backups_dir())?;
 
@@ -336,43 +343,59 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
         Some(l) if !l.is_empty() => format!("{}-{ts}", sanitize(l)),
         _ => ts.clone(),
     };
-    let host_path = stack.backups_dir().join(format!("aincient-{stem}.sql.gz"));
+    let host_path = stack.backups_dir().join(format!("aincient-{stem}.tar.gz"));
 
-    // drush appends `.gz` to --result-file when --gzip is set (see converge.sh).
-    let container_base = format!("/opt/drupal/private/snapshots/manual-{ts}.sql");
-    let container_gz = format!("{container_base}.gz");
+    let drush = DRUSH.join(" ");
+    // A manifest identifying the archive as an AIncient snapshot and pinning the
+    // image it was taken from — so a future restore can warn on a version skew.
+    // JSON has no single quotes, so it's safe inside the printf's single-quoted arg.
+    let manifest = format!(
+        r#"{{"format":"aincient-snapshot","version":1,"created":"{ts}","image":"{image}"}}"#,
+        image = stack.image(),
+    );
 
-    r.log("Dumping the database…");
-    let mut dump = compose(stack);
-    dump.args(["exec", "-T", "app"]).args(DRUSH).args([
-        "sql:dump",
-        "--gzip",
-        &format!("--result-file={container_base}"),
-    ]);
-    run_capture(dump, "dump the database")?;
+    // Build the bundle inside the container, then copy it out (mirrors the
+    // dump→cp→rm pattern).
+    r.log("Dumping the database and packing uploaded files…");
+    let script = backup_script(&drush, &manifest);
+    let mut build = compose(stack);
+    build.args(["exec", "-T", "app", "sh", "-c", &script]);
+    run_capture(build, "build the snapshot archive")?;
 
-    r.log("Copying the archive out of the container…");
+    r.log("Copying the snapshot out of the container…");
     let mut cp = compose(stack);
-    cp.args(["cp", &format!("app:{container_gz}"), &host_path.to_string_lossy()]);
-    run_capture(cp, "copy the backup out of the container")?;
+    cp.args(["cp", "app:/tmp/aincient-snapshot.tar.gz", &host_path.to_string_lossy()]);
+    run_capture(cp, "copy the snapshot out of the container")?;
 
-    // Best-effort cleanup of the in-container temp file.
+    // Best-effort cleanup of the in-container temp files.
     let mut rm = compose(stack);
-    rm.args(["exec", "-T", "app", "rm", "-f", &container_gz]);
+    rm.args([
+        "exec", "-T", "app", "rm", "-rf",
+        "/tmp/aincient-snapshot", "/tmp/aincient-snapshot.tar.gz",
+    ]);
     let _ = rm.output();
 
-    r.log(&format!("Backup written to {}", host_path.display()));
+    r.log(&format!("Snapshot written to {}", host_path.display()));
     Ok(host_path)
 }
 
-/// Restore the database from a host backup file. Mirrors converge's
-/// `restore_snapshot`: drop, load, rebuild caches. Destructive — confirm first.
+/// Restore the appliance from a host backup file. Destructive — confirm first.
+///
+/// A `.tar.gz` **snapshot bundle** (from [`backup`]) restores the database
+/// *and* the uploaded-files tree; a legacy `.sql`/`.sql.gz` dump restores the
+/// database only. Both mirror converge's `restore_snapshot` for the DB: drop,
+/// load, rebuild caches.
 pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
-    r.stage(Stage::Working, "Restoring the database…", None);
     ensure_running(stack)?;
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
     }
+    let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    if is_snapshot_bundle(name) {
+        return restore_bundle(stack, file, r);
+    }
+
+    r.stage(Stage::Working, "Restoring the database…", None);
     let gzipped = file
         .extension()
         .map(|e| e.eq_ignore_ascii_case("gz"))
@@ -416,6 +439,87 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
     Ok(())
 }
 
+/// Restore a full snapshot bundle (`.tar.gz` from [`backup`]): database + files.
+/// The whole thing runs as one in-container script so the DB load and the files
+/// swap stay together. Files are rewritten as root, so we re-assert
+/// `www-data` ownership afterwards — exactly as `entrypoint.sh` does on boot —
+/// or restored uploads and their derivatives would be unwritable/unreadable.
+fn restore_bundle(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
+    r.stage(Stage::Working, "Restoring the database and files…", None);
+
+    r.log("Copying the snapshot into the container…");
+    let mut cp = compose(stack);
+    cp.args(["cp", &file.to_string_lossy(), "app:/tmp/aincient-restore.tar.gz"]);
+    run_capture(cp, "copy the snapshot into the container")?;
+
+    r.log("Unpacking and restoring database + files…");
+    let script = restore_bundle_script(&DRUSH.join(" "));
+    let mut run = compose(stack);
+    run.args(["exec", "-T", "app", "sh", "-c", &script]);
+    run_capture(run, "restore the snapshot")?;
+
+    Ok(())
+}
+
+/// The in-container shell that builds a snapshot bundle. `drush --gzip` appends
+/// `.gz` to --result-file (see converge.sh). One `tar` with two `-C` changes
+/// packs the staged DB dump + manifest, then the live files tree, so `files/`
+/// lands at the archive root. `manifest` is JSON (no single quotes), so it's
+/// safe inside the single-quoted `printf` argument.
+fn backup_script(drush: &str, manifest: &str) -> String {
+    format!(
+        "set -e\n\
+         STAGE=/tmp/aincient-snapshot\n\
+         ARCHIVE=/tmp/aincient-snapshot.tar.gz\n\
+         rm -rf \"$STAGE\" \"$ARCHIVE\"\n\
+         mkdir -p \"$STAGE\"\n\
+         {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
+         printf '%s\\n' '{manifest}' > \"$STAGE/manifest.json\"\n\
+         tar czf \"$ARCHIVE\" -C \"$STAGE\" manifest.json database.sql.gz \
+         -C /opt/drupal/web/sites/default files\n",
+    )
+}
+
+/// The in-container shell that restores a snapshot bundle: drop + reload the DB,
+/// then swap the files tree. `find -mindepth 1 -delete` clears the files dir
+/// (dotfiles included) without removing the volume mount point; `cp -a`
+/// preserves the tree; the `chown` re-asserts `www-data` ownership (files are
+/// written as root) exactly as `entrypoint.sh` does. cache:rebuild and cleanup
+/// are best-effort so a hiccup there doesn't fail the restore.
+fn restore_bundle_script(drush: &str) -> String {
+    format!(
+        "set -e\n\
+         ARCHIVE=/tmp/aincient-restore.tar.gz\n\
+         WORK=/tmp/aincient-restore\n\
+         DEST={FILES_DIR}\n\
+         rm -rf \"$WORK\"\n\
+         mkdir -p \"$WORK\"\n\
+         tar xzf \"$ARCHIVE\" -C \"$WORK\"\n\
+         {drush} sql:drop -y\n\
+         zcat \"$WORK/database.sql.gz\" | {drush} sql:cli\n\
+         if [ -d \"$WORK/files\" ]; then\n\
+         \x20 find \"$DEST\" -mindepth 1 -delete 2>/dev/null || true\n\
+         \x20 cp -a \"$WORK/files/.\" \"$DEST/\"\n\
+         \x20 chown -R www-data:www-data \"$DEST\"\n\
+         fi\n\
+         {drush} cache:rebuild || true\n\
+         rm -rf \"$WORK\" \"$ARCHIVE\" || true\n",
+    )
+}
+
+/// True if `name` is a full snapshot bundle (database + files), vs. a legacy
+/// DB-only `.sql`/`.sql.gz` dump.
+fn is_snapshot_bundle(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".tar.gz") || n.ends_with(".tgz")
+}
+
+/// True if `name` is a restorable backup: a snapshot bundle or a legacy dump.
+fn is_backup_file(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    is_snapshot_bundle(name) || n.ends_with(".sql.gz") || n.ends_with(".sql")
+}
+
 /// List host backups, newest first.
 pub fn list_backups(stack: &Stack) -> Vec<Backup> {
     let dir = stack.backups_dir();
@@ -426,7 +530,7 @@ pub fn list_backups(stack: &Stack) -> Vec<Backup> {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !(name.ends_with(".sql.gz") || name.ends_with(".sql")) {
+        if !is_backup_file(&name) {
             continue;
         }
         let meta = match entry.metadata() {
@@ -639,7 +743,91 @@ fn sanitize(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_http_status;
+    use super::{
+        backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_http_status,
+        restore_bundle_script,
+    };
+    use crate::stack::Stack;
+
+    /// Syntax-check a shell snippet with `sh -n` (parse only; nothing executes).
+    fn assert_valid_sh(script: &str) {
+        let out = std::process::Command::new("sh")
+            .args(["-n", "-c", script])
+            .output()
+            .expect("run sh -n");
+        assert!(
+            out.status.success(),
+            "generated shell failed to parse:\n{script}\n---\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn backup_script_is_valid_shell_and_packs_db_and_files() {
+        let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
+        let manifest = r#"{"format":"aincient-snapshot","version":1,"created":"x","image":"y"}"#;
+        let script = backup_script(drush, manifest);
+        assert_valid_sh(&script);
+        assert!(script.contains("sql:dump --gzip"), "dumps the database");
+        // Both members packed: the staged DB dump and the live files tree.
+        assert!(script.contains("database.sql.gz"), "packs the db dump");
+        assert!(
+            script.contains("-C /opt/drupal/web/sites/default files"),
+            "packs the files tree"
+        );
+    }
+
+    #[test]
+    fn restore_bundle_script_is_valid_shell_and_reasserts_ownership() {
+        let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
+        let script = restore_bundle_script(drush);
+        assert_valid_sh(&script);
+        assert!(script.contains("sql:drop -y"), "drops before load");
+        assert!(script.contains("| /opt/drupal/vendor/bin/drush"), "loads the db");
+        // The scotty gotcha: files written as root must be chowned back to www-data.
+        assert!(
+            script.contains("chown -R www-data:www-data"),
+            "re-asserts files ownership"
+        );
+    }
+
+    #[test]
+    fn recognises_snapshot_bundles_vs_legacy_dumps() {
+        assert!(is_snapshot_bundle("aincient-20260707.tar.gz"));
+        assert!(is_snapshot_bundle("SNAP.TGZ")); // case-insensitive
+        assert!(!is_snapshot_bundle("aincient-20260707.sql.gz"));
+        assert!(!is_snapshot_bundle("aincient-20260707.sql"));
+    }
+
+    #[test]
+    fn accepts_both_bundles_and_legacy_dumps_as_backups() {
+        for good in ["a.tar.gz", "a.tgz", "a.sql.gz", "a.sql"] {
+            assert!(is_backup_file(good), "{good} should be a backup file");
+        }
+        for bad in ["notes.txt", "a.zip", "a.tar", "archive.gz"] {
+            assert!(!is_backup_file(bad), "{bad} should not be a backup file");
+        }
+    }
+
+    #[test]
+    fn list_backups_includes_bundles_and_dumps_and_ignores_others() {
+        let dir = std::env::temp_dir().join(format!("aincient-backups-{}", std::process::id()));
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        // Two restorable backups + one unrelated file that must be ignored.
+        std::fs::write(backups.join("aincient-old.sql.gz"), b"legacy").unwrap();
+        std::fs::write(backups.join("aincient-new.tar.gz"), b"bundle").unwrap();
+        std::fs::write(backups.join("README.txt"), b"nope").unwrap();
+
+        let listed = list_backups(&Stack { home: dir.clone() });
+        let mut names: Vec<_> = listed.iter().map(|b| b.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["aincient-new.tar.gz", "aincient-old.sql.gz"]);
+        // Results are sorted newest-first by mtime (no strict assertion here —
+        // the two files may share a timestamp; ordering is covered by mtime desc).
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parses_status_codes_from_the_status_line() {

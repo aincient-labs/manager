@@ -23,8 +23,8 @@ operation maps to a `docker compose` / `drush` primitive the appliance already u
 | `install`        | Lay down `~/.atelier/{compose.yaml,.env}`, pull, `up -d`. Idempotent.     |
 | `update`         | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
 | `check-update`   | Compare the local image digest against the registry tag.                  |
-| `backup`         | `drush sql:dump --gzip` in the container, copied to `~/.atelier/backups`. |
-| `restore <file>` | Drop, load the dump, rebuild caches (mirrors converge's `restore_snapshot`).|
+| `backup`         | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. |
+| `restore <file>` | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). |
 | `reinstall`      | Wipe volumes and install fresh (destructive, confirmed).                  |
 | `status`/`doctor`| Read-only health and Docker-readiness probes.                             |
 | `start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.                  |
