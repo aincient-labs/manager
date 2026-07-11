@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use aincient_core::{ops, Backup, InstallOptions, Preflight, Reporter, Stack, Stage, Status, UpdateCheck};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_dialog::DialogExt;
 
 /// Locate the stack, surfacing errors as strings for the webview.
 fn stack() -> Result<Stack, String> {
@@ -175,6 +176,59 @@ async fn do_restore(app: AppHandle, path: String) -> Result<(), String> {
     .await
 }
 
+/// Open a native "open file" dialog and return the chosen backup's path (or
+/// `None` if cancelled). The frontend then confirms and hands the path to
+/// [`do_restore`] — so restoring an *imported* snapshot goes through the exact
+/// same core path (and confirm gate) as restoring one from the backups list.
+/// Filtered to the archive shapes [`ops::restore`] accepts (`.tar.gz`/`.tgz`
+/// bundles and legacy `.sql`/`.sql.gz` dumps); core still validates.
+#[tauri::command]
+async fn pick_restore_file(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title("Choose a backup to restore")
+        .add_filter("AIncient backup", &["gz", "tgz", "sql"])
+        .pick_file(move |picked| {
+            let path = picked.and_then(|p| p.into_path().ok());
+            let _ = tx.blocking_send(path.map(|p| p.to_string_lossy().into_owned()));
+        });
+    Ok(rx.recv().await.flatten())
+}
+
+/// Open a native "save as" dialog and copy the selected backup out of the
+/// managed `~/.atelier/backups` directory to wherever the user chooses (Desktop,
+/// a USB drive, …) so they can archive it off-machine. `source` is the backup's
+/// path from [`list_backups`]. Returns whether a file was written (`false` = the
+/// user cancelled the dialog).
+#[tauri::command]
+async fn export_backup(app: AppHandle, source: String) -> Result<bool, String> {
+    let src = PathBuf::from(&source);
+    let default_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("aincient-backup.tar.gz")
+        .to_string();
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title("Save backup as")
+        .set_file_name(&default_name)
+        .save_file(move |picked| {
+            let path = picked.and_then(|p| p.into_path().ok());
+            let _ = tx.blocking_send(path);
+        });
+    let Some(dest) = rx.recv().await.flatten() else {
+        return Ok(false); // cancelled
+    };
+    blocking(move || {
+        std::fs::copy(&src, &dest)
+            .map(|_| true)
+            .map_err(|e| format!("could not save the backup: {e}"))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn do_reinstall(app: AppHandle) -> Result<(), String> {
     let s = stack()?;
@@ -217,6 +271,7 @@ fn open_login() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_preflight,
             preflight_problem,
@@ -228,6 +283,8 @@ pub fn run() {
             do_update,
             do_backup,
             do_restore,
+            pick_restore_file,
+            export_backup,
             do_reinstall,
             do_start,
             do_stop,

@@ -150,17 +150,31 @@
         <!-- Infrastructure: backup / restore (data lifecycle) -->
         <section class="group">
           <h3 class="group-label">Data &amp; backups</h3>
-          <div class="action-grid two">
-            <button class="btn" data-action="backup">
-              <svg class="ic"><use href="#i-backup" /></svg>Back up
-            </button>
-            <div class="restore-row">
-              <select id="backup-select"><option value="">No backups yet</option></select>
+
+          <!-- Create a fresh snapshot of the database + files. -->
+          <button class="btn full" data-action="backup">
+            <svg class="ic"><use href="#i-backup" /></svg>Back up now
+          </button>
+
+          <!-- Restore or export a saved snapshot. The select owns its own row so
+               long backup names stay readable; its actions stack beneath it. -->
+          <div class="restore-panel">
+            <label class="panel-label" for="backup-select">Saved backups</label>
+            <select id="backup-select"><option value="">No backups yet</option></select>
+            <div class="restore-actions">
               <button class="btn small" data-action="restore" disabled>
                 <svg class="ic"><use href="#i-restore" /></svg>Restore
               </button>
+              <button class="btn small" id="btn-export" data-action="export" disabled>
+                <svg class="ic"><use href="#i-download" /></svg>Export
+              </button>
             </div>
           </div>
+
+          <!-- Same intent (restore), different source: a file from anywhere. -->
+          <button class="btn small full" data-action="import">
+            <svg class="ic"><use href="#i-restore" /></svg>Restore from a file…
+          </button>
 
           <!-- Destructive actions live behind a disclosure. -->
           <details class="advanced">

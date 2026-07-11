@@ -21,6 +21,7 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 
 # The desktop GUI ships as a bundled .dmg/.msi/AppImage (via `cargo tauri build`),
 # not as a raw binary — so exclude it from cargo-dist (which distributes the CLI).

@@ -152,9 +152,6 @@ main {
   grid-template-columns: repeat(3, 1fr);
   gap: 10px;
 }
-.action-grid.two {
-  grid-template-columns: 1fr 1.4fr;
-}
 
 /* Status card head — state on the left, lifecycle toggle on the right. */
 .status-head {
@@ -349,6 +346,10 @@ main {
   padding: 8px 12px;
   font-size: 13px;
 }
+/* A button that spans the full group width; the group's flex gap spaces it. */
+.btn.full {
+  width: 100%;
+}
 .btn.danger {
   color: var(--danger);
 }
@@ -408,13 +409,28 @@ select:focus {
   outline-offset: 1px;
 }
 
-.restore-row {
+/* Restore panel — a saved backup gets a full-width select (names stay legible)
+   with its actions stacked below, so nothing squeezes the dropdown. */
+.restore-panel {
   display: flex;
+  flex-direction: column;
   gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
 }
-.restore-row select {
-  flex: 1;
-  min-width: 0; /* allow the select to shrink; long backup names clip, not push */
+.panel-label {
+  font-family: "Press Start 2P", "Schibsted Grotesk", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.restore-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
 }
 
 /* Error banner */

@@ -188,12 +188,17 @@ async function refreshUpdate() {
 async function refreshBackups() {
   const select = $("backup-select");
   const restoreBtn = document.querySelector('[data-action="restore"]');
+  const exportBtn = $("btn-export");
+  const setEnabled = (on) => {
+    restoreBtn.disabled = !on;
+    exportBtn.disabled = !on;
+  };
   try {
     const backups = await invoke("list_backups");
     select.innerHTML = "";
     if (!backups.length) {
       select.innerHTML = '<option value="">No backups yet</option>';
-      restoreBtn.disabled = true;
+      setEnabled(false);
       return;
     }
     for (const b of backups) {
@@ -203,9 +208,9 @@ async function refreshBackups() {
       opt.textContent = `${b.name}  (${mb} MB)`;
       select.appendChild(opt);
     }
-    restoreBtn.disabled = false;
+    setEnabled(true);
   } catch {
-    restoreBtn.disabled = true;
+    setEnabled(false);
   }
 }
 
@@ -261,6 +266,35 @@ const actions = {
   restore: async () => {
     const path = $("backup-select").value;
     if (!path) return;
+    const ok = await confirmModal(
+      "Restore will REPLACE the current database and files with this snapshot. Continue?"
+    );
+    if (!ok) return;
+    return runProgressOp("Restoring", () => invoke("do_restore", { path }));
+  },
+
+  // Export the selected backup out of ~/.atelier/backups to a user-chosen
+  // location (native Save As), for archiving off-machine.
+  export: async () => {
+    const source = $("backup-select").value;
+    if (!source) return;
+    try {
+      await invoke("export_backup", { source });
+    } catch (e) {
+      showError(String(e));
+    }
+  },
+
+  // Import: pick an external snapshot (native Open File) and restore it through
+  // the same confirm + core path as a listed backup.
+  import: async () => {
+    let path;
+    try {
+      path = await invoke("pick_restore_file");
+    } catch (e) {
+      return showError(String(e));
+    }
+    if (!path) return; // cancelled
     const ok = await confirmModal(
       "Restore will REPLACE the current database and files with this snapshot. Continue?"
     );
