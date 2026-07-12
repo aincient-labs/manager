@@ -51,7 +51,7 @@ function confirmModal(msg, opts = {}) {
   });
 }
 
-// Pixel labels for each core Stage, shown in the progress sub-status / feed.
+// Whisper labels for each core Stage, shown in the progress sub-status / feed.
 const STAGE_LABELS = {
   preflight: "Checking Docker",
   scaffold: "Preparing",
