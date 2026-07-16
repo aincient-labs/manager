@@ -1,6 +1,6 @@
 [package]
 name = "aincient-manager"
-description = "AIncient Manager — a double-click installer and manager for the AIncient CMS appliance."
+description = "Atelier Manager — a double-click installer and manager for the Atelier CMS appliance."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

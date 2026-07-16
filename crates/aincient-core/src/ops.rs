@@ -622,7 +622,7 @@ pub fn logs_command(stack: &Stack, follow: bool, service: Option<&str>) -> Comma
     c
 }
 
-/// Open the console (the chat workspace at `/aincient`) in the default browser.
+/// Open the console (the chat workspace at `/atelier`) in the default browser.
 pub fn open_console(stack: &Stack) -> Result<()> {
     open_url(&stack.console_url())
 }

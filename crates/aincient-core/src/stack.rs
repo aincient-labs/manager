@@ -1,8 +1,7 @@
 //! Location and on-disk layout of an Atelier appliance stack.
 //!
-//! The stack is a directory (default `~/.atelier`, override with `ATELIER_HOME`;
-//! a legacy `~/.aincient` is still honoured if present) holding a `compose.yaml`
-//! + `.env` — the same pair `docker/install.sh` writes.
+//! The stack is a directory (default `~/.atelier`, override with `ATELIER_HOME`)
+//! holding a `compose.yaml` + `.env` — the same pair `docker/install.sh` writes.
 //! The manager owns this directory so the CLI and GUI converge on one source of truth.
 
 use std::collections::BTreeMap;
@@ -18,19 +17,18 @@ pub const DEFAULT_PORT: u16 = 41221;
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
 /// step with the `cat > compose.yaml` heredoc in `docker/install.sh`: the slim
 /// runtime topology (app + db, no build context, no updater sidecar).
-pub const COMPOSE_TEMPLATE: &str = r#"name: aincient
+pub const COMPOSE_TEMPLATE: &str = r#"name: atelier
 services:
   db:
-    image: mariadb:11
+    image: pgvector/pgvector:pg16
     environment:
-      MARIADB_DATABASE: aincient
-      MARIADB_USER: aincient
-      MARIADB_PASSWORD: ${DB_PASSWORD:-aincient}
-      MARIADB_RANDOM_ROOT_PASSWORD: "yes"
+      POSTGRES_DB: aincient
+      POSTGRES_USER: aincient
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aincient}
     volumes:
-      - db-data:/var/lib/mysql
+      - db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "healthcheck.sh", "--connect"]
+      test: ["CMD-SHELL", "pg_isready -U aincient -d aincient"]
       interval: 10s
       retries: 10
   app:
@@ -39,7 +37,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: mysql://aincient:${DB_PASSWORD:-aincient}@db/aincient
+      DATABASE_URL: pgsql://aincient:${DB_PASSWORD:-aincient}@db/aincient
       HASH_SALT: ${HASH_SALT:?set HASH_SALT in .env}
       AINCIENT_TRUSTED_HOSTS: ${AINCIENT_TRUSTED_HOSTS:-}
       AINCIENT_ADMIN_PASS: ${ADMIN_PASS:-}
@@ -71,28 +69,13 @@ pub struct InstallOptions {
 }
 
 impl Stack {
-    /// Resolve the stack directory.
-    ///
-    /// Precedence: `ATELIER_HOME`, then the legacy `AINCIENT_HOME` (so existing
-    /// environments keep working). With neither set, default to `~/.atelier` —
-    /// but if that doesn't yet exist and a legacy `~/.aincient` does, adopt the
-    /// legacy directory so beta installs aren't orphaned.
+    /// Resolve the stack directory: `ATELIER_HOME` if set, else `~/.atelier`.
     pub fn locate() -> Result<Self> {
-        let env_override = std::env::var_os("ATELIER_HOME")
-            .or_else(|| std::env::var_os("AINCIENT_HOME"));
-        let home = match env_override {
+        let home = match std::env::var_os("ATELIER_HOME") {
             Some(p) => PathBuf::from(p),
-            None => {
-                let base = dirs::home_dir()
-                    .context("could not determine your home directory")?;
-                let new = base.join(".atelier");
-                let legacy = base.join(".aincient");
-                if !new.exists() && legacy.exists() {
-                    legacy
-                } else {
-                    new
-                }
-            }
+            None => dirs::home_dir()
+                .context("could not determine your home directory")?
+                .join(".atelier"),
         };
         Ok(Self { home })
     }
@@ -142,10 +125,10 @@ impl Stack {
             .unwrap_or(DEFAULT_PORT)
     }
 
-    /// URL of the AIncient **console** (the chat workspace at `/aincient`), not the
+    /// URL of the Atelier **console** (the chat workspace at `/atelier`), not the
     /// bare site root — this is what "open console" should land on.
     pub fn console_url(&self) -> String {
-        format!("http://localhost:{}/aincient", self.http_port())
+        format!("http://localhost:{}/atelier", self.http_port())
     }
 
     /// URL of Drupal's login form. "Login" sends the operator straight here to
@@ -227,7 +210,7 @@ mod tests {
         fn new() -> Self {
             static N: AtomicU32 = AtomicU32::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "aincient-test-{}-{}",
+                "atelier-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
@@ -270,7 +253,7 @@ mod tests {
         ts.0.ensure_scaffold(&opts).unwrap();
 
         assert_eq!(ts.0.http_port(), 8080);
-        assert_eq!(ts.0.console_url(), "http://localhost:8080/aincient");
+        assert_eq!(ts.0.console_url(), "http://localhost:8080/atelier");
     }
 
     #[test]

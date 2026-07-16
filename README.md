@@ -29,8 +29,7 @@ operation maps to a `docker compose` / `drush` primitive the appliance already u
 | `status`/`doctor`| Read-only health and Docker-readiness probes.                             |
 | `start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.                  |
 
-The stack directory defaults to `~/.atelier` (override with `ATELIER_HOME`; a legacy
-`~/.aincient` from the beta is still honoured if present) and holds the
+The stack directory defaults to `~/.atelier` (override with `ATELIER_HOME`) and holds the
 same `compose.yaml` + `.env` the `docker/install.sh` bootstrapper writes.
 
 ## Develop
@@ -46,3 +45,13 @@ cargo run -p aincient-manager         # launch the GUI
 The built CLI binary is `target/debug/atelier` (or `target/release/atelier`); the GUI
 binary is `target/debug/aincient-manager`. Packaging the GUI into a signed `.dmg`/`.msi`/
 AppImage (via `cargo tauri build`) and code-signing/notarization are deferred.
+
+## Release / distribution
+
+`dist-workspace.toml` drives cargo-dist: a tagged `v*` release builds the `atelier` CLI for
+every target and publishes a Homebrew formula (`Formula/atelier.rb`) to the
+`aincient-labs/homebrew-tap` repo, so `brew install aincient-labs/tap/atelier` works.
+
+**Prerequisite:** the cross-repo publish needs a `HOMEBREW_TAP_TOKEN` Actions secret on this
+repo — a token with `Contents: read and write` on `aincient-labs/homebrew-tap` (the built-in
+`GITHUB_TOKEN` can't push to another repo). Without it the `publish-homebrew-formula` job fails.

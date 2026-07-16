@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AIncient Manager",
+  "productName": "Atelier Manager",
   "version": "0.1.0",
   "identifier": "io.aincient.manager",
   "build": {
