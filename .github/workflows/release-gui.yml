@@ -1,0 +1,83 @@
+# Builds the Tauri desktop GUI (`atelier-manager`) into OS-native installers and
+# attaches them to a GitHub Release. This is a SEPARATE lane from `release.yml`
+# (cargo-dist, which ships the `atelier` CLI): the GUI needs Tauri's own bundler
+# to produce .dmg/.msi/.AppImage, which cargo-dist doesn't do.
+#
+# Trigger: push a tag like `gui-v0.1.0` (distinct namespace so it never collides
+# with the CLI's `v*` tags). Until you push such a tag, this workflow is dormant.
+#
+# NOTE: these bundles are UNSIGNED — macOS Gatekeeper / Windows SmartScreen will
+# warn on first launch. That's fine for testing and early adopters; code-signing
+# + notarization is a deliberate fast-follow (Apple Developer ID + Windows
+# Authenticode, fed in as Actions secrets). See the manager README.
+name: Release GUI
+
+on:
+  push:
+    tags:
+      - 'gui-v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS universal binary (Apple Silicon + Intel in one .dmg)
+          - platform: macos-latest
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            target: ''
+            rust-targets: ''
+          - platform: windows-latest
+            target: ''
+            rust-targets: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      # Linux system deps for Tauri v2 (webkit2gtk 4.1 + tray/app-indicator).
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libgtk-3-dev \
+            libssl-dev
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # The Tauri app crate lives in app/ (holds tauri.conf.json + src).
+          projectPath: app
+          # `--target ''` is invalid, so only pass the flag on macOS.
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+          # Reuse the pushed tag as the release; __VERSION__ is filled from
+          # tauri.conf.json's `version`.
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Atelier Manager __VERSION__'
+          releaseBody: 'Desktop GUI installers. Unsigned — see the README for the first-launch Gatekeeper/SmartScreen note.'
+          releaseDraft: true
+          prerelease: false

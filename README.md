@@ -55,3 +55,19 @@ every target and publishes a Homebrew formula (`Formula/atelier.rb`) to the
 **Prerequisite:** the cross-repo publish needs a `HOMEBREW_TAP_TOKEN` Actions secret on this
 repo — a token with `Contents: read and write` on `aincient-labs/homebrew-tap` (the built-in
 `GITHUB_TOKEN` can't push to another repo). Without it the `publish-homebrew-formula` job fails.
+
+### Desktop GUI
+
+The Tauri GUI ships on its own lane (`.github/workflows/release-gui.yml`, via
+`tauri-apps/tauri-action`) — cargo-dist only distributes the raw CLI binary, so the GUI needs
+Tauri's own bundler for `.dmg`/`.msi`/`.AppImage`. Push a **`gui-v*`** tag (a namespace kept
+separate from the CLI's `v*` tags) to build all three and attach them to a **draft** GitHub
+Release:
+
+```bash
+git tag gui-v0.1.0 && git push origin gui-v0.1.0
+```
+
+The bundles are currently **unsigned** — macOS Gatekeeper / Windows SmartScreen warn on first
+launch. Code-signing + notarization (Apple Developer ID + Windows Authenticode, supplied as
+Actions secrets) is a deliberate fast-follow before the GUI is promoted to non-technical users.
