@@ -15,3 +15,7 @@ tap = "aincient-labs/homebrew-tap"
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Build only the dist-enabled packages (the `atelier` CLI), not the whole
+# workspace — otherwise `cargo build --workspace` compiles the Tauri GUI app
+# (`aincient-manager`, dist=false), whose GTK/gdk-sys deps fail on Linux runners.
+precise-builds = true
