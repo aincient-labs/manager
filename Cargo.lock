@@ -30,19 +30,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aincient-manager"
-version = "0.1.0-rc.2"
-dependencies = [
- "aincient-core",
- "anyhow",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
-]
-
-[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -131,6 +118,19 @@ dependencies = [
  "clap",
  "owo-colors",
  "serde_json",
+]
+
+[[package]]
+name = "atelier-manager"
+version = "0.1.0-rc.2"
+dependencies = [
+ "aincient-core",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
 ]
 
 [[package]]

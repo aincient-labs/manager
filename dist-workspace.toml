@@ -20,7 +20,7 @@ publish-prereleases = true
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Build only the dist-enabled packages (the `atelier` CLI), not the whole
 # workspace — otherwise `cargo build --workspace` compiles the Tauri GUI app
-# (`aincient-manager`, dist=false), whose GTK/gdk-sys deps fail on Linux runners.
+# (`atelier-manager`, dist=false), whose GTK/gdk-sys deps fail on Linux runners.
 precise-builds = true
 # We hand-edit the generated CI (release.yml) to set the Homebrew-tap commit
 # author to our own persona (Starla Knight, the aincient-labs bot identity)

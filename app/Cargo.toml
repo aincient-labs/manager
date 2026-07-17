@@ -1,5 +1,5 @@
 [package]
-name = "aincient-manager"
+name = "atelier-manager"
 description = "Atelier Manager — a double-click installer and manager for the Atelier CMS appliance."
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "aincient_manager_lib"
+name = "atelier_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -39,11 +39,11 @@ cargo build            # build the workspace
 cargo test             # run unit tests
 cargo clippy           # lint
 cargo run -p atelier -- doctor        # run the CLI
-cargo run -p aincient-manager         # launch the GUI
+cargo run -p atelier-manager          # launch the GUI
 ```
 
 The built CLI binary is `target/debug/atelier` (or `target/release/atelier`); the GUI
-binary is `target/debug/aincient-manager`. Packaging the GUI into a signed `.dmg`/`.msi`/
+binary is `target/debug/atelier-manager`. Packaging the GUI into a signed `.dmg`/`.msi`/
 AppImage (via `cargo tauri build`) and code-signing/notarization are deferred.
 
 ## Release / distribution
