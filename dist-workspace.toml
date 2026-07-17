@@ -13,6 +13,9 @@ installers = ["shell", "powershell", "homebrew"]
 tap = "aincient-labs/homebrew-tap"
 # Enable the Homebrew publish job (pushes the formula to the tap)
 publish-jobs = ["homebrew"]
+# Also run publish jobs (Homebrew) for prerelease tags (e.g. -rc.N) — off by
+# default in dist, which is why rc tags otherwise skip the tap push.
+publish-prereleases = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Build only the dist-enabled packages (the `atelier` CLI), not the whole
