@@ -144,7 +144,10 @@ jobs:
           # normalize Windows backslash paths (D:\a\…) to forward slashes.
           files=()
           while IFS= read -r f; do
-            [ -n "$f" ] && files+=("${f//\\//}")
+            f="${f//$'\r'/}"   # strip CR — Windows step-output carries \r, which
+                               # otherwise appends to the path and fails -f tests
+            f="${f//\\//}"     # normalize Windows backslashes to forward slashes
+            [ -n "$f" ] && files+=("$f")
           done < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
 
           # Upload one at a time so a single bad entry can't sink the rest, and:
