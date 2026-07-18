@@ -141,14 +141,37 @@ jobs:
           # Parse artifactPaths WITHOUT `mapfile` — that's a bash-4 builtin and the
           # macOS runners ship bash 3.2. Read via process substitution so the array
           # survives (a `jq | while` pipe would populate it in a lost subshell). Also
-          # normalize Windows backslash paths (D:\a\…) to forward slashes, else gh
-          # reports "no matches found".
+          # normalize Windows backslash paths (D:\a\…) to forward slashes.
           files=()
           while IFS= read -r f; do
             [ -n "$f" ] && files+=("${f//\\//}")
           done < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no bundles were produced" >&2
+
+          # Upload one at a time so a single bad entry can't sink the rest, and:
+          #  - skip .app / directory bundles: gh can't upload a directory ("is a
+          #    directory"), and the .app is already inside the .dmg anyway;
+          #  - if a declared bundle is missing on disk, dump its dir and warn loudly
+          #    (surfaces the Windows "no matches found" cause without going silent).
+          uploaded=0
+          for f in "${files[@]}"; do
+            if [ -d "$f" ]; then
+              echo "skip bundle directory (shipped inside the .dmg): $f"
+              continue
+            fi
+            if [ ! -f "$f" ]; then
+              echo "::warning::declared bundle not found on disk: $f"
+              ls -la "$(dirname "$f")" 2>/dev/null || true
+              continue
+            fi
+            echo "uploading: $f"
+            if gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber; then
+              uploaded=$((uploaded + 1))
+            else
+              echo "::warning::gh failed to upload: $f"
+            fi
+          done
+          echo "uploaded $uploaded bundle(s)"
+          if [ "$uploaded" -eq 0 ]; then
+            echo "::error::no GUI bundles were uploaded for $TAG" >&2
             exit 1
           fi
-          gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
