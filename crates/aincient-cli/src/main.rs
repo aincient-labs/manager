@@ -212,11 +212,11 @@ fn main() {
     }
 }
 
-/// A success banner: a spectrum rule (when colour is on) over a mint headline and the
-/// violet console URL. Used at the end of install/reinstall/update.
+/// A success banner: a restrained hairline rule (when colour is on) over a mint headline and the
+/// cinnabar console URL. Used at the end of install/reinstall/update.
 fn done_banner(headline: &str, url: &str) {
     println!();
-    if let Some(rule) = style::spectrum_rule() {
+    if let Some(rule) = style::rule() {
         println!("{rule}");
     }
     println!("{} Console: {}", style::success(headline), style::url(url));
@@ -240,7 +240,7 @@ fn pending_banner(headline: &str, url: &str) {
 /// path, and a nudge toward the deploy-anywhere payoff.
 fn done_export_banner(path: &std::path::Path) {
     println!();
-    if let Some(rule) = style::spectrum_rule() {
+    if let Some(rule) = style::rule() {
         println!("{rule}");
     }
     println!(
@@ -521,7 +521,7 @@ fn doctor() -> Result<()> {
         }
         None => {
             println!();
-            if let Some(rule) = style::spectrum_rule() {
+            if let Some(rule) = style::rule() {
                 println!("{rule}");
             }
             println!("{}", style::success("Ready to run Atelier."));

@@ -1,4 +1,4 @@
-// AIncient Manager — frontend. All real work lives in the Rust core (aincient-core),
+// Atelier Manager — frontend. All real work lives in the Rust core (aincient-core),
 // reached through Tauri commands. This file only orchestrates screens and input.
 
 const { invoke } = window.__TAURI__.core;
@@ -247,7 +247,7 @@ const actions = {
 
   install: () => {
     const port = parseInt($("install-port").value, 10) || null;
-    return runProgressOp("Installing AIncient CMS", () =>
+    return runProgressOp("Installing Atelier", () =>
       invoke("do_install", { image: null, port })
     );
   },

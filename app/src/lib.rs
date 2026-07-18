@@ -1,7 +1,7 @@
-//! AIncient Manager — the Tauri (desktop GUI) front-end.
+//! Atelier Manager — the Tauri (desktop GUI) front-end.
 //!
 //! This is a thin shell: every command delegates to [`aincient_core`], the same
-//! engine the `aincient` CLI uses. Long-running operations (install, update,
+//! engine the `atelier` CLI uses. Long-running operations (install, update,
 //! backup, restore) run on a blocking thread so the UI never freezes.
 
 use std::path::PathBuf;
@@ -188,7 +188,7 @@ async fn pick_restore_file(app: AppHandle) -> Result<Option<String>, String> {
     app.dialog()
         .file()
         .set_title("Choose a backup to restore")
-        .add_filter("AIncient backup", &["gz", "tgz", "sql"])
+        .add_filter("Atelier backup", &["gz", "tgz", "sql"])
         .pick_file(move |picked| {
             let path = picked.and_then(|p| p.into_path().ok());
             let _ = tx.blocking_send(path.map(|p| p.to_string_lossy().into_owned()));
@@ -292,5 +292,5 @@ pub fn run() {
             open_login,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running the AIncient Manager");
+        .expect("error while running the Atelier Manager");
 }
