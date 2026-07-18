@@ -16,7 +16,7 @@ implementation of every operation and no duplicated logic.
 Install friction is the biggest leak in the evaluator funnel. The real prerequisite floor is
 **Docker** (a CMS needs PHP + a database + storage), not the terminal — so the manager is a
 *lifecycle manager over the existing appliance*, not a way to skip prerequisites. Every
-operation maps to a `docker compose` / `drush` primitive the appliance already uses:
+operation maps to a lower-level primitive the appliance already provides:
 
 Commands are grouped into noun namespaces so the surface stays maintainable as it grows
 (`doctor` is the one flat, universal preflight):
@@ -29,7 +29,7 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | `app reinstall`          | Wipe volumes and install fresh (destructive, confirmed).                  |
 | `app status`             | Read-only health probe. (Docker readiness is the flat `doctor`.)          |
 | `app start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.              |
-| `site export`            | Export the public site to static HTML — the deploy-anywhere artifact (`drush aincient:export`). |
+| `site export`            | Export the public site to static HTML — the deploy-anywhere artifact.      |
 | `data backup`            | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. (alias `data export`) |
 | `data restore <file>`    | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). (alias `data import`) |
 | `data list`              | List snapshots on this host. (alias `data backups`)                       |
