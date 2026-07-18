@@ -5,6 +5,7 @@
 //! heavy API-client dependency.
 
 use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -64,10 +65,10 @@ impl Preflight {
 
 /// Probe the host for Docker + the Compose plugin.
 pub fn preflight() -> Preflight {
-    let docker_installed = quiet(Command::new("docker").arg("--version"));
-    let docker_running = docker_installed && quiet(Command::new("docker").arg("info"));
+    let docker_installed = quiet(docker().arg("--version"));
+    let docker_running = docker_installed && quiet(docker().arg("info"));
     let compose_available =
-        docker_installed && quiet(Command::new("docker").args(["compose", "version"]));
+        docker_installed && quiet(docker().args(["compose", "version"]));
     Preflight {
         docker_installed,
         docker_running,
@@ -78,14 +79,66 @@ pub fn preflight() -> Preflight {
 /// A `docker compose` invocation rooted at the stack directory, so it picks up
 /// the stack's `compose.yaml` and `.env` exactly as a manual run would.
 pub fn compose(stack: &Stack) -> Command {
-    let mut c = Command::new("docker");
+    let mut c = docker();
     c.arg("compose").current_dir(&stack.home);
     c
 }
 
-/// A bare `docker` invocation.
+/// A bare `docker` invocation with a `PATH` that includes the common Docker
+/// install locations.
+///
+/// Every docker command in the manager is built here so it behaves the same no
+/// matter how the manager itself was launched. A GUI `.app` opened from Finder or
+/// the Dock inherits launchd's minimal `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) —
+/// not the login shell's — so OrbStack, Docker Desktop, Homebrew, Rancher Desktop
+/// and colima installs (which live under `~/.orbstack/bin`, `/usr/local/bin`,
+/// `/opt/homebrew/bin`, …) are invisible and `docker` looks "not installed", even
+/// though the same binary resolves fine from a terminal. Appending those dirs to
+/// the inherited `PATH` fixes GUI launches while leaving CLI/terminal launches —
+/// which already have a full `PATH` — to keep resolving `docker` exactly as before.
 pub fn docker() -> Command {
-    Command::new("docker")
+    let mut c = Command::new("docker");
+    c.env("PATH", augmented_path());
+    c
+}
+
+/// The process `PATH` with the well-known Docker install dirs appended.
+///
+/// Existing entries keep priority (so a terminal launch resolves `docker` from the
+/// user's own `PATH` unchanged); the extras only help when a dir is otherwise
+/// missing. Non-existent dirs are harmless — the OS skips them during lookup.
+fn augmented_path() -> String {
+    let mut parts: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut extras: Vec<PathBuf> = Vec::new();
+    if let Some(home) = &home {
+        // OrbStack, Rancher Desktop, Docker Desktop user bin, generic user bin.
+        for sub in [".orbstack/bin", ".rd/bin", ".docker/bin", ".local/bin"] {
+            extras.push(home.join(sub));
+        }
+    }
+    extras.extend(
+        [
+            "/usr/local/bin",                                   // Docker Desktop, Homebrew (Intel), colima
+            "/opt/homebrew/bin",                                // Homebrew (Apple Silicon)
+            "/home/linuxbrew/.linuxbrew/bin",                   // Homebrew (Linux)
+            "/Applications/Docker.app/Contents/Resources/bin",  // Docker Desktop (macOS)
+        ]
+        .iter()
+        .map(PathBuf::from),
+    );
+
+    for dir in extras {
+        if !parts.contains(&dir) {
+            parts.push(dir);
+        }
+    }
+    std::env::join_paths(parts)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Run a command, discard output, return whether it succeeded.
