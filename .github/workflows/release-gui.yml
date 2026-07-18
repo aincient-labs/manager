@@ -138,7 +138,15 @@ jobs:
             echo "waiting for cargo-dist to create release $TAG… ($i/40)"
             sleep 30
           done
-          mapfile -t files < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
+          # Parse artifactPaths WITHOUT `mapfile` — that's a bash-4 builtin and the
+          # macOS runners ship bash 3.2. Read via process substitution so the array
+          # survives (a `jq | while` pipe would populate it in a lost subshell). Also
+          # normalize Windows backslash paths (D:\a\…) to forward slashes, else gh
+          # reports "no matches found".
+          files=()
+          while IFS= read -r f; do
+            [ -n "$f" ] && files+=("${f//\\//}")
+          done < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
           if [ ${#files[@]} -eq 0 ]; then
             echo "no bundles were produced" >&2
             exit 1
