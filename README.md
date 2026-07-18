@@ -61,26 +61,33 @@ AppImage (via `cargo tauri build`) and code-signing/notarization are deferred.
 
 ## Release / distribution
 
-`dist-workspace.toml` drives cargo-dist: a tagged `v*` release builds the `atelier` CLI for
-every target and publishes a Homebrew formula (`Formula/atelier.rb`) to the
-`aincient-labs/homebrew-tap` repo, so `brew install aincient-labs/tap/atelier` works.
-
-**Prerequisite:** the cross-repo publish needs a `HOMEBREW_TAP_TOKEN` Actions secret on this
-repo — a token with `Contents: read and write` on `aincient-labs/homebrew-tap` (the built-in
-`GITHUB_TOKEN` can't push to another repo). Without it the `publish-homebrew-formula` job fails.
-
-### Desktop GUI
-
-The Tauri GUI ships on its own lane (`.github/workflows/release-gui.yml`, via
-`tauri-apps/tauri-action`) — cargo-dist only distributes the raw CLI binary, so the GUI needs
-Tauri's own bundler for `.dmg`/`.msi`/`.AppImage`. Push a **`gui-v*`** tag (a namespace kept
-separate from the CLI's `v*` tags) to build all three and attach them to a **draft** GitHub
-Release:
+**One tag ships everything.** CLI and GUI share the workspace version and ride the **same `v*`
+tag**, so they can never drift apart:
 
 ```bash
-git tag gui-v0.1.0 && git push origin gui-v0.1.0
+git tag v0.2.2 && git push origin v0.2.2
 ```
 
-The bundles are currently **unsigned** — macOS Gatekeeper / Windows SmartScreen warn on first
-launch. Code-signing + notarization (Apple Developer ID + Windows Authenticode, supplied as
+That fans out to two workflows on the one tag:
+
+- **`release.yml`** (cargo-dist, driven by `dist-workspace.toml`) builds the `atelier` CLI for
+  every target, creates the GitHub Release, and publishes the Homebrew formula
+  (`Formula/atelier.rb`) to `aincient-labs/homebrew-tap` so `brew install aincient-labs/tap/atelier`
+  works.
+- **`release-gui.yml`** (`tauri-apps/tauri-action`) builds the desktop bundles
+  (`.dmg`/`.msi`/`.AppImage`/`.deb`/`.rpm`) — which cargo-dist can't produce — and uploads them
+  onto the *same* release cargo-dist creates for that tag.
+
+Keep `app/tauri.conf.json`'s `version` in lockstep with the workspace `Cargo.toml` version when
+bumping (the GUI release name is derived from it).
+
+**Homebrew-tap prerequisite:** the cross-repo formula push needs a `HOMEBREW_TAP_TOKEN` Actions
+secret — a token with `Contents: read and write` on `aincient-labs/homebrew-tap` (the built-in
+`GITHUB_TOKEN` can't push to another repo). Note the **`aincient-labs` org rejects fine-grained
+PATs whose lifetime exceeds 366 days** — if `publish-homebrew-formula` fails at the tap checkout,
+rotate the secret to a ≤366-day token. (Recovery when it fails: the formula is also attached to
+the release as `atelier.rb`, so it can be pushed to the tap by hand.)
+
+The desktop bundles are currently **unsigned** — macOS Gatekeeper / Windows SmartScreen warn on
+first launch. Code-signing + notarization (Apple Developer ID + Windows Authenticode, supplied as
 Actions secrets) is a deliberate fast-follow before the GUI is promoted to non-technical users.

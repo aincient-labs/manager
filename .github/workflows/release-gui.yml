@@ -1,10 +1,14 @@
 # Builds the Tauri desktop GUI (`atelier-manager`) into OS-native installers and
-# attaches them to a GitHub Release. This is a SEPARATE lane from `release.yml`
-# (cargo-dist, which ships the `atelier` CLI): the GUI needs Tauri's own bundler
-# to produce .dmg/.msi/.AppImage, which cargo-dist doesn't do.
+# attaches them to the SAME GitHub Release that cargo-dist (`release.yml`) creates
+# for the CLI. The GUI needs Tauri's own bundler to produce .dmg/.msi/.AppImage,
+# which cargo-dist doesn't do — so it stays a separate workflow file, but it now
+# rides the SAME tag so CLI + GUI ship as one versioned release, never out of sync.
 #
-# Trigger: push a tag like `gui-v0.1.0` (distinct namespace so it never collides
-# with the CLI's `v*` tags). Until you push such a tag, this workflow is dormant.
+# Trigger: the same `v*` tag as the CLI lane. One `git tag vX.Y.Z && git push
+# --tags` fans out to both workflows; cargo-dist owns creating the Release, and
+# this lane uploads the GUI bundles onto it. (The old `gui-v*` tag scheme is
+# retired — it split one version across two releases and also false-triggered
+# cargo-dist's plan step.)
 #
 # NOTE: these bundles are UNSIGNED — macOS Gatekeeper / Windows SmartScreen will
 # warn on first launch. That's fine for testing and early adopters; code-signing
@@ -15,7 +19,7 @@ name: Release GUI
 on:
   push:
     tags:
-      - 'gui-v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
   contents: write
@@ -65,19 +69,41 @@ jobs:
             libgtk-3-dev \
             libssl-dev
 
-      - name: Build and release
+      # Build the native bundles ONLY — no `tagName`/`releaseName`, so tauri-action
+      # does not create or upload a Release. It exposes the built bundle paths as
+      # the `artifactPaths` output, which the next step attaches to the shared
+      # release. Version comes from tauri.conf.json (kept in lockstep with the
+      # workspace Cargo.toml version).
+      - name: Build GUI bundles
+        id: tauri
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # The Tauri app crate lives in app/ (holds tauri.conf.json + src).
           projectPath: app
           # `--target ''` is invalid, so only pass the flag on macOS.
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
-          # Reuse the pushed tag as the release; __VERSION__ is filled from
-          # tauri.conf.json's `version`.
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Atelier Manager __VERSION__'
-          releaseBody: 'Desktop GUI installers. Unsigned — see the README for the first-launch Gatekeeper/SmartScreen note.'
-          releaseDraft: true
-          prerelease: false
+
+      # cargo-dist (release.yml) owns creating the GitHub Release for this tag.
+      # Wait for it to appear, then upload the GUI bundles onto it so CLI + GUI
+      # live on ONE release. `--clobber` keeps re-runs idempotent. Runs under bash
+      # on every OS (Git Bash on Windows) so seq/sleep/jq behave.
+      - name: Attach bundles to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          for i in $(seq 1 40); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "release $TAG found — uploading GUI bundles"
+              break
+            fi
+            echo "waiting for cargo-dist to create release $TAG… ($i/40)"
+            sleep 30
+          done
+          mapfile -t files < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no bundles were produced" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
