@@ -165,8 +165,25 @@ body {
   width: auto;
   display: block;
 }
-.brand .tag {
+/* The maker line — hairline-separated small-caps "by AIncient Labs", set on the
+   same line to the right of the lockup, exactly as the marketing site's header
+   does it. */
+.maker {
+  padding-left: 10px;
+  margin-left: 2px;
+  border-left: 1px solid var(--border-strong);
   color: var(--text-faint);
+}
+/* The app's role, held quietly at the far right of the bar. */
+.app-role {
+  color: var(--text-faint);
+}
+/* On the narrowest windows, drop the maker line before the role — the lockup
+   plus "Manager" is enough to place you. */
+@media (max-width: 452px) {
+  .maker {
+    display: none;
+  }
 }
 
 main {
@@ -179,11 +196,27 @@ main {
   padding: 20px;
   max-width: var(--maxw);
   margin: 0 auto;
+  /* A flex column so the visible screen can own the full height — centred
+     welcome screens breathe; tab panels sit calmly at the top. */
+  display: flex;
+  flex-direction: column;
 }
 .screen {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+/* Welcome/status screens (loading, Docker, first-run) sit centred in the window
+   so a first-time owner meets one calm message, not a top-anchored form. */
+.screen.center {
+  justify-content: center;
+  align-items: stretch;
+  text-align: center;
+}
+.screen.center .field,
+.screen.center .advanced {
+  text-align: left;
 }
 
 /* Action groups — a mono whisper label over a set of related actions. */
@@ -749,4 +782,405 @@ select:focus {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ============================================================================
+   Redesign additions — a welcoming, tabbed shell over the same Atelier kit.
+   Plain-language screens for people who've never run a website: one calm
+   message per view, one obvious next step, jargon folded away under disclosures.
+   ============================================================================ */
+
+/* Tab bar — four calm destinations under the chrome. A quiet segmented row on
+   the recessed panel; the active tab wears the one pigment as an underline, not
+   a filled shout (Law 01). */
+.tabbar {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 6px 12px 0;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  max-width: var(--maxw);
+  margin: 0 auto;
+  width: 100%;
+}
+.tab {
+  appearance: none;
+  flex: 1 1 0;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 6px 9px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.tab .ic {
+  width: 20px;
+  height: 20px;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.tab:focus-visible {
+  outline: 3px solid color-mix(in oklch, var(--accent) 30%, transparent);
+  outline-offset: -3px;
+  border-radius: var(--r-chip);
+}
+
+/* An intro block that opens a panel — a display-serif heading + a plain-language
+   lede, no card frame (it's orientation, not a control). */
+.intro h2,
+.card.welcome h2 {
+  font-family: var(--font-display);
+  font-weight: 550;
+  font-size: 21px;
+  letter-spacing: -0.01em;
+  margin: 0 0 10px;
+}
+.intro {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.intro .muted,
+.card.welcome .muted {
+  font-size: 14px;
+}
+
+/* A hint line — small, dim, often paired with a leading check/○ icon. */
+.hint {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+}
+.hint .ic {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  color: var(--jade);
+  flex: none;
+}
+.screen.center .hint {
+  justify-content: center;
+}
+
+/* Welcome cards (Docker, first-run) get a touch more inner air. */
+.card.welcome {
+  padding: 22px;
+}
+
+/* A soft informational card (e.g. "start your site first"). */
+.card.note {
+  background: color-mix(in oklch, var(--accent-2) 7%, var(--surface));
+  border-color: color-mix(in oklch, var(--accent-2) 40%, var(--border));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Inline link cluster — doc/action links laid on one wrapping row. */
+.inline-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 14px;
+}
+.screen.center .inline-links {
+  justify-content: center;
+}
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.link .ic {
+  width: 15px;
+  height: 15px;
+}
+.link.centered {
+  align-self: center;
+}
+
+/* The status hero on Home — the emotional centre of the app. */
+.card.hero {
+  padding: 20px;
+}
+.status-headline {
+  font-family: var(--font-display);
+  font-weight: 550;
+  font-size: 19px;
+  letter-spacing: -0.01em;
+}
+.hero-sub {
+  margin-top: 6px;
+}
+.card.hero .console-link {
+  margin-top: 8px;
+}
+.hero-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+.hero-actions .btn.primary {
+  flex: 1 1 auto;
+}
+
+/* A larger primary — the one confident action on a welcome/hero view. */
+.btn.big {
+  padding: 13px 18px;
+  font-size: 15px;
+}
+
+/* Quiet secondary actions (Sign in · Reset password) — understated, spaced. */
+.quiet-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+.btn.ghost.small {
+  color: var(--text-dim);
+}
+.btn.ghost.small:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+/* A gentle help line closing a panel. */
+.help-line {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* Update banner gains a two-line body (headline + reassurance). */
+.banner > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.banner-sub {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Folder / value picker row — a read-only field beside a Choose button. */
+.picker {
+  display: flex;
+  gap: 8px;
+}
+.picker input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.picker .btn {
+  flex: none;
+}
+
+/* Checkbox rows — a friendly opt-in, aligned and roomy. */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 13.5px;
+  line-height: 1.45;
+  cursor: pointer;
+}
+.check input {
+  width: 16px;
+  height: 16px;
+  margin: 1px 0 0;
+  flex: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.check code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--surface-2);
+  border-radius: var(--r-chip);
+  padding: 1px 5px;
+}
+
+/* Export success card. */
+.card.done-card {
+  border-color: color-mix(in oklch, var(--jade) 45%, var(--border));
+  background: color-mix(in oklch, var(--jade) 7%, var(--surface));
+}
+.done-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-display);
+  font-weight: 550;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+  margin: 0 0 8px;
+  text-transform: none;
+  color: var(--text);
+}
+.done-head .ic {
+  width: 18px;
+  height: 18px;
+  color: var(--jade);
+}
+.path-line {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  padding: 8px 10px;
+  margin: 6px 0 0;
+  word-break: break-all;
+}
+
+/* Empty-state hint inside the backups panel. */
+#backups-empty {
+  margin: 0;
+}
+
+/* AI model roles — a compact read-first list; each row can reveal an editor. */
+.roles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 4px;
+}
+.role {
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  padding: 10px 12px;
+  background: var(--surface-2);
+}
+.role-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.role-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.role-name .star {
+  color: var(--accent);
+  margin-left: 4px;
+}
+.role-binding {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.role-binding.unset {
+  color: var(--text-faint);
+  font-style: italic;
+  font-family: var(--font);
+}
+.role-edit {
+  display: none;
+  gap: 8px;
+  margin-top: 10px;
+}
+.role.editing .role-edit {
+  display: flex;
+  flex-wrap: wrap;
+}
+.role-edit input {
+  flex: 1 1 120px;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 13px;
+}
+.role-edit .btn {
+  flex: none;
+}
+
+/* Activity (logs) view. */
+.logs-controls {
+  display: flex;
+  gap: 8px;
+  margin: 14px 0 10px;
+}
+.logs-controls select {
+  flex: 1 1 auto;
+}
+.logs-controls .btn {
+  flex: none;
+}
+.logs-view {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
+  padding: 10px 12px;
+  margin: 0;
+  height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* A key/value line in Maintenance (version, etc.). */
+.kv {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.kv-label {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.kv-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* The advanced/danger disclosure stacks its buttons with breathing room. */
+.danger-zone {
+  margin-top: 14px;
+}
+.danger-zone .check,
+.danger-zone .btn {
+  margin-top: 10px;
+}
+.group-label .ic {
+  width: 13px;
+  height: 13px;
+  vertical-align: -2px;
+  margin-right: 5px;
 }

@@ -1,14 +1,45 @@
 // Atelier Manager — frontend. All real work lives in the Rust core (aincient-core),
 // reached through Tauri commands. This file only orchestrates screens and input.
+//
+// Tone note: many people opening this have never run a website before. Every
+// screen aims to feel calm and welcoming — one clear message, one obvious next
+// step, plain language, and the technical bits tucked behind disclosures.
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 const $ = (id) => document.getElementById(id);
-const screens = ["loading", "docker", "install", "main"];
 
-function showScreen(name) {
-  for (const s of screens) $(`screen-${s}`).classList.toggle("hidden", s !== name);
+// The four top-level "views" (what the whole window is showing) vs. the four
+// tab "panels" inside the installed app.
+const VIEWS = ["loading", "docker", "install", "app"];
+const PANELS = ["home", "publish", "backups", "settings"];
+
+let lastStatus = null; // most recent get_status, so panels can adapt to it
+let currentTab = "home";
+let exportDir = null; // folder chosen for the static export
+let lastExportPath = null; // where the last export landed, for "Open the folder"
+
+// --- view + tab routing -----------------------------------------------------
+
+function setView(name) {
+  for (const v of VIEWS.slice(0, 3)) $(`screen-${v}`).classList.toggle("hidden", name !== v);
+  const app = name === "app";
+  $("tabbar").classList.toggle("hidden", !app);
+  for (const p of PANELS) $(`panel-${p}`).classList.toggle("hidden", !(app && p === currentTab));
+  if (app) showTab(currentTab);
+}
+
+function showTab(tab) {
+  currentTab = tab;
+  for (const p of PANELS) $(`panel-${p}`).classList.toggle("hidden", p !== tab);
+  document
+    .querySelectorAll(".tab")
+    .forEach((el) => el.classList.toggle("active", el.dataset.tab === tab));
+  // Lazy-load each panel's data the moment it's shown.
+  if (tab === "publish") updatePublishGate();
+  if (tab === "backups") refreshBackups();
+  if (tab === "settings") loadSettings();
 }
 
 function showError(msg) {
@@ -55,10 +86,11 @@ function confirmModal(msg, opts = {}) {
 const STAGE_LABELS = {
   preflight: "Checking Docker",
   scaffold: "Preparing",
-  pull: "Downloading image",
-  starting: "Starting containers",
+  pull: "Downloading",
+  starting: "Starting",
   booting: "Booting the console",
   ready: "Ready",
+  working: "Working",
 };
 
 let lastStage = null;
@@ -91,10 +123,6 @@ function appendLog(line) {
   log.scrollTop = log.scrollHeight;
 }
 
-// Apply one op-progress event: advance the bar, update the sub-status, and feed
-// the log. A numeric fraction switches the bar to determinate (and mint at 1.0);
-// repeated ticks update the live status without spamming the feed; each new phase
-// and every passed-through docker line get a feed line.
 function progressUpdate(p) {
   if (typeof p.fraction === "number") {
     sawFraction = true;
@@ -106,8 +134,7 @@ function progressUpdate(p) {
     if (p.message.trim()) appendLog(p.message);
     return;
   }
-  // A stage milestone.
-  $("progress-stage").textContent = p.message; // live, e.g. "Booting… (12s)"
+  $("progress-stage").textContent = p.message;
   if (p.stage !== lastStage) {
     appendLog(`▸ ${STAGE_LABELS[p.stage] || p.message}`);
     lastStage = p.stage;
@@ -115,15 +142,16 @@ function progressUpdate(p) {
 }
 
 // Wrap any long op in the progress panel: stream its phases/steps via op-progress
-// events, then refresh. Phased ops (install/update/start) drive the bar with
-// fractions; the rest run an indeterminate bar that settles green on success.
+// events, then refresh. Returns whether the op completed without error.
 async function runProgressOp(title, fn) {
   progressReset(title);
   $("progress").classList.remove("hidden");
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
+  let ok = false;
   try {
     await fn();
     if (!sawFraction) progressFinish();
+    ok = true;
     await refresh();
   } catch (e) {
     showError(String(e));
@@ -131,73 +159,123 @@ async function runProgressOp(title, fn) {
     unlisten();
     $("progress").classList.add("hidden");
   }
+  return ok;
 }
+
+// --- status -----------------------------------------------------------------
 
 async function refresh() {
   const problem = await invoke("preflight_problem");
   if (problem) {
     $("docker-msg").textContent = problem;
-    showScreen("docker");
+    setView("docker");
     return;
   }
 
   const status = await invoke("get_status");
+  lastStatus = status;
   if (!status.installed) {
-    showScreen("install");
+    setView("install");
     return;
   }
 
   renderStatus(status);
-  showScreen("main");
+  setView("app");
   // Best-effort, non-blocking enrichment.
   refreshUpdate();
-  refreshBackups();
 }
 
+// Paint the Home hero from the current status — and adapt the one primary action
+// to whatever the person most likely wants to do next.
 function renderStatus(status) {
   const dot = $("status-dot");
-  const text = $("status-text");
-  if (status.running) {
+  const headline = $("status-headline");
+  const sub = $("status-sub");
+  const primary = $("home-primary");
+  const primaryLabel = $("home-primary-label");
+  const toggle = $("home-toggle");
+
+  const url = status.console_url;
+  const urlLink = $("console-url");
+  const primaryIcon = $("home-primary-icon");
+  urlLink.textContent = url;
+  urlLink.href = url;
+  // Only present the address as a live link once it actually answers.
+  urlLink.classList.toggle("hidden", !status.reachable);
+
+  if (status.running && status.reachable) {
     dot.className = "dot up";
-    text.textContent = status.reachable ? "Running" : "Running (starting…)";
+    headline.textContent = "Your website is running";
+    sub.textContent = "It's live on this computer and ready for you.";
+    primary.disabled = false;
+    primary.dataset.action = "open";
+    primaryIcon.setAttribute("href", "#i-open");
+    primaryLabel.textContent = "Open my website";
+    toggle.classList.remove("hidden");
+    $("startstop-label").textContent = "Stop";
+  } else if (status.running) {
+    dot.className = "dot up";
+    headline.textContent = "Starting up…";
+    sub.textContent = "Almost there — this usually takes a few seconds.";
+    primary.disabled = true;
+    primary.dataset.action = "open";
+    primaryIcon.setAttribute("href", "#i-open");
+    primaryLabel.textContent = "Starting…";
+    toggle.classList.remove("hidden");
+    $("startstop-label").textContent = "Stop";
   } else {
     dot.className = "dot down";
-    text.textContent = "Stopped";
+    headline.textContent = "Your website is stopped";
+    sub.textContent = "Start it whenever you'd like to work on your site.";
+    primary.disabled = false;
+    primary.dataset.action = "startstop";
+    primaryIcon.setAttribute("href", "#i-play");
+    primaryLabel.textContent = "Start my website";
+    toggle.classList.add("hidden");
   }
-  const url = status.console_url;
-  $("console-url").textContent = url;
-  $("console-url").href = url;
-  $("startstop-label").textContent = status.running ? "Stop" : "Start";
+
+  // Keep any open panels honest about the new state.
+  if (currentTab === "publish") updatePublishGate();
+  if (currentTab === "settings") $("image-tag").textContent = status.image || "—";
 }
 
 async function refreshUpdate() {
   try {
     const u = await invoke("get_update");
-    const banner = $("update-banner");
-    if (u.update_available === true) {
-      $("update-text").textContent = "An update is available.";
-      banner.classList.remove("hidden");
-    } else {
-      banner.classList.add("hidden");
-    }
+    $("update-banner").classList.toggle("hidden", u.update_available !== true);
   } catch {
     $("update-banner").classList.add("hidden");
   }
 }
 
+// --- Publish panel ----------------------------------------------------------
+
+// You can only export a running site, so gate the form gently rather than
+// letting the export fail with a raw error.
+function updatePublishGate() {
+  const running = !!(lastStatus && lastStatus.running);
+  $("publish-needs-running").classList.toggle("hidden", running);
+  $("publish-form").classList.toggle("hidden", !running);
+  $("export-btn").classList.toggle("hidden", !running);
+}
+
+// --- Backups panel ----------------------------------------------------------
+
 async function refreshBackups() {
   const select = $("backup-select");
+  const empty = $("backups-empty");
   const restoreBtn = document.querySelector('[data-action="restore"]');
   const exportBtn = $("btn-export");
   const setEnabled = (on) => {
     restoreBtn.disabled = !on;
     exportBtn.disabled = !on;
+    empty.classList.toggle("hidden", on);
+    select.classList.toggle("hidden", !on);
   };
   try {
     const backups = await invoke("list_backups");
     select.innerHTML = "";
     if (!backups.length) {
-      select.innerHTML = '<option value="">No backups yet</option>';
       setEnabled(false);
       return;
     }
@@ -214,6 +292,116 @@ async function refreshBackups() {
   }
 }
 
+// --- Settings panel ---------------------------------------------------------
+
+function loadSettings() {
+  $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
+  loadModels();
+}
+
+// A model role, rendered read-first with a foldable inline editor for the
+// curious. Most people never touch this — they set AI up inside Atelier.
+function roleRow(r) {
+  const row = document.createElement("div");
+  row.className = "role";
+
+  const head = document.createElement("div");
+  head.className = "role-head";
+
+  const name = document.createElement("span");
+  name.className = "role-name";
+  name.textContent = r.label || r.role;
+  if (r.default === "yes") {
+    const star = document.createElement("span");
+    star.className = "star";
+    star.textContent = "★";
+    star.title = "This is the default the console uses";
+    name.appendChild(star);
+  }
+
+  const bind = document.createElement("span");
+  const set = r.provider && r.model;
+  bind.className = set ? "role-binding" : "role-binding unset";
+  bind.textContent = set ? `${r.provider} · ${r.model}` : "Not set";
+
+  const edit = document.createElement("button");
+  edit.className = "btn ghost small";
+  edit.textContent = "Edit";
+  edit.onclick = () => row.classList.toggle("editing");
+
+  head.append(name, bind, edit);
+
+  const editor = document.createElement("div");
+  editor.className = "role-edit";
+  const provider = document.createElement("input");
+  provider.placeholder = "Provider (e.g. anthropic)";
+  provider.value = r.provider || "";
+  const model = document.createElement("input");
+  model.placeholder = "Model (e.g. claude-sonnet-5)";
+  model.value = r.model || "";
+  const save = document.createElement("button");
+  save.className = "btn small primary";
+  save.textContent = "Save";
+  save.onclick = async () => {
+    if (!provider.value.trim() || !model.value.trim()) return;
+    save.disabled = true;
+    save.textContent = "Saving…";
+    try {
+      await invoke("set_model_role", {
+        role: r.role,
+        provider: provider.value.trim(),
+        model: model.value.trim(),
+      });
+      await loadModels();
+    } catch (e) {
+      showError(String(e));
+      save.disabled = false;
+      save.textContent = "Save";
+    }
+  };
+  editor.append(provider, model, save);
+
+  row.append(head, editor);
+  return row;
+}
+
+async function loadModels() {
+  const box = $("model-roles");
+  const note = $("model-note");
+  box.innerHTML = "";
+  note.classList.add("hidden");
+  if (!(lastStatus && lastStatus.running)) {
+    note.textContent = "Start your website to view and adjust its AI settings.";
+    note.classList.remove("hidden");
+    return;
+  }
+  try {
+    const roles = await invoke("get_model_roles");
+    if (!roles.length) {
+      note.textContent = "No AI connected yet — open Atelier to set it up.";
+      note.classList.remove("hidden");
+      return;
+    }
+    for (const r of roles) box.appendChild(roleRow(r));
+  } catch {
+    note.textContent = "Couldn't read the AI settings — open Atelier to set it up there.";
+    note.classList.remove("hidden");
+  }
+}
+
+async function refreshLogs() {
+  const view = $("logs-view");
+  const svc = $("logs-service").value || null;
+  view.textContent = "Loading…";
+  try {
+    const out = await invoke("get_logs", { service: svc, lines: 400 });
+    view.textContent = out.trim() || "Nothing here yet.";
+    view.scrollTop = view.scrollHeight;
+  } catch (e) {
+    view.textContent = String(e);
+  }
+}
+
 // --- actions ----------------------------------------------------------------
 
 const actions = {
@@ -223,9 +411,6 @@ const actions = {
 
   open: () => invoke("open_console").catch((e) => showError(String(e))),
 
-  // Send the operator straight to Drupal's /user/login form in their browser.
-  // The manager never displays the admin password; if they've forgotten it,
-  // "Reset password" below sets a new one.
   login: () => invoke("open_login").catch((e) => showError(String(e))),
 
   "reset-password": () => {
@@ -247,34 +432,73 @@ const actions = {
 
   install: () => {
     const port = parseInt($("install-port").value, 10) || null;
-    return runProgressOp("Installing Atelier", () =>
-      invoke("do_install", { image: null, port })
-    );
+    return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }));
   },
 
-  update: () => runProgressOp("Updating", () => invoke("do_update")),
+  update: () => runProgressOp("Updating Atelier", () => invoke("do_update")),
 
-  startstop: async () => {
-    const running = $("startstop-label").textContent === "Stop";
-    return runProgressOp(running ? "Stopping" : "Starting", () =>
+  // Start or stop, decided by the live status rather than a label.
+  startstop: () => {
+    const running = !!(lastStatus && lastStatus.running);
+    return runProgressOp(running ? "Stopping your website" : "Starting your website", () =>
       invoke(running ? "do_stop" : "do_start")
     );
   },
 
-  backup: () => runProgressOp("Backing up", () => invoke("do_backup", { label: null })),
+  "startstop-from-publish": () =>
+    runProgressOp("Starting your website", () => invoke("do_start")),
+
+  // ---- Publish ----
+  "pick-export-dir": async () => {
+    try {
+      const dir = await invoke("pick_export_dir");
+      if (!dir) return;
+      exportDir = dir;
+      $("export-dir").value = dir;
+      $("export-btn").disabled = false;
+    } catch (e) {
+      showError(String(e));
+    }
+  },
+
+  "export-site": async () => {
+    if (!exportDir) return;
+    lastExportPath = null;
+    $("publish-result").classList.add("hidden");
+    const ok = await runProgressOp("Exporting your site", async () => {
+      lastExportPath = await invoke("site_export", {
+        out: exportDir,
+        baseUrl: $("export-baseurl").value.trim() || null,
+        zip: $("export-zip").checked,
+        includeConfig: $("export-config").checked,
+        includeUsers: $("export-users").checked,
+        skipLinkCheck: $("export-skiplinks").checked,
+      });
+    });
+    if (ok && lastExportPath) {
+      $("export-path").textContent = lastExportPath;
+      $("publish-result").classList.remove("hidden");
+    }
+  },
+
+  "reveal-export": () => {
+    if (!lastExportPath) return;
+    invoke("reveal_path", { path: lastExportPath }).catch((e) => showError(String(e)));
+  },
+
+  // ---- Backups ----
+  backup: () => runProgressOp("Backing up your site", () => invoke("do_backup", { label: null })),
 
   restore: async () => {
     const path = $("backup-select").value;
     if (!path) return;
     const ok = await confirmModal(
-      "Restore will REPLACE the current database and files with this snapshot. Continue?"
+      "Restoring replaces your current site (pages, images, and settings) with this backup. Continue?"
     );
     if (!ok) return;
-    return runProgressOp("Restoring", () => invoke("do_restore", { path }));
+    return runProgressOp("Restoring your backup", () => invoke("do_restore", { path }));
   },
 
-  // Export the selected backup out of ~/.atelier/backups to a user-chosen
-  // location (native Save As), for archiving off-machine.
   export: async () => {
     const source = $("backup-select").value;
     if (!source) return;
@@ -285,8 +509,6 @@ const actions = {
     }
   },
 
-  // Import: pick an external snapshot (native Open File) and restore it through
-  // the same confirm + core path as a listed backup.
   import: async () => {
     let path;
     try {
@@ -296,16 +518,49 @@ const actions = {
     }
     if (!path) return; // cancelled
     const ok = await confirmModal(
-      "Restore will REPLACE the current database and files with this snapshot. Continue?"
+      "Restoring replaces your current site (pages, images, and settings) with this file. Continue?"
     );
     if (!ok) return;
-    return runProgressOp("Restoring", () => invoke("do_restore", { path }));
+    return runProgressOp("Restoring your backup", () => invoke("do_restore", { path }));
+  },
+
+  // ---- Settings ----
+  "refresh-logs": () => refreshLogs(),
+
+  "check-update": async () => {
+    const s = $("update-status");
+    s.classList.remove("hidden");
+    s.textContent = "Checking…";
+    try {
+      const u = await invoke("get_update");
+      if (u.update_available === true) {
+        s.textContent = "A new version is available — go to Home to update.";
+      } else if (u.update_available === false) {
+        s.textContent = "You're on the latest version.";
+      } else {
+        s.textContent = "Couldn't check right now. Make sure your site is running and you're online.";
+      }
+      refreshUpdate();
+    } catch (e) {
+      s.textContent = String(e);
+    }
+  },
+
+  down: async () => {
+    const wipe = $("down-wipe").checked;
+    const msg = wipe
+      ? "This removes Atelier AND erases all your data — pages, images, settings, and password. This cannot be undone."
+      : "This removes the running containers. Your data is kept safe, and you can start again anytime.";
+    const ok = await confirmModal(msg, wipe ? { requireText: "erase" } : {});
+    if (!ok) return;
+    return runProgressOp(wipe ? "Removing and erasing" : "Removing containers", () =>
+      invoke("do_down", { wipe })
+    );
   },
 
   reinstall: async () => {
     const ok = await confirmModal(
-      "Reinstall DELETES all data (database, files, admin password) and installs fresh. " +
-        "This cannot be undone.",
+      "Reinstalling erases everything — your pages, images, settings, and password — and sets up a fresh Atelier. This cannot be undone.",
       { requireText: "confirm" }
     );
     if (!ok) return;
@@ -313,8 +568,13 @@ const actions = {
   },
 };
 
-// Event delegation for every [data-action] control.
+// Event delegation for tabs and every [data-action] control.
 document.addEventListener("click", (e) => {
+  const tab = e.target.closest(".tab");
+  if (tab) {
+    showTab(tab.dataset.tab);
+    return;
+  }
   const target = e.target.closest("[data-action]");
   if (!target) return;
   const name = target.getAttribute("data-action");

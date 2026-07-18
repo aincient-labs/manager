@@ -728,6 +728,18 @@ pub fn logs_command(stack: &Stack, follow: bool, service: Option<&str>) -> Comma
     c
 }
 
+/// Capture the most recent appliance log lines (no follow) as plain text — the
+/// snapshot the GUI's activity view shows and re-fetches on demand. `--no-color`
+/// keeps the webview text clean; `--tail` bounds how much we read back.
+pub fn tail_logs(stack: &Stack, service: Option<&str>, lines: usize) -> Result<String> {
+    let mut c = compose(stack);
+    c.args(["logs", "--no-color", "--tail", &lines.to_string()]);
+    if let Some(svc) = service {
+        c.arg(svc);
+    }
+    run_capture(c, "read the appliance logs")
+}
+
 /// Open the console (the chat workspace at `/atelier`) in the default browser.
 pub fn open_console(stack: &Stack) -> Result<()> {
     open_url(&stack.console_url())

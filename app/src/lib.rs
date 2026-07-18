@@ -6,7 +6,9 @@
 
 use std::path::PathBuf;
 
-use aincient_core::{ops, Backup, InstallOptions, Preflight, Reporter, Stack, Stage, Status, UpdateCheck};
+use aincient_core::{
+    ops, Backup, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage, Status, UpdateCheck,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
@@ -256,10 +258,107 @@ async fn do_stop(app: AppHandle) -> Result<(), String> {
     blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
 }
 
+/// Remove the appliance's containers. With `wipe = true` this also deletes the
+/// data volumes (database, files, admin password) — a harder teardown than a
+/// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
+#[tauri::command]
+async fn do_down(wipe: bool) -> Result<(), String> {
+    let s = stack()?;
+    blocking(move || ops::down(&s, wipe).map_err(err)).await
+}
+
+/// Read back the most recent appliance log lines for the Activity view.
+/// `service` narrows to one container (`app`/`db`); `None` shows everything.
+#[tauri::command]
+async fn get_logs(service: Option<String>, lines: Option<usize>) -> Result<String, String> {
+    let s = stack()?;
+    let n = lines.unwrap_or(400);
+    blocking(move || ops::tail_logs(&s, service.as_deref(), n).map_err(err)).await
+}
+
+/// Open a native folder picker for the static-export destination. Returns the
+/// chosen directory (or `None` if the user cancelled).
+#[tauri::command]
+async fn pick_export_dir(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, mut rx) = tauri::async_runtime::channel(1);
+    app.dialog()
+        .file()
+        .set_title("Choose where to save your site")
+        .pick_folder(move |picked| {
+            let path = picked.and_then(|p| p.into_path().ok());
+            let _ = tx.blocking_send(path.map(|p| p.to_string_lossy().into_owned()));
+        });
+    Ok(rx.recv().await.flatten())
+}
+
+/// Export the built site to static HTML — the deploy-anywhere artifact behind
+/// `atelier site export`. Streams progress through the same reporter as the
+/// lifecycle ops and returns the host output directory.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn site_export(
+    app: AppHandle,
+    out: Option<String>,
+    base_url: Option<String>,
+    zip: bool,
+    include_config: bool,
+    include_users: bool,
+    skip_link_check: bool,
+) -> Result<String, String> {
+    let s = stack()?;
+    blocking(move || {
+        let opts = ops::ExportOptions {
+            out: out.map(PathBuf::from),
+            base_url: base_url.filter(|u| !u.trim().is_empty()),
+            zip,
+            include_config,
+            include_users,
+            skip_link_check,
+        };
+        ops::export_static(&s, &opts, &mut EventReporter { app })
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(err)
+    })
+    .await
+}
+
+/// List each Atelier model role and the provider/model it's bound to. Needs the
+/// appliance running (it asks Drupal), so it may fail with a friendly error the
+/// AI view surfaces as "start your site first."
+#[tauri::command]
+async fn get_model_roles() -> Result<Vec<ModelRole>, String> {
+    let s = stack()?;
+    blocking(move || ops::model_list(&s).map_err(err)).await
+}
+
+/// Bind one role (reasoning|task|fast) to a provider + model.
+#[tauri::command]
+async fn set_model_role(role: String, provider: String, model: String) -> Result<(), String> {
+    let s = stack()?;
+    blocking(move || ops::model_set(&s, &role, &provider, &model).map_err(err)).await
+}
+
 #[tauri::command]
 fn open_console() -> Result<(), String> {
     let s = stack()?;
     ops::open_console(&s).map_err(err)
+}
+
+/// Open a folder (the exported site) in the OS file manager. Shells out to the
+/// platform opener, exactly as the core does for URLs — no extra plugin needed.
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer")
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    cmd.arg(&path);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not open the folder: {e}"))
 }
 
 #[tauri::command]
@@ -288,6 +387,13 @@ pub fn run() {
             do_reinstall,
             do_start,
             do_stop,
+            do_down,
+            get_logs,
+            pick_export_dir,
+            site_export,
+            get_model_roles,
+            set_model_role,
+            reveal_path,
             open_console,
             open_login,
         ])
