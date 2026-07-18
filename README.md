@@ -56,8 +56,9 @@ cargo run -p atelier-manager          # launch the GUI
 ```
 
 The built CLI binary is `target/debug/atelier` (or `target/release/atelier`); the GUI
-binary is `target/debug/atelier-manager`. Packaging the GUI into a signed `.dmg`/`.msi`/
-AppImage (via `cargo tauri build`) and code-signing/notarization are deferred.
+binary is `target/debug/atelier-manager`. The GUI is packaged into `.dmg`/`.msi`/AppImage
+by `cargo tauri build` (in CI, `release-gui.yml`); the macOS bundle is Developer ID signed
+and notarized when the Apple secrets are configured (see "macOS code signing" below).
 
 ## Release / distribution
 
@@ -88,6 +89,32 @@ PATs whose lifetime exceeds 366 days** — if `publish-homebrew-formula` fails a
 rotate the secret to a ≤366-day token. (Recovery when it fails: the formula is also attached to
 the release as `atelier.rb`, so it can be pushed to the tap by hand.)
 
-The desktop bundles are currently **unsigned** — macOS Gatekeeper / Windows SmartScreen warn on
-first launch. Code-signing + notarization (Apple Developer ID + Windows Authenticode, supplied as
-Actions secrets) is a deliberate fast-follow before the GUI is promoted to non-technical users.
+### macOS code signing
+
+The macOS bundle is signed with a **Developer ID Application** certificate and **notarized** via the
+App Store Connect API. `release-gui.yml` does this automatically **when the secrets below are set**;
+with them absent the build falls back to an unsigned bundle (Gatekeeper warns on first launch), so the
+workflow is safe to run either way. Windows Authenticode is still a fast-follow.
+
+One-time Apple-side setup (all from [developer.apple.com](https://developer.apple.com/account)):
+
+1. **Certificate** — create a *Developer ID Application* certificate, then export it from Keychain
+   Access as a `.p12` (with a password). Base64 it for the secret:
+   `base64 -i cert.p12 | pbcopy`.
+2. **Signing identity** — the cert's full name, e.g.
+   `Developer ID Application: Your Name (TEAMID)` (copy from Keychain Access or `security find-identity -v -p codesigning`).
+3. **Notarization key** — App Store Connect → Users and Access → Integrations → App Store Connect API
+   → generate a key with the **Developer** role. Download the `.p8` (one-time download), and note the
+   **Key ID** and **Issuer ID**. Base64 it for the secret: `base64 -i AuthKey_XXXX.p8 | pbcopy`.
+
+Then add these repo Actions secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_CERTIFICATE` | base64 of the `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | password you set when exporting the `.p12` |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: … (TEAMID)` |
+| `APPLE_API_ISSUER` | Issuer ID (UUID) from App Store Connect |
+| `APPLE_API_KEY` | Key ID (e.g. `XXXXXXXXXX`) |
+| `APPLE_API_KEY_BASE64` | base64 of the `.p8` key (workflow decodes it to a file) |
+| `KEYCHAIN_PASSWORD` | *(optional)* any string; auto-generated if unset |
