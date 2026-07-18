@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 /// Default image tag, matching `docker/install.sh`.
-pub const DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier:edge";
+pub const DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:edge";
 /// Default console port — "AINCI" in leet (4=A,1=I,2=N,2=C,1=I).
 pub const DEFAULT_PORT: u16 = 41221;
 
@@ -32,7 +32,7 @@ services:
       interval: 10s
       retries: 10
   app:
-    image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier:edge}
+    image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:edge}
     depends_on:
       db:
         condition: service_healthy
@@ -266,13 +266,13 @@ mod tests {
         // Re-run pointing at a new image + port.
         stack
             .ensure_scaffold(&InstallOptions {
-                image: Some("ghcr.io/aincient-labs/atelier:v2".into()),
+                image: Some("ghcr.io/aincient-labs/atelier-cms:v2".into()),
                 http_port: Some(9000),
             })
             .unwrap();
 
         assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must be preserved");
-        assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier:v2");
+        assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v2");
         assert_eq!(stack.http_port(), 9000);
     }
 
