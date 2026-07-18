@@ -250,6 +250,30 @@ async function refreshUpdate() {
 
 // --- Publish panel ----------------------------------------------------------
 
+// Publish preferences are remembered between sessions (webview localStorage) so
+// a repeat export doesn't ask for the same folder and address every time. The
+// website address especially matters — localhost isn't a place anyone can visit,
+// so links must be rendered against where the site will actually live.
+const PREF_URL = "atelier.publish.baseUrl";
+const PREF_DIR = "atelier.publish.dir";
+
+function initPublishPrefs() {
+  const url = localStorage.getItem(PREF_URL);
+  if (url) $("export-baseurl").value = url;
+  const dir = localStorage.getItem(PREF_DIR);
+  if (dir) {
+    exportDir = dir;
+    $("export-dir").value = dir;
+    $("export-btn").disabled = false;
+  }
+  // Remember the address as it's typed, not only on export.
+  $("export-baseurl").addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    if (v) localStorage.setItem(PREF_URL, v);
+    else localStorage.removeItem(PREF_URL);
+  });
+}
+
 // You can only export a running site, so gate the form gently rather than
 // letting the export fail with a raw error.
 function updatePublishGate() {
@@ -456,6 +480,7 @@ const actions = {
       exportDir = dir;
       $("export-dir").value = dir;
       $("export-btn").disabled = false;
+      localStorage.setItem(PREF_DIR, dir);
     } catch (e) {
       showError(String(e));
     }
@@ -585,4 +610,5 @@ document.addEventListener("click", (e) => {
   }
 });
 
+initPublishPrefs();
 refresh().catch((e) => showError(String(e)));
