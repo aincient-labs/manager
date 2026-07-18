@@ -379,6 +379,112 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     Ok(host_path)
 }
 
+/// Where the static export is staged inside the `app` container before it's
+/// copied out to the host.
+const EXPORT_CONTAINER_DIR: &str = "/tmp/aincient-site-export";
+
+/// Options for [`export_static`] — a thin passthrough onto the appliance's
+/// `drush aincient:export` (the static-site exporter). Every field maps to a
+/// flag the exporter already understands, so the manager invents no behaviour.
+#[derive(Debug, Default, Clone)]
+pub struct ExportOptions {
+    /// Host directory to write the static site into. Defaults to
+    /// `./aincient-export` in the caller's current directory.
+    pub out: Option<PathBuf>,
+    /// Scheme + host to render absolute links against (drush `--base-url`).
+    /// `None` lets the exporter use its own default.
+    pub base_url: Option<String>,
+    /// Also package a `.zip` beside the exported site.
+    pub zip: bool,
+    /// Add `config/sync` to the zip (a portable "own your data" bundle).
+    pub include_config: bool,
+    /// Add `users.json` (accounts without password hashes) to the zip.
+    pub include_users: bool,
+    /// Skip the exporter's post-export link check.
+    pub skip_link_check: bool,
+}
+
+/// Export the public site to static HTML on the host — the deploy-anywhere
+/// artifact behind `atelier site export`. Runs the appliance's
+/// `drush aincient:export` inside the `app` container (staging into a temp dir),
+/// then copies the result out. Returns the host output directory.
+pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) -> Result<PathBuf> {
+    r.stage(Stage::Working, "Exporting the site to static HTML…", None);
+    ensure_running(stack)?;
+
+    let host_out = match &opts.out {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()
+            .context("failed to read the current directory")?
+            .join("aincient-export"),
+    };
+    if let Some(parent) = host_out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let container_zip = format!("{EXPORT_CONTAINER_DIR}.zip");
+
+    // Assemble the drush invocation, rendering into a clean container staging dir.
+    let mut export_args: Vec<String> = DRUSH.iter().map(|s| (*s).to_string()).collect();
+    export_args.push("aincient:export".into());
+    export_args.push(format!("--out={EXPORT_CONTAINER_DIR}"));
+    if let Some(base) = &opts.base_url {
+        export_args.push(format!("--base-url={base}"));
+    }
+    if opts.zip {
+        export_args.push(format!("--zip={container_zip}"));
+    }
+    if opts.include_config {
+        export_args.push("--include-config".into());
+    }
+    if opts.include_users {
+        export_args.push("--include-users".into());
+    }
+    if opts.skip_link_check {
+        export_args.push("--skip-link-check".into());
+    }
+
+    // Clear any stale staging dir so a re-export is clean.
+    let mut clean = compose(stack);
+    clean.args([
+        "exec", "-T", "app", "rm", "-rf",
+        EXPORT_CONTAINER_DIR, container_zip.as_str(),
+    ]);
+    let _ = clean.output();
+
+    r.log("Rendering pages to static HTML…");
+    let mut build = compose(stack);
+    build.args(["exec", "-T", "app"]);
+    build.args(&export_args);
+    // The exporter reports page/asset counts and any broken links — surface them.
+    run_step(build, "export the static site", r)?;
+
+    r.log("Copying the exported site out of the container…");
+    // `docker compose cp` copies the source dir *as* the destination — so remove
+    // an existing target first, otherwise the export nests inside it.
+    let _ = std::fs::remove_dir_all(&host_out);
+    let mut cp = compose(stack);
+    cp.args(["cp", &format!("app:{EXPORT_CONTAINER_DIR}"), &host_out.to_string_lossy()]);
+    run_capture(cp, "copy the exported site out of the container")?;
+
+    if opts.zip {
+        let host_zip = host_out.with_extension("zip");
+        let mut cpz = compose(stack);
+        cpz.args(["cp", &format!("app:{container_zip}"), &host_zip.to_string_lossy()]);
+        run_capture(cpz, "copy the export zip out of the container")?;
+    }
+
+    // Best-effort cleanup of the in-container staging files.
+    let mut rm = compose(stack);
+    rm.args([
+        "exec", "-T", "app", "rm", "-rf",
+        EXPORT_CONTAINER_DIR, container_zip.as_str(),
+    ]);
+    let _ = rm.output();
+
+    r.log(&format!("Static site exported to {}", host_out.display()));
+    Ok(host_out)
+}
+
 /// Restore the appliance from a host backup file. Destructive — confirm first.
 ///
 /// A `.tar.gz` **snapshot bundle** (from [`backup`]) restores the database
@@ -658,7 +764,7 @@ fn open_url(url: &str) -> Result<()> {
 fn ensure_installed(stack: &Stack) -> Result<()> {
     if !stack.exists() {
         bail!(
-            "no Atelier stack found at {} — run `atelier install` first",
+            "no Atelier stack found at {} — run `atelier app install` first",
             stack.home.display()
         );
     }
@@ -669,7 +775,7 @@ fn ensure_running(stack: &Stack) -> Result<()> {
     ensure_installed(stack)?;
     preflight().require()?;
     if !status(stack).running {
-        bail!("the appliance isn't running — start it with `atelier start`");
+        bail!("the appliance isn't running — start it with `atelier app start`");
     }
     Ok(())
 }

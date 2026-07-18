@@ -18,19 +18,32 @@ Install friction is the biggest leak in the evaluator funnel. The real prerequis
 *lifecycle manager over the existing appliance*, not a way to skip prerequisites. Every
 operation maps to a `docker compose` / `drush` primitive the appliance already uses:
 
-| Command          | What it does                                                              |
-| ---------------- | ------------------------------------------------------------------------- |
-| `install`        | Lay down `~/.atelier/{compose.yaml,.env}`, pull, `up -d`. Idempotent.     |
-| `update`         | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
-| `check-update`   | Compare the local image digest against the registry tag.                  |
-| `backup`         | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. |
-| `restore <file>` | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). |
-| `reinstall`      | Wipe volumes and install fresh (destructive, confirmed).                  |
-| `status`/`doctor`| Read-only health and Docker-readiness probes.                             |
-| `start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.                  |
+Commands are grouped into noun namespaces so the surface stays maintainable as it grows
+(`doctor` is the one flat, universal preflight):
 
-The stack directory defaults to `~/.atelier` (override with `ATELIER_HOME`) and holds the
-same `compose.yaml` + `.env` the `docker/install.sh` bootstrapper writes.
+| Command                  | What it does                                                              |
+| ------------------------ | ------------------------------------------------------------------------- |
+| `app install`            | Lay down `~/.atelier/{compose.yaml,.env}`, pull, `up -d`. Idempotent.     |
+| `app update`             | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
+| `app check-update`       | Compare the local image digest against the registry tag. (alias `app check`) |
+| `app reinstall`          | Wipe volumes and install fresh (destructive, confirmed).                  |
+| `app status`             | Read-only health probe. (Docker readiness is the flat `doctor`.)          |
+| `app start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.              |
+| `site export`            | Export the public site to static HTML — the deploy-anywhere artifact (`drush aincient:export`). |
+| `data backup`            | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. (alias `data export`) |
+| `data restore <file>`    | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). (alias `data import`) |
+| `data list`              | List snapshots on this host. (alias `data backups`)                       |
+| `ai model list`/`set`    | Inspect or bind the AI model per Atelier role.                            |
+
+`export`/`import` alias `data backup`/`restore` so either mental model works; `export` is
+never a bare top-level verb (it means one of three things — static site, db+files, db-only —
+so it's always qualified by its namespace). The stack directory defaults to `~/.atelier`
+(override with `ATELIER_HOME`) and holds the same `compose.yaml` + `.env` the
+`docker/install.sh` bootstrapper writes.
+
+> **v0.2.0 renamed the flat commands into these namespaces** (BC break vs v0.1.0): `install` →
+> `app install`, `backup` → `data backup`, `model set` → `ai model set`, and so on. `doctor`
+> is unchanged.
 
 ## Develop
 

@@ -31,6 +31,31 @@ struct Cli {
 enum Command {
     /// Check that Docker and Compose are ready to run the appliance.
     Doctor,
+    /// Manage the appliance: install, update, run, and inspect it.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
+    },
+    /// Publish the site you built — export it to static HTML (deploy anywhere).
+    Site {
+        #[command(subcommand)]
+        command: SiteCommand,
+    },
+    /// Move your data in and out as portable snapshots (database + files).
+    Data {
+        #[command(subcommand)]
+        command: DataCommand,
+    },
+    /// Configure AI providers and the model bound to each Atelier role.
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
+    },
+}
+
+/// The appliance (Docker) lifecycle — the 90% commands.
+#[derive(Subcommand)]
+enum AppCommand {
     /// Show the appliance status (installed, running, reachable).
     Status {
         /// Emit machine-readable JSON.
@@ -53,24 +78,6 @@ enum Command {
     CheckUpdate {
         #[arg(long)]
         json: bool,
-    },
-    /// Back up the database and uploaded files to ~/.atelier/backups as a
-    /// portable .tar.gz snapshot.
-    Backup {
-        /// A label folded into the filename.
-        #[arg(long)]
-        label: Option<String>,
-    },
-    /// List backups taken on this host.
-    Backups,
-    /// Restore from a backup file (destructive). A .tar.gz snapshot restores the
-    /// database and files; a legacy .sql/.sql.gz dump restores the database only.
-    Restore {
-        /// Path to a `.tar.gz` snapshot (or a legacy `.sql`/`.sql.gz` dump).
-        file: PathBuf,
-        /// Skip the confirmation prompt.
-        #[arg(short = 'y', long)]
-        yes: bool,
     },
     /// Wipe all data and install from scratch (destructive).
     Reinstall {
@@ -105,6 +112,66 @@ enum Command {
         #[arg(long, value_name = "NEW")]
         set: Option<String>,
     },
+}
+
+/// Publishing the site you built — the static export and (later) deploy.
+#[derive(Subcommand)]
+enum SiteCommand {
+    /// Export the public site to static HTML — the deploy-anywhere artifact.
+    Export {
+        /// Host directory to write the static site into
+        /// (default: ./aincient-export).
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Scheme + host to render absolute links against
+        /// (e.g. https://example.com).
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
+        /// Also package a .zip beside the exported site.
+        #[arg(long)]
+        zip: bool,
+        /// Add config/sync to the zip (a portable "own your data" bundle).
+        #[arg(long)]
+        include_config: bool,
+        /// Add users.json (accounts without password hashes) to the zip.
+        #[arg(long)]
+        include_users: bool,
+        /// Skip the post-export link check.
+        #[arg(long)]
+        skip_link_check: bool,
+    },
+}
+
+/// Your data in and out — portable db + files snapshots. `export`/`import` are
+/// aliases for `backup`/`restore`, whichever mental model you prefer.
+#[derive(Subcommand)]
+enum DataCommand {
+    /// Back up the database and uploaded files to ~/.atelier/backups as a
+    /// portable .tar.gz snapshot.
+    #[command(visible_alias = "export")]
+    Backup {
+        /// A label folded into the filename.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Restore from a backup file (destructive). A .tar.gz snapshot restores the
+    /// database and files; a legacy .sql/.sql.gz dump restores the database only.
+    #[command(visible_alias = "import")]
+    Restore {
+        /// Path to a `.tar.gz` snapshot (or a legacy `.sql`/`.sql.gz` dump).
+        file: PathBuf,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// List snapshots taken on this host.
+    #[command(visible_alias = "backups")]
+    List,
+}
+
+/// AI provider + model-role configuration.
+#[derive(Subcommand)]
+enum AiCommand {
     /// Inspect or change the AI model bound to each Atelier role.
     Model {
         #[command(subcommand)]
@@ -164,9 +231,24 @@ fn pending_banner(headline: &str, url: &str) {
         "{}",
         style::warn(
             "It's taking longer than usual to come up. Give it another minute, then reload \
-             — or watch it boot with `atelier logs -f app`."
+             — or watch it boot with `atelier app logs -f app`."
         )
     );
+}
+
+/// A success banner for `atelier site export`: the mint headline, the output
+/// path, and a nudge toward the deploy-anywhere payoff.
+fn done_export_banner(path: &std::path::Path) {
+    println!();
+    if let Some(rule) = style::spectrum_rule() {
+        println!("{rule}");
+    }
+    println!(
+        "{} Static site at {}",
+        style::success("Exported."),
+        style::url(&path.display().to_string())
+    );
+    println!("Deploy it anywhere — Netlify, Cloudflare Pages, GitHub Pages, or any static host.");
 }
 
 /// Renders core lifecycle progress on the terminal: a headline as each stage
@@ -211,36 +293,159 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Doctor => doctor(),
-        Command::Status { json } => status(&stack, json),
-        Command::Install { image, port } => {
+        Command::App { command } => run_app(command, &stack),
+        Command::Site { command } => run_site(command, &stack),
+        Command::Data { command } => run_data(command, &stack),
+        Command::Ai { command } => run_ai(command, &stack),
+    }
+}
+
+/// `atelier app …` — the appliance lifecycle.
+fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
+    match command {
+        AppCommand::Status { json } => status(stack, json),
+        AppCommand::Install { image, port } => {
             let opts = InstallOptions {
                 image,
                 http_port: port,
             };
-            if ops::install(&stack, &opts, &mut CliReporter::default())? {
+            if ops::install(stack, &opts, &mut CliReporter::default())? {
                 done_banner("Installed.", &stack.console_url());
             } else {
                 pending_banner("Installed — still finishing first boot.", &stack.console_url());
             }
-            show_login(&stack);
+            show_login(stack);
             Ok(())
         }
-        Command::Update => {
-            if ops::update(&stack, &mut CliReporter::default())? {
+        AppCommand::Update => {
+            if ops::update(stack, &mut CliReporter::default())? {
                 done_banner("Update complete.", &stack.console_url());
             } else {
                 pending_banner("Update applied — still finishing boot.", &stack.console_url());
             }
             Ok(())
         }
-        Command::CheckUpdate { json } => check_update(&stack, json),
-        Command::Backup { label } => {
-            let path = ops::backup(&stack, label.as_deref(), &mut ops::Silent)?;
+        AppCommand::CheckUpdate { json } => check_update(stack, json),
+        AppCommand::Reinstall { yes } => {
+            if !confirm(
+                "Reinstall will DELETE all data (database, files, admin password) and install \
+                 fresh. Continue?",
+                yes,
+            )? {
+                println!("{}", style::warn("Aborted."));
+                return Ok(());
+            }
+            let opts = InstallOptions::default();
+            if ops::reinstall(stack, &opts, &mut CliReporter::default())? {
+                done_banner("Reinstalled.", &stack.console_url());
+            } else {
+                pending_banner("Reinstalled — still finishing first boot.", &stack.console_url());
+            }
+            show_login(stack);
+            Ok(())
+        }
+        AppCommand::Start => {
+            if ops::start(stack, &mut CliReporter::default())? {
+                println!(
+                    "{} Console: {}",
+                    style::success("Started."),
+                    style::url(&stack.console_url())
+                );
+            } else {
+                pending_banner("Started — still finishing boot.", &stack.console_url());
+            }
+            Ok(())
+        }
+        AppCommand::Stop => {
+            ops::stop(stack, &mut ops::Silent)?;
+            println!("{}", style::success("Stopped."));
+            Ok(())
+        }
+        AppCommand::Down { wipe, yes } => {
+            if wipe
+                && !confirm(
+                    "This will DELETE all data (database, files, admin password). Continue?",
+                    yes,
+                )?
+            {
+                println!("{}", style::warn("Aborted."));
+                return Ok(());
+            }
+            ops::down(stack, wipe)?;
+            println!(
+                "{}",
+                style::success(if wipe {
+                    "Removed and wiped."
+                } else {
+                    "Removed (data kept)."
+                })
+            );
+            Ok(())
+        }
+        AppCommand::Logs { follow, service } => {
+            let mut cmd = ops::logs_command(stack, follow, service.as_deref());
+            cmd.status().context("failed to run docker compose logs")?;
+            Ok(())
+        }
+        AppCommand::Open => {
+            ops::open_console(stack)?;
+            Ok(())
+        }
+        AppCommand::Password { set } => match set {
+            Some(pw) => {
+                ops::set_admin_password(stack, &pw, &mut ops::Silent)?;
+                println!("{}", style::success("Admin password updated."));
+                Ok(())
+            }
+            None => {
+                match ops::admin_password(stack) {
+                    Some(pw) => println!("admin / {pw}"),
+                    None => println!(
+                        "No saved initial password (it was likely changed, or you pinned one at \
+                         install). Set a new one with: atelier app password --set <new>"
+                    ),
+                }
+                Ok(())
+            }
+        },
+    }
+}
+
+/// `atelier site …` — publish the site you built.
+fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
+    match command {
+        SiteCommand::Export {
+            out,
+            base_url,
+            zip,
+            include_config,
+            include_users,
+            skip_link_check,
+        } => {
+            let opts = ops::ExportOptions {
+                out,
+                base_url,
+                zip,
+                include_config,
+                include_users,
+                skip_link_check,
+            };
+            let path = ops::export_static(stack, &opts, &mut ops::Silent)?;
+            done_export_banner(&path);
+            Ok(())
+        }
+    }
+}
+
+/// `atelier data …` — portable db + files snapshots.
+fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
+    match command {
+        DataCommand::Backup { label } => {
+            let path = ops::backup(stack, label.as_deref(), &mut ops::Silent)?;
             println!("{} {}", style::success("Backup written to"), path.display());
             Ok(())
         }
-        Command::Backups => list_backups(&stack),
-        Command::Restore { file, yes } => {
+        DataCommand::Restore { file, yes } => {
             if !confirm(
                 &format!(
                     "Restore will REPLACE the current database (and files, for a .tar.gz \
@@ -252,104 +457,26 @@ fn run() -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            ops::restore(&stack, &file, &mut ops::Silent)?;
+            ops::restore(stack, &file, &mut ops::Silent)?;
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
-        Command::Reinstall { yes } => {
-            if !confirm(
-                "Reinstall will DELETE all data (database, files, admin password) and install \
-                 fresh. Continue?",
-                yes,
-            )? {
-                println!("{}", style::warn("Aborted."));
-                return Ok(());
-            }
-            let opts = InstallOptions::default();
-            if ops::reinstall(&stack, &opts, &mut CliReporter::default())? {
-                done_banner("Reinstalled.", &stack.console_url());
-            } else {
-                pending_banner("Reinstalled — still finishing first boot.", &stack.console_url());
-            }
-            show_login(&stack);
-            Ok(())
-        }
-        Command::Start => {
-            if ops::start(&stack, &mut CliReporter::default())? {
-                println!(
-                    "{} Console: {}",
-                    style::success("Started."),
-                    style::url(&stack.console_url())
-                );
-            } else {
-                pending_banner("Started — still finishing boot.", &stack.console_url());
-            }
-            Ok(())
-        }
-        Command::Stop => {
-            ops::stop(&stack, &mut ops::Silent)?;
-            println!("{}", style::success("Stopped."));
-            Ok(())
-        }
-        Command::Down { wipe, yes } => {
-            if wipe
-                && !confirm(
-                    "This will DELETE all data (database, files, admin password). Continue?",
-                    yes,
-                )?
-            {
-                println!("{}", style::warn("Aborted."));
-                return Ok(());
-            }
-            ops::down(&stack, wipe)?;
-            println!(
-                "{}",
-                style::success(if wipe {
-                    "Removed and wiped."
-                } else {
-                    "Removed (data kept)."
-                })
-            );
-            Ok(())
-        }
-        Command::Logs { follow, service } => {
-            let mut cmd = ops::logs_command(&stack, follow, service.as_deref());
-            cmd.status().context("failed to run docker compose logs")?;
-            Ok(())
-        }
-        Command::Open => {
-            ops::open_console(&stack)?;
-            Ok(())
-        }
-        Command::Password { set } => match set {
-            Some(pw) => {
-                ops::set_admin_password(&stack, &pw, &mut ops::Silent)?;
-                println!("{}", style::success("Admin password updated."));
-                Ok(())
-            }
-            None => {
-                match ops::admin_password(&stack) {
-                    Some(pw) => println!("admin / {pw}"),
-                    None => println!(
-                        "No saved initial password (it was likely changed, or you pinned one at \
-                         install). Set a new one with: atelier password --set <new>"
-                    ),
-                }
-                Ok(())
-            }
-        },
-        Command::Model { command } => match command {
-            ModelCommand::List { json } => model_list(&stack, json),
+        DataCommand::List => list_backups(stack),
+    }
+}
+
+/// `atelier ai …` — AI provider + model-role configuration.
+fn run_ai(command: AiCommand, stack: &Stack) -> Result<()> {
+    match command {
+        AiCommand::Model { command } => match command {
+            ModelCommand::List { json } => model_list(stack, json),
             ModelCommand::Set {
                 role,
                 provider,
                 model,
             } => {
-                ops::model_set(&stack, &role, &provider, &model)?;
-                println!(
-                    "{} {role} → {provider}:{model}",
-                    style::success("Bound")
-                );
+                ops::model_set(stack, &role, &provider, &model)?;
+                println!("{} {role} → {provider}:{model}", style::success("Bound"));
                 Ok(())
             }
         },
@@ -431,7 +558,7 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
     }
     match check.update_available {
         Some(true) => println!(
-            "{} for {}.\nRun `atelier update`.",
+            "{} for {}.\nRun `atelier app update`.",
             style::heading("An update is available"),
             check.image
         ),
@@ -456,7 +583,7 @@ fn list_backups(stack: &Stack) -> Result<()> {
     if backups.is_empty() {
         println!(
             "{}",
-            style::warn("No backups yet. Create one with `atelier backup`.")
+            style::warn("No backups yet. Create one with `atelier data backup`.")
         );
         return Ok(());
     }

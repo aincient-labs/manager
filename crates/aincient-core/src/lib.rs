@@ -16,8 +16,8 @@ pub mod stack;
 
 pub use docker::{preflight, Preflight};
 pub use ops::{
-    admin_password, backup, check_update, down, install, list_backups, logs_command, open_console,
-    open_login, reinstall, restore, set_admin_password, start, status, stop, update, Backup,
-    Reporter, Silent, Stage, Status, UpdateCheck,
+    admin_password, backup, check_update, down, export_static, install, list_backups,
+    logs_command, open_console, open_login, reinstall, restore, set_admin_password, start, status,
+    stop, update, Backup, ExportOptions, Reporter, Silent, Stage, Status, UpdateCheck,
 };
 pub use stack::{InstallOptions, Stack, DEFAULT_IMAGE, DEFAULT_PORT};
