@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- GitHub release notes now lead with the **desktop app** download (macOS `.dmg`
+  first, then Linux/Windows bundles), mirroring the install order on
+  aincient-labs.com. cargo-dist's CLI/Homebrew instructions move into a
+  "Prefer the terminal?" section below. Automated by a new `lead-with-desktop-app`
+  job in `release-gui.yml` that builds the links from the release's real assets.
+
 ## [0.2.7] - 2026-07-19
 
 ### Fixed

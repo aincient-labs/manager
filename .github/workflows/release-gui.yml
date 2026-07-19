@@ -178,3 +178,95 @@ jobs:
             echo "::error::no GUI bundles were uploaded for $TAG" >&2
             exit 1
           fi
+
+  # cargo-dist (release.yml) writes a release body that LEADS with the CLI shell
+  # installer + a table of `.tar.xz` command-line archives — a visitor landing on
+  # the release page sees terminal tooling, not the double-click desktop app. This
+  # job runs once after all GUI bundles are attached and PREPENDS a "Download the
+  # desktop app" section (macOS .dmg first, mirroring aincient-labs.com's install
+  # order) above cargo-dist's body, which is kept intact below. Links are built
+  # from the release's ACTUAL assets (so a bundle-name change can't rot them), and
+  # the block is fenced by <!-- desktop-downloads --> markers so re-runs replace it
+  # rather than stack copies.
+  lead-with-desktop-app:
+    name: Lead release notes with the desktop app
+    needs: build
+    if: ${{ always() && needs.build.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Prepend the desktop-download section
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+          # Release is created by cargo-dist and the bundles were just attached, but
+          # keep a short wait as a cheap safety in case of races.
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then break; fi
+            echo "waiting for release $TAG… ($i/20)"; sleep 15
+          done
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::warning::release $TAG not found — leaving notes as-is"; exit 0
+          fi
+
+          assets="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
+          find_asset() { printf '%s\n' "$assets" | grep -E "$1" | head -n1 || true; }
+          dmg="$(find_asset '\.dmg$')"
+          appimage="$(find_asset '\.AppImage$')"
+          deb="$(find_asset '\.deb$')"
+          rpm="$(find_asset '\.rpm$')"
+          exe="$(find_asset '\.exe$')"
+          msi="$(find_asset '\.msi$')"
+
+          if [ -z "$dmg$appimage$deb$rpm$exe$msi" ]; then
+            echo "::warning::no desktop bundles found for $TAG — leaving notes as-is"; exit 0
+          fi
+
+          {
+            echo '<!-- desktop-downloads:start -->'
+            echo '## Download Atelier Manager'
+            echo
+            echo 'The desktop app installs, updates, and backs up your Atelier site — a double-click app, no terminal needed. Pick the build for your system:'
+            echo
+            echo '| Platform | Download | Which one? |'
+            echo '|----------|----------|------------|'
+            [ -n "$dmg" ] && echo "| **macOS** | **[Atelier Manager (.dmg)]($BASE/$dmg)** | One file for any Mac — Apple Silicon or Intel. |"
+            if [ -n "$appimage$deb$rpm" ]; then
+              cell=''; sep=''
+              [ -n "$appimage" ] && { cell="$cell[.AppImage]($BASE/$appimage)"; sep=' &nbsp;·&nbsp; '; }
+              [ -n "$deb" ] && { cell="$cell$sep[.deb]($BASE/$deb)"; sep=' &nbsp;·&nbsp; '; }
+              [ -n "$rpm" ] && { cell="$cell$sep[.rpm]($BASE/$rpm)"; }
+              echo "| **Linux** | $cell | AppImage runs on any distro; \`.deb\` for Debian/Ubuntu, \`.rpm\` for Fedora/RHEL. |"
+            fi
+            if [ -n "$exe$msi" ]; then
+              cell=''; sep=''
+              [ -n "$exe" ] && { cell="$cell[.exe]($BASE/$exe)"; sep=' &nbsp;·&nbsp; '; }
+              [ -n "$msi" ] && { cell="$cell$sep[.msi]($BASE/$msi)"; }
+              echo "| **Windows** | $cell | Unsigned for now — if SmartScreen warns, choose *More info → Run anyway*. |"
+            fi
+            echo
+            echo "New here? Full walkthrough at **[aincient-labs.com](https://aincient-labs.com/#install)**. You'll also need Docker (OrbStack or Docker Desktop) running."
+            echo '<!-- desktop-downloads:end -->'
+            echo
+            echo '---'
+            echo
+          } > section.md
+
+          # Strip any previously-injected block (markers included), then collapse the
+          # leading blank lines + '---' it used to leave behind, so re-runs stay clean.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > body.md
+          awk '/<!-- desktop-downloads:start -->/{skip=1} skip!=1{print} /<!-- desktop-downloads:end -->/{skip=0}' body.md > body.clean.md
+          awk '
+            started { print; next }
+            /^[[:space:]]*$/ { next }          # drop leading blank lines
+            /^---$/ && !hr   { hr=1; next }     # drop one leading horizontal rule
+            { started=1; print }
+          ' body.clean.md > body.trim.md
+
+          cat section.md body.trim.md > final.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file final.md
+          echo "release notes for $TAG now lead with the desktop app"
