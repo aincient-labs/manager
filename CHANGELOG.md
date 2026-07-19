@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-19
+
 ### Added
 - **"Edit my site" now signs you in.** A fresh appliance mints a random admin
   password that the manager never shows, so the old "Open my website" button
