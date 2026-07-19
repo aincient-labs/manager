@@ -104,8 +104,10 @@ enum AppCommand {
         /// Limit to one service (e.g. `app` or `db`).
         service: Option<String>,
     },
-    /// Open the console in your browser.
+    /// Open the console in your browser, signed in (one-time login link).
     Open,
+    /// Open your public site (the front page visitors see) in your browser.
+    View,
     /// Show the initial admin password, or set a new one with --set.
     Password {
         /// Set a new admin password instead of showing the current one.
@@ -388,7 +390,11 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             Ok(())
         }
         AppCommand::Open => {
-            ops::open_console(stack)?;
+            ops::open_console_authed(stack)?;
+            Ok(())
+        }
+        AppCommand::View => {
+            ops::open_url(&stack.site_url())?;
             Ok(())
         }
         AppCommand::Password { set } => match set {

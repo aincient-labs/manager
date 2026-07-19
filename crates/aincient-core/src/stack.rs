@@ -175,6 +175,13 @@ impl Stack {
         format!("http://localhost:{}/user/login", self.http_port())
     }
 
+    /// URL of the public site root — the front page a visitor sees, as opposed
+    /// to the console at `/atelier`. Anonymous-viewable, so "View my site" lands
+    /// here with no login wall.
+    pub fn site_url(&self) -> String {
+        format!("http://localhost:{}", self.http_port())
+    }
+
     pub fn image(&self) -> String {
         self.env_get("AINCIENT_IMAGE")
             .unwrap_or_else(|| DEFAULT_IMAGE.to_string())
@@ -313,6 +320,7 @@ mod tests {
 
         assert_eq!(ts.0.http_port(), 8080);
         assert_eq!(ts.0.console_url(), "http://localhost:8080/atelier");
+        assert_eq!(ts.0.site_url(), "http://localhost:8080");
     }
 
     #[test]

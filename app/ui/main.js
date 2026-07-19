@@ -193,24 +193,29 @@ function renderStatus(status) {
   const sub = $("status-sub");
   const primary = $("home-primary");
   const primaryLabel = $("home-primary-label");
+  const view = $("home-view");
   const toggle = $("home-toggle");
 
-  const url = status.console_url;
+  // The address shown is the public site root (what visitors see), not the
+  // /atelier console — clicking it "views" the site with no login wall.
+  const url = status.site_url;
   const urlLink = $("console-url");
   const primaryIcon = $("home-primary-icon");
   urlLink.textContent = url;
   urlLink.href = url;
-  // Only present the address as a live link once it actually answers.
+  // Only present the address as a live link once the site actually answers.
   urlLink.classList.toggle("hidden", !status.reachable);
 
   if (status.running && status.reachable) {
     dot.className = "dot up";
     headline.textContent = "Your website is running";
     sub.textContent = "It's live on this computer and ready for you.";
+    // "Edit my site" → console, signed in. "View my site" → public front page.
     primary.disabled = false;
-    primary.dataset.action = "open";
+    primary.dataset.action = "edit";
     primaryIcon.setAttribute("href", "#i-open");
-    primaryLabel.textContent = "Open my website";
+    primaryLabel.textContent = "Edit my site";
+    view.classList.remove("hidden");
     toggle.classList.remove("hidden");
     $("startstop-label").textContent = "Stop";
   } else if (status.running) {
@@ -218,9 +223,10 @@ function renderStatus(status) {
     headline.textContent = "Starting up…";
     sub.textContent = "Almost there — this usually takes a few seconds.";
     primary.disabled = true;
-    primary.dataset.action = "open";
+    primary.dataset.action = "edit";
     primaryIcon.setAttribute("href", "#i-open");
     primaryLabel.textContent = "Starting…";
+    view.classList.add("hidden");
     toggle.classList.remove("hidden");
     $("startstop-label").textContent = "Stop";
   } else {
@@ -231,6 +237,7 @@ function renderStatus(status) {
     primary.dataset.action = "startstop";
     primaryIcon.setAttribute("href", "#i-play");
     primaryLabel.textContent = "Start my website";
+    view.classList.add("hidden");
     toggle.classList.add("hidden");
   }
 
@@ -342,7 +349,17 @@ const actions = {
 
   "dismiss-error": () => $("error").classList.add("hidden"),
 
-  open: () => invoke("open_console").catch((e) => showError(String(e))),
+  // "Edit my site" — drop the operator into the console signed in. A fresh
+  // appliance's admin password is never shown, so a plain /atelier link would
+  // access-deny; open_console_authed mints a one-time login link instead.
+  edit: () => invoke("open_console_authed").catch((e) => showError(String(e))),
+
+  // "View my site" — the public front page, anonymous-viewable, no login wall.
+  view: () => {
+    const url = lastStatus && lastStatus.site_url;
+    if (!url) return;
+    invoke("open_url", { url }).catch((e) => showError(String(e)));
+  },
 
   login: () => invoke("open_login").catch((e) => showError(String(e))),
 

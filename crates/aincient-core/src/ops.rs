@@ -85,6 +85,9 @@ pub struct Status {
     /// starts, while Drupal keeps booting and serves 5xx for a while after.
     pub reachable: bool,
     pub console_url: String,
+    /// Public site root (the front page visitors see) — the "View my site"
+    /// target, distinct from the `/atelier` console.
+    pub site_url: String,
     pub image: String,
     /// Local image digest (best effort).
     pub image_digest: Option<String>,
@@ -161,6 +164,7 @@ pub fn status(stack: &Stack) -> Status {
         running,
         reachable,
         console_url: stack.console_url(),
+        site_url: stack.site_url(),
         image: stack.image(),
         image_digest: local_digest(&stack.image()),
     }
@@ -743,6 +747,44 @@ pub fn tail_logs(stack: &Stack, service: Option<&str>, lines: usize) -> Result<S
 /// Open the console (the chat workspace at `/atelier`) in the default browser.
 pub fn open_console(stack: &Stack) -> Result<()> {
     open_url(&stack.console_url())
+}
+
+/// Open the console **already signed in**. A fresh appliance mints a random
+/// admin password (see `converge.sh`) that the manager deliberately never
+/// shows, so navigating to `/atelier` as an anonymous user just access-denies.
+/// This mints a one-time login link via `drush user:login` inside the `app`
+/// container — redirecting to `/atelier` — and opens it, dropping the operator
+/// straight into the console authenticated, without a password ever surfacing.
+///
+/// The link is a short-lived, single-use capability URL: fine for the
+/// localhost appliance, but worth revisiting if the port is ever exposed
+/// beyond the local machine.
+pub fn open_console_authed(stack: &Stack) -> Result<()> {
+    ensure_running(stack)?;
+
+    // `--uri` fixes the host/port drush renders into the absolute login URL so
+    // it targets the host-mapped port the browser can reach (not the
+    // container-internal one); the positional path is where to land after login.
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"]);
+    c.args(DRUSH);
+    c.args([
+        "user:login",
+        &format!("--uri={}", stack.site_url()),
+        "/atelier",
+    ]);
+    let out = run_capture(c, "generate a one-time login link")?;
+
+    // drush prints the URL (occasionally alongside notices) — take the first
+    // line that looks like one.
+    let url = out
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("http"));
+    match url {
+        Some(url) => open_url(url),
+        None => bail!("drush did not return a login link:\n{}", out.trim()),
+    }
 }
 
 /// Open Drupal's login form (`/user/login`) in the default browser so the

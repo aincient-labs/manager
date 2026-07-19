@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **"Edit my site" now signs you in.** A fresh appliance mints a random admin
+  password that the manager never shows, so the old "Open my website" button
+  (which pointed at the `/atelier` console) landed a logged-out operator on an
+  access-denied page. The Home screen now has two doors: **Edit my site** mints
+  a one-time login link (`drush user:login`, via a new `open_console_authed`
+  op / Tauri command) and drops you into the console authenticated, and **View
+  my site** opens the public front page (anonymous-viewable, no login). The
+  address shown is now the public site root. CLI parity: `atelier app open`
+  opens the console signed in; new `atelier app view` opens the public site.
+
 ### Changed
 - GitHub release notes now lead with the **desktop app** download (macOS `.dmg`
   first, then Linux/Windows bundles), mirroring the install order on

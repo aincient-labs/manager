@@ -344,6 +344,15 @@ fn open_console() -> Result<(), String> {
     ops::open_console(&s).map_err(err)
 }
 
+/// Open the console signed in — mints a one-time login link inside the
+/// container (a `drush` exec, so it runs off the UI thread) and opens it, so a
+/// fresh operator lands in `/atelier` authenticated instead of access-denied.
+#[tauri::command]
+async fn open_console_authed() -> Result<(), String> {
+    let s = stack()?;
+    blocking(move || ops::open_console_authed(&s).map_err(err)).await
+}
+
 /// Open a folder (the exported site) in the OS file manager. Shells out to the
 /// platform opener, exactly as the core does for URLs — no extra plugin needed.
 #[tauri::command]
@@ -404,6 +413,7 @@ pub fn run() {
             set_model_role,
             reveal_path,
             open_console,
+            open_console_authed,
             open_login,
             open_url,
         ])
