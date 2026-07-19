@@ -142,8 +142,6 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 13px 20px;
-  max-width: var(--maxw);
-  margin: 0 auto;
 }
 /* The Atelier lockup — handcrafted monogram + outlined wordmark (masters in
    the umbrella's docs/brand-assets/atelier/). Both are currentColor, so the
@@ -189,6 +187,7 @@ body {
 main {
   flex: 1 1 auto;
   min-height: 0; /* let the flex child shrink so its own scroll engages */
+  min-width: 0; /* and shrink horizontally beside the sidebar */
   overflow-y: auto; /* scroll the content region only when it overflows */
   overflow-x: hidden; /* never horizontally */
   overscroll-behavior: contain;
@@ -790,54 +789,76 @@ select:focus {
    message per view, one obvious next step, jargon folded away under disclosures.
    ============================================================================ */
 
-/* Tab bar — four calm destinations under the chrome. A quiet segmented row on
-   the recessed panel; the active tab wears the one pigment as an underline, not
-   a filled shout (Law 01). */
-.tabbar {
-  flex: none;
+/* Shell — the sidebar + content row that fills the window under the header. */
+.shell {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
-  gap: 2px;
-  padding: 6px 12px 0;
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--border);
-  max-width: var(--maxw);
-  margin: 0 auto;
-  width: 100%;
 }
-.tab {
-  appearance: none;
-  flex: 1 1 0;
-  display: inline-flex;
+
+/* Sidebar — calm, vertical navigation on the recessed panel. Scales cleanly as
+   destinations are added (and leaves room to seat a server switcher on top for
+   multi-server later). Shown only once the appliance is installed. */
+.sidebar {
+  flex: none;
+  width: 176px;
+  display: flex;
   flex-direction: column;
-  align-items: center;
   gap: 3px;
-  padding: 8px 6px 9px;
+  padding: 14px 10px;
+  background: var(--surface-2);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+.nav-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 12px;
   border: none;
-  border-bottom: 2px solid transparent;
+  border-radius: var(--r-control);
   background: none;
   color: var(--text-dim);
   font-family: var(--font);
-  font-size: 11px;
+  font-size: 13.5px;
   font-weight: 600;
-  letter-spacing: 0.01em;
+  text-align: left;
   cursor: pointer;
-  transition: color 0.12s, border-color 0.12s;
+  transition: color 0.12s, background 0.12s;
 }
-.tab .ic {
-  width: 20px;
-  height: 20px;
+.nav-item .ic {
+  width: 18px;
+  height: 18px;
 }
-.tab:hover {
+.nav-item:hover {
   color: var(--text);
+  background: var(--surface);
 }
-.tab.active {
+/* Active = a soft pigment tint pill — the one place the cinnabar marks "you are
+   here" (Law 01). */
+.nav-item.active {
   color: var(--accent);
-  border-bottom-color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 12%, transparent);
 }
-.tab:focus-visible {
+.nav-item:focus-visible {
   outline: 3px solid color-mix(in oklch, var(--accent) 30%, transparent);
-  outline-offset: -3px;
-  border-radius: var(--r-chip);
+  outline-offset: -2px;
+}
+/* On a cramped width, collapse the sidebar to icons so content keeps room. */
+@media (max-width: 620px) {
+  .sidebar {
+    width: 56px;
+    align-items: center;
+  }
+  .nav-item {
+    justify-content: center;
+    padding: 10px 0;
+  }
+  .nav-item span {
+    display: none;
+  }
 }
 
 /* An intro block that opens a panel — a display-serif heading + a plain-language
@@ -1059,62 +1080,6 @@ select:focus {
 /* Empty-state hint inside the backups panel. */
 #backups-empty {
   margin: 0;
-}
-
-/* AI model roles — a compact read-first list; each row can reveal an editor. */
-.roles {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 14px 0 4px;
-}
-.role {
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  padding: 10px 12px;
-  background: var(--surface-2);
-}
-.role-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-.role-name {
-  font-weight: 600;
-  font-size: 13.5px;
-}
-.role-name .star {
-  color: var(--accent);
-  margin-left: 4px;
-}
-.role-binding {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-dim);
-}
-.role-binding.unset {
-  color: var(--text-faint);
-  font-style: italic;
-  font-family: var(--font);
-}
-.role-edit {
-  display: none;
-  gap: 8px;
-  margin-top: 10px;
-}
-.role.editing .role-edit {
-  display: flex;
-  flex-wrap: wrap;
-}
-.role-edit input {
-  flex: 1 1 120px;
-  min-width: 0;
-  padding: 7px 10px;
-  font-size: 13px;
-}
-.role-edit .btn {
-  flex: none;
 }
 
 /* Activity (logs) view. */

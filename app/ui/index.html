@@ -58,9 +58,6 @@
         <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
         <circle cx="12" cy="12" r="3" />
       </symbol>
-      <symbol id="i-sparkles" viewBox="0 0 24 24">
-        <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .962 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.962 0z" />
-      </symbol>
       <symbol id="i-logs" viewBox="0 0 24 24">
         <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z" />
         <path d="M14 2v4a2 2 0 0 0 2 2h4" />
@@ -108,26 +105,29 @@
       </div>
     </header>
 
-    <!-- Primary navigation — shown only once the appliance is installed. Four
-         calm, plain-language destinations; the techy bits live under Settings so
-         a first-time site owner is never met with a wall of jargon. (A server
-         switcher can slot in above these tabs when multi-server lands.) -->
-    <nav id="tabbar" class="tabbar hidden" role="tablist" aria-label="Sections">
-      <button class="tab" role="tab" data-tab="home">
-        <svg class="ic"><use href="#i-home" /></svg><span>Home</span>
-      </button>
-      <button class="tab" role="tab" data-tab="publish">
-        <svg class="ic"><use href="#i-globe" /></svg><span>Publish</span>
-      </button>
-      <button class="tab" role="tab" data-tab="backups">
-        <svg class="ic"><use href="#i-backup" /></svg><span>Backups</span>
-      </button>
-      <button class="tab" role="tab" data-tab="settings">
-        <svg class="ic"><use href="#i-settings" /></svg><span>Settings</span>
-      </button>
-    </nav>
+    <!-- The chrome below the header is a sidebar + content pair. The sidebar
+         scales as the app grows (and is where a server switcher will sit once
+         multi-server lands) — it's shown only after the appliance is installed. -->
+    <div class="shell">
+      <!-- Primary navigation — calm, plain-language destinations; the techy bits
+           live under "System" so a first-time site owner never meets a wall of
+           jargon. -->
+      <nav id="sidebar" class="sidebar hidden" role="tablist" aria-label="Sections">
+        <button class="nav-item" role="tab" data-tab="home">
+          <svg class="ic"><use href="#i-home" /></svg><span>Home</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="publish">
+          <svg class="ic"><use href="#i-globe" /></svg><span>Publish</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="backups">
+          <svg class="ic"><use href="#i-backup" /></svg><span>Backups</span>
+        </button>
+        <button class="nav-item" role="tab" data-tab="settings">
+          <svg class="ic"><use href="#i-settings" /></svg><span>System</span>
+        </button>
+      </nav>
 
-    <main id="view">
+      <main id="view">
       <!-- Loading -->
       <section id="screen-loading" class="screen center">
         <div class="spinner"></div>
@@ -172,7 +172,7 @@
             Everything stays private on your own machine.
           </p>
           <details class="advanced">
-            <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Advanced options</summary>
+            <summary><svg class="ic chev"><use href="#i-chevron" /></svg>More options</summary>
             <label class="field">
               <span>Console port <em>— leave this as it is unless it clashes with something</em></span>
               <input id="install-port" type="number" value="41221" min="1" max="65535" />
@@ -271,7 +271,7 @@
           </label>
 
           <details class="advanced">
-            <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Advanced options</summary>
+            <summary><svg class="ic chev"><use href="#i-chevron" /></svg>More options</summary>
             <label class="check"><input id="export-zip" type="checkbox" /><span>Also make a <code>.zip</code> I can share</span></label>
             <label class="check"><input id="export-config" type="checkbox" /><span>Include my settings in the zip</span></label>
             <label class="check"><input id="export-users" type="checkbox" /><span>Include the list of accounts (no passwords)</span></label>
@@ -342,25 +342,44 @@
 
       <!-- ========================== SETTINGS ========================= -->
       <section id="panel-settings" class="screen panel hidden">
-        <!-- AI models -->
+        <!-- AI setup deliberately lives only inside Atelier (the console's
+             first-run onboarding), not here — offering it in two places just
+             confuses people about which one is authoritative. Power users can
+             still script it with `atelier ai model …` on the CLI. -->
+
+        <!-- Maintenance — the heart of a "System" tab: what you're running, and
+             whether there's anything to update. -->
         <section class="group">
-          <h3 class="group-label"><svg class="ic"><use href="#i-sparkles" /></svg>AI assistant</h3>
+          <h3 class="group-label"><svg class="ic"><use href="#i-settings" /></svg>Your installation</h3>
           <div class="card">
-            <p class="muted">
-              You choose which AI does what right inside Atelier. Here's what's
-              active now — you can fine-tune it if you like.
-            </p>
-            <div id="model-roles" class="roles"></div>
-            <p id="model-note" class="hint hidden"></p>
-            <div class="inline-links">
-              <a class="link" href="https://aincient-labs.com/docs/onboarding" target="_blank" rel="noreferrer">
-                <svg class="ic"><use href="#i-book" /></svg>About AI in Atelier
-              </a>
+            <div class="kv">
+              <span class="kv-label">Version</span>
+              <span id="image-tag" class="kv-value">—</span>
             </div>
+            <button class="btn small full" data-action="check-update">
+              <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
+            </button>
+            <p id="update-status" class="hint hidden"></p>
+
+            <details class="advanced danger-zone">
+              <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Reset &amp; remove</summary>
+              <p class="muted">
+                These change or remove your installation. The last one deletes
+                everything and can't be undone — so we ask you to confirm.
+              </p>
+              <label class="check"><input id="down-wipe" type="checkbox" /><span>Also erase all data when removing</span></label>
+              <button class="btn full" data-action="down">
+                <svg class="ic"><use href="#i-power" /></svg>Remove the containers
+              </button>
+              <button class="btn danger full" data-action="reinstall">
+                <svg class="ic"><use href="#i-trash" /></svg>Reinstall from scratch (erases everything)
+              </button>
+            </details>
           </div>
         </section>
 
-        <!-- Activity / logs -->
+        <!-- Activity / logs — diagnostics, kept last: handy when something's off,
+             ignorable the rest of the time. -->
         <section class="group">
           <h3 class="group-label"><svg class="ic"><use href="#i-logs" /></svg>Activity</h3>
           <div class="card">
@@ -382,41 +401,12 @@
           </div>
         </section>
 
-        <!-- Maintenance -->
-        <section class="group">
-          <h3 class="group-label"><svg class="ic"><use href="#i-settings" /></svg>Maintenance</h3>
-          <div class="card">
-            <div class="kv">
-              <span class="kv-label">Version</span>
-              <span id="image-tag" class="kv-value">—</span>
-            </div>
-            <button class="btn small full" data-action="check-update">
-              <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
-            </button>
-            <p id="update-status" class="hint hidden"></p>
-
-            <details class="advanced danger-zone">
-              <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Advanced &amp; reset</summary>
-              <p class="muted">
-                These change or remove your installation. The last one deletes
-                everything and can't be undone — so we ask you to confirm.
-              </p>
-              <label class="check"><input id="down-wipe" type="checkbox" /><span>Also erase all data when removing</span></label>
-              <button class="btn full" data-action="down">
-                <svg class="ic"><use href="#i-power" /></svg>Remove the containers
-              </button>
-              <button class="btn danger full" data-action="reinstall">
-                <svg class="ic"><use href="#i-trash" /></svg>Reinstall from scratch (erases everything)
-              </button>
-            </details>
-          </div>
-        </section>
-
         <p class="help-line">
           <a class="link" href="https://aincient-labs.com/docs" target="_blank" rel="noreferrer">Browse all the guides →</a>
         </p>
       </section>
-    </main>
+      </main>
+    </div>
 
     <!-- Error toast -->
     <div id="error" class="error hidden">

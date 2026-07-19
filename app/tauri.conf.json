@@ -12,10 +12,10 @@
       {
         "label": "main",
         "title": "Atelier Manager",
-        "width": 520,
-        "height": 720,
-        "minWidth": 440,
-        "minHeight": 600,
+        "width": 860,
+        "height": 640,
+        "minWidth": 640,
+        "minHeight": 540,
         "resizable": true
       }
     ],

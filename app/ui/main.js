@@ -25,7 +25,7 @@ let lastExportPath = null; // where the last export landed, for "Open the folder
 function setView(name) {
   for (const v of VIEWS.slice(0, 3)) $(`screen-${v}`).classList.toggle("hidden", name !== v);
   const app = name === "app";
-  $("tabbar").classList.toggle("hidden", !app);
+  $("sidebar").classList.toggle("hidden", !app);
   for (const p of PANELS) $(`panel-${p}`).classList.toggle("hidden", !(app && p === currentTab));
   if (app) showTab(currentTab);
 }
@@ -34,7 +34,7 @@ function showTab(tab) {
   currentTab = tab;
   for (const p of PANELS) $(`panel-${p}`).classList.toggle("hidden", p !== tab);
   document
-    .querySelectorAll(".tab")
+    .querySelectorAll(".nav-item")
     .forEach((el) => el.classList.toggle("active", el.dataset.tab === tab));
   // Lazy-load each panel's data the moment it's shown.
   if (tab === "publish") updatePublishGate();
@@ -320,97 +320,6 @@ async function refreshBackups() {
 
 function loadSettings() {
   $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
-  loadModels();
-}
-
-// A model role, rendered read-first with a foldable inline editor for the
-// curious. Most people never touch this — they set AI up inside Atelier.
-function roleRow(r) {
-  const row = document.createElement("div");
-  row.className = "role";
-
-  const head = document.createElement("div");
-  head.className = "role-head";
-
-  const name = document.createElement("span");
-  name.className = "role-name";
-  name.textContent = r.label || r.role;
-  if (r.default === "yes") {
-    const star = document.createElement("span");
-    star.className = "star";
-    star.textContent = "★";
-    star.title = "This is the default the console uses";
-    name.appendChild(star);
-  }
-
-  const bind = document.createElement("span");
-  const set = r.provider && r.model;
-  bind.className = set ? "role-binding" : "role-binding unset";
-  bind.textContent = set ? `${r.provider} · ${r.model}` : "Not set";
-
-  const edit = document.createElement("button");
-  edit.className = "btn ghost small";
-  edit.textContent = "Edit";
-  edit.onclick = () => row.classList.toggle("editing");
-
-  head.append(name, bind, edit);
-
-  const editor = document.createElement("div");
-  editor.className = "role-edit";
-  const provider = document.createElement("input");
-  provider.placeholder = "Provider (e.g. anthropic)";
-  provider.value = r.provider || "";
-  const model = document.createElement("input");
-  model.placeholder = "Model (e.g. claude-sonnet-5)";
-  model.value = r.model || "";
-  const save = document.createElement("button");
-  save.className = "btn small primary";
-  save.textContent = "Save";
-  save.onclick = async () => {
-    if (!provider.value.trim() || !model.value.trim()) return;
-    save.disabled = true;
-    save.textContent = "Saving…";
-    try {
-      await invoke("set_model_role", {
-        role: r.role,
-        provider: provider.value.trim(),
-        model: model.value.trim(),
-      });
-      await loadModels();
-    } catch (e) {
-      showError(String(e));
-      save.disabled = false;
-      save.textContent = "Save";
-    }
-  };
-  editor.append(provider, model, save);
-
-  row.append(head, editor);
-  return row;
-}
-
-async function loadModels() {
-  const box = $("model-roles");
-  const note = $("model-note");
-  box.innerHTML = "";
-  note.classList.add("hidden");
-  if (!(lastStatus && lastStatus.running)) {
-    note.textContent = "Start your website to view and adjust its AI settings.";
-    note.classList.remove("hidden");
-    return;
-  }
-  try {
-    const roles = await invoke("get_model_roles");
-    if (!roles.length) {
-      note.textContent = "No AI connected yet — open Atelier to set it up.";
-      note.classList.remove("hidden");
-      return;
-    }
-    for (const r of roles) box.appendChild(roleRow(r));
-  } catch {
-    note.textContent = "Couldn't read the AI settings — open Atelier to set it up there.";
-    note.classList.remove("hidden");
-  }
 }
 
 async function refreshLogs() {
@@ -595,9 +504,9 @@ const actions = {
 
 // Event delegation for tabs and every [data-action] control.
 document.addEventListener("click", (e) => {
-  const tab = e.target.closest(".tab");
-  if (tab) {
-    showTab(tab.dataset.tab);
+  const navItem = e.target.closest(".nav-item");
+  if (navItem) {
+    showTab(navItem.dataset.tab);
     return;
   }
   const target = e.target.closest("[data-action]");
