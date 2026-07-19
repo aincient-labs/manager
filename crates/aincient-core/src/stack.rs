@@ -84,6 +84,44 @@ impl Stack {
         self.home.join("compose.yaml")
     }
 
+    /// The Docker Compose **project name** for this stack — the namespace its
+    /// containers, volumes and network live under.
+    ///
+    /// Derived from the stack directory so that a custom `ATELIER_HOME` gets a
+    /// genuinely independent set of containers/volumes (compose otherwise keys
+    /// everything off the project name, and the on-disk `compose.yaml` pins a
+    /// literal `name: atelier` — so without an explicit `-p` two homes would
+    /// silently share one appliance). The canonical `~/.atelier` sanitizes to
+    /// `atelier`, matching the template's `name:`, so existing installs keep the
+    /// exact same containers and volumes — this is backward compatible.
+    pub fn project_name(&self) -> String {
+        let base = self
+            .home
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("atelier");
+        // Compose project names allow only [a-z0-9_-] and must start with an
+        // alphanumeric. Lowercase, map anything else to '-', then trim leading
+        // separators (so `.atelier` → `atelier`).
+        let mapped: String = base
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let trimmed = mapped.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        if trimmed.is_empty() {
+            "atelier".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     pub fn env_path(&self) -> PathBuf {
         self.home.join(".env")
     }
@@ -155,11 +193,11 @@ impl Stack {
                 .with_context(|| format!("could not write {}", compose.display()))?;
         }
 
-        let image = opts.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string());
-        let port = opts.http_port.unwrap_or(DEFAULT_PORT);
         let env_path = self.env_path();
 
         if !env_path.is_file() {
+            let image = opts.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+            let port = opts.http_port.unwrap_or(DEFAULT_PORT);
             let contents = format!(
                 "HASH_SALT={salt}\n\
                  AINCIENT_IMAGE={image}\n\
@@ -169,10 +207,31 @@ impl Stack {
             );
             write_private(&env_path, &contents)?;
         } else {
-            // Reconcile tunables this run may have changed; keep secrets on disk.
+            // Reconcile only the tunables the caller explicitly chose this run;
+            // keep secrets AND any previously-chosen port/image on disk. Reinstall
+            // (and the GUI) pass `InstallOptions::default()`, so overriding
+            // unconditionally here would silently reset a custom port or image to
+            // the defaults on every re-run. Fall back to the defaults only when a
+            // value is genuinely absent.
             let mut env = self.read_env();
-            env.insert("AINCIENT_IMAGE".to_string(), image.clone());
-            env.insert("HTTP_PORT".to_string(), port.to_string());
+            match &opts.image {
+                Some(image) => {
+                    env.insert("AINCIENT_IMAGE".to_string(), image.clone());
+                }
+                None => {
+                    env.entry("AINCIENT_IMAGE".to_string())
+                        .or_insert_with(|| DEFAULT_IMAGE.to_string());
+                }
+            }
+            match opts.http_port {
+                Some(port) => {
+                    env.insert("HTTP_PORT".to_string(), port.to_string());
+                }
+                None => {
+                    env.entry("HTTP_PORT".to_string())
+                        .or_insert_with(|| DEFAULT_PORT.to_string());
+                }
+            }
             let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
             write_private(&env_path, &body)?;
         }
@@ -274,6 +333,59 @@ mod tests {
         assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must be preserved");
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v2");
         assert_eq!(stack.http_port(), 9000);
+    }
+
+    #[test]
+    fn re_scaffold_with_defaults_preserves_existing_tunables() {
+        // A reinstall passes `InstallOptions::default()`. It must NOT reset a
+        // custom port/image back to the defaults — the whole appliance would move
+        // ports out from under the user.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold(&InstallOptions {
+                image: Some("ghcr.io/aincient-labs/atelier-cms:pinned".into()),
+                http_port: Some(51000),
+            })
+            .unwrap();
+
+        // Re-run exactly as reinstall does — no overrides.
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+
+        assert_eq!(
+            stack.image(),
+            "ghcr.io/aincient-labs/atelier-cms:pinned",
+            "a default re-run must keep the previously-chosen image"
+        );
+        assert_eq!(
+            stack.http_port(),
+            51000,
+            "a default re-run must keep the previously-chosen port"
+        );
+    }
+
+    #[test]
+    fn project_name_defaults_to_atelier_for_canonical_home() {
+        // ~/.atelier must sanitize to `atelier`, matching the template's `name:`,
+        // so existing installs keep the same containers/volumes.
+        let stack = Stack {
+            home: PathBuf::from("/Users/someone/.atelier"),
+        };
+        assert_eq!(stack.project_name(), "atelier");
+    }
+
+    #[test]
+    fn project_name_is_distinct_for_custom_home() {
+        let stack = Stack {
+            home: PathBuf::from("/tmp/atelier-staging"),
+        };
+        assert_eq!(stack.project_name(), "atelier-staging");
+
+        // Sanitizes odd characters and leading separators.
+        let odd = Stack {
+            home: PathBuf::from("/tmp/.My Stack!"),
+        };
+        assert_eq!(odd.project_name(), "my-stack-");
     }
 
     #[test]

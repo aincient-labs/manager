@@ -80,7 +80,13 @@ pub fn preflight() -> Preflight {
 /// the stack's `compose.yaml` and `.env` exactly as a manual run would.
 pub fn compose(stack: &Stack) -> Command {
     let mut c = docker();
-    c.arg("compose").current_dir(&stack.home);
+    // Pin the project name explicitly so a custom `ATELIER_HOME` is a truly
+    // independent stack. `-p` outranks the literal `name:` in the on-disk
+    // compose.yaml; the default `~/.atelier` resolves to `atelier`, matching that
+    // literal, so existing installs address the exact same containers/volumes.
+    c.arg("compose")
+        .args(["-p", &stack.project_name()])
+        .current_dir(&stack.home);
     c
 }
 
