@@ -1,0 +1,91 @@
+# Changelog
+
+All notable changes to the Atelier CLI + Manager GUI are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.2.7] - 2026-07-19
+
+### Fixed
+- GUI docs/guide links now open in the browser. The Tauri WebView blocks
+  `target=_blank`, so links are routed through a new `open_url` command.
+- Reinstall no longer resets a custom port or image back to defaults — the
+  existing tunables are preserved when the stack is re-scaffolded.
+- `ATELIER_HOME` now isolates stacks. The Compose project name is derived from
+  the stack directory instead of a hardcoded `name: atelier`, so multiple homes
+  no longer share containers/volumes (last-install-wins collision).
+
+## [0.2.6] - 2026-07-19
+
+### Added
+- GUI static site export, activity/logs, and remove/teardown — closing the
+  GUI-vs-CLI capability gap (the engine already lived in `aincient-core`).
+
+### Changed
+- GUI redesigned around first-time website owners: full-width
+  "Atelier · by AIncient Labs" header lockup and a left sidebar
+  (Home · Publish · Backups · System) replacing the button wall.
+- AI setup is deliberately hidden in the GUI (done inside Atelier onboarding);
+  the CLI `ai model` command stays.
+- Publish address is promoted and remembered across sessions.
+
+## [0.2.5] - 2026-07-19
+
+### Fixed
+- GUI detects OrbStack / Docker Desktop when launched from Finder or the Dock.
+  A `.app` inherits launchd's minimal `PATH`, hiding Docker installs; all docker
+  invocations now route through one builder that appends the well-known install
+  dirs (`~/.orbstack/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, …).
+
+## [0.2.4] - 2026-07-19
+
+### Fixed
+- macOS GUI bundle upload in the release workflow (bash 3.2 `mapfile`, skips the
+  `.app` directory, per-file upload with loud diagnostics).
+
+## [0.2.3] - 2026-07-19
+
+### Fixed
+- GUI bundle upload on macOS and Windows in the release workflow.
+
+## [0.2.2] - 2026-07-19
+
+### Added
+- macOS GUI bundle is now signed with a Developer ID Application certificate and
+  notarized via the App Store Connect API key — installs with no "unidentified
+  developer" wall.
+
+## [0.2.1] - 2026-07-18
+
+### Fixed
+- Post-0.2.0 fixes and release-pipeline adjustments.
+
+## [0.2.0] - 2026-07-18
+
+### Added
+- Namespaced CLI surface (`app` / `site` / `data` / `ai`).
+- `atelier site` static export — publish the running appliance as a portable
+  static site.
+
+## [0.1.0] - 2026-07-17
+
+### Added
+- First stable release of the Atelier CLI + Manager over the shared
+  `aincient-core` Rust core: install / update / backup / restore lifecycle for
+  the Docker appliance, plus the Tauri GUI.
+- Distributed via `cargo-dist` → GitHub Releases and the
+  `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
+
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/aincient-labs/manager/compare/v0.2.6...v0.2.7
+[0.2.6]: https://github.com/aincient-labs/manager/compare/v0.2.5...v0.2.6
+[0.2.5]: https://github.com/aincient-labs/manager/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/aincient-labs/manager/compare/v0.2.3...v0.2.4
+[0.2.3]: https://github.com/aincient-labs/manager/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/aincient-labs/manager/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/aincient-labs/manager/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/aincient-labs/manager/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/aincient-labs/manager/releases/tag/v0.1.0
