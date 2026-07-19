@@ -367,6 +367,15 @@ fn open_login() -> Result<(), String> {
     ops::open_login(&s).map_err(err)
 }
 
+/// Open an external URL (docs/guides) in the default browser. Plain
+/// `<a target="_blank">` does nothing inside the Tauri WebView, so the
+/// frontend routes external links through here — the same platform opener the
+/// core uses for the console.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    ops::open_url(&url).map_err(err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -396,6 +405,7 @@ pub fn run() {
             reveal_path,
             open_console,
             open_login,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Atelier Manager");

@@ -509,13 +509,25 @@ document.addEventListener("click", (e) => {
     showTab(navItem.dataset.tab);
     return;
   }
+
   const target = e.target.closest("[data-action]");
-  if (!target) return;
-  const name = target.getAttribute("data-action");
-  const fn = actions[name];
-  if (fn) {
+  if (target) {
+    const name = target.getAttribute("data-action");
+    const fn = actions[name];
+    if (fn) {
+      e.preventDefault();
+      fn();
+    }
+    return;
+  }
+
+  // External links (docs/guides) must open in the system browser — a plain
+  // <a target="_blank"> does nothing inside the Tauri WebView, so hand the URL
+  // to the Rust opener instead.
+  const link = e.target.closest('a[href^="http"]');
+  if (link) {
     e.preventDefault();
-    fn();
+    invoke("open_url", { url: link.href }).catch((err) => showError(String(err)));
   }
 });
 

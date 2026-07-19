@@ -752,7 +752,7 @@ pub fn open_login(stack: &Stack) -> Result<()> {
 }
 
 /// Open a URL in the user's default browser.
-fn open_url(url: &str) -> Result<()> {
+pub fn open_url(url: &str) -> Result<()> {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = Command::new("open");
         c.arg(url);
