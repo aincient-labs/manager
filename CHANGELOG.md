@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (GitHub Security Advisories), supported-version and disclosure statements, and signing/
   verification notes. Part of Phase 0 launch-readiness.
 
+### Fixed
+- **Confirmation dialogs were completely non-functional in the GUI** — the
+  "Reset & remove" actions (Reinstall from scratch, Remove the containers) and
+  Restore-backup all pop a confirm modal that could neither be confirmed nor
+  cancelled, and the underlying operation never ran (no feedback, nothing reset).
+  The modal's Cancel button carried a `data-action` but no `id`, while
+  `confirmModal()` wires both buttons by `id` (`$("confirm-no")`), so setup threw
+  a `TypeError` on `null` inside the Promise executor and the promise rejected
+  before any click could resolve it. Cancel now has `id="confirm-no"` (and the
+  dead `data-action` attributes, which had no handlers, were removed). Regression
+  from the v0.2.6 type-to-confirm redesign.
+
 ## [0.2.8] - 2026-07-19
 
 ### Added
