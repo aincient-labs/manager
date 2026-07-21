@@ -17,30 +17,53 @@
   src: url("fonts/fraunces.woff2") format("woff2");
 }
 
+/* Schibsted Grotesk (OFL) — the body/UI sans, same face the marketing site and
+   the console run (apps/website · Schibsted Grotesk, latin subset). Bundled
+   locally so the manager reads as the same shop as the homepage while staying
+   offline-first. Replaces the bare system-ui stack that made the app feel flat. */
+@font-face {
+  font-family: "Schibsted Grotesk";
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url("fonts/schibsted-grotesk.woff2") format("woff2");
+}
+
 :root {
-  /* Gesso paper (Atelier light — default): warm mineral off-white ground,
-     brightest paper on raised cards, bistre near-black ink. */
-  --bg: oklch(0.923 0.009 82); /* gesso ground — the window canvas */
-  --surface: oklch(0.986 0.004 82); /* raised cards — brightest paper */
-  --surface-2: oklch(0.951 0.007 82); /* chrome / recessed fills */
-  --border: oklch(0.86 0.007 88); /* hairline */
-  --border-strong: oklch(0.58 0.01 85); /* soft stone */
-  --text: oklch(0.24 0.008 70); /* bistre ink */
-  --text-dim: oklch(0.47 0.01 78);
-  --text-faint: oklch(0.62 0.01 80);
-  --accent: oklch(0.545 0.155 32); /* CINNABAR — the one pigment */
-  --accent-2: oklch(0.6 0.1 66); /* warm ochre — quiet secondary */
-  --jade: oklch(0.52 0.09 163); /* verdigris — links & positive */
-  --danger: oklch(0.52 0.16 28); /* deeper red, held apart from accent */
-  --on-accent: oklch(0.985 0.005 90); /* paper ink on a cinnabar/brick fill */
-  --shadow: oklch(0.3 0.01 60); /* soft warm ink — diffuse, never offset */
+  /* Gesso paper (Atelier light — default): the tokens are taken VERBATIM from the
+     marketing homepage (apps/website/site/assets/css/styles.css) so the manager
+     reads as the same warm-paper shop as aincient-labs.com — a bright #FDFCFA
+     ground with pure-white raised cards, not the grey ground it used to wear. */
+  --bg: #fdfcfa; /* warm off-white ground — the window canvas (site --paper) */
+  --surface: #ffffff; /* raised cards — the brightest paper (site --card) */
+  --surface-2: #f4f1ec; /* chrome / recessed fills (site --paper-2) */
+  --border: #e8e3da; /* hairline (site --line) */
+  --border-strong: rgba(25, 23, 20, 0.16); /* soft stone (site --line-strong) */
+  --text: #191714; /* bistre ink (site --ink) */
+  --text-dim: #6b655b; /* muted (site --muted) */
+  --text-faint: #948e83; /* a lighter muted — the app's own faint step */
+  --accent: #b94430; /* CINNABAR — the one pigment (site --cinnabar) */
+  --accent-deep: #a83825; /* pressed / hover cinnabar (site --cinnabar-deep) */
+  --accent-2: #b87400; /* warm ochre — quiet secondary (site --amber) */
+  --jade: #0e8a5f; /* verdigris — links & positive (site --mint) */
+  --danger: #c4432f; /* held apart from accent (site --coral) */
+  --on-accent: #fbf9f5; /* paper ink on a cinnabar/brick fill */
+  --shadow: #191714; /* warm ink base for inset + tinted shadows */
+  /* Diffuse "light falls, nothing glows" shadows (Law 04) — the same two-layer
+     recipe the homepage uses, so cards lift off the bright paper instead of
+     sitting flat on it. */
+  --shadow-1: 0 1px 1px rgba(25, 23, 20, 0.04),
+    0 10px 28px -16px rgba(25, 23, 20, 0.28);
+  --shadow-lift: 0 2px 3px rgba(25, 23, 20, 0.06),
+    0 16px 40px -18px rgba(25, 23, 20, 0.32);
   /* One radius family (Law 06): chips / controls / cards / panels. */
   --r-chip: 4px;
   --r-control: 7px;
   --r-card: 10px;
   --r-panel: 14px;
   --maxw: 720px; /* centred column — content never stretches edge-to-edge */
-  --font: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font: "Schibsted Grotesk", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Helvetica, Arial, sans-serif;
   --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Palatino,
     Georgia, serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
@@ -49,23 +72,29 @@
   color-scheme: light;
 }
 
-/* Studio night — the atelier after hours: warm charcoal grounds, paper ink,
-   the pigment lifted a half-step for the dark ground. */
+/* Studio night — the atelier after hours: warm charcoal grounds, paper ink, the
+   pigment lifted a half-step for the dark ground. Mirrors the homepage's dark
+   tokens verbatim so both surfaces read as one warm-charcoal room. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: oklch(0.205 0.006 72);
-    --surface: oklch(0.285 0.008 72);
-    --surface-2: oklch(0.245 0.007 72);
-    --border: oklch(0.34 0.008 72);
-    --border-strong: oklch(0.46 0.01 72);
-    --text: oklch(0.93 0.008 85);
-    --text-dim: oklch(0.7 0.01 85);
-    --text-faint: oklch(0.55 0.01 82);
-    --accent: oklch(0.66 0.155 34);
-    --accent-2: oklch(0.72 0.095 66);
-    --jade: oklch(0.72 0.085 165);
-    --danger: oklch(0.62 0.15 25);
-    --shadow: oklch(0.12 0.01 60);
+    --bg: #191714; /* site --paper (dark) */
+    --surface: #211e19; /* site --card (dark) */
+    --surface-2: #26221c; /* site --paper-2 (dark) */
+    --border: rgba(234, 231, 226, 0.13); /* site --line (dark) */
+    --border-strong: rgba(234, 231, 226, 0.22); /* site --line-strong (dark) */
+    --text: #eae7e2; /* site --ink (dark) */
+    --text-dim: #a29b91; /* site --muted (dark) */
+    --text-faint: #7d7669; /* the app's own faint step */
+    --accent: #e0694e; /* site --cinnabar (dark) */
+    --accent-deep: #e0694e; /* site --cinnabar-deep (dark) */
+    --accent-2: #e0a23c; /* site --amber (dark) */
+    --jade: #3fcf9b; /* site --mint (dark) */
+    --danger: #f0715c; /* site --coral (dark) */
+    --shadow: #000000; /* pure ink base for inset + tinted shadows */
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35),
+      0 12px 32px -16px rgba(0, 0, 0, 0.65);
+    --shadow-lift: 0 2px 4px rgba(0, 0, 0, 0.4),
+      0 18px 46px -18px rgba(0, 0, 0, 0.72);
     color-scheme: dark;
   }
 }
@@ -297,7 +326,7 @@ main {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  box-shadow: 0 2px 8px -2px color-mix(in oklch, var(--shadow) 25%, transparent);
+  box-shadow: var(--shadow-1);
   padding: 18px;
 }
 .card h2 {
@@ -398,7 +427,7 @@ main {
   border: 1px solid color-mix(in oklch, var(--accent-2) 45%, var(--border));
   color: var(--text);
   border-radius: var(--r-card);
-  box-shadow: 0 2px 8px -2px color-mix(in oklch, var(--shadow) 25%, transparent);
+  box-shadow: var(--shadow-1);
   padding: 12px 14px;
   font-size: 13px;
   font-weight: 600;
@@ -418,7 +447,8 @@ main {
   background: var(--surface);
   color: var(--text);
   border-radius: var(--r-control);
-  box-shadow: 0 1px 2px color-mix(in oklch, var(--shadow) 15%, transparent);
+  box-shadow: 0 1px 1px color-mix(in oklch, var(--shadow) 8%, transparent),
+    0 6px 16px -10px color-mix(in oklch, var(--shadow) 26%, transparent);
   padding: 10px 14px;
   font-family: inherit;
   font-size: 14px;
@@ -454,8 +484,8 @@ main {
   color: var(--on-accent);
 }
 .btn.primary:not(:disabled):hover {
-  background: color-mix(in oklch, var(--accent) 90%, var(--text));
-  border-color: color-mix(in oklch, var(--accent) 90%, var(--text));
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
 }
 .btn.small {
   padding: 7px 12px;
@@ -573,7 +603,7 @@ select:focus {
   border: 1px solid color-mix(in oklch, var(--danger) 45%, var(--border));
   color: var(--danger);
   border-radius: var(--r-card);
-  box-shadow: 0 8px 22px -6px color-mix(in oklch, var(--shadow) 42%, transparent);
+  box-shadow: var(--shadow-lift);
   padding: 12px 14px;
   font-size: 13px;
   display: flex;
@@ -607,7 +637,7 @@ select:focus {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--r-panel);
-  box-shadow: 0 8px 22px -6px color-mix(in oklch, var(--shadow) 42%, transparent);
+  box-shadow: var(--shadow-lift);
   padding: 22px;
   width: min(360px, 86vw);
 }
@@ -695,7 +725,7 @@ select:focus {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--r-panel);
-  box-shadow: 0 8px 22px -6px color-mix(in oklch, var(--shadow) 42%, transparent);
+  box-shadow: var(--shadow-lift);
   width: min(440px, 90vw);
   overflow: hidden;
 }
@@ -939,9 +969,11 @@ select:focus {
   align-self: center;
 }
 
-/* The status hero on Home — the emotional centre of the app. */
+/* The status hero on Home — the emotional centre of the app; it floats a half
+   step higher than the plain cards around it. */
 .card.hero {
   padding: 20px;
+  box-shadow: var(--shadow-lift);
 }
 .status-headline {
   font-family: var(--font-display);

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Fresher, warmer GUI that reads as the same shop as the marketing site.** The
+  manager now shares the homepage's exact warm-paper palette (a bright `#FDFCFA`
+  ground with pure-white raised cards, in place of the greyer ground it used to
+  wear), bundles **Schibsted Grotesk** as the body/UI font (it previously fell
+  back to bare `system-ui`, which made the app feel flat next to the site), and
+  adopts the site's two-layer "light falls" diffuse shadows so cards lift off the
+  paper. Light and dark tokens are taken verbatim from
+  `apps/website/site/assets/css/styles.css`; the brand laws are unchanged (one
+  cinnabar pigment, Fraunces display, the 4/7/10/14 radius family).
+
 ## [0.2.8] - 2026-07-19
 
 ### Added
