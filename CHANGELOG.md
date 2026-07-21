@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `apps/website/site/assets/css/styles.css`; the brand laws are unchanged (one
   cinnabar pigment, Fraunces display, the 4/7/10/14 radius family).
 
+### Added
+- **`SECURITY.md`** — a security policy with a private vulnerability-reporting channel
+  (GitHub Security Advisories), supported-version and disclosure statements, and signing/
+  verification notes. Part of Phase 0 launch-readiness.
+
 ## [0.2.8] - 2026-07-19
 
 ### Added
