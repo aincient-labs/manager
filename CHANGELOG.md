@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-08-04
+
 ### Fixed
 - **"Check for updates" now says what it found, and why it couldn't.** It used to
   answer *"Couldn't check right now. Make sure your site is running and you're
@@ -150,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.2.9...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.2.10...HEAD
+[0.2.10]: https://github.com/aincient-labs/manager/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/aincient-labs/manager/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/aincient-labs/manager/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/aincient-labs/manager/compare/v0.2.6...v0.2.7
