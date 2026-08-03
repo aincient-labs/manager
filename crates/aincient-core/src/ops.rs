@@ -101,8 +101,17 @@ pub struct UpdateCheck {
     pub current: Option<String>,
     /// Registry digest for the same tag.
     pub latest: Option<String>,
+    /// The installed image's `org.opencontainers.image.version` label — what the
+    /// running Atelier actually calls itself (`v0.1.1`, `edge+f8bdcb9`). Absent on
+    /// images built before the stamp existed.
+    pub current_version: Option<String>,
+    /// Same label, read from the registry without pulling.
+    pub latest_version: Option<String>,
     /// `Some(true)` if an update is available, `None` if it couldn't be determined.
     pub update_available: Option<bool>,
+    /// Why the check was inconclusive, phrased for the user. `None` when
+    /// `update_available` is conclusive.
+    pub problem: Option<String>,
 }
 
 /// A backup file on the host.
@@ -216,22 +225,87 @@ fn run_step(cmd: Command, action: &str, r: &mut dyn Reporter) -> Result<()> {
     }
 }
 
-/// Compare the local image to the registry tag. Best effort — returns
-/// `update_available: None` when the registry can't be reached.
+/// Compare the local image to the registry tag, reading both digests (the
+/// comparison) and both version labels (what to *call* them).
+///
+/// Inconclusive is a legitimate outcome, but it must say why: an unattributed
+/// "couldn't check" is what made atelier-cms#7 undiagnosable from a bug report.
+/// Each failure is attributed to one of four causes — Docker unavailable, the
+/// image not pulled, `buildx` missing, the registry unreachable — since the fix
+/// differs for every one of them.
 pub fn check_update(stack: &Stack) -> UpdateCheck {
     let image = stack.image();
-    let current = local_digest(&image);
-    let latest = remote_digest(&image);
-    let update_available = match (&current, &latest) {
+    let mut check = UpdateCheck {
+        image: image.clone(),
+        current: None,
+        latest: None,
+        current_version: None,
+        latest_version: None,
+        update_available: None,
+        problem: None,
+    };
+
+    // Docker itself is the floor: without it neither probe can say anything, and
+    // `preflight` already phrases that case well.
+    if let Some(problem) = preflight().problem() {
+        check.problem = Some(problem);
+        return check;
+    }
+
+    match local_probe(&image) {
+        Ok((digest, version)) => {
+            check.current = digest;
+            check.current_version = version;
+            if check.current.is_none() {
+                check.problem = Some(format!(
+                    "{image} was built or loaded locally, so it carries no registry \
+                     digest to compare against."
+                ));
+            }
+        }
+        Err(e) => {
+            check.problem = Some(format!(
+                "{image} isn't on this machine yet, so there's nothing to compare — \
+                 install Atelier first. ({e})"
+            ));
+        }
+    }
+
+    match remote_probe(&image) {
+        Ok((digest, version)) => {
+            check.latest = digest;
+            check.latest_version = version;
+        }
+        Err(e) if check.problem.is_none() => check.problem = Some(registry_problem(&image, &e)),
+        Err(_) => {}
+    }
+
+    check.update_available = match (&check.current, &check.latest) {
         (Some(c), Some(l)) => Some(c != l),
         _ => None,
     };
-    UpdateCheck {
-        image,
-        current,
-        latest,
-        update_available,
+    if check.update_available.is_some() {
+        check.problem = None;
+    } else if check.problem.is_none() {
+        check.problem = Some(format!("Couldn't compare {image} against the registry."));
     }
+    check
+}
+
+/// Turn a failed registry read into advice. A missing `buildx` plugin is the
+/// common one — it ships with Docker Desktop but is a separate package on Linux
+/// (`docker-buildx-plugin`), and nothing else in the manager needs it, so a host
+/// without it works fine right up to the update check.
+fn registry_problem(image: &str, error: &str) -> String {
+    let e = error.to_lowercase();
+    if e.contains("buildx") && (e.contains("unknown command") || e.contains("not a docker command"))
+    {
+        return "Docker's buildx plugin is missing — it's what reads the registry. \
+                Install it (`docker-buildx-plugin` on Linux; it ships with Docker \
+                Desktop), then check again. Everything else works without it."
+            .to_string();
+    }
+    format!("Couldn't reach the registry to look up {image}. ({error})")
 }
 
 /// Lay down the stack (if needed), pull the image, and start it. Idempotent:
@@ -882,16 +956,73 @@ fn parse_http_status(bytes: &[u8]) -> Option<u16> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// The OCI label the image build stamps with the version it is (DECISIONS 0308).
+const VERSION_LABEL: &str = "org.opencontainers.image.version";
+
 fn local_digest(image: &str) -> Option<String> {
-    let mut c = docker::docker();
-    c.args(["image", "inspect", image, "--format", "{{index .RepoDigests 0}}"]);
-    try_capture(c).and_then(|s| s.split('@').nth(1).map(str::to_string))
+    local_probe(image).ok().and_then(|(digest, _)| digest)
 }
 
-fn remote_digest(image: &str) -> Option<String> {
+/// Read the pulled image's registry digest **and** version label in one
+/// `docker image inspect` — no container start needed, which is why the stamp is
+/// carried as a label and not only as a runtime env var.
+///
+/// Both fields are guarded with `{{if}}`: a locally built image has an empty
+/// `RepoDigests` (bare `index` on it is a template error, not an empty string)
+/// and may carry no labels at all. Those are missing values, not failures — the
+/// `Err` arm means inspect itself failed, i.e. the image isn't here.
+fn local_probe(image: &str) -> std::result::Result<(Option<String>, Option<String>), String> {
     let mut c = docker::docker();
-    c.args(["buildx", "imagetools", "inspect", image, "--format", "{{.Manifest.Digest}}"]);
-    try_capture(c)
+    c.args([
+        "image",
+        "inspect",
+        image,
+        "--format",
+        &format!(
+            "{{{{if .RepoDigests}}}}{{{{index .RepoDigests 0}}}}{{{{end}}}}|\
+             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}"
+        ),
+    ]);
+    Ok(parse_local_probe(&docker::probe(c)?))
+}
+
+fn parse_local_probe(out: &str) -> (Option<String>, Option<String>) {
+    let (repo_digest, version) = out.split_once('|').unwrap_or((out, ""));
+    (
+        repo_digest.split('@').nth(1).map(str::to_string),
+        non_empty(version.trim()),
+    )
+}
+
+/// Read the registry's digest and version label for the same tag, without
+/// pulling. `.Image` is keyed by platform for a multi-arch tag, so the version is
+/// collected by ranging over it (identical across arches — verified: two
+/// differently-stamped builds share byte-identical layers) rather than by naming
+/// one platform the host may not be.
+fn remote_probe(image: &str) -> std::result::Result<(Option<String>, Option<String>), String> {
+    let mut c = docker::docker();
+    c.args([
+        "buildx",
+        "imagetools",
+        "inspect",
+        image,
+        "--format",
+        &format!(
+            "{{{{.Manifest.Digest}}}}|\
+             {{{{range $img := .Image}}}}{{{{index $img.Config.Labels \"{VERSION_LABEL}\"}}}}|{{{{end}}}}"
+        ),
+    ]);
+    Ok(parse_remote_probe(&docker::probe(c)?))
+}
+
+fn parse_remote_probe(out: &str) -> (Option<String>, Option<String>) {
+    let mut parts = out.split('|');
+    let digest = parts.next().unwrap_or_default();
+    (non_empty(digest.trim()), parts.find_map(|v| non_empty(v.trim())))
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 fn sanitize(label: &str) -> String {
@@ -905,7 +1036,7 @@ fn sanitize(label: &str) -> String {
 mod tests {
     use super::{
         backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_http_status,
-        restore_bundle_script,
+        parse_local_probe, parse_remote_probe, registry_problem, restore_bundle_script,
     };
     use crate::stack::Stack;
 
@@ -1015,5 +1146,56 @@ mod tests {
         ] {
             assert_eq!(parse_http_status(raw).is_some_and(|c| c < 500), ready);
         }
+    }
+
+    // Fixtures below are verbatim output of the two probe commands against
+    // ghcr.io/aincient-labs/atelier-cms, captured 2026-08-04.
+
+    #[test]
+    fn local_probe_reads_the_digest_and_the_version_label() {
+        let (digest, version) = parse_local_probe(
+            "ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2|edge+f8bdcb9",
+        );
+        assert_eq!(digest.as_deref(), Some("sha256:413ed726a1a2"));
+        assert_eq!(version.as_deref(), Some("edge+f8bdcb9"));
+    }
+
+    #[test]
+    fn local_probe_tolerates_a_locally_built_unlabelled_image() {
+        // Empty RepoDigests and no labels — both fields blank, not an error.
+        let (digest, version) = parse_local_probe("|");
+        assert!(digest.is_none(), "no registry digest to compare");
+        assert!(version.is_none(), "unstamped build claims no version");
+    }
+
+    #[test]
+    fn remote_probe_takes_one_version_from_the_multi_arch_index() {
+        // `range` over .Image emits the label once per platform, both identical.
+        let (digest, version) =
+            parse_remote_probe("sha256:413ed726a1a2|edge+f8bdcb9|edge+f8bdcb9|");
+        assert_eq!(digest.as_deref(), Some("sha256:413ed726a1a2"));
+        assert_eq!(version.as_deref(), Some("edge+f8bdcb9"));
+    }
+
+    #[test]
+    fn remote_probe_keeps_the_digest_when_no_platform_is_stamped() {
+        let (digest, version) = parse_remote_probe("sha256:a36250871de0|||");
+        assert_eq!(digest.as_deref(), Some("sha256:a36250871de0"));
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn a_missing_buildx_plugin_is_named_as_such() {
+        // Docker's own wording for an absent CLI plugin.
+        let problem = registry_problem("img", "docker: unknown command: docker buildx");
+        assert!(problem.contains("buildx plugin is missing"), "{problem}");
+        assert!(!problem.contains("logged in"), "the image is public");
+    }
+
+    #[test]
+    fn any_other_registry_failure_carries_the_error_through() {
+        let problem = registry_problem("img", "dial tcp: lookup ghcr.io: no such host");
+        assert!(problem.contains("Couldn't reach the registry"), "{problem}");
+        assert!(problem.contains("no such host"), "keeps the cause: {problem}");
     }
 }

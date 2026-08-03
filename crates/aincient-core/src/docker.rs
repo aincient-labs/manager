@@ -232,6 +232,27 @@ pub fn run_capture(mut cmd: Command, action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run, capture stdout, and return the *reason* on failure instead of discarding
+/// it — so a caller can tell "docker isn't there" from "buildx is missing" from
+/// "the registry didn't answer" and say something actionable.
+///
+/// [`try_capture`] collapses all three into `None`, which made the update check
+/// unattributable from a bug report (aincient-labs/atelier-cms#7).
+pub fn probe(mut cmd: Command) -> std::result::Result<String, String> {
+    let out = cmd
+        .output()
+        .map_err(|e| format!("couldn't run docker: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("docker exited with {}", out.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Run, capture stdout, but return `None` on any failure instead of erroring.
 /// For best-effort probes (image digests, registry inspection).
 pub fn try_capture(mut cmd: Command) -> Option<String> {

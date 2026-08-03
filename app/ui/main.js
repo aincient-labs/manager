@@ -484,12 +484,17 @@ const actions = {
     s.textContent = "Checking…";
     try {
       const u = await invoke("get_update");
+      // Name the versions when the image says what it is — on a rolling tag the
+      // digest changes every build, so "an update is available" alone is noise.
+      const from = u.current_version ? ` (you're on ${u.current_version})` : "";
       if (u.update_available === true) {
-        s.textContent = "A new version is available — go to Home to update.";
+        const to = u.latest_version ? `Version ${u.latest_version}` : "A new version";
+        s.textContent = `${to} is available — go to Home to update.${from}`;
       } else if (u.update_available === false) {
-        s.textContent = "You're on the latest version.";
+        s.textContent = `You're on the latest version${u.current_version ? ` (${u.current_version})` : ""}.`;
       } else {
-        s.textContent = "Couldn't check right now. Make sure your site is running and you're online.";
+        // Say which of the four causes it was, not a guess at two of them.
+        s.textContent = u.problem || "Couldn't check for updates right now.";
       }
       refreshUpdate();
     } catch (e) {

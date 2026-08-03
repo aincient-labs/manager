@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.9] - 2026-07-22
+### Fixed
+- **"Check for updates" now says what it found, and why it couldn't.** It used to
+  answer *"Couldn't check right now. Make sure your site is running and you're
+  online."* for every inconclusive outcome, which named two things that aren't the
+  cause (the check never needs the site running, and the image is public — the CLI's
+  equivalent hint asked whether you were logged in). Both digest probes ran through a
+  helper that discarded stderr and the exit code, so the failure was unattributable
+  even from a bug report. The four real causes are now told apart and each phrased with
+  its own fix: Docker unavailable, the image not pulled yet, **Docker's `buildx` plugin
+  missing** (the likely one — it reads the registry, ships with Docker Desktop but is a
+  separate package on Linux, and nothing else in the manager needs it), and the registry
+  unreachable (carrying the underlying error). Reported as
+  aincient-labs/atelier-cms#7.
+
+### Added
+- **The update check names versions, not just digests.** It now reads the image's
+  `org.opencontainers.image.version` label — locally via `docker image inspect` and
+  from the registry via `imagetools`, neither of which starts a container — so both
+  front-ends can say "Version v0.1.2 is available (you're on v0.1.1)" instead of a bare
+  "an update is available". On a rolling tag like `:edge` the digest changes on every
+  build, which made the old digest-only message unreadable. This is the first consumer
+  of the image stamp added in the appliance.
 
 ### Changed
 - **Fresher, warmer GUI that reads as the same shop as the marketing site.** The

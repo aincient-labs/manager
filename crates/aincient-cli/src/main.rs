@@ -562,23 +562,33 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&check)?);
         return Ok(());
     }
+    // Name the versions when the image says what it is (DECISIONS 0308) — on a
+    // rolling tag like `:edge` the digest alone tells the user nothing.
+    let from = check.current_version.as_deref().unwrap_or("unknown");
     match check.update_available {
         Some(true) => println!(
-            "{} for {}.\nRun `atelier app update`.",
+            "{} for {}.\n{} → {}\nRun `atelier app update`.",
             style::heading("An update is available"),
-            check.image
+            check.image,
+            from,
+            check.latest_version.as_deref().unwrap_or("a newer build"),
         ),
         Some(false) => println!(
-            "{} {}.",
+            "{} {} ({}).",
             style::success("You're on the latest"),
-            check.image
+            check.image,
+            from,
         ),
+        // Not "are you logged in?" — the image is public; the real cause is one of
+        // four, and `problem` names which.
         None => println!(
             "{}",
-            style::warn(&format!(
-                "Couldn't reach the registry to compare {} (are you logged in?).",
-                check.image
-            ))
+            style::warn(
+                check
+                    .problem
+                    .as_deref()
+                    .unwrap_or("Couldn't check for updates.")
+            )
         ),
     }
     Ok(())
