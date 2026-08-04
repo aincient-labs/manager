@@ -150,6 +150,22 @@ jobs:
             [ -n "$f" ] && files+=("$f")
           done < <(printf '%s' '${{ steps.tauri.outputs.artifactPaths }}' | jq -r '.[]')
 
+          # Hash HERE, on the machine that built the bundle — a checksum computed
+          # anywhere downstream (e.g. by re-downloading the asset) attests nothing
+          # but "GitHub served me these bytes". cargo-dist emits a `.sha256` sibling
+          # per CLI archive; the GUI bundles had none, so aincient-labs.com could
+          # not publish a verifiable hash for the .dmg/.msi/.AppImage. Match
+          # cargo-dist's format exactly — `<hex> *<basename>`, binary mode — so one
+          # `shasum -a 256 -c <file>.sha256` works against either lane's artifacts.
+          # sha256sum on Linux + Git Bash, shasum on the macOS runners.
+          sha256_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum -b "$1" | awk '{print $1}'
+            else
+              shasum -a 256 -b "$1" | awk '{print $1}'
+            fi
+          }
+
           # Upload one at a time so a single bad entry can't sink the rest, and:
           #  - skip .app / directory bundles: gh can't upload a directory ("is a
           #    directory"), and the .app is already inside the .dmg anyway;
@@ -171,6 +187,18 @@ jobs:
               uploaded=$((uploaded + 1))
             else
               echo "::warning::gh failed to upload: $f"
+              continue
+            fi
+            # Checksum sibling, only once the bundle itself is up — a hash for an
+            # asset that isn't there would be worse than none. Non-fatal: a missing
+            # .sha256 costs verifiability, not the release.
+            if hash="$(sha256_of "$f")" && [ -n "$hash" ]; then
+              printf '%s *%s\n' "$hash" "$(basename "$f")" > "$f.sha256"
+              echo "uploading: $f.sha256 ($hash)"
+              gh release upload "$TAG" "$f.sha256" --repo "$GITHUB_REPOSITORY" --clobber \
+                || echo "::warning::gh failed to upload checksum for: $f"
+            else
+              echo "::warning::could not compute sha256 for: $f"
             fi
           done
           echo "uploaded $uploaded bundle(s)"
@@ -270,3 +298,34 @@ jobs:
           cat section.md body.trim.md > final.md
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file final.md
           echo "release notes for $TAG now lead with the desktop app"
+
+      # aincient-labs.com's download buttons link a SPECIFIC installer file, not
+      # /releases/latest — GitHub's latest-download shortcut can't address our GUI
+      # bundles because their filenames embed the version. So the site has to be
+      # told a new version exists; it then regenerates its manifest and redeploys
+      # itself. This fires from the END of the release chain on purpose: the site
+      # refuses to publish a release whose desktop bundles aren't attached yet, and
+      # until the `build` job above finished, they weren't.
+      #
+      # Cross-repo dispatch can't use GITHUB_TOKEN (it's scoped to this repo), so
+      # it needs a PAT with `contents: write` on aincient-labs/website:
+      #   RELEASE_SYNC_TOKEN
+      # Absent that secret this step is a no-op and says so — the website runs the
+      # same sync on a daily schedule, so a release still reaches it, just later.
+      # Never fails the release: the bundles are already published either way.
+      - name: Tell the website about the new release
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          SYNC_TOKEN: ${{ secrets.RELEASE_SYNC_TOKEN }}
+        run: |
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "RELEASE_SYNC_TOKEN unset — not notifying the website."
+            echo "aincient-labs.com will pick $TAG up on its next scheduled sync."
+            exit 0
+          fi
+          jq -n --arg tag "$TAG" \
+            '{event_type: "manager-release", client_payload: {tag: $tag}}' \
+            | GH_TOKEN="$SYNC_TOKEN" gh api repos/aincient-labs/website/dispatches --input - \
+            && echo "dispatched manager-release ($TAG) to aincient-labs/website" \
+            || echo "::warning::could not notify the website — its scheduled sync will catch $TAG"

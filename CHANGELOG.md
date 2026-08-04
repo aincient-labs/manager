@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Every desktop bundle now ships a `.sha256` checksum sibling.** The `.dmg`, `.msi`, `.exe`,
+  `.AppImage`, `.deb` and `.rpm` had none — only cargo-dist's CLI archives did — so a download
+  page could not publish a verifiable hash for the app most people actually install. The hash is
+  computed on the runner that built the bundle (a checksum derived by re-downloading the asset
+  attests nothing but "GitHub served me these bytes") and uses cargo-dist's exact format, so one
+  `shasum -a 256 -c <file>.sha256` verifies artifacts from either release lane.
+
 ## [0.4.0] - 2026-08-04
 
 ### Added
