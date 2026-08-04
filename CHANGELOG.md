@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-04
+
 ### Added
 - **`atelier doctor` now diagnoses the whole appliance, and repairs it with `--fix`.**
   It used to check three things about your machine (Docker installed, running, Compose
@@ -198,7 +200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/aincient-labs/manager/compare/v0.2.10...v0.3.0
 [0.2.10]: https://github.com/aincient-labs/manager/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/aincient-labs/manager/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/aincient-labs/manager/compare/v0.2.7...v0.2.8
