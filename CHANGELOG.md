@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-04
+
 ### Added
 - **`app update` steps through intermediate versions when one hop can't get there.** A release
   can be unable to migrate arbitrarily old state: the update that uninstalls a module has to run
@@ -267,7 +269,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/aincient-labs/manager/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/aincient-labs/manager/compare/v0.2.10...v0.3.0
 [0.2.10]: https://github.com/aincient-labs/manager/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/aincient-labs/manager/compare/v0.2.8...v0.2.9
