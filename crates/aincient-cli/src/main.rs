@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use aincient_core::{ops, InstallOptions, Stack};
+use aincient_core::{doctor, ops, InstallOptions, Stack};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -29,8 +29,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check that Docker and Compose are ready to run the appliance.
-    Doctor,
+    /// Diagnose the appliance — and repair it with --fix.
+    ///
+    /// Checks the host (Docker, ports, disk), the stack (compose files,
+    /// containers) and the site inside it (Drupal boots, updates applied, files
+    /// writable). Read-only unless you pass --fix.
+    Doctor {
+        /// Apply the safe repairs: rebuild caches, run pending database
+        /// updates, repair file ownership, restart containers, and re-run the
+        /// appliance's self-heal. Never deletes data.
+        #[arg(long)]
+        fix: bool,
+        /// Emit machine-readable JSON — paste this into a bug report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the appliance: install, update, run, and inspect it.
     App {
         #[command(subcommand)]
@@ -294,7 +307,7 @@ fn run() -> Result<()> {
     let stack = Stack::locate()?;
 
     match cli.command {
-        Command::Doctor => doctor(),
+        Command::Doctor { fix, json } => doctor(&stack, fix, json),
         Command::App { command } => run_app(command, &stack),
         Command::Site { command } => run_site(command, &stack),
         Command::Data { command } => run_data(command, &stack),
@@ -515,25 +528,160 @@ fn model_list(stack: &Stack, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn doctor() -> Result<()> {
-    let pf = aincient_core::preflight();
-    line("Docker installed", pf.docker_installed);
-    line("Docker running", pf.docker_running);
-    line("Compose plugin", pf.compose_available);
-    match pf.problem() {
-        Some(msg) => {
-            println!("\n{}", style::warn(&msg));
-            std::process::exit(1);
-        }
-        None => {
-            println!();
-            if let Some(rule) = style::rule() {
-                println!("{rule}");
-            }
-            println!("{}", style::success("Ready to run Atelier."));
-            Ok(())
+/// `atelier doctor [--fix] [--json]` — the diagnose/repair front door.
+///
+/// Exits non-zero when something is still failing after the run, so it works as
+/// a gate in a script; warnings alone keep the exit code at 0.
+fn doctor(stack: &Stack, fix: bool, json: bool) -> Result<()> {
+    let report = if fix {
+        // The repair ladder is chatty (a converge run streams docker output), so
+        // it goes through the same reporter the lifecycle ops use.
+        doctor::fix(stack, &mut CliReporter::default())
+    } else {
+        doctor::diagnose(stack)
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&JsonReport::of(&report))?);
+    } else {
+        print_report(&report, fix);
+    }
+
+    if !report.healthy() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// The `--json` envelope: the report plus the verdict a reader would otherwise
+/// have to recompute, and the manager version that produced it.
+///
+/// This exists so a pasted report answers "is it broken, and which build said
+/// so?" without the reader tallying severities by hand — the whole point of
+/// having a machine-readable mode in a bug report.
+#[derive(serde::Serialize)]
+struct JsonReport<'a> {
+    manager_version: &'static str,
+    healthy: bool,
+    failures: usize,
+    warnings: usize,
+    skipped: usize,
+    /// What `--fix` would attempt, in the order it would attempt it.
+    available_repairs: Vec<doctor::Repair>,
+    #[serde(flatten)]
+    report: &'a doctor::Report,
+}
+
+impl<'a> JsonReport<'a> {
+    fn of(report: &'a doctor::Report) -> Self {
+        JsonReport {
+            manager_version: env!("CARGO_PKG_VERSION"),
+            healthy: report.healthy(),
+            failures: report.count(doctor::Severity::Fail),
+            warnings: report.count(doctor::Severity::Warn),
+            skipped: report.count(doctor::Severity::Skipped),
+            available_repairs: report.available_repairs(),
+            report,
         }
     }
+}
+
+/// Render a report grouped by tier, with each failure's remedy indented under
+/// it — so the fix is never more than one line away from the problem.
+fn print_report(report: &doctor::Report, fixed: bool) {
+    for (tier, title) in [
+        (doctor::Tier::Host, "Your machine"),
+        (doctor::Tier::Stack, "The appliance"),
+        (doctor::Tier::Site, "Your site"),
+    ] {
+        let checks: Vec<_> = report.checks.iter().filter(|c| c.tier == tier).collect();
+        if checks.is_empty() {
+            continue;
+        }
+        println!("\n{}", style::heading(title));
+        for check in checks {
+            print_check(check);
+        }
+    }
+
+    if !report.actions.is_empty() {
+        println!("\n{}", style::heading("Repairs"));
+        for action in &report.actions {
+            let mark = if action.succeeded {
+                style::success("fixed")
+            } else {
+                style::warn("failed")
+            };
+            println!("  {mark}  {}", action.description);
+            if !action.succeeded {
+                if let Some(detail) = &action.detail {
+                    println!("        {}", style::warn(&first_line(detail)));
+                }
+            }
+        }
+    }
+
+    println!();
+    if let Some(rule) = style::rule() {
+        println!("{rule}");
+    }
+
+    let failures = report.count(doctor::Severity::Fail);
+    let warnings = report.count(doctor::Severity::Warn);
+    if failures == 0 {
+        let headline = if warnings > 0 {
+            format!("No problems found ({warnings} advisory).")
+        } else {
+            "Everything checks out.".to_string()
+        };
+        println!("{}", style::success(&headline));
+        return;
+    }
+
+    println!(
+        "{}",
+        style::warn(&format!(
+            "{failures} problem{} still need{} attention.",
+            if failures == 1 { "" } else { "s" },
+            if failures == 1 { "s" } else { "" },
+        ))
+    );
+    // Only advertise --fix when it would actually do something, and only when
+    // the user hasn't just run it — "run --fix" after --fix already failed is
+    // noise, not advice.
+    if !fixed && !report.available_repairs().is_empty() {
+        println!("Run `atelier doctor --fix` to repair what can be repaired automatically.");
+    }
+}
+
+fn print_check(check: &doctor::Check) {
+    // Marks must stay distinguishable with colour off, so each severity gets its
+    // own glyph: a checked box passes, an empty one fails (the existing
+    // `style::mark` convention), `!` advises, `-` was never reached.
+    let (mark, styled_label) = match check.severity {
+        doctor::Severity::Ok => (style::mark(true), check.label.to_string()),
+        doctor::Severity::Warn => ("[!]".to_string(), style::warn(check.label)),
+        doctor::Severity::Fail => (style::mark(false), style::danger(check.label)),
+        doctor::Severity::Skipped => ("[-]".to_string(), check.label.to_string()),
+    };
+    match &check.detail {
+        Some(d) if check.severity == doctor::Severity::Ok => {
+            println!("  {mark} {styled_label} — {d}")
+        }
+        Some(d) => println!("  {mark} {styled_label} — {}", first_line(d)),
+        None => println!("  {mark} {styled_label}"),
+    }
+    if let Some(remedy) = &check.remedy {
+        println!("      {}", style::warn(&format!("→ {remedy}")));
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 fn status(stack: &Stack, json: bool) -> Result<()> {

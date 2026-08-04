@@ -19,6 +19,20 @@ let lastStatus = null; // most recent get_status, so panels can adapt to it
 let currentTab = "home";
 let exportDir = null; // folder chosen for the static export
 let lastExportPath = null; // where the last export landed, for "Open the folder"
+let managerVersion = ""; // this app's own version, shown in the chrome
+
+// Stamp the manager's version into the title bar once, before anything else can
+// fail. It's compile-time constant — no Docker, no stack — so it must still show
+// on the Docker-missing screen, which is exactly where a screenshot gets taken.
+async function showManagerVersion() {
+  try {
+    managerVersion = await invoke("manager_version");
+    $("manager-version").textContent = managerVersion;
+    $("manager-version").title = `Atelier Manager ${managerVersion}`;
+  } catch {
+    // A missing version label must never block the app from starting.
+  }
+}
 
 // --- view + tab routing -----------------------------------------------------
 
@@ -327,6 +341,7 @@ async function refreshBackups() {
 
 function loadSettings() {
   $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
+  $("manager-version-row").textContent = managerVersion || "—";
 }
 
 async function refreshLogs() {
@@ -340,6 +355,94 @@ async function refreshLogs() {
   } catch (e) {
     view.textContent = String(e);
   }
+}
+
+// --- Troubleshoot (doctor) --------------------------------------------------
+
+// Tier headings, in the order the core reports them: outward-in, from the
+// machine to the site. Plain words — the core's tier ids are the stable handle,
+// these are just what a person reads.
+const DOCTOR_TIERS = [
+  ["host", "Your computer"],
+  ["stack", "Atelier itself"],
+  ["site", "Your website"],
+];
+
+const DOCTOR_MARK = { ok: "✓", warn: "!", fail: "✕", skipped: "–" };
+
+// Render a report from the core. Skipped checks are folded away unless
+// something actually failed — on a healthy appliance nothing is skipped, and on
+// a broken one they're the trail showing how far the checkup got.
+function renderDoctor(report) {
+  const results = $("doctor-results");
+  const summary = $("doctor-summary");
+  const failures = report.checks.filter((c) => c.severity === "fail").length;
+  const warnings = report.checks.filter((c) => c.severity === "warn").length;
+
+  let html = "";
+  for (const [tier, title] of DOCTOR_TIERS) {
+    const checks = report.checks.filter((c) => c.tier === tier);
+    if (!checks.length) continue;
+    html += `<h4 class="doctor-tier">${esc(title)}</h4><ul class="doctor-list">`;
+    for (const c of checks) {
+      html += `<li class="doctor-item sev-${esc(c.severity)}">`;
+      html += `<span class="doctor-mark" aria-hidden="true">${DOCTOR_MARK[c.severity] || "?"}</span>`;
+      html += `<span class="doctor-body"><span class="doctor-label">${esc(c.label)}</span>`;
+      if (c.detail) html += `<span class="doctor-detail">${esc(firstLine(c.detail))}</span>`;
+      if (c.remedy) html += `<span class="doctor-remedy">${esc(c.remedy)}</span>`;
+      html += "</span></li>";
+    }
+    html += "</ul>";
+  }
+
+  if (report.actions && report.actions.length) {
+    html += `<h4 class="doctor-tier">What we repaired</h4><ul class="doctor-list">`;
+    for (const a of report.actions) {
+      const sev = a.succeeded ? "ok" : "fail";
+      html += `<li class="doctor-item sev-${sev}">`;
+      html += `<span class="doctor-mark" aria-hidden="true">${DOCTOR_MARK[sev]}</span>`;
+      html += `<span class="doctor-body"><span class="doctor-label">${esc(a.description)}</span>`;
+      if (!a.succeeded && a.detail) {
+        html += `<span class="doctor-detail">${esc(firstLine(a.detail))}</span>`;
+      }
+      html += "</span></li>";
+    }
+    html += "</ul>";
+  }
+
+  results.innerHTML = html;
+  results.classList.remove("hidden");
+
+  if (failures === 0) {
+    summary.textContent = warnings
+      ? "Everything essential is working. There's one thing worth a look below."
+      : "Everything looks good.";
+  } else {
+    summary.textContent =
+      failures === 1
+        ? "We found 1 problem. Details below."
+        : `We found ${failures} problems. Details below.`;
+  }
+  summary.classList.remove("hidden");
+
+  // Only offer the repair button when there's actually something it can do —
+  // an unfixable failure (a port taken by another program) needs the person,
+  // not a button that would appear to do nothing.
+  const fixable = report.checks.some(
+    (c) => c.fix && (c.severity === "fail" || c.severity === "warn")
+  );
+  $("doctor-fix").classList.toggle("hidden", !fixable);
+}
+
+function firstLine(s) {
+  return String(s).split("\n").map((l) => l.trim()).find((l) => l) || "";
+}
+
+function esc(s) {
+  return String(s).replace(
+    /[&<>"']/g,
+    (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]
+  );
 }
 
 // --- actions ----------------------------------------------------------------
@@ -478,6 +581,29 @@ const actions = {
   // ---- Settings ----
   "refresh-logs": () => refreshLogs(),
 
+  doctor: async () => {
+    const summary = $("doctor-summary");
+    summary.classList.remove("hidden");
+    summary.textContent = "Checking…";
+    $("doctor-results").classList.add("hidden");
+    $("doctor-fix").classList.add("hidden");
+    try {
+      renderDoctor(await invoke("run_doctor"));
+    } catch (e) {
+      summary.textContent = String(e);
+    }
+  },
+
+  "doctor-fix": async () => {
+    // Repairs can take minutes (a self-heal run streams its own output), so this
+    // goes through the shared progress overlay rather than a silent button.
+    let report = null;
+    await runProgressOp("Repairing your website", async () => {
+      report = await invoke("run_doctor_fix");
+    });
+    if (report) renderDoctor(report);
+  },
+
   "check-update": async () => {
     const s = $("update-status");
     s.classList.remove("hidden");
@@ -554,4 +680,5 @@ document.addEventListener("click", (e) => {
 });
 
 initPublishPrefs();
+showManagerVersion();
 refresh().catch((e) => showError(String(e)));

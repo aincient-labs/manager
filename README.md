@@ -19,7 +19,7 @@ Install friction is the biggest leak in the evaluator funnel. The real prerequis
 operation maps to a lower-level primitive the appliance already provides:
 
 Commands are grouped into noun namespaces so the surface stays maintainable as it grows
-(`doctor` is the one flat, universal preflight):
+(`doctor` is the one flat, universal command):
 
 | Command                  | What it does                                                              |
 | ------------------------ | ------------------------------------------------------------------------- |
@@ -27,19 +27,50 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | `app update`             | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
 | `app check-update`       | Compare the local image digest against the registry tag. (alias `app check`) |
 | `app reinstall`          | Wipe volumes and install fresh (destructive, confirmed).                  |
-| `app status`             | Read-only health probe. (Docker readiness is the flat `doctor`.)          |
+| `app status`             | Read-only health probe. (The full checkup is the flat `doctor`.)          |
 | `app start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.              |
 | `site export`            | Export the public site to static HTML — the deploy-anywhere artifact.      |
 | `data backup`            | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. (alias `data export`) |
 | `data restore <file>`    | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). (alias `data import`) |
 | `data list`              | List snapshots on this host. (alias `data backups`)                       |
 | `ai model list`/`set`    | Inspect or bind the AI model per Atelier role.                            |
+| `doctor`                 | Diagnose host + stack + site. `--fix` repairs safely, `--json` for bug reports. |
 
 `export`/`import` alias `data backup`/`restore` so either mental model works; `export` is
 never a bare top-level verb (it means one of three things — static site, db+files, db-only —
 so it's always qualified by its namespace). The stack directory defaults to `~/.atelier`
 (override with `ATELIER_HOME`) and holds the same `compose.yaml` + `.env` the
 `docker/install.sh` bootstrapper writes.
+
+### `doctor`
+
+`atelier doctor` is read-only and checks three tiers in dependency order, so a failure never
+masquerades as the tier below it (a check whose prerequisite failed reports *skipped*, not
+*failed*):
+
+| Tier | Checks |
+| ---- | ------ |
+| **host**  | Docker installed/running, Compose plugin, `buildx` (only the update check needs it) — each reported **with its version**, the CLI and the engine separately since they can differ — plus whether another program has taken the console port, and free disk space. |
+| **stack** | `compose.yaml` present and parseable, `.env` still has its `HASH_SALT`, both containers exist, neither is restart-looping or unhealthy. |
+| **site**  | Drupal bootstraps, no pending `updatedb`, uploaded-files tree still owned by `www-data`, the image's own `healthcheck.sh` passes, a model role is bound. |
+
+`atelier doctor --fix` climbs a **safe repair ladder**, re-diagnosing after each rung and stopping
+the moment nothing is failing — so a site that only needed a cache rebuild never gets a full
+self-heal run:
+
+1. restore the stack files (a replaced `compose.yaml` is moved aside, never deleted)
+2. `docker compose up -d`, then wait for the console to actually serve
+3. `drush cache:rebuild`
+4. `drush updatedb -y`
+5. `chown -R www-data:www-data` on the files tree
+6. re-run the appliance's `converge.sh` — which snapshots the database first and rolls back if
+   the repair makes things worse
+
+Every rung's worst case is lost time. **`down -v`, reinstall and restore are excluded at any
+flag** — doctor names them as the next step and stops. Exit code is non-zero while anything is
+still failing (advisories, like "no model connected yet" on a fresh install, don't count), so it
+works as a gate in a script. `--json` emits the whole report plus the verdict and manager version,
+for pasting into an issue.
 
 > **v0.2.0 renamed the flat commands into these namespaces** (BC break vs v0.1.0): `install` →
 > `app install`, `backup` → `data backup`, `model set` → `ai model set`, and so on. `doctor`

@@ -54,6 +54,14 @@ pub fn error(text: &str) -> String {
     paint(text, Stream::Stderr, s)
 }
 
+/// Coral — a failing item in output written to **stdout** (the doctor report).
+/// Same pigment as [`error`], different stream: colour support is detected per
+/// stream, so a report printed to stdout must not gate on stderr's TTY.
+pub fn danger(text: &str) -> String {
+    let s = Style::new().truecolor(CORAL.0, CORAL.1, CORAL.2);
+    paint(text, Stream::Stdout, s)
+}
+
 /// A checklist mark: mint `[x]` when ok, plain `[ ]` when not.
 pub fn mark(ok: bool) -> String {
     if ok {

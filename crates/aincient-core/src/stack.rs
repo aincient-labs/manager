@@ -244,6 +244,74 @@ impl Stack {
         }
         Ok(())
     }
+
+    /// Repair the stack's own files — what `doctor --fix` calls when
+    /// `compose.yaml` is missing/unparseable or `.env` lost its `HASH_SALT`.
+    ///
+    /// Distinct from [`ensure_scaffold`](Self::ensure_scaffold), which is
+    /// deliberately non-destructive: it never overwrites an existing
+    /// `compose.yaml` and never adds keys to an existing `.env`. Those are the
+    /// right semantics for install (don't clobber a user's edits) and exactly
+    /// the wrong ones for repair, where the file is already broken.
+    ///
+    /// A replaced `compose.yaml` is moved aside rather than deleted — if the
+    /// operator had hand-edited it (a custom port mapping, an extra volume), the
+    /// repair must not silently eat that. **Data volumes are never touched**:
+    /// they're named in the template identically, so the rewritten file
+    /// re-adopts the same `db-data`/`files`/`private` volumes.
+    ///
+    /// Returns a line per change, for the report.
+    pub fn repair_scaffold(&self) -> Result<Vec<String>> {
+        let mut changes = Vec::new();
+        std::fs::create_dir_all(&self.home)
+            .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
+
+        let compose = self.compose_path();
+        if compose.is_file() {
+            let current = std::fs::read_to_string(&compose).unwrap_or_default();
+            if current != COMPOSE_TEMPLATE {
+                let aside = self.home.join(format!(
+                    "compose.yaml.replaced-{}",
+                    chrono::Local::now().format("%Y%m%d-%H%M%S")
+                ));
+                std::fs::rename(&compose, &aside).with_context(|| {
+                    format!("could not move the old compose.yaml to {}", aside.display())
+                })?;
+                std::fs::write(&compose, COMPOSE_TEMPLATE)
+                    .with_context(|| format!("could not write {}", compose.display()))?;
+                changes.push(format!(
+                    "rewrote compose.yaml (previous kept as {})",
+                    aside.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        } else {
+            std::fs::write(&compose, COMPOSE_TEMPLATE)
+                .with_context(|| format!("could not write {}", compose.display()))?;
+            changes.push("wrote a fresh compose.yaml".to_string());
+        }
+
+        // Fill in only what's missing. An existing salt is never regenerated —
+        // rotating it would invalidate every session and every one-time login
+        // link for no reason.
+        let mut env = self.read_env();
+        if env.get("HASH_SALT").map(|s| s.len() < 32).unwrap_or(true) {
+            env.insert("HASH_SALT".to_string(), hash_salt());
+            changes.push("generated a new HASH_SALT".to_string());
+        }
+        if !env.contains_key("AINCIENT_IMAGE") {
+            env.insert("AINCIENT_IMAGE".to_string(), DEFAULT_IMAGE.to_string());
+            changes.push("restored the image setting".to_string());
+        }
+        if !env.contains_key("HTTP_PORT") {
+            env.insert("HTTP_PORT".to_string(), DEFAULT_PORT.to_string());
+            changes.push("restored the port setting".to_string());
+        }
+        if !changes.is_empty() {
+            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+            write_private(&self.env_path(), &body)?;
+        }
+        Ok(changes)
+    }
 }
 
 /// Write a file containing secrets with `0600` perms where the platform supports it.
@@ -394,6 +462,100 @@ mod tests {
             home: PathBuf::from("/tmp/.My Stack!"),
         };
         assert_eq!(odd.project_name(), "my-stack-");
+    }
+
+    #[test]
+    fn repair_rewrites_a_broken_compose_but_keeps_the_original() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let salt = stack.env_get("HASH_SALT").unwrap();
+        std::fs::write(stack.compose_path(), "services:\n  app:\n    image: [[[broken\n").unwrap();
+
+        let changes = stack.repair_scaffold().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE,
+            "the broken compose.yaml must be replaced by the template"
+        );
+        assert_eq!(
+            stack.env_get("HASH_SALT"),
+            Some(salt),
+            "a healthy salt must never be rotated — it would drop every session"
+        );
+        assert!(changes.iter().any(|c| c.contains("rewrote compose.yaml")));
+        // The operator's file is moved aside, not deleted — they may have
+        // hand-edited it.
+        let kept: Vec<_> = std::fs::read_dir(&stack.home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("compose.yaml.replaced-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the previous compose.yaml is preserved");
+    }
+
+    #[test]
+    fn repair_restores_a_missing_hash_salt_without_touching_other_keys() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold(&InstallOptions {
+                image: Some("ghcr.io/aincient-labs/atelier-cms:pinned".into()),
+                http_port: Some(51000),
+            })
+            .unwrap();
+        // Drop the salt, exactly as a truncated/hand-edited .env would.
+        std::fs::write(
+            stack.env_path(),
+            "AINCIENT_IMAGE=ghcr.io/aincient-labs/atelier-cms:pinned\nHTTP_PORT=51000\n",
+        )
+        .unwrap();
+
+        let changes = stack.repair_scaffold().unwrap();
+
+        let new_salt = stack.env_get("HASH_SALT").expect("a salt is written back");
+        assert_eq!(new_salt.len(), 64);
+        assert!(new_salt.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(changes.iter().any(|c| c.contains("HASH_SALT")));
+        // The repair must not reset the operator's chosen image/port.
+        assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:pinned");
+        assert_eq!(stack.http_port(), 51000);
+    }
+
+    #[test]
+    fn repair_is_a_no_op_on_a_healthy_stack() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let before = std::fs::read_to_string(stack.env_path()).unwrap();
+
+        let changes = stack.repair_scaffold().unwrap();
+
+        assert!(changes.is_empty(), "nothing to repair: {changes:?}");
+        assert_eq!(std::fs::read_to_string(stack.env_path()).unwrap(), before);
+        // And no stray backup file was created.
+        let strays = std::fs::read_dir(&stack.home)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("replaced-"))
+            .count();
+        assert_eq!(strays, 0);
+    }
+
+    #[test]
+    fn repair_builds_a_stack_from_nothing() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        assert!(!stack.exists());
+
+        stack.repair_scaffold().unwrap();
+
+        assert!(stack.exists());
+        assert_eq!(stack.env_get("HASH_SALT").unwrap().len(), 64);
+        assert_eq!(stack.image(), DEFAULT_IMAGE);
+        assert_eq!(stack.http_port(), DEFAULT_PORT);
     }
 
     #[test]

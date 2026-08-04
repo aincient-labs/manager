@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`atelier doctor` now diagnoses the whole appliance, and repairs it with `--fix`.**
+  It used to check three things about your machine (Docker installed, running, Compose
+  plugin) and stop — everything that could actually go wrong with a *site* was invisible
+  to it. It now checks three tiers in dependency order and reports each with the fix
+  right underneath:
+  - **Your computer** — Docker (CLI **and** engine version, which routinely differ under a
+    remote context, OrbStack or colima), the Compose plugin, the `buildx` plugin (previously
+    only discoverable by watching an update check fail), whether another program has taken the
+    console's port, and free disk space. Each of the four tools reports **its version**, not
+    just a tick — "Docker installed ✓" is the same line on every machine and tells a bug report
+    nothing, whereas the version is what separates a host where something works from one where
+    it doesn't.
+  - **Atelier itself** — the stack files are present and `compose.yaml` parses, `.env`
+    still has its `HASH_SALT`, both containers exist, and neither is stuck in a restart
+    loop (a crash-looping container reports "running" at any single glance).
+  - **Your site** — Drupal boots, no database updates are left pending, the uploaded-files
+    directory is still owned by the web server, the appliance's own health check passes,
+    and a model is bound.
+
+  A tier whose prerequisite failed reports as *skipped*, never as failed — "we couldn't
+  look" and "we looked and it's broken" are different answers.
+
+  `atelier doctor --fix` climbs a safe repair ladder, re-checking after each rung and
+  stopping the moment the appliance is healthy — so a site that only needed a cache
+  rebuild never gets a full self-heal run: restore the stack files → start the containers
+  → `drush cache:rebuild` → run pending database updates → repair file ownership → re-run
+  the appliance's `converge.sh` (which snapshots the database first and rolls back if the
+  repair makes things worse). **Nothing in the ladder deletes data.** Removing, reinstalling
+  and restoring stay where they were, behind their own confirmations; doctor only names
+  them as the next step.
+- **`atelier doctor --json`** — the whole report, machine-readable, with the verdict and
+  the manager version already computed. Paste it into a bug report instead of prose.
+- **A Troubleshoot panel in the Manager GUI** (System → Troubleshoot): the same checkup
+  and the same repairs, for the people who can't run a CLI. Repairs stream their progress
+  through the existing overlay, since a self-heal run can take minutes.
+- Doctor exits non-zero when something is still failing, so it works as a gate in a
+  script. Advisories (no model connected yet on a fresh install) never fail the exit code.
+- **The Manager GUI shows its own version in the window chrome**, beside the "Manager" label —
+  so it lands in *any* screenshot, including ones taken from the Docker-not-ready and first-run
+  screens, where a bug report is most likely to start. It's compile-time constant, needs neither
+  Docker nor an installed stack, and is stamped before anything else can fail. Also listed in
+  **System → Your installation**, where the existing "Version" row is now labelled **Atelier** —
+  with two versions on screen, neither could stay named just "Version": the Atelier row is what
+  your *site* runs, the Manager row is this app, and a useful bug report usually names both.
+
 ## [0.2.10] - 2026-08-04
 
 ### Fixed

@@ -1181,3 +1181,104 @@ select:focus {
   vertical-align: -2px;
   margin-right: 5px;
 }
+
+/* ---------------------------------------------------------------------------
+   Troubleshoot (doctor) report.
+
+   Severity is carried by a mark + a colour, never by colour alone (the marks
+   read the same to a colour-blind eye, and survive a screenshot). Semantic
+   colours only — jade/ochre/coral — so the cinnabar accent stays the one
+   pigment and never lands on status (brand.md §3.4/§10.1).
+--------------------------------------------------------------------------- */
+.doctor {
+  margin-top: 14px;
+}
+.doctor-tier {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-dim);
+  margin: 16px 0 6px;
+}
+.doctor-tier:first-child {
+  margin-top: 0;
+}
+.doctor-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.doctor-item {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.doctor-mark {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  flex: 0 0 auto;
+  width: 1em;
+  text-align: center;
+}
+.doctor-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.doctor-detail,
+.doctor-remedy {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.doctor-detail {
+  color: var(--text-dim);
+}
+/* The remedy is the actionable half — it earns a little more weight than the
+   observation above it, without shouting. */
+.doctor-remedy {
+  color: var(--text);
+}
+
+.sev-ok .doctor-mark {
+  color: var(--jade);
+}
+.sev-warn .doctor-mark {
+  color: var(--accent-2);
+}
+.sev-fail .doctor-mark {
+  color: var(--danger);
+}
+.sev-fail .doctor-label {
+  font-weight: 600;
+}
+/* A skipped check was never reached — it must recede, not read as a verdict. */
+.sev-skipped {
+  color: var(--text-dim);
+}
+.sev-skipped .doctor-mark {
+  color: var(--border);
+}
+
+/* The manager's version, held beside the role label in the chrome. Tabular
+   figures so it doesn't jitter between builds, and a notch fainter than the
+   role — it's provenance for a bug report, not a thing to read. */
+.version-tag {
+  margin-left: 6px;
+  color: var(--text-faint);
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+  letter-spacing: 0.06em;
+}
+.version-tag:empty {
+  display: none;
+}

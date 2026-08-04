@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 aincient-core = { path = "../aincient-core" }
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 owo-colors.workspace = true
 clap = { version = "4", features = ["derive"] }

@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use aincient_core::{
-    ops, Backup, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage, Status, UpdateCheck,
+    doctor, ops, Backup, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage, Status,
+    UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -338,6 +339,38 @@ async fn set_model_role(role: String, provider: String, model: String) -> Result
     blocking(move || ops::model_set(&s, &role, &provider, &model).map_err(err)).await
 }
 
+/// The manager's own version — distinct from the appliance image's version,
+/// which is what `get_status`/`get_update` report.
+///
+/// Surfaced in the window chrome so it lands in any screenshot, including ones
+/// taken from the Docker-not-ready and first-run screens where a report is most
+/// likely to start. Baked in at compile time, so it needs no Docker and can't
+/// disagree with the binary that's running.
+#[tauri::command]
+fn manager_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Diagnose the appliance — host, stack and site — without changing anything.
+/// Runs off the UI thread: it shells several docker/drush probes.
+#[tauri::command]
+async fn run_doctor() -> Result<doctor::Report, String> {
+    let s = stack()?;
+    blocking(move || Ok(doctor::diagnose(&s))).await
+}
+
+/// Run the safe repair ladder, then re-diagnose. Progress (including a streamed
+/// `converge` run, which can take minutes) goes through the same `op-progress`
+/// feed the lifecycle ops use, so the UI shows the existing overlay.
+///
+/// Nothing here deletes data — the destructive recoveries (remove, reinstall,
+/// restore) stay behind their own confirmations elsewhere in the UI.
+#[tauri::command]
+async fn run_doctor_fix(app: AppHandle) -> Result<doctor::Report, String> {
+    let s = stack()?;
+    blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await
+}
+
 #[tauri::command]
 fn open_console() -> Result<(), String> {
     let s = stack()?;
@@ -411,6 +444,9 @@ pub fn run() {
             site_export,
             get_model_roles,
             set_model_role,
+            run_doctor,
+            run_doctor_fix,
+            manager_version,
             reveal_path,
             open_console,
             open_console_authed,

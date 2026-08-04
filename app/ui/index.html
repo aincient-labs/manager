@@ -70,6 +70,15 @@
       <symbol id="i-folder" viewBox="0 0 24 24">
         <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
       </symbol>
+      <symbol id="i-stethoscope" viewBox="0 0 24 24">
+        <path d="M11 2v2" /><path d="M5 2v2" />
+        <path d="M5 3H4a2 2 0 0 0-2 2v4a6 6 0 0 0 12 0V5a2 2 0 0 0-2-2h-1" />
+        <path d="M8 15a6 6 0 0 0 12 0v-3" />
+        <circle cx="20" cy="10" r="2" />
+      </symbol>
+      <symbol id="i-wrench" viewBox="0 0 24 24">
+        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+      </symbol>
       <symbol id="i-check" viewBox="0 0 24 24">
         <path d="M21.801 10A10 10 0 1 1 17 3.335" /><path d="m9 11 3 3L22 4" />
       </symbol>
@@ -101,7 +110,10 @@
           </svg>
           <span class="maker whisper">by AIncient&nbsp;Labs</span>
         </span>
-        <span class="app-role whisper">Manager</span>
+        <!-- The manager's own version rides in the chrome, so it appears in ANY
+             screenshot — including the Docker-not-ready and first-run screens,
+             where a bug report is most likely to start. -->
+        <span class="app-role whisper">Manager<span id="manager-version" class="version-tag"></span></span>
       </div>
     </header>
 
@@ -355,9 +367,16 @@
         <section class="group">
           <h3 class="group-label"><svg class="ic"><use href="#i-settings" /></svg>Your installation</h3>
           <div class="card">
+            <!-- Two different versions live here, so neither may be labelled
+                 just "Version": the appliance image is what your site runs, the
+                 manager is this app. A bug report usually needs both. -->
             <div class="kv">
-              <span class="kv-label">Version</span>
+              <span class="kv-label">Atelier</span>
               <span id="image-tag" class="kv-value">—</span>
+            </div>
+            <div class="kv">
+              <span class="kv-label">Manager</span>
+              <span id="manager-version-row" class="kv-value">—</span>
             </div>
             <button class="btn small full" data-action="check-update">
               <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
@@ -378,6 +397,31 @@
                 <svg class="ic"><use href="#i-trash" /></svg>Reinstall from scratch (erases everything)
               </button>
             </details>
+          </div>
+        </section>
+
+        <!-- Troubleshoot — the "something's not right" surface. Sits above
+             Activity because a checkup is what you want first; the raw log is
+             what you fall back to. Repairs here never delete data (the ones that
+             do live in "Reset & remove" above, behind their own confirmations). -->
+        <section class="group">
+          <h3 class="group-label"><svg class="ic"><use href="#i-stethoscope" /></svg>Troubleshoot</h3>
+          <div class="card">
+            <p class="muted">
+              If something isn't working, run a checkup. It looks at your
+              computer, Atelier itself, and your website, and tells you what it
+              finds — then it can repair most problems for you.
+            </p>
+            <div class="logs-controls">
+              <button class="btn small" data-action="doctor">
+                <svg class="ic"><use href="#i-stethoscope" /></svg>Run a checkup
+              </button>
+              <button class="btn small hidden" id="doctor-fix" data-action="doctor-fix">
+                <svg class="ic"><use href="#i-wrench" /></svg>Repair what you can
+              </button>
+            </div>
+            <p id="doctor-summary" class="hint hidden" aria-live="polite"></p>
+            <div id="doctor-results" class="doctor hidden"></div>
           </div>
         </section>
 

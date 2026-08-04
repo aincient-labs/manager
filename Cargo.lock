@@ -117,6 +117,7 @@ dependencies = [
  "anyhow",
  "clap",
  "owo-colors",
+ "serde",
  "serde_json",
 ]
 

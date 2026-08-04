@@ -19,7 +19,7 @@ use crate::docker::{
 use crate::stack::{InstallOptions, Stack};
 
 /// drush, as invoked inside the `app` container.
-const DRUSH: &[&str] = &["/opt/drupal/vendor/bin/drush", "--root=/opt/drupal/web"];
+pub(crate) const DRUSH: &[&str] = &["/opt/drupal/vendor/bin/drush", "--root=/opt/drupal/web"];
 
 /// How long to wait for the console to finish booting after an install or
 /// upgrade before giving up and telling the user it's still coming up. Generous:
@@ -185,7 +185,7 @@ pub fn status(stack: &Stack) -> Status {
 /// This is what holds the manager's "ready" signal back until Drupal has
 /// actually finished booting (site install, `converge.sh` migrations) instead of
 /// the moment the container reports "running".
-fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> bool {
+pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> bool {
     let port = stack.http_port();
     let started = Instant::now();
     let deadline = started + timeout;
@@ -404,7 +404,7 @@ pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> 
 
 /// The uploaded-files tree inside the `app` container — the `files:` volume from
 /// `compose.yaml`, holding user uploads and generated image derivatives.
-const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
+pub(crate) const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
 
 /// Back up the whole appliance to a single portable `.tar.gz` snapshot on the
 /// host: the database (`drush sql:dump --gzip`, converge's format) **plus** the
