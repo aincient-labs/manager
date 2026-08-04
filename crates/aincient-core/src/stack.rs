@@ -8,11 +8,112 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
-/// Default image tag, matching `docker/install.sh`.
-pub const DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:edge";
+/// The registry repository every published appliance image comes from.
+pub const IMAGE_REPO: &str = "ghcr.io/aincient-labs/atelier-cms";
+/// Default image tag, matching `docker/install.sh` — the [stable](Channel::Stable)
+/// channel, i.e. released versions.
+pub const DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:latest";
+/// What the default used to be, before there were tagged releases to point at.
+///
+/// An install still carrying this exact string was never *asked* which channel it
+/// wanted — it got edge because edge was all there was. Those are the installs
+/// [`Stack::migrate_default_channel`] moves onto stable, once.
+pub const LEGACY_DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:edge";
+/// `.env` key recording the channel the operator **chose**, as opposed to the one
+/// they happen to be on. See [`Stack::migrate_default_channel`] for why the
+/// distinction has to be written down.
+pub const CHANNEL_KEY: &str = "AINCIENT_CHANNEL";
 /// Default console port — "AINCI" in leet (4=A,1=I,2=N,2=C,1=I).
 pub const DEFAULT_PORT: u16 = 41221;
+
+/// Which stream of appliance images an install follows.
+///
+/// The registry publishes two moving tags — `:latest`, retagged on every release,
+/// and `:edge`, rebuilt on every merge to main — plus immutable `:vX.Y.Z` tags.
+/// A channel is therefore just a policy about which tag `AINCIENT_IMAGE` names;
+/// anything that isn't one of the two moving tags (a version tag, a digest, a
+/// locally-built image) is [`Pinned`](Channel::Pinned): it doesn't move on its
+/// own, so no update can arrive through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    /// `:latest` — released versions only. The default.
+    Stable,
+    /// `:edge` — every merge to main. Unreleased; may break.
+    Edge,
+    /// A specific version, digest, or a private image. Never moves.
+    Pinned,
+}
+
+impl Channel {
+    /// The two channels an operator can switch between. `Pinned` is deliberately
+    /// absent: you reach it by naming an image, not by choosing a channel.
+    pub const SWITCHABLE: [Channel; 2] = [Channel::Stable, Channel::Edge];
+
+    /// The moving tag this channel follows, if it is one.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Channel::Stable => Some("latest"),
+            Channel::Edge => Some("edge"),
+            Channel::Pinned => None,
+        }
+    }
+
+    /// The full image reference for this channel.
+    pub fn image(self) -> Option<String> {
+        self.tag().map(|tag| format!("{IMAGE_REPO}:{tag}"))
+    }
+
+    /// The machine name — what's written to `.env` and accepted on the CLI.
+    pub fn name(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable",
+            Channel::Edge => "edge",
+            Channel::Pinned => "pinned",
+        }
+    }
+
+    /// One line of prose, for a status line or a GUI row.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Channel::Stable => "stable — released versions",
+            Channel::Edge => "edge — every build off main, unreleased",
+            Channel::Pinned => "pinned — this exact image, no updates",
+        }
+    }
+
+    /// Parse an operator-supplied channel name. Generous about the synonyms
+    /// people reach for (`latest`, `release`, `main`, `dev`) — the registry tag
+    /// and the channel name aren't the same word, and confusing them shouldn't be
+    /// an error.
+    pub fn parse(s: &str) -> Option<Channel> {
+        match s.trim().to_lowercase().as_str() {
+            "stable" | "latest" | "release" | "releases" => Some(Channel::Stable),
+            "edge" | "main" | "dev" | "nightly" => Some(Channel::Edge),
+            _ => None,
+        }
+    }
+
+    /// Classify an image reference. Only our own repository's moving tags count
+    /// as channels — someone running a fork or a local build is pinned, whatever
+    /// they called the tag.
+    pub fn of_image(image: &str) -> Channel {
+        let Some((repo, tag)) = image.rsplit_once(':') else {
+            return Channel::Pinned;
+        };
+        // `repo@sha256:…` splits at the digest's colon, leaving the `@` behind.
+        if repo != IMAGE_REPO {
+            return Channel::Pinned;
+        }
+        match tag {
+            "latest" => Channel::Stable,
+            "edge" => Channel::Edge,
+            _ => Channel::Pinned,
+        }
+    }
+}
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
 /// step with the `cat > compose.yaml` heredoc in `docker/install.sh`: the slim
@@ -32,7 +133,7 @@ services:
       interval: 10s
       retries: 10
   app:
-    image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:edge}
+    image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:latest}
     depends_on:
       db:
         condition: service_healthy
@@ -187,6 +288,73 @@ impl Stack {
             .unwrap_or_else(|| DEFAULT_IMAGE.to_string())
     }
 
+    /// Which channel this install is actually on — derived from the image, which
+    /// is the only thing Docker obeys. [`CHANNEL_KEY`] is never consulted here:
+    /// it records a *choice*, and a hand-edited `AINCIENT_IMAGE` must win over a
+    /// stale marker rather than be contradicted by it.
+    pub fn channel(&self) -> Channel {
+        Channel::of_image(&self.image())
+    }
+
+    /// The channel the operator explicitly chose, if they ever did — `None` on an
+    /// install that predates channels or was never switched.
+    pub fn chosen_channel(&self) -> Option<Channel> {
+        self.env_get(CHANNEL_KEY).and_then(|v| Channel::parse(&v))
+    }
+
+    /// Point the stack at a channel's tag and record the choice. Returns the image
+    /// now configured.
+    ///
+    /// Writing `.env` is the whole of it — the image only actually changes on the
+    /// next pull, which is why callers follow this with an update rather than
+    /// claiming the switch already happened.
+    pub fn set_channel(&self, channel: Channel) -> Result<String> {
+        let image = channel
+            .image()
+            .context("`pinned` isn't a channel you can switch to — name an image instead")?;
+        let mut env = self.read_env();
+        env.insert("AINCIENT_IMAGE".to_string(), image.clone());
+        env.insert(CHANNEL_KEY.to_string(), channel.name().to_string());
+        self.write_env(&env)?;
+        Ok(image)
+    }
+
+    /// Move an install that never chose a channel off the old `:edge` default and
+    /// onto stable, once. Returns `Some((from, to))` if it moved anything.
+    ///
+    /// Before there were releases to point at, `:edge` *was* the default, so every
+    /// install made in that era is following unreleased builds without ever having
+    /// asked to. Flipping [`DEFAULT_IMAGE`] alone wouldn't reach them: the tag was
+    /// baked into their `.env` at install time and nothing re-reads the default.
+    ///
+    /// The guard is [`CHANNEL_KEY`] plus an exact match on [`LEGACY_DEFAULT_IMAGE`]:
+    /// a marker means the operator picked this channel and must be left alone, and
+    /// any other image (a version tag, a fork, a local build) is a decision too.
+    /// The migration writes the marker itself, so it can only ever fire once and a
+    /// deliberate move back to edge afterwards sticks.
+    pub fn migrate_default_channel(&self) -> Result<Option<(String, String)>> {
+        if !self.pending_default_channel_migration() {
+            return Ok(None);
+        }
+        let to = self.set_channel(Channel::Stable)?;
+        Ok(Some((LEGACY_DEFAULT_IMAGE.to_string(), to)))
+    }
+
+    /// Whether [`migrate_default_channel`](Self::migrate_default_channel) would
+    /// move this install — asked separately so a caller can take precautions (a
+    /// snapshot, a warning) *before* the `.env` changes under it.
+    pub fn pending_default_channel_migration(&self) -> bool {
+        self.exists()
+            && self.chosen_channel().is_none()
+            && self.env_get("AINCIENT_IMAGE").as_deref() == Some(LEGACY_DEFAULT_IMAGE)
+    }
+
+    /// Serialize the env map back to `.env`, keeping its `0600` perms.
+    fn write_env(&self, env: &BTreeMap<String, String>) -> Result<()> {
+        let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        write_private(&self.env_path(), &body)
+    }
+
     /// Lay down `compose.yaml` + `.env` if absent. Never clobbers an existing
     /// `.env` (preserves `HASH_SALT`); reconciles the image and port tunables on
     /// a re-run, mirroring `install.sh`.
@@ -205,12 +373,17 @@ impl Stack {
         if !env_path.is_file() {
             let image = opts.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string());
             let port = opts.http_port.unwrap_or(DEFAULT_PORT);
+            // A fresh install has chosen its channel by definition — whatever the
+            // image it was pointed at implies. Recording it here is what keeps the
+            // legacy-edge migration from ever looking at this install again.
             let contents = format!(
                 "HASH_SALT={salt}\n\
                  AINCIENT_IMAGE={image}\n\
+                 AINCIENT_CHANNEL={channel}\n\
                  HTTP_PORT={port}\n\
                  ADMIN_PASS=\n",
                 salt = hash_salt(),
+                channel = Channel::of_image(&image).name(),
             );
             write_private(&env_path, &contents)?;
         } else {
@@ -224,6 +397,14 @@ impl Stack {
             match &opts.image {
                 Some(image) => {
                     env.insert("AINCIENT_IMAGE".to_string(), image.clone());
+                    // Naming an image is choosing a channel (often `pinned`), so
+                    // the marker moves with it — otherwise the legacy-edge
+                    // migration could later "correct" a deliberate `--image
+                    // …:edge` back to stable.
+                    env.insert(
+                        CHANNEL_KEY.to_string(),
+                        Channel::of_image(image).name().to_string(),
+                    );
                 }
                 None => {
                     env.entry("AINCIENT_IMAGE".to_string())
@@ -239,8 +420,7 @@ impl Stack {
                         .or_insert_with(|| DEFAULT_PORT.to_string());
                 }
             }
-            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-            write_private(&env_path, &body)?;
+            self.write_env(&env)?;
         }
         Ok(())
     }
@@ -307,8 +487,7 @@ impl Stack {
             changes.push("restored the port setting".to_string());
         }
         if !changes.is_empty() {
-            let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-            write_private(&self.env_path(), &body)?;
+            self.write_env(&env)?;
         }
         Ok(changes)
     }
@@ -556,6 +735,119 @@ mod tests {
         assert_eq!(stack.env_get("HASH_SALT").unwrap().len(), 64);
         assert_eq!(stack.image(), DEFAULT_IMAGE);
         assert_eq!(stack.http_port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn a_fresh_install_is_on_the_stable_channel() {
+        let ts = TempStack::new();
+        ts.0.ensure_scaffold(&InstallOptions::default()).unwrap();
+
+        assert_eq!(ts.0.image(), "ghcr.io/aincient-labs/atelier-cms:latest");
+        assert_eq!(ts.0.channel(), Channel::Stable);
+        // The marker is written on install, so this stack can never be mistaken
+        // for one that never chose.
+        assert_eq!(ts.0.chosen_channel(), Some(Channel::Stable));
+    }
+
+    #[test]
+    fn channels_are_classified_from_the_image() {
+        assert_eq!(
+            Channel::of_image("ghcr.io/aincient-labs/atelier-cms:latest"),
+            Channel::Stable
+        );
+        assert_eq!(
+            Channel::of_image("ghcr.io/aincient-labs/atelier-cms:edge"),
+            Channel::Edge
+        );
+        // A version tag doesn't move, so it isn't a channel.
+        assert_eq!(
+            Channel::of_image("ghcr.io/aincient-labs/atelier-cms:v0.1.2"),
+            Channel::Pinned
+        );
+        assert_eq!(
+            Channel::of_image("ghcr.io/aincient-labs/atelier-cms@sha256:abc123"),
+            Channel::Pinned
+        );
+        // Someone else's `:latest` is not our stable channel.
+        assert_eq!(Channel::of_image("example.com/fork/atelier-cms:latest"), Channel::Pinned);
+        assert_eq!(Channel::of_image("atelier-cms-local"), Channel::Pinned);
+    }
+
+    #[test]
+    fn set_channel_rewrites_the_image_and_records_the_choice() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let salt = stack.env_get("HASH_SALT").unwrap();
+
+        let image = stack.set_channel(Channel::Edge).unwrap();
+
+        assert_eq!(image, "ghcr.io/aincient-labs/atelier-cms:edge");
+        assert_eq!(stack.image(), image);
+        assert_eq!(stack.channel(), Channel::Edge);
+        assert_eq!(stack.chosen_channel(), Some(Channel::Edge));
+        assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must survive a switch");
+    }
+
+    #[test]
+    fn a_legacy_edge_install_is_moved_to_stable_once() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        // Exactly what the pre-channels installer wrote: the old default image,
+        // and no channel marker at all.
+        std::fs::create_dir_all(&stack.home).unwrap();
+        std::fs::write(stack.compose_path(), COMPOSE_TEMPLATE).unwrap();
+        std::fs::write(
+            stack.env_path(),
+            format!("HASH_SALT={}\nAINCIENT_IMAGE={LEGACY_DEFAULT_IMAGE}\nHTTP_PORT=41221\n", "a".repeat(64)),
+        )
+        .unwrap();
+
+        let moved = stack.migrate_default_channel().unwrap();
+
+        assert_eq!(
+            moved,
+            Some((LEGACY_DEFAULT_IMAGE.to_string(), DEFAULT_IMAGE.to_string()))
+        );
+        assert_eq!(stack.channel(), Channel::Stable);
+
+        // Once only: a deliberate move back to edge afterwards must stick, even
+        // though the image is once again the legacy string.
+        stack.set_channel(Channel::Edge).unwrap();
+        assert_eq!(stack.migrate_default_channel().unwrap(), None);
+        assert_eq!(stack.channel(), Channel::Edge);
+    }
+
+    #[test]
+    fn migration_leaves_pinned_and_chosen_installs_alone() {
+        // A pinned version tag is a decision, not a leftover default.
+        let pinned = TempStack::new();
+        pinned
+            .0
+            .ensure_scaffold(&InstallOptions {
+                image: Some("ghcr.io/aincient-labs/atelier-cms:v0.1.1".into()),
+                http_port: None,
+            })
+            .unwrap();
+        assert_eq!(pinned.0.migrate_default_channel().unwrap(), None);
+        assert_eq!(pinned.0.image(), "ghcr.io/aincient-labs/atelier-cms:v0.1.1");
+
+        // `--image …:edge` records the choice, so the migration must not undo it.
+        let chose_edge = TempStack::new();
+        chose_edge
+            .0
+            .ensure_scaffold(&InstallOptions {
+                image: Some(LEGACY_DEFAULT_IMAGE.into()),
+                http_port: None,
+            })
+            .unwrap();
+        assert_eq!(chose_edge.0.chosen_channel(), Some(Channel::Edge));
+        assert_eq!(chose_edge.0.migrate_default_channel().unwrap(), None);
+        assert_eq!(chose_edge.0.channel(), Channel::Edge);
+
+        // And with no stack at all there is nothing to migrate.
+        let empty = TempStack::new();
+        assert_eq!(empty.0.migrate_default_channel().unwrap(), None);
     }
 
     #[test]

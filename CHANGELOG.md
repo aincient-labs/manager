@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Update channels: new installs follow released versions, and you can choose.** The
+  appliance image publishes two moving tags — `:latest`, retagged on every release, and
+  `:edge`, rebuilt on every merge to main — but the manager only ever pointed at `:edge`,
+  because when it was written there were no releases to point at. That is no longer true, so
+  the default is now **stable** (`:latest`): released versions only.
+  - `atelier app channel` says which channel you're on and what the alternative is;
+    `atelier app channel stable|edge` switches, and `--now` pulls and converges immediately
+    instead of waiting for your next update.
+  - `atelier app install --channel stable|edge` picks one at install time. `--image` still
+    pins one exact image (and is now reported as such: a pinned image can never receive an
+    update, which `check-update`'s cheerful "you're on the latest" used to hide).
+  - `app status` and `doctor` both name the channel — a pasted report now answers "why hasn't
+    this updated" and "why did this change under me" without a second command.
+  - In the GUI: **Settings → Your installation → Updates**.
+- **Existing installs are moved onto released versions, once.** An install still carrying the
+  old default `:edge` never *chose* unreleased builds, so `install`/`update` move it to
+  `:latest`, say so, and tell you how to go back. It takes a full snapshot (database + files)
+  first: edge can be ahead of the newest release and a Drupal database only migrates forward,
+  so this direction is the risky one. A deliberate `--channel edge`, an `--image` pin, or a
+  channel you picked yourself is recorded in `.env` (`AINCIENT_CHANNEL`) and left alone — the
+  move can only ever happen to an install that never expressed a preference, and only once.
+
 ## [0.3.0] - 2026-08-04
 
 ### Added

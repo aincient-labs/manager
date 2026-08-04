@@ -257,7 +257,10 @@ function renderStatus(status) {
 
   // Keep any open panels honest about the new state.
   if (currentTab === "publish") updatePublishGate();
-  if (currentTab === "settings") $("image-tag").textContent = status.image || "—";
+  if (currentTab === "settings") {
+    $("image-tag").textContent = status.image || "—";
+    renderChannel();
+  }
 }
 
 async function refreshUpdate() {
@@ -342,6 +345,31 @@ async function refreshBackups() {
 function loadSettings() {
   $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
   $("manager-version-row").textContent = managerVersion || "—";
+  renderChannel();
+}
+
+// Which images this install follows. A pinned image (a specific version, or one
+// built by hand) belongs to neither channel, so it gets its own option rather
+// than being misreported as one of the two — picking a real channel is how you
+// leave it.
+function renderChannel() {
+  const select = $("channel-select");
+  const hint = $("channel-hint");
+  const channel = (lastStatus && lastStatus.channel) || "stable";
+  select.querySelector('option[value="pinned"]')?.remove();
+  if (channel === "pinned") {
+    const opt = document.createElement("option");
+    opt.value = "pinned";
+    opt.textContent = "This exact version (pinned)";
+    select.prepend(opt);
+  }
+  select.value = channel;
+  hint.textContent =
+    channel === "edge"
+      ? "Every new build off main, before it's released. Expect rough edges."
+      : channel === "pinned"
+        ? "Pinned to one image, so no updates arrive. Pick a channel to follow updates again."
+        : "Released versions only — the recommended choice.";
 }
 
 async function refreshLogs() {
@@ -677,6 +705,30 @@ document.addEventListener("click", (e) => {
     e.preventDefault();
     invoke("open_url", { url: link.href }).catch((err) => showError(String(err)));
   }
+});
+
+// Changing the channel pulls the other image and converges onto it, so it goes
+// through the same confirm + progress overlay as any other lifecycle op. On
+// cancel (or failure) the select is put back where it was — it must never show a
+// channel the appliance isn't actually on.
+$("channel-select").addEventListener("change", async (e) => {
+  const target = e.target.value;
+  if (target === "pinned") {
+    renderChannel();
+    return;
+  }
+  const msg =
+    target === "edge"
+      ? "Edge builds come straight off main and haven't been released — they can break. Atelier backs up and rolls back if an update fails. Switch to edge?"
+      : "Edge can be ahead of the newest release, and a site's database only migrates forward. Atelier snapshots first and rolls back if the switch fails. Switch to released versions?";
+  if (!(await confirmModal(msg))) {
+    renderChannel();
+    return;
+  }
+  // runProgressOp refreshes the status itself (and reports failures), so the row
+  // is re-rendered from what the appliance now reports, not from the click.
+  await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }));
+  renderChannel();
 });
 
 initPublishPrefs();

@@ -26,6 +26,7 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | `app install`            | Lay down `~/.atelier/{compose.yaml,.env}`, pull, `up -d`. Idempotent.     |
 | `app update`             | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
 | `app check-update`       | Compare the local image digest against the registry tag. (alias `app check`) |
+| `app channel [stable\|edge]` | Show or switch which images the install follows. `--now` pulls immediately. |
 | `app reinstall`          | Wipe volumes and install fresh (destructive, confirmed).                  |
 | `app status`             | Read-only health probe. (The full checkup is the flat `doctor`.)          |
 | `app start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.              |
@@ -41,6 +42,20 @@ never a bare top-level verb (it means one of three things — static site, db+fi
 so it's always qualified by its namespace). The stack directory defaults to `~/.atelier`
 (override with `ATELIER_HOME`) and holds the same `compose.yaml` + `.env` the
 `docker/install.sh` bootstrapper writes.
+
+### Channels
+
+`AINCIENT_IMAGE` decides everything Docker does, so a "channel" is just a policy about which tag
+it names: **stable** = `:latest` (retagged on every release, the default), **edge** = `:edge`
+(rebuilt on every merge to main), and anything else — a `:vX.Y.Z` tag, a digest, a local build —
+is **pinned** and never moves, so no update can arrive through it.
+
+`.env` also carries `AINCIENT_CHANNEL`, which records the channel the operator *chose* rather than
+the one they're on. It exists for exactly one reason: installs made before there were releases
+have `:edge` baked into their `.env` because edge was all there was, and they need to be told apart
+from an operator who asked for unreleased builds. `install`/`update` move the former onto stable
+once (snapshotting first — edge can be *ahead* of the newest release, and Drupal only migrates
+forward), announce it, and write the marker so it can never fire twice.
 
 ### `doctor`
 

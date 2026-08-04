@@ -378,6 +378,19 @@
               <span class="kv-label">Manager</span>
               <span id="manager-version-row" class="kv-value">—</span>
             </div>
+            <!-- Which images this install follows. Default is released versions;
+                 "every new build" is the testers' path and says so, because it
+                 ships work that hasn't been through a release. -->
+            <div class="kv">
+              <span class="kv-label">Updates</span>
+              <span class="kv-value">
+                <select id="channel-select">
+                  <option value="stable">Released versions</option>
+                  <option value="edge">Every new build (for testers)</option>
+                </select>
+              </span>
+            </div>
+            <p id="channel-hint" class="hint">Released versions only — the recommended choice.</p>
             <button class="btn small full" data-action="check-update">
               <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
             </button>

@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use aincient_core::{doctor, ops, InstallOptions, Stack};
+use aincient_core::{doctor, ops, Channel, InstallOptions, Stack};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -77,12 +77,33 @@ enum AppCommand {
     },
     /// Install the appliance (or upgrade in place if already installed).
     Install {
-        /// Image tag to run.
+        /// Which images to follow: `stable` (released versions, the default) or
+        /// `edge` (every build off main — unreleased, may break).
+        #[arg(long, value_name = "CHANNEL", conflicts_with = "image")]
+        channel: Option<String>,
+        /// Image tag to run — pins this exact image, following no channel.
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
         /// Host port for the console.
         #[arg(long, value_name = "PORT")]
         port: Option<u16>,
+    },
+    /// Show which images this install follows, or switch it to another channel.
+    ///
+    /// `stable` tracks released versions (`:latest`); `edge` tracks every build
+    /// off main (`:edge`) — unreleased and may break. Switching rewrites the
+    /// stack's image setting; the new image arrives on the next update, or
+    /// immediately with --now.
+    Channel {
+        /// The channel to switch to. Omit to show the current one.
+        #[arg(value_name = "stable|edge")]
+        channel: Option<String>,
+        /// Pull and converge onto the new channel right away.
+        #[arg(long)]
+        now: bool,
+        /// Skip the confirmation when the switch may step backwards.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Pull a newer image and converge in place (snapshot + auto-rollback).
     Update,
@@ -319,9 +340,16 @@ fn run() -> Result<()> {
 fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
     match command {
         AppCommand::Status { json } => status(stack, json),
-        AppCommand::Install { image, port } => {
+        AppCommand::Install {
+            channel,
+            image,
+            port,
+        } => {
             let opts = InstallOptions {
-                image,
+                image: match channel {
+                    Some(name) => parse_channel(&name)?.image(),
+                    None => image,
+                },
                 http_port: port,
             };
             if ops::install(stack, &opts, &mut CliReporter::default())? {
@@ -340,6 +368,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             }
             Ok(())
         }
+        AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
             if !confirm(
@@ -684,6 +713,87 @@ fn first_line(s: &str) -> String {
         .to_string()
 }
 
+/// Accept a channel name, rejecting `pinned` — it's a state you land in by
+/// naming an image, not one you can switch to.
+fn parse_channel(name: &str) -> Result<Channel> {
+    match Channel::parse(name) {
+        Some(Channel::Pinned) | None => anyhow::bail!(
+            "unknown channel {name:?} — use `stable` (released versions) or `edge` \
+             (every build off main). To run one specific image, pass `--image` to \
+             `atelier app install` instead."
+        ),
+        Some(c) => Ok(c),
+    }
+}
+
+/// `atelier app channel [stable|edge]` — show or switch the image stream.
+fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> Result<()> {
+    let current = stack.channel();
+    let Some(name) = channel else {
+        println!("  Channel:  {}", current.describe());
+        println!("  Image:    {}", stack.image());
+        match current {
+            Channel::Stable => println!(
+                "\nTo follow unreleased builds off main: `atelier app channel edge`."
+            ),
+            Channel::Edge => println!(
+                "\nTo follow released versions only: `atelier app channel stable`."
+            ),
+            Channel::Pinned => println!(
+                "\nThis image never moves, so updates won't arrive. \
+                 `atelier app channel stable` follows releases again."
+            ),
+        }
+        return Ok(());
+    };
+
+    let target = parse_channel(&name)?;
+    if target == current {
+        println!(
+            "{} {}",
+            style::success("Already on"),
+            target.describe()
+        );
+        return Ok(());
+    }
+
+    // Edge is built from every merge, so it can be ahead of the newest release:
+    // moving to stable can hand an older codebase a database a newer one already
+    // migrated, and Drupal only migrates forward. Say so before doing it.
+    if current == Channel::Edge && target == Channel::Stable {
+        println!(
+            "{}",
+            style::warn(
+                "Edge builds can be ahead of the newest release, and a site's database \
+                 only migrates forward. The appliance snapshots and rolls back if the \
+                 switch fails, but take your own backup first if the site matters: \
+                 `atelier data backup`."
+            )
+        );
+        if !confirm("Switch to released versions anyway?", yes)? {
+            println!("{}", style::warn("Aborted."));
+            return Ok(());
+        }
+    }
+
+    let (image, ready) = ops::switch_channel(stack, target, now, &mut CliReporter::default())?;
+    match ready {
+        Some(true) => done_banner(
+            &format!("Now on {}.", target.describe()),
+            &stack.console_url(),
+        ),
+        Some(false) => pending_banner(
+            &format!("Switched to {} — still finishing boot.", target.name()),
+            &stack.console_url(),
+        ),
+        None => println!(
+            "{} {image}\nRun `atelier app update` to pull it (or re-run with --now).",
+            style::success(&format!("Channel set to {}:", target.name())),
+        ),
+    }
+    Ok(())
+}
+
 fn status(stack: &Stack, json: bool) -> Result<()> {
     let st = ops::status(stack);
     if json {
@@ -695,6 +805,7 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     line("Console reachable", st.reachable);
     println!("  Console:  {}", style::url(&st.console_url));
     println!("  Image:    {}", st.image);
+    println!("  Channel:  {}", st.channel.describe());
     if !st.installed {
         println!(
             "\n{}",
@@ -720,6 +831,15 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
             check.image,
             from,
             check.latest_version.as_deref().unwrap_or("a newer build"),
+        ),
+        // On a pinned image "up to date" is true but useless — the tag can't move,
+        // so no update will ever arrive through it. Say which it is.
+        Some(false) if stack.channel() == Channel::Pinned => println!(
+            "{} {} ({}) — a pinned image, so updates never arrive here. \
+             `atelier app channel stable` follows releases.",
+            style::success("You're on"),
+            check.image,
+            from,
         ),
         Some(false) => println!(
             "{} {} ({}).",

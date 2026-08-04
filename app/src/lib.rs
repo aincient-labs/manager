@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, ops, Backup, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage, Status,
-    UpdateCheck,
+    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage,
+    Status, UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -155,6 +155,26 @@ async fn do_update(app: AppHandle) -> Result<(), String> {
     blocking(move || {
         ops::update(&s, &mut EventReporter { app }).map_err(err)?;
         Ok(())
+    })
+    .await
+}
+
+/// Switch which images this install follows, then pull and converge onto the new
+/// channel. Always applies: a settings toggle that silently waits for some later
+/// update would leave the UI claiming a state the appliance isn't in.
+///
+/// The frontend confirms first — a move from edge to stable can hand an older
+/// codebase a database a newer one already migrated.
+#[tauri::command]
+async fn set_channel(app: AppHandle, channel: String) -> Result<String, String> {
+    let target = Channel::parse(&channel)
+        .filter(|c| *c != Channel::Pinned)
+        .ok_or_else(|| format!("unknown channel {channel:?} — use \"stable\" or \"edge\""))?;
+    let s = stack()?;
+    blocking(move || {
+        ops::switch_channel(&s, target, true, &mut EventReporter { app })
+            .map(|(image, _ready)| image)
+            .map_err(err)
     })
     .await
 }
@@ -444,6 +464,7 @@ pub fn run() {
             site_export,
             get_model_roles,
             set_model_role,
+            set_channel,
             run_doctor,
             run_doctor_fix,
             manager_version,

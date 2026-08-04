@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::docker::{
     self, compose, preflight, run_capture, run_inherited, run_streaming, try_capture,
 };
-use crate::stack::{InstallOptions, Stack};
+use crate::stack::{Channel, InstallOptions, Stack};
 
 /// drush, as invoked inside the `app` container.
 pub(crate) const DRUSH: &[&str] = &["/opt/drupal/vendor/bin/drush", "--root=/opt/drupal/web"];
@@ -89,6 +89,8 @@ pub struct Status {
     /// target, distinct from the `/atelier` console.
     pub site_url: String,
     pub image: String,
+    /// Which stream of images this install follows — stable, edge, or pinned.
+    pub channel: Channel,
     /// Local image digest (best effort).
     pub image_digest: Option<String>,
 }
@@ -175,6 +177,7 @@ pub fn status(stack: &Stack) -> Status {
         console_url: stack.console_url(),
         site_url: stack.site_url(),
         image: stack.image(),
+        channel: stack.channel(),
         image_digest: local_digest(&stack.image()),
     }
 }
@@ -317,6 +320,9 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     preflight().require()?;
     r.stage(Stage::Scaffold, "Preparing the stack…", Some(0.08));
     stack.ensure_scaffold(opts)?;
+    if opts.image.is_none() {
+        announce_channel_migration(stack, r)?;
+    }
     pull(stack, r)?;
     up(stack, r)?;
     Ok(wait_until_ready(stack, READY_TIMEOUT, r))
@@ -328,9 +334,83 @@ pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
     preflight().require()?;
+    announce_channel_migration(stack, r)?;
     pull(stack, r)?;
     up(stack, r)?;
     Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+}
+
+/// Run the one-time legacy-`:edge` → stable move, and say so out loud.
+///
+/// A channel change moves the install to a different image, so it must never be
+/// silent — the operator has to be able to connect "I ran update" to "I'm on
+/// releases now", and to reverse it. Reported through `stage` rather than `log`
+/// because the CLI prints stages and drops log lines.
+///
+/// It can also be a step *backwards*: `:edge` is built from every merge, so it can
+/// sit ahead of the newest release, and Drupal's `hook_update_N` only runs forward.
+/// `converge.sh` snapshots the database and rolls back if the migrated site fails
+/// its health check, but a rollback leaves the older image in place — so this takes
+/// a full portable snapshot (database + files) first, while the *old* image is still
+/// the one running. Best effort: if the snapshot can't be taken the switch still
+/// proceeds, since converge's own rollback is the real safety net.
+fn announce_channel_migration(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    if !stack.pending_default_channel_migration() {
+        return Ok(());
+    }
+    if status(stack).running {
+        r.stage(Stage::Working, "Backing up before switching channels…", Some(0.09));
+        match backup(stack, Some("before-channel-switch"), r) {
+            Ok(path) => r.stage(
+                Stage::Working,
+                &format!("Snapshot saved: {}", path.display()),
+                Some(0.1),
+            ),
+            Err(e) => r.stage(
+                Stage::Working,
+                &format!(
+                    "Couldn't take a snapshot first ({e:#}) — continuing; the appliance \
+                     rolls its own database back if the upgrade fails."
+                ),
+                Some(0.1),
+            ),
+        }
+    }
+    if let Some((from, to)) = stack.migrate_default_channel()? {
+        r.stage(
+            Stage::Scaffold,
+            &format!(
+                "Switching you to released versions ({to}). You were on {from}, which \
+                 was the old default. To follow unreleased builds again: \
+                 `atelier app channel edge`.",
+            ),
+            Some(0.11),
+        );
+    }
+    Ok(())
+}
+
+/// Point the install at a different channel and, unless `apply` is false, pull it
+/// and converge onto it straight away.
+///
+/// Returns the image now configured plus (when applied) whether the console came
+/// back up before the readiness timeout. Without `apply` nothing has actually
+/// changed yet in Docker's eyes — the new tag is only fetched on the next update.
+pub fn switch_channel(
+    stack: &Stack,
+    channel: Channel,
+    apply: bool,
+    r: &mut dyn Reporter,
+) -> Result<(String, Option<bool>)> {
+    ensure_installed(stack)?;
+    let image = stack.set_channel(channel)?;
+    if !apply {
+        return Ok((image, None));
+    }
+    preflight().require()?;
+    pull(stack, r)?;
+    up(stack, r)?;
+    Ok((image, Some(wait_until_ready(stack, READY_TIMEOUT, r))))
 }
 
 /// `docker compose pull`, with a registry-login hint for the private image.

@@ -553,8 +553,17 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     // The stack files are on disk, so this one is answerable even without Docker.
     let scaffolded = stack.exists();
     out.push(if scaffolded {
+        // The channel rides along on this line: which image stream an install
+        // follows explains both "why do I have no updates" (pinned) and "why did
+        // something change under me" (edge), and a pasted report should answer
+        // those without a second command.
         Check::ok("stack.present", Tier::Stack, "Stack files present")
-            .detail(stack.home.display().to_string())
+            .detail(format!(
+                "{} — {} ({})",
+                stack.home.display(),
+                stack.image(),
+                stack.channel().name()
+            ))
     } else {
         Check::bad(
             "stack.present",
