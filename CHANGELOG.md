@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The Publish tab hands you to a host instead of stopping at a folder.** Exporting used to end
+  with a path and a link to the docs — the last thing you see, at the moment you most want to be
+  finished, was a directory. The result now carries the next step with it: Netlify Drop,
+  Cloudflare Pages, and our deploy template each get a row, and each button reveals the export
+  folder *and* opens the host in your browser, so the files are sitting there ready to drag. The
+  export location gained a copy button, and a disclosure holds the ready-made
+  `netlify deploy --prod --dir="…"` for people who'd rather type it. No accounts, tokens or
+  credentials are involved — Atelier still stores nothing about your host.
+- **An export made without a website address now says what that costs.** Leaving the address blank
+  makes the exporter render against the address the appliance runs on locally, so page links,
+  social previews and the sitemap all point at your own computer — silently, and only visible once
+  the site was live. The result panel now flags it and points back at the field.
 - **Every desktop bundle now ships a `.sha256` checksum sibling.** The `.dmg`, `.msi`, `.exe`,
   `.AppImage`, `.deb` and `.rpm` had none — only cargo-dist's CLI archives did — so a download
   page could not publish a verifiable hash for the app most people actually install. The hash is

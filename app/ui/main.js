@@ -19,6 +19,7 @@ let lastStatus = null; // most recent get_status, so panels can adapt to it
 let currentTab = "home";
 let exportDir = null; // folder chosen for the static export
 let lastExportPath = null; // where the last export landed, for "Open the folder"
+let lastExportHadBaseUrl = false; // did that export get a real website address?
 let managerVersion = ""; // this app's own version, shown in the chrome
 
 // Stamp the manager's version into the title bar once, before anything else can
@@ -307,6 +308,40 @@ function updatePublishGate() {
   $("export-btn").classList.toggle("hidden", !running);
 }
 
+function revealExport() {
+  if (!lastExportPath) return;
+  invoke("reveal_path", { path: lastExportPath }).catch((e) => showError(String(e)));
+}
+
+// Hand the export off to a host: put the folder on screen (it's about to be
+// dragged) and open the host in the system browser, never in this window.
+function openHost(url) {
+  revealExport();
+  invoke("open_url", { url }).catch((e) => showError(String(e)));
+}
+
+// Copy to the clipboard and say so on the button itself — a silent copy leaves
+// people wondering whether it worked.
+async function copyText(text, button) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    showError("Couldn't reach the clipboard — you can select the text and copy it by hand.");
+    return;
+  }
+  if (!button) return;
+  const label = button.querySelector("span") ?? button;
+  if (button.dataset.copyBusy) return;
+  button.dataset.copyBusy = "1";
+  const original = label.textContent;
+  label.textContent = "Copied";
+  setTimeout(() => {
+    label.textContent = original;
+    delete button.dataset.copyBusy;
+  }, 1600);
+}
+
 // --- Backups panel ----------------------------------------------------------
 
 async function refreshBackups() {
@@ -573,10 +608,11 @@ const actions = {
     if (!exportDir) return;
     lastExportPath = null;
     $("publish-result").classList.add("hidden");
+    const baseUrl = $("export-baseurl").value.trim() || null;
     const ok = await runProgressOp("Exporting your site", async () => {
       lastExportPath = await invoke("site_export", {
         out: exportDir,
-        baseUrl: $("export-baseurl").value.trim() || null,
+        baseUrl,
         zip: $("export-zip").checked,
         includeConfig: $("export-config").checked,
         includeUsers: $("export-users").checked,
@@ -584,15 +620,28 @@ const actions = {
       });
     });
     if (ok && lastExportPath) {
+      lastExportHadBaseUrl = baseUrl !== null;
       $("export-path").textContent = lastExportPath;
+      $("export-cli-cmd").textContent = `netlify deploy --prod --dir="${lastExportPath}"`;
+      $("export-baseurl-warn").classList.toggle("hidden", lastExportHadBaseUrl);
       $("publish-result").classList.remove("hidden");
     }
   },
 
-  "reveal-export": () => {
-    if (!lastExportPath) return;
-    invoke("reveal_path", { path: lastExportPath }).catch((e) => showError(String(e)));
+  "reveal-export": () => revealExport(),
+
+  "copy-export-path": (el) => {
+    if (lastExportPath) copyText(lastExportPath, el);
   },
+
+  "copy-deploy-cmd": (el) => copyText($("export-cli-cmd").textContent, el),
+
+  // Each host hand-off does the same two things: reveal the export folder so
+  // it's sitting there to drag, then open the host in the real browser.
+  "host-netlify": () => openHost("https://app.netlify.com/drop"),
+  "host-cloudflare": () => openHost("https://dash.cloudflare.com/?to=/:account/pages/new/upload"),
+  "host-template": () =>
+    openHost("https://github.com/aincient-labs/atelier-deploy-template/generate"),
 
   // ---- Backups ----
   backup: () => runProgressOp("Backing up your site", () => invoke("do_backup", { label: null })),
@@ -724,7 +773,7 @@ document.addEventListener("click", (e) => {
     const fn = actions[name];
     if (fn) {
       e.preventDefault();
-      fn();
+      fn(target);
     }
     return;
   }

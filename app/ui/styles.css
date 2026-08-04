@@ -1109,6 +1109,54 @@ select:focus {
   word-break: break-all;
 }
 
+/* The export result stacks its own cards, so it needs the panel's own rhythm. */
+#publish-result {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Host hand-off list — one row per host: what it is on the left, the way in on
+   the right. Rules between rows, never boxes; the card is the box (Law 02). */
+.host-list {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+}
+.host {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 0;
+}
+.host + .host {
+  border-top: 1px solid var(--border);
+}
+.host-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.host-text strong {
+  font-size: 13px;
+  font-weight: 550;
+}
+.host .btn {
+  flex: none;
+}
+#export-cli-cmd + .btn {
+  margin-top: 10px;
+  width: fit-content;
+}
+@media (max-width: 560px) {
+  .host {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 /* Empty-state hint inside the backups panel. */
 #backups-empty {
   margin: 0;

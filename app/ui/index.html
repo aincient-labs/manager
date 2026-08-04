@@ -30,6 +30,14 @@
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
         <polyline points="7 10 12 15 17 10" /><line x1="12" x2="12" y1="15" y2="3" />
       </symbol>
+      <symbol id="i-upload" viewBox="0 0 24 24">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+        <polyline points="17 8 12 3 7 8" /><line x1="12" x2="12" y1="3" y2="15" />
+      </symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24">
+        <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+      </symbol>
       <symbol id="i-backup" viewBox="0 0 24 24">
         <ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M3 5V19A9 3 0 0 0 21 19V5" />
         <path d="M3 12A9 3 0 0 0 21 12" />
@@ -298,19 +306,92 @@
           <svg class="ic"><use href="#i-globe" /></svg>Export my site
         </button>
 
-        <!-- Success state, revealed after an export completes. -->
-        <div id="publish-result" class="card done-card hidden">
-          <h3 class="done-head"><svg class="ic"><use href="#i-check" /></svg>Your site is ready to publish</h3>
-          <p class="muted">We saved it here:</p>
-          <p id="export-path" class="path-line"></p>
-          <div class="inline-links">
-            <button class="btn small" data-action="reveal-export">
-              <svg class="ic"><use href="#i-folder" /></svg>Open the folder
-            </button>
-            <a class="link" href="https://aincient-labs.com/docs/deploy" target="_blank" rel="noreferrer">
-              <svg class="ic"><use href="#i-book" /></svg>How to put it online
-            </a>
+        <!-- Success state, revealed after an export completes. Export is only
+             half the job — the folder is a dead end unless we hand people
+             straight to a host, so the result carries the next step with it. -->
+        <div id="publish-result" class="hidden">
+          <div class="card done-card">
+            <h3 class="done-head"><svg class="ic"><use href="#i-check" /></svg>Your site is ready to publish</h3>
+            <p class="muted">We saved it here:</p>
+            <p id="export-path" class="path-line"></p>
+            <div class="inline-links">
+              <button class="btn small" data-action="reveal-export">
+                <svg class="ic"><use href="#i-folder" /></svg>Open the folder
+              </button>
+              <button class="btn small" data-action="copy-export-path">
+                <svg class="ic"><use href="#i-copy" /></svg><span>Copy the location</span>
+              </button>
+            </div>
           </div>
+
+          <!-- Shown only when the export ran without a website address. The
+               exporter falls back to the address Atelier runs on locally, so
+               canonical links, social previews and the sitemap all point at this
+               computer — fine for a look around, wrong the moment it's live. -->
+          <div id="export-baseurl-warn" class="card warn hidden">
+            <p class="muted">
+              <strong>These pages still point at this computer.</strong> You exported
+              without a website address, so links inside the pages, the social
+              previews and the sitemap all use the local address Atelier runs on.
+              Good enough to look around — before you go live, fill in
+              <em>Your website address</em> above and export again.
+            </p>
+          </div>
+
+          <section class="group">
+            <h3 class="group-label"><svg class="ic"><use href="#i-upload" /></svg>Now put it online</h3>
+            <div class="card">
+              <p class="muted">
+                What Atelier made is ordinary web files, so any host will take them.
+                Here are three that are free to start with — easiest first.
+              </p>
+              <ul class="host-list">
+                <li class="host">
+                  <div class="host-text">
+                    <strong>Netlify Drop</strong>
+                    <span class="muted">Drag the folder onto the page. Nothing to set up, and your site is live in seconds.</span>
+                  </div>
+                  <button class="btn small" data-action="host-netlify">
+                    <svg class="ic"><use href="#i-open" /></svg>Open it
+                  </button>
+                </li>
+                <li class="host">
+                  <div class="host-text">
+                    <strong>Cloudflare Pages</strong>
+                    <span class="muted">Upload the folder from your dashboard. Free custom domains and certificates.</span>
+                  </div>
+                  <button class="btn small" data-action="host-cloudflare">
+                    <svg class="ic"><use href="#i-open" /></svg>Open it
+                  </button>
+                </li>
+                <li class="host">
+                  <div class="host-text">
+                    <strong>GitHub Pages, Vercel, or a host you already use</strong>
+                    <span class="muted">Start from our ready-made template: copy it, put your export in <code>site/</code>, push.</span>
+                  </div>
+                  <button class="btn small" data-action="host-template">
+                    <svg class="ic"><use href="#i-open" /></svg>Open it
+                  </button>
+                </li>
+              </ul>
+              <p class="hint">Each button opens the host in your browser and reveals your export folder, ready to drag.</p>
+
+              <details class="advanced">
+                <summary><svg class="ic chev"><use href="#i-chevron" /></svg>I'd rather use the terminal</summary>
+                <p class="muted">With the Netlify CLI installed (<code>npm i -g netlify-cli</code>):</p>
+                <p id="export-cli-cmd" class="path-line"></p>
+                <button class="btn small" data-action="copy-deploy-cmd">
+                  <svg class="ic"><use href="#i-copy" /></svg><span>Copy the command</span>
+                </button>
+              </details>
+
+              <div class="inline-links">
+                <a class="link" href="https://aincient-labs.com/docs/deploy" target="_blank" rel="noreferrer">
+                  <svg class="ic"><use href="#i-book" /></svg>Step-by-step guides for every host
+                </a>
+              </div>
+            </div>
+          </section>
         </div>
 
         <p class="help-line">
