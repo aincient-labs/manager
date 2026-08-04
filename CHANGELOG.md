@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`app update` steps through intermediate versions when one hop can't get there.** A release
+  can be unable to migrate arbitrarily old state: the update that uninstalls a module has to run
+  while that module is still present, so the release that finally drops it can only migrate sites
+  that already ran it. The appliance now declares the oldest version it can migrate from and
+  refuses anything older before touching the database — which is safe, but on its own leaves you
+  to work the route out by hand.
+  - `atelier app update` reads those declarations **from the registry, pulling nothing** (the OCI
+    label `dev.atelier.upgrade.min-from`), walks them backwards from the target until it reaches a
+    version your install satisfies, and shows the route — `from 0.1.1 → 0.3.0 → 0.4.0`, with the
+    reason each waypoint is there — before anything happens. Confirm and it walks the whole thing;
+    `-y` skips the prompt.
+  - A **full snapshot** is taken before the first hop, and each hop pulls, migrates and is
+    health-checked before the next one starts (it has to be: the floor is checked against the
+    version the site recorded on its last successful converge). A hop that doesn't come up stops
+    the route and says where it stopped, rather than pressing on into a refusal.
+  - `app check-update` reports the same route, so a five-minute upgrade is visible before you
+    start it rather than during. Also in the GUI: **Update** asks first when the route has more
+    than one step, and Settings → Updates says how many.
+  - New `app update --to X.Y.Z` stops at a specific version. It leaves the install **pinned** to
+    that version — said out loud, with the command to resume following releases.
+  - Reading either the registry or your installed image can fail, and neither is treated as a
+    reason to block an update: the plan falls back to one direct hop and explains that the route
+    wasn't verified. The appliance's own refusal is the safety net, and it costs no data.
 - **Update channels: new installs follow released versions, and you can choose.** The
   appliance image publishes two moving tags — `:latest`, retagged on every release, and
   `:edge`, rebuilt on every merge to main — but the manager only ever pointed at `:edge`,

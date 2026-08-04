@@ -516,7 +516,33 @@ const actions = {
     return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }));
   },
 
-  update: () => runProgressOp("Updating Atelier", () => invoke("do_update")),
+  // A very old site can't always reach the newest release in one move: a release
+  // that drops code can only migrate a site that's already past it. The backend
+  // works the route out and walks it; this asks first, because a multi-step
+  // upgrade runs several migrations and takes far longer than the one restart
+  // "Update" implies. Any failure to plan is not a reason to block the update —
+  // the appliance refuses an impossible migration itself, without touching data.
+  update: async () => {
+    let plan = null;
+    try {
+      plan = (await invoke("get_update")).plan;
+    } catch {
+      /* couldn't plan — update anyway; the appliance is the real gate. */
+    }
+    if (plan && plan.steps && plan.steps.length > 1) {
+      const route = plan.steps
+        .map((s, i) => `${i + 1}. ${s.version || s.image}`)
+        .join("\n");
+      const ok = await confirmModal(
+        `Getting to the newest version takes ${plan.steps.length} steps, because it ` +
+          `can't move a site this old there directly:\n\n${route}\n\n` +
+          `Each step updates and checks your site before the next one starts, and a ` +
+          `full backup is taken first. This will take a while — please leave it running.`
+      );
+      if (!ok) return;
+    }
+    return runProgressOp("Updating Atelier", () => invoke("do_update"));
+  },
 
   // Start or stop, decided by the live status rather than a label.
   startstop: () => {
@@ -643,7 +669,13 @@ const actions = {
       const from = u.current_version ? ` (you're on ${u.current_version})` : "";
       if (u.update_available === true) {
         const to = u.latest_version ? `Version ${u.latest_version}` : "A new version";
-        s.textContent = `${to} is available — go to Home to update.${from}`;
+        // Say up front when it's a multi-step route: it's the difference between
+        // an update you start before a meeting and one you don't.
+        const steps =
+          u.plan && u.plan.steps && u.plan.steps.length > 1
+            ? ` It takes ${u.plan.steps.length} steps from where you are, so allow extra time.`
+            : "";
+        s.textContent = `${to} is available — go to Home to update.${from}${steps}`;
       } else if (u.update_available === false) {
         s.textContent = `You're on the latest version${u.current_version ? ` (${u.current_version})` : ""}.`;
       } else {

@@ -24,8 +24,8 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | Command                  | What it does                                                              |
 | ------------------------ | ------------------------------------------------------------------------- |
 | `app install`            | Lay down `~/.atelier/{compose.yaml,.env}`, pull, `up -d`. Idempotent.     |
-| `app update`             | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back.    |
-| `app check-update`       | Compare the local image digest against the registry tag. (alias `app check`) |
+| `app update`             | `pull` + `up -d` — `converge.sh` migrates in place and auto-rolls-back. Steps through intermediate versions when one hop can't get there (`--to X.Y.Z`, `-y`). |
+| `app check-update`       | Compare the local image digest against the registry tag, and show the route the update would take. (alias `app check`) |
 | `app channel [stable\|edge]` | Show or switch which images the install follows. `--now` pulls immediately. |
 | `app reinstall`          | Wipe volumes and install fresh (destructive, confirmed).                  |
 | `app status`             | Read-only health probe. (The full checkup is the flat `doctor`.)          |
@@ -56,6 +56,48 @@ have `:edge` baked into their `.env` because edge was all there was, and they ne
 from an operator who asked for unreleased builds. `install`/`update` move the former onto stable
 once (snapshotting first — edge can be *ahead* of the newest release, and Drupal only migrates
 forward), announce it, and write the marker so it can never fire twice.
+
+### Stepped upgrades
+
+A release can be unable to migrate arbitrarily old state. The concrete case: the update
+that uninstalls a module must run while that module is still in the image, so the release
+that finally drops it from `composer.json` can only migrate sites that already ran it.
+Every appliance image therefore declares the oldest version it can migrate from, as the
+OCI label `dev.atelier.upgrade.min-from` (see `docker/upgrade-floor` in the cms repo).
+
+`app update` reads those labels **straight from the registry, pulling nothing**, walks them
+backwards from the target until it reaches a version the install satisfies, and shows the
+route before doing anything:
+
+```
+$ atelier app update
+This upgrade takes more than one step
+
+  from 0.1.1
+  1. 0.3.0   (0.4.0 can't migrate a site this old directly)
+  2. 0.4.0
+
+Each step pulls its image, migrates, and is health-checked before the next one starts;
+a step that fails rolls its own database back. A full snapshot is taken first.
+
+Walk the whole route now? [y/N]:
+```
+
+Each hop must finish converging before the next begins — the floor is checked against the
+version the site *recorded* on its last successful converge, so running ahead of one would
+present the next image with two-versions-ago state and earn its refusal. A hop that doesn't
+come up stops the route and says so; the site is left on the last version that converged,
+which is a state the appliance guarantees (converge rolls its own database back on failure).
+`app check-update` reports the same route, so a long upgrade is visible before it's started.
+
+The manager is the ergonomics, not the safety: the appliance refuses an impossible migration
+itself, before touching the database, so a hand-run `docker compose pull` fails safely with a
+message naming the version to go through. That also means an unreadable registry or an
+unstamped local image costs the *route*, not the safety — the plan falls back to one direct
+hop and says why it wasn't verified.
+
+`--to X.Y.Z` stops at a specific version (which leaves the install **pinned** to it —
+`app channel stable` resumes following releases). `-y` skips the confirmation.
 
 ### `doctor`
 

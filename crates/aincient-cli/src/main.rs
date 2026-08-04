@@ -106,7 +106,20 @@ enum AppCommand {
         yes: bool,
     },
     /// Pull a newer image and converge in place (snapshot + auto-rollback).
-    Update,
+    ///
+    /// A very old site may not be able to reach the newest release in one move —
+    /// a release that drops code can only migrate state that is already past it.
+    /// When that happens the route through the required intermediate versions is
+    /// worked out, shown, and (once confirmed) walked in order.
+    Update {
+        /// Stop at this version instead of the newest one your channel offers
+        /// (e.g. `0.3.0`). Leaves the install pinned to it.
+        #[arg(long, value_name = "VERSION")]
+        to: Option<String>,
+        /// Don't ask before walking a multi-step upgrade.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Check whether a newer image is available in the registry.
     #[command(visible_alias = "check")]
     CheckUpdate {
@@ -360,14 +373,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             show_login(stack);
             Ok(())
         }
-        AppCommand::Update => {
-            if ops::update(stack, &mut CliReporter::default())? {
-                done_banner("Update complete.", &stack.console_url());
-            } else {
-                pending_banner("Update applied — still finishing boot.", &stack.console_url());
-            }
-            Ok(())
-        }
+        AppCommand::Update { to, yes } => update_cmd(stack, to, yes),
         AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
@@ -727,6 +733,77 @@ fn parse_channel(name: &str) -> Result<Channel> {
 }
 
 /// `atelier app channel [stable|edge]` — show or switch the image stream.
+/// `atelier app update` — plan the route, show it if it has more than one step,
+/// then walk it.
+///
+/// The plan is shown BEFORE anything is pulled. A stepped upgrade runs a migration
+/// per hop and can take several minutes, and the operator's mental model of
+/// "update" is one pull and one restart — landing them in a five-minute sequence
+/// through versions they never chose, without saying so first, is how a routine
+/// update becomes a support conversation.
+fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
+    let plan = ops::plan_upgrade(stack, to.as_deref());
+
+    if plan.is_stepped() {
+        println!("{}", style::heading("This upgrade takes more than one step"));
+        print_route(&plan);
+        println!(
+            "\nEach step pulls its image, migrates, and is health-checked before the \
+             next one starts;\na step that fails rolls its own database back. A full \
+             snapshot is taken first."
+        );
+        if let Some(problem) = &plan.problem {
+            println!("\n{}", style::warn(problem));
+        }
+        if !confirm("\nWalk the whole route now?", yes)? {
+            println!("{}", style::warn("Aborted — nothing was changed."));
+            return Ok(());
+        }
+    } else if let Some(problem) = &plan.problem {
+        // Worth saying even on a single hop: it means the route wasn't verified,
+        // and the operator should know that before a long run rather than after.
+        println!("{}", style::warn(problem));
+    }
+
+    let pinned_to = to.is_some();
+    if ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
+        done_banner("Update complete.", &stack.console_url());
+    } else {
+        pending_banner("Update applied — still finishing boot.", &stack.console_url());
+    }
+    if pinned_to {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "You asked for a specific version, so this install is now pinned to \
+                 {} and no further updates will arrive. \
+                 `atelier app channel stable` follows releases again.",
+                stack.image()
+            ))
+        );
+    }
+    Ok(())
+}
+
+/// Print a route as a numbered list, one line per hop.
+fn print_route(plan: &ops::UpgradePlan) {
+    let from = plan
+        .from
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "an unknown version".to_string());
+    println!("\n  from {from}");
+    for (i, step) in plan.steps.iter().enumerate() {
+        let label = match step.version {
+            Some(v) => v.to_string(),
+            None => step.image.clone(),
+        };
+        match &step.reason {
+            Some(reason) => println!("  {}. {label}   ({reason})", i + 1),
+            None => println!("  {}. {label}", i + 1),
+        }
+    }
+}
+
 fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> Result<()> {
     let current = stack.channel();
     let Some(name) = channel else {
@@ -825,13 +902,32 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
     // rolling tag like `:edge` the digest alone tells the user nothing.
     let from = check.current_version.as_deref().unwrap_or("unknown");
     match check.update_available {
-        Some(true) => println!(
-            "{} for {}.\n{} → {}\nRun `atelier app update`.",
-            style::heading("An update is available"),
-            check.image,
-            from,
-            check.latest_version.as_deref().unwrap_or("a newer build"),
-        ),
+        Some(true) => {
+            println!(
+                "{} for {}.\n{} → {}",
+                style::heading("An update is available"),
+                check.image,
+                from,
+                check.latest_version.as_deref().unwrap_or("a newer build"),
+            );
+            // A stepped route is the thing to know before starting, not during:
+            // it is longer than expected and it passes through versions nobody
+            // asked for. `update` asks again before it walks it.
+            match check.plan.as_ref().filter(|p| p.is_stepped()) {
+                Some(plan) => {
+                    println!(
+                        "\n{}",
+                        style::warn(
+                            "That release can't migrate a site this old directly, so the \
+                             update goes through:"
+                        )
+                    );
+                    print_route(plan);
+                    println!("\nRun `atelier app update` — it walks the whole route.");
+                }
+                None => println!("Run `atelier app update`."),
+            }
+        }
         // On a pinned image "up to date" is true but useless — the tag can't move,
         // so no update will ever arrive through it. Say which it is.
         Some(false) if stack.channel() == Channel::Pinned => println!(

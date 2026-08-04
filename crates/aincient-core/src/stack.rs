@@ -319,6 +319,21 @@ impl Stack {
         Ok(image)
     }
 
+    /// Point the stack at one exact image, WITHOUT recording a channel choice.
+    ///
+    /// This is how a stepped upgrade walks its waypoints: each hop runs a specific
+    /// `:vX.Y.Z` tag, which by [`Channel::of_image`] reads as `pinned`. Writing
+    /// [`CHANNEL_KEY`] here would turn a transient hop into a permanent decision —
+    /// the operator would come out of a routine update pinned to a version tag,
+    /// receiving no further releases, because a step on the way was mistaken for a
+    /// destination. The chosen channel is a fact about the operator, not about
+    /// which image happens to be running mid-route.
+    pub fn set_image(&self, image: &str) -> Result<()> {
+        let mut env = self.read_env();
+        env.insert("AINCIENT_IMAGE".to_string(), image.to_string());
+        self.write_env(&env)
+    }
+
     /// Move an install that never chose a channel off the old `:edge` default and
     /// onto stable, once. Returns `Some((from, to))` if it moved anything.
     ///

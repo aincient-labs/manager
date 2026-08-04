@@ -114,6 +114,108 @@ pub struct UpdateCheck {
     /// Why the check was inconclusive, phrased for the user. `None` when
     /// `update_available` is conclusive.
     pub problem: Option<String>,
+    /// The route the update would take, present only when there IS an update.
+    /// Usually one hop; more when the target refuses to migrate from this far
+    /// back. Reported here so the operator sees a stepped upgrade coming before
+    /// committing to it, rather than discovering it mid-run.
+    pub plan: Option<UpgradePlan>,
+}
+
+/// A released version, as a comparable triple.
+///
+/// Only `X.Y.Z` (with or without a leading `v`) parses. `dev` and `edge+<sha7>`
+/// deliberately do NOT: they have no position in the version order, so no floor
+/// can be checked against them, and inventing one would be worse than admitting
+/// it. Callers treat `None` as "unknown", never as "old".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version(u64, u64, u64);
+
+/// Serialized as `"0.3.0"`, not as the `[0,3,0]` a tuple struct would give.
+/// Every consumer — `--json`, the GUI — wants to print it, and the ordering the
+/// triple exists for is Rust-side only.
+impl Serialize for Version {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl Version {
+    /// Parse a release version, or `None` for anything that isn't one.
+    pub fn parse(s: &str) -> Option<Version> {
+        let s = s.trim();
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let mut parts = s.split('.');
+        let mut next = || parts.next().filter(|p| !p.is_empty())?.parse::<u64>().ok();
+        let (major, minor, patch) = (next()?, next()?, next()?);
+        parts.next().is_none().then_some(Version(major, minor, patch))
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0, self.1, self.2)
+    }
+}
+
+/// The immutable tag a released version is pullable under — the form a waypoint
+/// takes. Matches what the release workflow publishes (`v` + the bare version).
+pub fn waypoint_image(v: Version) -> String {
+    format!("{}:v{v}", crate::stack::IMAGE_REPO)
+}
+
+/// One hop of an upgrade: an image to converge onto before going further.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradeStep {
+    /// The image this hop runs.
+    pub image: String,
+    /// The version it is, when known (a channel tag's version is read from the
+    /// registry; a waypoint's is the version that named it).
+    pub version: Option<Version>,
+    /// Set on the last hop — the one that lands on what the operator asked for.
+    /// Intermediate hops are waypoints nobody chose.
+    pub is_target: bool,
+    /// Why this hop exists, for a plan the operator can read. `None` on the target.
+    pub reason: Option<String>,
+}
+
+/// A route from the installed version to the target — one hop in the ordinary
+/// case, more when a release refuses to migrate from as far back as this install.
+///
+/// THE POINT OF THE WHOLE MECHANISM. A release can be unable to migrate
+/// arbitrarily old state — most concretely when it deletes the code a pending
+/// update needs (drop `drupal/ai` and the update that uninstalls it is gone with
+/// it). Each image therefore declares the oldest version it can migrate from, and
+/// `converge.sh` refuses anything older before touching the database. That
+/// refusal is a safety net, not a user experience: on its own it leaves the
+/// operator to work out the route by hand. So the manager reads those declarations
+/// FROM THE REGISTRY, WITHOUT PULLING (`dev.atelier.upgrade.min-from`), walks them
+/// backwards from the target until it reaches one this install satisfies, and
+/// applies the hops in order.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpgradePlan {
+    /// The version installed now, when the image says (unstamped builds don't).
+    pub from: Option<Version>,
+    /// The image the operator is heading for — a channel tag, or an explicit one.
+    pub target_image: String,
+    /// Every hop, in the order they must be applied; the last is the target.
+    pub steps: Vec<UpgradeStep>,
+    /// Why the route couldn't be verified, phrased for the operator. Set when the
+    /// registry or the installed version couldn't be read — in which case `steps`
+    /// falls back to the single direct hop, which is safe because the appliance
+    /// refuses an impossible migration itself rather than half-performing one.
+    pub problem: Option<String>,
+}
+
+impl UpgradePlan {
+    /// Whether this route passes through versions nobody asked for.
+    pub fn is_stepped(&self) -> bool {
+        self.steps.len() > 1
+    }
+
+    /// The waypoints — every hop that isn't the destination.
+    pub fn waypoints(&self) -> impl Iterator<Item = &UpgradeStep> {
+        self.steps.iter().filter(|s| !s.is_target)
+    }
 }
 
 /// A backup file on the host.
@@ -246,6 +348,7 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         latest_version: None,
         update_available: None,
         problem: None,
+        plan: None,
     };
 
     // Docker itself is the floor: without it neither probe can say anything, and
@@ -256,9 +359,9 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     }
 
     match local_probe(&image) {
-        Ok((digest, version)) => {
-            check.current = digest;
-            check.current_version = version;
+        Ok(probe) => {
+            check.current = probe.digest;
+            check.current_version = probe.version;
             if check.current.is_none() {
                 check.problem = Some(format!(
                     "{image} was built or loaded locally, so it carries no registry \
@@ -274,10 +377,12 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         }
     }
 
+    let mut target = None;
     match remote_probe(&image) {
-        Ok((digest, version)) => {
-            check.latest = digest;
-            check.latest_version = version;
+        Ok(probe) => {
+            check.latest = probe.digest.clone();
+            check.latest_version = probe.version.clone();
+            target = Some(probe);
         }
         Err(e) if check.problem.is_none() => check.problem = Some(registry_problem(&image, &e)),
         Err(_) => {}
@@ -292,7 +397,189 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     } else if check.problem.is_none() {
         check.problem = Some(format!("Couldn't compare {image} against the registry."));
     }
+
+    // Only when there's something to do: the route is advice about an update, and
+    // computing it probes the registry once per waypoint considered.
+    if check.update_available == Some(true) {
+        if let Some(target) = target {
+            let from = check.current_version.as_deref().and_then(Version::parse);
+            check.plan = Some(plan_route(from, image, target, None));
+        }
+    }
     check
+}
+
+/// How many waypoints a route may contain before we call it broken rather than
+/// long. Each hop is a full pull + migrate + health check, and a floor chain that
+/// deep would mean a release history nobody should be upgrading across in one go;
+/// far more likely it means the floors themselves are wrong, and looping forever
+/// on bad metadata is the one outcome worse than saying so.
+const MAX_WAYPOINTS: usize = 8;
+
+/// Work out the route from the installed version to `to` (or to whatever the
+/// current channel points at), walking each candidate image's declared upgrade
+/// floor backwards until one this install satisfies.
+///
+/// Reads floors from the registry, so it costs one `imagetools inspect` per hop
+/// considered and pulls nothing. See [`UpgradePlan`] for why this exists at all.
+pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
+    let target_image = match to {
+        Some(v) => match Version::parse(v) {
+            Some(v) => waypoint_image(v),
+            // Not a version — take it as a literal image reference, which is how
+            // an operator pins a fork or a local build.
+            None => v.to_string(),
+        },
+        // The image an update is heading for is the one that will be configured
+        // when it runs — so a pending legacy-`:edge` → stable move counts, or the
+        // route would be planned against the tag the operator is about to leave.
+        None if stack.pending_default_channel_migration() => Channel::Stable
+            .image()
+            .unwrap_or_else(|| stack.image()),
+        None => stack.image(),
+    };
+
+    let (from, from_problem) = match local_probe(&stack.image()) {
+        Ok(p) => (
+            p.version.as_deref().and_then(Version::parse),
+            p.version.is_none().then(|| {
+                format!(
+                    "The installed image ({}) carries no version stamp, so we can't tell \
+                     how far back this site is. Going straight there; the appliance itself \
+                     refuses a migration it can't perform, without touching your data.",
+                    stack.image()
+                )
+            }),
+        ),
+        Err(e) => (
+            None,
+            Some(format!(
+                "Couldn't read the installed image to see which version it is. ({e})"
+            )),
+        ),
+    };
+
+    match remote_probe(&target_image) {
+        Ok(target) => plan_route(from, target_image, target, from_problem),
+        Err(e) => {
+            // No floors to read → the direct hop, and say why it wasn't verified.
+            // Not an error: the appliance's own refusal covers the unsafe case, so
+            // an unreadable registry costs the route, not the safety.
+            let mut plan = plan_route(from, target_image.clone(), ImageProbe::default(), None);
+            plan.problem = Some(registry_problem(&target_image, &e));
+            plan
+        }
+    }
+}
+
+/// Build the route from an already-probed target. Split out so [`check_update`]
+/// can reuse the probes it just paid for.
+fn plan_route(
+    from: Option<Version>,
+    target_image: String,
+    target: ImageProbe,
+    problem: Option<String>,
+) -> UpgradePlan {
+    plan_route_with(from, target_image, target, problem, |image| {
+        remote_probe(image).map(|p| p.floor)
+    })
+}
+
+/// The route walk, over an injected floor lookup.
+///
+/// The lookup is a parameter purely so this is testable without a registry: the
+/// backwards walk, its ordering, and the two guards against metadata that can't
+/// resolve are the whole mechanism, and they are exactly what a live-registry test
+/// could never exercise (there is no published release with a broken floor chain,
+/// and there had better never be one).
+fn plan_route_with(
+    from: Option<Version>,
+    target_image: String,
+    target: ImageProbe,
+    mut problem: Option<String>,
+    floor_of: impl Fn(&str) -> std::result::Result<Option<Version>, String>,
+) -> UpgradePlan {
+    let target_version = target.version.as_deref().and_then(Version::parse);
+    let mut waypoints: Vec<(Version, String)> = Vec::new();
+    let mut floor = target.floor;
+
+    // Walk backwards: while the image we intend to run can't migrate from where we
+    // are, the version it names becomes a hop, and we ask the same of that one.
+    // Terminates on the first floor this install satisfies — or on the guards
+    // below, which exist because the chain is built from metadata we don't get to
+    // re-verify at read time.
+    while let Some(needed) = floor {
+        let Some(current) = from else {
+            // Unknown installed version: we can't say whether the floor is met.
+            // Don't invent a route through versions the operator may already be
+            // past — go direct and let the appliance decide, which it does safely.
+            break;
+        };
+        if current >= needed {
+            break;
+        }
+        if waypoints.iter().any(|(v, _)| *v == needed) || waypoints.len() >= MAX_WAYPOINTS {
+            problem = Some(format!(
+                "The published upgrade requirements don't resolve to a route from \
+                 {current} (stuck at {needed}). Upgrading one release at a time, or \
+                 restoring onto a current install, is the way through this."
+            ));
+            break;
+        }
+        let image = waypoint_image(needed);
+        let next_floor = match floor_of(&image) {
+            Ok(f) => f,
+            Err(e) => {
+                problem = Some(format!(
+                    "This upgrade has to pass through {needed}, but that release \
+                     couldn't be read from the registry, so the rest of the route is \
+                     unknown. ({e})"
+                ));
+                waypoints.push((needed, image));
+                break;
+            }
+        };
+        waypoints.push((needed, image));
+        // A floor must be strictly older than the release declaring it, or the
+        // chain can't converge. Treat a non-decreasing one as absent and stop.
+        floor = next_floor.filter(|f| *f < needed);
+    }
+
+    // Collected newest-first; applied oldest-first.
+    waypoints.reverse();
+    let hops = waypoints.len();
+    let mut steps: Vec<UpgradeStep> = waypoints
+        .into_iter()
+        .enumerate()
+        .map(|(i, (version, image))| UpgradeStep {
+            image,
+            version: Some(version),
+            is_target: false,
+            reason: Some(if i + 1 == hops {
+                match target_version {
+                    Some(t) => format!("{t} can't migrate a site this old directly"),
+                    None => "the version you're heading to can't migrate a site this old \
+                             directly"
+                        .to_string(),
+                }
+            } else {
+                "needed to reach the next step".to_string()
+            }),
+        })
+        .collect();
+    steps.push(UpgradeStep {
+        image: target_image.clone(),
+        version: target_version,
+        is_target: true,
+        reason: None,
+    });
+
+    UpgradePlan {
+        from,
+        target_image,
+        steps,
+        problem,
+    }
 }
 
 /// Turn a failed registry read into advice. A missing `buildx` plugin is the
@@ -328,16 +615,135 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     Ok(wait_until_ready(stack, READY_TIMEOUT, r))
 }
 
-/// Pull a newer image and recreate the stack — the upgrade path. Returns whether
-/// the console came up before the readiness timeout.
+/// Pull a newer image and recreate the stack — the upgrade path. Plans the route
+/// itself and walks every hop it needs; see [`apply_upgrade`] to show the operator
+/// the route first. Returns whether the console came up before the timeout.
 pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let plan = plan_upgrade(stack, None);
+    apply_upgrade(stack, &plan, r)
+}
+
+/// Apply a route, hop by hop. Returns whether the console came up before the
+/// readiness timeout **on the final hop**.
+///
+/// EVERY HOP IS A FULL CONVERGE, and it must finish before the next one starts:
+/// each image's floor is checked against the version the site RECORDED on its last
+/// successful converge, so hopping ahead of a converge would present the next image
+/// with the state of two versions ago and earn its refusal. So a hop that doesn't
+/// come up stops the route rather than pressing on — the site is left on the last
+/// version that did converge, which is a state the appliance guarantees (converge
+/// rolls its database back if the migration or the health check fails).
+pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
-    r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
+    r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
     announce_channel_migration(stack, r)?;
-    pull(stack, r)?;
-    up(stack, r)?;
-    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+
+    if !plan.is_stepped() {
+        pull(stack, r)?;
+        up(stack, r)?;
+        return Ok(wait_until_ready(stack, READY_TIMEOUT, r));
+    }
+
+    // A stepped route is the case where a snapshot is least optional: it is longer,
+    // it crosses releases the operator never chose to run, and it is only ever
+    // planned because one of them changes state in a way that can't be reversed by
+    // running the old image again. Best effort, like the channel-switch snapshot —
+    // converge's own per-hop rollback is the guarantee; this is the belt.
+    let total = plan.steps.len();
+    if status(stack).running {
+        r.stage(Stage::Working, "Backing up before the first step…", Some(0.03));
+        match backup(stack, Some("before-stepped-upgrade"), r) {
+            Ok(path) => r.stage(
+                Stage::Working,
+                &format!("Snapshot saved: {}", path.display()),
+                Some(0.05),
+            ),
+            Err(e) => r.stage(
+                Stage::Working,
+                &format!(
+                    "Couldn't take a snapshot first ({e:#}) — continuing; each step \
+                     rolls its own database back if it fails."
+                ),
+                Some(0.05),
+            ),
+        }
+    }
+
+    // Hops share the bar from 0.05 to 1.0, each rescaling the stage fractions the
+    // shared pull/up/wait helpers report so a five-minute route doesn't look like
+    // five separate runs that each finish at 100%.
+    const ROUTE_START: f32 = 0.05;
+    let span = (1.0 - ROUTE_START) / total as f32;
+
+    for (i, step) in plan.steps.iter().enumerate() {
+        let label = match step.version {
+            Some(v) => v.to_string(),
+            None => step.image.clone(),
+        };
+        let mut hop = ScaledReporter {
+            inner: r,
+            base: ROUTE_START + span * i as f32,
+            span,
+            prefix: format!("Step {} of {total} ({label}): ", i + 1),
+        };
+        hop.stage(
+            Stage::Scaffold,
+            &format!("switching to {}…", step.image),
+            Some(0.0),
+        );
+        stack.set_image(&step.image)?;
+        pull(stack, &mut hop)?;
+        up(stack, &mut hop)?;
+        let ready = wait_until_ready(stack, READY_TIMEOUT, &mut hop);
+
+        if !ready {
+            // Deliberately an error, not a `false`: on a multi-hop route "still
+            // booting" and "this step refused or rolled back" look identical from
+            // out here, and the difference decides whether the operator should
+            // wait or read the logs. Only the LAST hop can honestly report
+            // still-booting, and it returns below.
+            if step.is_target {
+                return Ok(false);
+            }
+            bail!(
+                "step {} of {total} ({label}) didn't finish coming up, so the rest of \
+                 the upgrade was not attempted. Your site is on {label} — its own \
+                 migration either succeeded or rolled itself back, so it is not \
+                 half-upgraded. Check `atelier app logs` for what happened, then run \
+                 `atelier app update` again to continue.",
+                i + 1
+            );
+        }
+    }
+    Ok(true)
+}
+
+/// Wraps a [`Reporter`] so a sub-run's 0.0–1.0 progress lands inside one slice of
+/// the outer bar, and its headlines say which step they belong to.
+struct ScaledReporter<'a> {
+    inner: &'a mut dyn Reporter,
+    base: f32,
+    span: f32,
+    prefix: String,
+}
+
+impl Reporter for ScaledReporter<'_> {
+    fn stage(&mut self, stage: Stage, message: &str, fraction: Option<f32>) {
+        self.inner.stage(
+            stage,
+            &format!("{}{message}", self.prefix),
+            fraction.map(|f| self.base + f * self.span),
+        );
+    }
+
+    fn log(&mut self, line: &str) {
+        self.inner.log(line);
+    }
+
+    fn captures_output(&self) -> bool {
+        self.inner.captures_output()
+    }
 }
 
 /// Run the one-time legacy-`:edge` → stable move, and say so out loud.
@@ -1039,8 +1445,28 @@ fn parse_http_status(bytes: &[u8]) -> Option<u16> {
 /// The OCI label the image build stamps with the version it is (DECISIONS 0308).
 const VERSION_LABEL: &str = "org.opencontainers.image.version";
 
+/// The label carrying an image's upgrade floor — the oldest version whose database
+/// its `converge.sh` will migrate. Baked from `docker/upgrade-floor`.
+///
+/// Read from the REGISTRY, which is the reason it is a label at all: the manager
+/// has to know an image's floor before deciding to pull it, and the same value in
+/// a file inside the image is only readable once the image is already downloaded.
+const FLOOR_LABEL: &str = "dev.atelier.upgrade.min-from";
+
+/// What an image says about itself, from either side of the pull.
+#[derive(Debug, Default, Clone)]
+struct ImageProbe {
+    /// Registry digest — absent on a locally built image.
+    digest: Option<String>,
+    /// `org.opencontainers.image.version` — absent on builds predating the stamp.
+    version: Option<String>,
+    /// [`FLOOR_LABEL`] as a parsed version. Absent means "declares no floor", and
+    /// is the correct reading for every image built before this existed.
+    floor: Option<Version>,
+}
+
 fn local_digest(image: &str) -> Option<String> {
-    local_probe(image).ok().and_then(|(digest, _)| digest)
+    local_probe(image).ok().and_then(|p| p.digest)
 }
 
 /// Read the pulled image's registry digest **and** version label in one
@@ -1051,7 +1477,7 @@ fn local_digest(image: &str) -> Option<String> {
 /// `RepoDigests` (bare `index` on it is a template error, not an empty string)
 /// and may carry no labels at all. Those are missing values, not failures — the
 /// `Err` arm means inspect itself failed, i.e. the image isn't here.
-fn local_probe(image: &str) -> std::result::Result<(Option<String>, Option<String>), String> {
+fn local_probe(image: &str) -> std::result::Result<ImageProbe, String> {
     let mut c = docker::docker();
     c.args([
         "image",
@@ -1060,18 +1486,21 @@ fn local_probe(image: &str) -> std::result::Result<(Option<String>, Option<Strin
         "--format",
         &format!(
             "{{{{if .RepoDigests}}}}{{{{index .RepoDigests 0}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}"
+             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}|\
+             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{FLOOR_LABEL}\"}}}}{{{{end}}}}"
         ),
     ]);
     Ok(parse_local_probe(&docker::probe(c)?))
 }
 
-fn parse_local_probe(out: &str) -> (Option<String>, Option<String>) {
-    let (repo_digest, version) = out.split_once('|').unwrap_or((out, ""));
-    (
-        repo_digest.split('@').nth(1).map(str::to_string),
-        non_empty(version.trim()),
-    )
+fn parse_local_probe(out: &str) -> ImageProbe {
+    let mut parts = out.split('|');
+    let repo_digest = parts.next().unwrap_or_default();
+    ImageProbe {
+        digest: repo_digest.split('@').nth(1).map(str::to_string),
+        version: non_empty(parts.next().unwrap_or_default().trim()),
+        floor: parts.next().and_then(|f| Version::parse(f.trim())),
+    }
 }
 
 /// Read the registry's digest and version label for the same tag, without
@@ -1079,7 +1508,7 @@ fn parse_local_probe(out: &str) -> (Option<String>, Option<String>) {
 /// collected by ranging over it (identical across arches — verified: two
 /// differently-stamped builds share byte-identical layers) rather than by naming
 /// one platform the host may not be.
-fn remote_probe(image: &str) -> std::result::Result<(Option<String>, Option<String>), String> {
+fn remote_probe(image: &str) -> std::result::Result<ImageProbe, String> {
     let mut c = docker::docker();
     c.args([
         "buildx",
@@ -1089,16 +1518,35 @@ fn remote_probe(image: &str) -> std::result::Result<(Option<String>, Option<Stri
         "--format",
         &format!(
             "{{{{.Manifest.Digest}}}}|\
-             {{{{range $img := .Image}}}}{{{{index $img.Config.Labels \"{VERSION_LABEL}\"}}}}|{{{{end}}}}"
+             {{{{range $img := .Image}}}}{{{{if $img.Config.Labels}}}}\
+             {{{{index $img.Config.Labels \"{VERSION_LABEL}\"}}}};\
+             {{{{index $img.Config.Labels \"{FLOOR_LABEL}\"}}}}\
+             {{{{end}}}}|{{{{end}}}}"
         ),
     ]);
     Ok(parse_remote_probe(&docker::probe(c)?))
 }
 
-fn parse_remote_probe(out: &str) -> (Option<String>, Option<String>) {
+/// Split `digest|version;floor|version;floor|` — one `version;floor` pair per
+/// platform in a multi-arch tag. The pairs are identical across arches (verified:
+/// two differently-stamped builds share byte-identical layers), so the first
+/// populated one answers for the tag; ranging rather than naming a platform keeps
+/// this working on a host whose arch we didn't guess.
+fn parse_remote_probe(out: &str) -> ImageProbe {
     let mut parts = out.split('|');
     let digest = parts.next().unwrap_or_default();
-    (non_empty(digest.trim()), parts.find_map(|v| non_empty(v.trim())))
+    let (version, floor) = parts
+        .map(|pair| {
+            let (v, f) = pair.split_once(';').unwrap_or((pair, ""));
+            (non_empty(v.trim()), Version::parse(f.trim()))
+        })
+        .find(|(v, f)| v.is_some() || f.is_some())
+        .unwrap_or((None, None));
+    ImageProbe {
+        digest: non_empty(digest.trim()),
+        version,
+        floor,
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -1116,7 +1564,8 @@ fn sanitize(label: &str) -> String {
 mod tests {
     use super::{
         backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_http_status,
-        parse_local_probe, parse_remote_probe, registry_problem, restore_bundle_script,
+        parse_local_probe, parse_remote_probe, plan_route, plan_route_with, registry_problem,
+        restore_bundle_script, waypoint_image, ImageProbe, Version, MAX_WAYPOINTS,
     };
     use crate::stack::Stack;
 
@@ -1232,36 +1681,300 @@ mod tests {
     // ghcr.io/aincient-labs/atelier-cms, captured 2026-08-04.
 
     #[test]
-    fn local_probe_reads_the_digest_and_the_version_label() {
-        let (digest, version) = parse_local_probe(
-            "ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2|edge+f8bdcb9",
+    fn local_probe_reads_the_digest_the_version_and_the_floor() {
+        let p = parse_local_probe(
+            "ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2|edge+f8bdcb9|0.3.0",
         );
-        assert_eq!(digest.as_deref(), Some("sha256:413ed726a1a2"));
-        assert_eq!(version.as_deref(), Some("edge+f8bdcb9"));
+        assert_eq!(p.digest.as_deref(), Some("sha256:413ed726a1a2"));
+        assert_eq!(p.version.as_deref(), Some("edge+f8bdcb9"));
+        assert_eq!(p.floor, Some(Version(0, 3, 0)));
     }
 
     #[test]
     fn local_probe_tolerates_a_locally_built_unlabelled_image() {
-        // Empty RepoDigests and no labels — both fields blank, not an error.
-        let (digest, version) = parse_local_probe("|");
-        assert!(digest.is_none(), "no registry digest to compare");
-        assert!(version.is_none(), "unstamped build claims no version");
+        // Empty RepoDigests and no labels — all three fields blank, not an error.
+        let p = parse_local_probe("||");
+        assert!(p.digest.is_none(), "no registry digest to compare");
+        assert!(p.version.is_none(), "unstamped build claims no version");
+        assert!(p.floor.is_none(), "and declares no floor");
     }
 
     #[test]
-    fn remote_probe_takes_one_version_from_the_multi_arch_index() {
-        // `range` over .Image emits the label once per platform, both identical.
-        let (digest, version) =
-            parse_remote_probe("sha256:413ed726a1a2|edge+f8bdcb9|edge+f8bdcb9|");
-        assert_eq!(digest.as_deref(), Some("sha256:413ed726a1a2"));
-        assert_eq!(version.as_deref(), Some("edge+f8bdcb9"));
+    fn a_probe_of_an_image_predating_the_floor_label_declares_no_floor() {
+        // The label is simply absent, which the template renders as empty. Read as
+        // "no floor", never as 0.0.0 — an old image makes no promise either way.
+        let p = parse_local_probe("repo@sha256:abc|v0.1.0|");
+        assert_eq!(p.version.as_deref(), Some("v0.1.0"));
+        assert!(p.floor.is_none());
+    }
+
+    #[test]
+    fn remote_probe_takes_one_version_and_floor_from_the_multi_arch_index() {
+        // `range` over .Image emits the pair once per platform, both identical.
+        let p = parse_remote_probe("sha256:413ed726a1a2|v0.4.0;0.3.0|v0.4.0;0.3.0|");
+        assert_eq!(p.digest.as_deref(), Some("sha256:413ed726a1a2"));
+        assert_eq!(p.version.as_deref(), Some("v0.4.0"));
+        assert_eq!(p.floor, Some(Version(0, 3, 0)));
     }
 
     #[test]
     fn remote_probe_keeps_the_digest_when_no_platform_is_stamped() {
-        let (digest, version) = parse_remote_probe("sha256:a36250871de0|||");
-        assert_eq!(digest.as_deref(), Some("sha256:a36250871de0"));
-        assert!(version.is_none());
+        let p = parse_remote_probe("sha256:a36250871de0|;|;|");
+        assert_eq!(p.digest.as_deref(), Some("sha256:a36250871de0"));
+        assert!(p.version.is_none());
+        assert!(p.floor.is_none());
+    }
+
+    #[test]
+    fn versions_parse_only_when_they_are_releases() {
+        assert_eq!(Version::parse("0.2.0"), Some(Version(0, 2, 0)));
+        assert_eq!(Version::parse("v0.2.0"), Some(Version(0, 2, 0)));
+        assert_eq!(Version::parse(" v1.10.3 "), Some(Version(1, 10, 3)));
+        // Neither of these has a position in the version order, so neither may
+        // pretend to: a floor check against them must come out "unknown".
+        assert_eq!(Version::parse("edge+f8bdcb9"), None);
+        assert_eq!(Version::parse("dev"), None);
+        for bad in ["", "0.2", "0.2.0.1", "0.2.x", "v", "0..0", "1.2.3-rc1"] {
+            assert_eq!(Version::parse(bad), None, "{bad} is not a release version");
+        }
+    }
+
+    #[test]
+    fn versions_order_numerically_not_lexically() {
+        assert!(Version::parse("0.9.0") < Version::parse("0.10.0"));
+        assert!(Version::parse("0.2.10") > Version::parse("0.2.9"));
+        assert!(Version::parse("1.0.0") > Version::parse("0.99.99"));
+    }
+
+    #[test]
+    fn a_waypoint_is_the_immutable_tag_the_release_workflow_publishes() {
+        assert_eq!(
+            waypoint_image(Version(0, 3, 0)),
+            "ghcr.io/aincient-labs/atelier-cms:v0.3.0"
+        );
+    }
+
+    /// A target whose floor this install already meets is one hop — the ordinary
+    /// case, and the one that must not grow a step.
+    #[test]
+    fn a_satisfied_floor_plans_a_single_direct_hop() {
+        let plan = plan_route(
+            Version::parse("0.3.0"),
+            "ghcr.io/aincient-labs/atelier-cms:latest".into(),
+            ImageProbe {
+                digest: Some("sha256:x".into()),
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+            },
+            None,
+        );
+        assert!(!plan.is_stepped());
+        assert_eq!(plan.steps.len(), 1);
+        assert!(plan.steps[0].is_target);
+        assert!(plan.problem.is_none());
+    }
+
+    /// No floor at all (every image published before this mechanism) is also one
+    /// hop: absence is a declaration of "no requirement", not a missing one.
+    #[test]
+    fn no_declared_floor_plans_a_single_direct_hop() {
+        let plan = plan_route(
+            Version::parse("0.1.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!plan.is_stepped());
+    }
+
+    /// An unknown installed version must not manufacture a route through releases
+    /// the operator may well be past already.
+    #[test]
+    fn an_unknown_installed_version_goes_direct_and_lets_the_appliance_decide() {
+        let plan = plan_route(
+            None,
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!plan.is_stepped());
+        assert!(plan.steps[0].is_target);
+    }
+
+    /// The last hop is always the thing the operator asked for, and it is the only
+    /// one flagged as the target — the waypoints are ours, not theirs.
+    #[test]
+    fn the_target_is_the_final_hop_and_carries_no_reason() {
+        let plan = plan_route(
+            Version::parse("0.3.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+                ..Default::default()
+            },
+            None,
+        );
+        let last = plan.steps.last().unwrap();
+        assert!(last.is_target);
+        assert_eq!(last.image, "img:latest");
+        assert!(last.reason.is_none());
+        assert_eq!(plan.waypoints().count(), 0);
+    }
+
+    /// A fake registry: version → the floor that release declares.
+    fn registry(
+        floors: &[(&'static str, Option<&'static str>)],
+    ) -> impl Fn(&str) -> std::result::Result<Option<Version>, String> {
+        let floors: Vec<_> = floors
+            .iter()
+            .map(|(v, f)| (waypoint_image(Version::parse(v).unwrap()), *f))
+            .collect();
+        move |image: &str| {
+            floors
+                .iter()
+                .find(|(img, _)| img == image)
+                .map(|(_, f)| f.and_then(Version::parse))
+                .ok_or_else(|| format!("no such tag: {image}"))
+        }
+    }
+
+    /// THE CASE THE WHOLE MECHANISM EXISTS FOR: 0.4.0 drops the code that
+    /// uninstalls `drupal/ai`, so it declares it can only migrate 0.3.0 and newer,
+    /// and a 0.1.1 install has to pass through 0.3.0 to get there.
+    #[test]
+    fn an_unmet_floor_plans_a_waypoint_before_the_target() {
+        let plan = plan_route_with(
+            Version::parse("0.1.1"),
+            "ghcr.io/aincient-labs/atelier-cms:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+                ..Default::default()
+            },
+            None,
+            registry(&[("0.3.0", Some("0.1.0"))]),
+        );
+        assert!(plan.is_stepped());
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].image, "ghcr.io/aincient-labs/atelier-cms:v0.3.0");
+        assert_eq!(plan.steps[0].version, Version::parse("0.3.0"));
+        assert!(!plan.steps[0].is_target);
+        assert!(plan.steps[0].reason.as_ref().unwrap().contains("0.4.0"));
+        assert!(plan.steps[1].is_target);
+        assert!(plan.problem.is_none());
+    }
+
+    /// Chained floors: the waypoint has a floor of its own that this install also
+    /// fails, so the route grows another hop — and comes out OLDEST FIRST, which is
+    /// the only order in which it can be applied.
+    #[test]
+    fn chained_floors_produce_an_oldest_first_route() {
+        let plan = plan_route_with(
+            Version::parse("0.1.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.6.0".into()),
+                floor: Version::parse("0.5.0"),
+                ..Default::default()
+            },
+            None,
+            registry(&[
+                ("0.5.0", Some("0.3.0")),
+                ("0.3.0", Some("0.1.0")), // met — the walk stops here
+            ]),
+        );
+        let route: Vec<_> = plan.steps.iter().map(|s| s.version).collect();
+        assert_eq!(
+            route,
+            vec![Version::parse("0.3.0"), Version::parse("0.5.0"), Version::parse("0.6.0")]
+        );
+        assert_eq!(plan.waypoints().count(), 2);
+        assert!(plan.problem.is_none());
+    }
+
+    /// A floor that isn't older than the release declaring it can't converge. Treat
+    /// it as the end of the chain rather than looping: the route so far is still
+    /// worth applying, and the alternative is a hang on bad metadata.
+    #[test]
+    fn a_non_decreasing_floor_ends_the_walk_instead_of_looping() {
+        let plan = plan_route_with(
+            Version::parse("0.1.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+                ..Default::default()
+            },
+            None,
+            // 0.3.0 claims it needs 0.3.0 — itself.
+            registry(&[("0.3.0", Some("0.3.0"))]),
+        );
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].version, Version::parse("0.3.0"));
+    }
+
+    /// Floors that keep asking for something older forever must be reported, not
+    /// walked. Each candidate here demands the next one down, so nothing is ever
+    /// satisfied and only the cap stops it.
+    #[test]
+    fn a_route_that_never_resolves_is_reported_as_a_problem() {
+        let mut floors: Vec<(&'static str, Option<&'static str>)> = Vec::new();
+        for (v, f) in [
+            ("0.9.0", "0.8.0"),
+            ("0.8.0", "0.7.0"),
+            ("0.7.0", "0.6.0"),
+            ("0.6.0", "0.5.0"),
+            ("0.5.0", "0.4.0"),
+            ("0.4.0", "0.3.0"),
+            ("0.3.0", "0.2.0"),
+            ("0.2.0", "0.1.0"),
+            ("0.1.0", "0.0.9"),
+            ("0.0.9", "0.0.8"),
+        ] {
+            floors.push((v, Some(f)));
+        }
+        let plan = plan_route_with(
+            // Older than every floor in the chain, so none is ever met.
+            Version::parse("0.0.1"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v1.0.0".into()),
+                floor: Version::parse("0.9.0"),
+                ..Default::default()
+            },
+            None,
+            registry(&floors),
+        );
+        assert!(plan.problem.is_some(), "must say the route doesn't resolve");
+        assert!(plan.waypoints().count() <= MAX_WAYPOINTS);
+    }
+
+    /// A waypoint we can't read leaves the rest of the route unknown — keep the
+    /// hops we do know, and say so rather than implying the route is complete.
+    #[test]
+    fn an_unreadable_waypoint_keeps_the_known_hops_and_explains() {
+        let plan = plan_route_with(
+            Version::parse("0.1.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.4.0".into()),
+                floor: Version::parse("0.3.0"),
+                ..Default::default()
+            },
+            None,
+            registry(&[]), // 0.3.0 isn't in the registry
+        );
+        assert!(plan.is_stepped());
+        assert_eq!(plan.steps[0].version, Version::parse("0.3.0"));
+        assert!(plan.problem.as_ref().unwrap().contains("0.3.0"));
     }
 
     #[test]
