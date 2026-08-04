@@ -599,6 +599,34 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         ));
     }
 
+    // An install made before the appliance's registry package was renamed still
+    // points at the old name, which no longer answers — so every update check fails
+    // and no update can ever arrive. A warning rather than a failure: the site itself
+    // runs fine on the image it already has, which is exactly why this goes unnoticed.
+    if scaffolded {
+        out.push(match stack.pending_image_repo_migration() {
+            Some((from, to)) => Check::bad(
+                "stack.image_repo",
+                Tier::Stack,
+                "Appliance image name current",
+                Severity::Warn,
+                "This install points at the image name Atelier was published under \
+                 before the repository was renamed. That name no longer answers, so \
+                 updates can't be found through it.",
+            )
+            .detail(format!("{from} → {to}"))
+            .fixable(Repair::Scaffold),
+            None => Check::ok("stack.image_repo", Tier::Stack, "Appliance image name current"),
+        });
+    } else {
+        out.push(Check::skipped(
+            "stack.image_repo",
+            Tier::Stack,
+            "Appliance image name current",
+            "No stack yet.",
+        ));
+    }
+
     if !host_ok || !scaffolded {
         // Say which prerequisite is actually missing. "Docker isn't ready" on a
         // machine with perfectly good Docker sends the user to fix the wrong

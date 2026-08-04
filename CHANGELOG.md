@@ -53,6 +53,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel you picked yourself is recorded in `.env` (`AINCIENT_CHANNEL`) and left alone — the
   move can only ever happen to an install that never expressed a preference, and only once.
 
+### Fixed
+- **Installs made before the appliance's image was renamed can find updates again.** The public
+  image moved from `ghcr.io/aincient-labs/atelier` to `…/atelier-cms` when the repository behind
+  it was renamed, and the old name does not merely go stale — it stops answering entirely. Anything
+  installed by manager ≤ v0.2.0 (or the installer of that era) has the retired name written into
+  its `.env`, and nothing re-reads the default, so **every update check on those installs failed
+  permanently** while the site itself carried on running fine. Reported as
+  [#1](https://github.com/aincient-labs/manager/issues/1); the earlier fix there made the failure
+  legible ("Couldn't reach the registry… 403 Forbidden") but not survivable.
+  - `install` and `update` now rewrite the retired name to the current one, keeping whatever tag
+    or digest it named, and say so. Unlike the channel move this is not guarded by your recorded
+    channel: a repository that no longer answers is a dead pointer, not a preference. An install
+    that also predates channels is then moved onto stable by the existing migration, in the same
+    run.
+  - `check-update` asks the registry about the name an update would actually come from, while
+    still asking your machine about the image it is actually running — so the check works before
+    any repair has been applied, rather than reporting "install Atelier first" to someone whose
+    site is up.
+  - `doctor` reports the retired name as a warning (the site runs, which is why this goes
+    unnoticed) and `doctor --fix` repairs it without an update having to be attempted first.
+
 ## [0.3.0] - 2026-08-04
 
 ### Added

@@ -340,6 +340,13 @@ fn run_step(cmd: Command, action: &str, r: &mut dyn Reporter) -> Result<()> {
 /// differs for every one of them.
 pub fn check_update(stack: &Stack) -> UpdateCheck {
     let image = stack.image();
+    // What the registry gets asked about is where an update would *come from*, which
+    // on a legacy install is not what `.env` says — see `Stack::prospective_image`.
+    // The local probe below keeps using `image`, because that is what is on this
+    // machine. Digests compare across the rename regardless: `parse_local_probe`
+    // keeps only the `sha256:…`, and the rename moved the package rather than
+    // republishing it.
+    let target_image = stack.prospective_image();
     let mut check = UpdateCheck {
         image: image.clone(),
         current: None,
@@ -378,13 +385,15 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     }
 
     let mut target = None;
-    match remote_probe(&image) {
+    match remote_probe(&target_image) {
         Ok(probe) => {
             check.latest = probe.digest.clone();
             check.latest_version = probe.version.clone();
             target = Some(probe);
         }
-        Err(e) if check.problem.is_none() => check.problem = Some(registry_problem(&image, &e)),
+        Err(e) if check.problem.is_none() => {
+            check.problem = Some(registry_problem(&target_image, &e))
+        }
         Err(_) => {}
     }
 
@@ -403,7 +412,7 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     if check.update_available == Some(true) {
         if let Some(target) = target {
             let from = check.current_version.as_deref().and_then(Version::parse);
-            check.plan = Some(plan_route(from, image, target, None));
+            check.plan = Some(plan_route(from, target_image, target, None));
         }
     }
     check
@@ -430,13 +439,11 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
             // an operator pins a fork or a local build.
             None => v.to_string(),
         },
-        // The image an update is heading for is the one that will be configured
-        // when it runs — so a pending legacy-`:edge` → stable move counts, or the
-        // route would be planned against the tag the operator is about to leave.
-        None if stack.pending_default_channel_migration() => Channel::Stable
-            .image()
-            .unwrap_or_else(|| stack.image()),
-        None => stack.image(),
+        // The image an update is heading for is the one that will be configured when
+        // it runs — so the pending legacy repairs count (a `:edge` → stable move, a
+        // retired repository name), or the route would be planned against a tag the
+        // operator is about to leave, or against a repository that cannot answer.
+        None => stack.prospective_image(),
     };
 
     let (from, from_problem) = match local_probe(&stack.image()) {
@@ -608,7 +615,7 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     r.stage(Stage::Scaffold, "Preparing the stack…", Some(0.08));
     stack.ensure_scaffold(opts)?;
     if opts.image.is_none() {
-        announce_channel_migration(stack, r)?;
+        announce_legacy_migrations(stack, r)?;
     }
     pull(stack, r)?;
     up(stack, r)?;
@@ -637,7 +644,7 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     ensure_installed(stack)?;
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
-    announce_channel_migration(stack, r)?;
+    announce_legacy_migrations(stack, r)?;
 
     if !plan.is_stepped() {
         pull(stack, r)?;
@@ -746,7 +753,14 @@ impl Reporter for ScaledReporter<'_> {
     }
 }
 
-/// Run the one-time legacy-`:edge` → stable move, and say so out loud.
+/// Run the one-time repairs an install made under an older manager needs — the
+/// retired-repository rename and the legacy-`:edge` → stable move — and say so out
+/// loud.
+///
+/// Both rewrite `AINCIENT_IMAGE`, and neither can be reached by changing a default:
+/// the value was baked into `.env` at install time and nothing re-reads it. So this
+/// is the only path by which those installs are ever corrected, which is why it sits
+/// on install and upgrade rather than behind a flag.
 ///
 /// A channel change moves the install to a different image, so it must never be
 /// silent — the operator has to be able to connect "I ran update" to "I'm on
@@ -760,7 +774,22 @@ impl Reporter for ScaledReporter<'_> {
 /// a full portable snapshot (database + files) first, while the *old* image is still
 /// the one running. Best effort: if the snapshot can't be taken the switch still
 /// proceeds, since converge's own rollback is the real safety net.
-fn announce_channel_migration(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    // The repository rename first, and unconditionally: it is a dead pointer rather
+    // than a preference (see `Stack::migrate_image_repo`), it needs no snapshot
+    // because it changes no version, and the channel migration below reads its output
+    // — a pre-rename `…/atelier:edge` only becomes the legacy default once renamed.
+    if let Some((from, to)) = stack.migrate_image_repo()? {
+        r.stage(
+            Stage::Scaffold,
+            &format!(
+                "Repointing this install at {to}. It was set to {from}, the name Atelier \
+                 was published under before the repository was renamed — that name no \
+                 longer answers, which is why checking for updates had been failing.",
+            ),
+            Some(0.07),
+        );
+    }
     if !stack.pending_default_channel_migration() {
         return Ok(());
     }

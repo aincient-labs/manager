@@ -21,6 +21,18 @@ pub const DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:latest";
 /// wanted — it got edge because edge was all there was. Those are the installs
 /// [`Stack::migrate_default_channel`] moves onto stable, once.
 pub const LEGACY_DEFAULT_IMAGE: &str = "ghcr.io/aincient-labs/atelier-cms:edge";
+/// The registry repository the appliance was published from until 2026-07-18, when
+/// the public artifact repo — and with it the GHCR package — was renamed `atelier`
+/// → `atelier-cms`.
+///
+/// The old name does not merely point somewhere stale: it does not answer at all
+/// (GHCR's token endpoint 403s `DENIED` for it anonymously), so every registry read
+/// through it fails, permanently. Installs made by manager ≤ v0.2.0 or by the
+/// pre-rename `install.sh` have it written into their `.env`, and nothing re-reads
+/// [`DEFAULT_IMAGE`] — so the manager cannot grow out of this on its own; the
+/// pointer on disk has to be rewritten. That is
+/// [`Stack::migrate_image_repo`] (manager#1).
+pub const LEGACY_IMAGE_REPO: &str = "ghcr.io/aincient-labs/atelier";
 /// `.env` key recording the channel the operator **chose**, as opposed to the one
 /// they happen to be on. See [`Stack::migrate_default_channel`] for why the
 /// distinction has to be written down.
@@ -113,6 +125,26 @@ impl Channel {
             _ => Channel::Pinned,
         }
     }
+}
+
+/// Rewrite a reference to the retired [`LEGACY_IMAGE_REPO`] onto [`IMAGE_REPO`],
+/// keeping whatever it names there — tag or digest. `None` when the reference isn't
+/// on the old repository, which includes every current one.
+///
+/// The boundary check is the point: [`IMAGE_REPO`] itself *starts with*
+/// [`LEGACY_IMAGE_REPO`] (`…/atelier` is a prefix of `…/atelier-cms`), so a plain
+/// prefix test would rename today's images into `…/atelier-cms-cms`. Only a `:` or
+/// `@` — or nothing at all, an implicit `:latest` — may follow.
+///
+/// The tag survives on purpose: the rename moved the package, so `:v0.1.1` and any
+/// digest published before it still resolve under the new name, and an operator who
+/// pinned a version pinned a version, not a repository.
+pub fn rename_legacy_repo(image: &str) -> Option<String> {
+    let rest = image.strip_prefix(LEGACY_IMAGE_REPO)?;
+    if !(rest.is_empty() || rest.starts_with(':') || rest.starts_with('@')) {
+        return None;
+    }
+    Some(format!("{IMAGE_REPO}{rest}"))
 }
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
@@ -355,6 +387,63 @@ impl Stack {
         Ok(Some((LEGACY_DEFAULT_IMAGE.to_string(), to)))
     }
 
+    /// Move an install off the retired [`LEGACY_IMAGE_REPO`] and onto [`IMAGE_REPO`],
+    /// keeping its tag. Returns `Some((from, to))` if it rewrote anything.
+    ///
+    /// Unlike [`migrate_default_channel`](Self::migrate_default_channel) this is
+    /// **not** guarded by [`CHANNEL_KEY`], and that asymmetry is the whole design: a
+    /// channel is a preference, so a recorded choice must be respected, but a
+    /// repository that no longer answers is a dead pointer — there is no intent in it
+    /// worth preserving, and leaving it in place only preserves the failure. It
+    /// deliberately writes through [`set_image`](Self::set_image) rather than
+    /// `set_channel`, because renaming a repository decides nothing about which
+    /// channel the operator follows.
+    ///
+    /// Idempotent by construction: once rewritten the reference no longer matches, so
+    /// this can only fire once per install.
+    pub fn migrate_image_repo(&self) -> Result<Option<(String, String)>> {
+        let Some((from, to)) = self.pending_image_repo_migration() else {
+            return Ok(None);
+        };
+        self.set_image(&to)?;
+        Ok(Some((from, to)))
+    }
+
+    /// Whether [`migrate_image_repo`](Self::migrate_image_repo) would rewrite this
+    /// install, and to what — asked separately for the same reason as the channel
+    /// migration's counterpart.
+    pub fn pending_image_repo_migration(&self) -> Option<(String, String)> {
+        if !self.exists() {
+            return None;
+        }
+        let from = self.env_get("AINCIENT_IMAGE")?;
+        rename_legacy_repo(&from).map(|to| (from, to))
+    }
+
+    /// The image this install will be configured to run once the legacy repairs have
+    /// been applied — what the *registry* has to be asked about, as opposed to
+    /// [`image`](Self::image), which is what Docker is running right now.
+    ///
+    /// The two diverge on exactly the installs those repairs exist for, and a caller
+    /// that conflates them gets a wrong answer rather than a failed one: probing the
+    /// registry for the recorded image asks a name that no longer exists, while
+    /// probing the local daemon for the prospective one asks for an image that was
+    /// never pulled ("install Atelier first" — to someone whose site is running).
+    ///
+    /// Composed in the order the repairs run, because the second reads the first's
+    /// output: a pre-rename `…/atelier:edge` becomes [`LEGACY_DEFAULT_IMAGE`], which
+    /// is then the very string the channel migration moves onto stable.
+    pub fn prospective_image(&self) -> String {
+        let image = self.image();
+        let image = rename_legacy_repo(&image).unwrap_or(image);
+        if self.chosen_channel().is_none() && image == LEGACY_DEFAULT_IMAGE {
+            if let Some(stable) = Channel::Stable.image() {
+                return stable;
+            }
+        }
+        image
+    }
+
     /// Whether [`migrate_default_channel`](Self::migrate_default_channel) would
     /// move this install — asked separately so a caller can take precautions (a
     /// snapshot, a warning) *before* the `.env` changes under it.
@@ -493,9 +582,20 @@ impl Stack {
             env.insert("HASH_SALT".to_string(), hash_salt());
             changes.push("generated a new HASH_SALT".to_string());
         }
-        if !env.contains_key("AINCIENT_IMAGE") {
-            env.insert("AINCIENT_IMAGE".to_string(), DEFAULT_IMAGE.to_string());
-            changes.push("restored the image setting".to_string());
+        match env.get("AINCIENT_IMAGE").and_then(|i| rename_legacy_repo(i)) {
+            // A reference to the retired repository is a broken stack file in the same
+            // sense as a missing key: it names somewhere that cannot answer. Repaired
+            // here as well as in `migrate_image_repo` so a checkup fixes it without
+            // requiring the operator to attempt an update first.
+            Some(fixed) => {
+                changes.push(format!("repointed the image at {fixed} (the old name is retired)"));
+                env.insert("AINCIENT_IMAGE".to_string(), fixed);
+            }
+            None if !env.contains_key("AINCIENT_IMAGE") => {
+                env.insert("AINCIENT_IMAGE".to_string(), DEFAULT_IMAGE.to_string());
+                changes.push("restored the image setting".to_string());
+            }
+            None => {}
         }
         if !env.contains_key("HTTP_PORT") {
             env.insert("HTTP_PORT".to_string(), DEFAULT_PORT.to_string());
@@ -806,17 +906,10 @@ mod tests {
 
     #[test]
     fn a_legacy_edge_install_is_moved_to_stable_once() {
-        let ts = TempStack::new();
-        let stack = &ts.0;
         // Exactly what the pre-channels installer wrote: the old default image,
         // and no channel marker at all.
-        std::fs::create_dir_all(&stack.home).unwrap();
-        std::fs::write(stack.compose_path(), COMPOSE_TEMPLATE).unwrap();
-        std::fs::write(
-            stack.env_path(),
-            format!("HASH_SALT={}\nAINCIENT_IMAGE={LEGACY_DEFAULT_IMAGE}\nHTTP_PORT=41221\n", "a".repeat(64)),
-        )
-        .unwrap();
+        let ts = legacy_stack(LEGACY_DEFAULT_IMAGE);
+        let stack = &ts.0;
 
         let moved = stack.migrate_default_channel().unwrap();
 
@@ -831,6 +924,140 @@ mod tests {
         stack.set_channel(Channel::Edge).unwrap();
         assert_eq!(stack.migrate_default_channel().unwrap(), None);
         assert_eq!(stack.channel(), Channel::Edge);
+    }
+
+    /// Write exactly what a pre-channels installer left behind: an image string and
+    /// no channel marker at all.
+    fn legacy_stack(image: &str) -> TempStack {
+        let ts = TempStack::new();
+        std::fs::create_dir_all(&ts.0.home).unwrap();
+        std::fs::write(ts.0.compose_path(), COMPOSE_TEMPLATE).unwrap();
+        std::fs::write(
+            ts.0.env_path(),
+            format!("HASH_SALT={}\nAINCIENT_IMAGE={image}\nHTTP_PORT=41221\n", "a".repeat(64)),
+        )
+        .unwrap();
+        ts
+    }
+
+    #[test]
+    fn the_retired_repository_is_renamed_without_eating_the_current_one() {
+        // The trap: `…/atelier` is a prefix of `…/atelier-cms`, so the current
+        // repository must not be renamed into `…/atelier-cms-cms`.
+        assert_eq!(rename_legacy_repo(DEFAULT_IMAGE), None);
+        assert_eq!(rename_legacy_repo(LEGACY_DEFAULT_IMAGE), None);
+        assert_eq!(rename_legacy_repo("ghcr.io/aincient-labs/atelier-cms@sha256:abc"), None);
+
+        assert_eq!(
+            rename_legacy_repo("ghcr.io/aincient-labs/atelier:edge").as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms:edge")
+        );
+        // A pinned tag and a digest keep what they named — the package moved, so
+        // both still resolve under the new name.
+        assert_eq!(
+            rename_legacy_repo("ghcr.io/aincient-labs/atelier:v0.1.1").as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms:v0.1.1")
+        );
+        assert_eq!(
+            rename_legacy_repo("ghcr.io/aincient-labs/atelier@sha256:abc").as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms@sha256:abc")
+        );
+        // Bare, i.e. an implicit `:latest`.
+        assert_eq!(
+            rename_legacy_repo("ghcr.io/aincient-labs/atelier").as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms")
+        );
+        // Someone else's repository of the same name is not ours to rewrite.
+        assert_eq!(rename_legacy_repo("example.com/aincient-labs/atelier:edge"), None);
+    }
+
+    #[test]
+    fn a_pre_rename_install_is_repaired_then_moved_to_stable() {
+        // manager#1: installed by manager ≤ v0.2.0, so it carries the retired
+        // repository name *and* predates channels.
+        let ts = legacy_stack("ghcr.io/aincient-labs/atelier:edge");
+        let stack = &ts.0;
+
+        // Before anything: the repo is the pending repair, and the channel migration
+        // cannot see this install at all — it matches on the exact legacy default.
+        assert!(!stack.pending_default_channel_migration());
+        assert_eq!(
+            stack.pending_image_repo_migration(),
+            Some((
+                "ghcr.io/aincient-labs/atelier:edge".to_string(),
+                LEGACY_DEFAULT_IMAGE.to_string()
+            ))
+        );
+        // And the route is planned against where the repairs land, not `.env`.
+        assert_eq!(stack.prospective_image(), DEFAULT_IMAGE);
+
+        let renamed = stack.migrate_image_repo().unwrap();
+        assert_eq!(
+            renamed,
+            Some((
+                "ghcr.io/aincient-labs/atelier:edge".to_string(),
+                LEGACY_DEFAULT_IMAGE.to_string()
+            ))
+        );
+        // Renaming a repository decides nothing about channels, so no marker yet…
+        assert_eq!(stack.chosen_channel(), None);
+        // …which is precisely what lets the channel migration now recognise it.
+        assert!(stack.pending_default_channel_migration());
+        assert_eq!(
+            stack.migrate_default_channel().unwrap(),
+            Some((LEGACY_DEFAULT_IMAGE.to_string(), DEFAULT_IMAGE.to_string()))
+        );
+        assert_eq!(stack.image(), DEFAULT_IMAGE);
+        assert_eq!(stack.chosen_channel(), Some(Channel::Stable));
+
+        // Once only.
+        assert_eq!(stack.migrate_image_repo().unwrap(), None);
+        assert_eq!(stack.migrate_default_channel().unwrap(), None);
+    }
+
+    #[test]
+    fn the_rename_fixes_the_repository_but_respects_a_chosen_channel() {
+        let ts = legacy_stack("ghcr.io/aincient-labs/atelier:edge");
+        let stack = &ts.0;
+        // An operator who asked for edge keeps edge — on the repository that answers.
+        stack.set_channel(Channel::Edge).unwrap();
+        stack.set_image("ghcr.io/aincient-labs/atelier:edge").unwrap();
+
+        assert_eq!(stack.prospective_image(), LEGACY_DEFAULT_IMAGE);
+        assert_eq!(
+            stack.migrate_image_repo().unwrap().map(|(_, to)| to),
+            Some(LEGACY_DEFAULT_IMAGE.to_string())
+        );
+        assert_eq!(stack.chosen_channel(), Some(Channel::Edge));
+        assert_eq!(stack.migrate_default_channel().unwrap(), None, "the choice stands");
+    }
+
+    #[test]
+    fn a_pinned_legacy_version_keeps_its_version() {
+        let ts = legacy_stack("ghcr.io/aincient-labs/atelier:v0.1.1");
+        let stack = &ts.0;
+
+        assert_eq!(stack.prospective_image(), "ghcr.io/aincient-labs/atelier-cms:v0.1.1");
+        stack.migrate_image_repo().unwrap();
+        assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v0.1.1");
+        // A pinned install was never a candidate for the channel move.
+        assert_eq!(stack.migrate_default_channel().unwrap(), None);
+    }
+
+    #[test]
+    fn a_current_install_has_nothing_to_repair() {
+        let ts = TempStack::new();
+        ts.0.ensure_scaffold(&InstallOptions::default()).unwrap();
+
+        assert_eq!(ts.0.pending_image_repo_migration(), None);
+        assert_eq!(ts.0.migrate_image_repo().unwrap(), None);
+        assert_eq!(ts.0.prospective_image(), DEFAULT_IMAGE);
+        assert_eq!(ts.0.image(), DEFAULT_IMAGE);
+
+        // And with no stack at all there is nothing to repair either.
+        let empty = TempStack::new();
+        assert_eq!(empty.0.pending_image_repo_migration(), None);
+        assert_eq!(empty.0.migrate_image_repo().unwrap(), None);
     }
 
     #[test]
