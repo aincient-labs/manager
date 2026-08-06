@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **An update is now refused before it downloads if the new image is missing a module your site
+  has installed.** Drupal cannot start without an installed module's code, so an update across a
+  release that dropped one leaves the site unable to boot — and the fix (uninstalling the module)
+  is only possible on the version you are still running. Images now publish the extensions they
+  ship, which Atelier reads straight from the registry, so the check happens before the ~500 MB
+  pull and names the modules to uninstall first. It only ever acts on a definite answer: an older
+  image that publishes no list, or a site it cannot read, means the update proceeds exactly as
+  before, and the appliance's own check at boot remains the backstop.
+- **Edge is demoted to a testing channel.** It ships unreleased work off main and was one menu
+  selection away in the desktop app, which is not where a site you care about should be able to
+  end up. The Updates menu now offers released versions only; an install already on edge still
+  shows edge, and can move back. `atelier app channel edge` keeps working, behind a confirmation
+  that says what it costs. Nothing changes for installs already following either channel.
+
+### Fixed
+- **A backup now records the exact image it was taken from, not just the channel it was following.**
+  The snapshot manifest stored the configured image reference — and on a moving channel (`edge`,
+  `latest`) that names no particular build, so by the time you need the manifest it can point at a
+  different release than the one your data ran on. It now records the image's **digest** and version
+  alongside it, which identify one build permanently. Restoring a snapshot that came from a
+  different image than the one installed prints a warning naming both, plus the
+  `atelier app install --image …@sha256:…` that puts the data back on the build it is known to run
+  on. It is a warning, not a refusal: restoring onto a different image is a legitimate recovery
+  move. Backups made by earlier versions restore exactly as before, without the warning — they
+  simply have no digest to compare.
+
 ## [0.5.0] - 2026-08-04
 
 ### Added

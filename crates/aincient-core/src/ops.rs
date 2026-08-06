@@ -141,9 +141,17 @@ impl Serialize for Version {
 
 impl Version {
     /// Parse a release version, or `None` for anything that isn't one.
+    ///
+    /// Semver **build metadata** is stripped, because that is how a rolling build
+    /// says which release it descends from: `v0.5.1+edge.a1b2c3d` is a build off
+    /// main after `v0.5.1`, and comparing it as `0.5.1` is both truthful (it
+    /// contains everything 0.5.1 shipped) and conservative (the unreleased work on
+    /// top counts for nothing). The older `edge+<sha7>` stamp has no version in
+    /// front of the `+` and correctly stays unparseable.
     pub fn parse(s: &str) -> Option<Version> {
         let s = s.trim();
         let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split('+').next()?;
         let mut parts = s.split('.');
         let mut next = || parts.next().filter(|p| !p.is_empty())?.parse::<u64>().ok();
         let (major, minor, patch) = (next()?, next()?, next()?);
@@ -850,6 +858,7 @@ pub fn switch_channel(
 
 /// `docker compose pull`, with a registry-login hint for the private image.
 fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    guard_missing_extensions(stack, r)?;
     r.stage(Stage::Pull, "Pulling the latest appliance image…", Some(0.12));
     let mut c = compose(stack);
     c.arg("pull");
@@ -863,6 +872,161 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
             e
         }
     })
+}
+
+// --- The pre-pull extension guard --------------------------------------------
+//
+// The host-side twin of converge's `check_installed_code_present()`, asked early
+// enough to be advice instead of a refusal at boot. On 2026-08-06 an update
+// carried a user onto a release that no longer shipped fourteen modules their
+// site had installed; Drupal could not resolve their paths, could not boot, and
+// converge reinstalled over the database (DECISIONS 0348/0353). Converge no
+// longer does that — but the update should never have been pulled at all, and
+// the fix for the user is on the OLD image, which is still running while this
+// check happens.
+//
+// Sits inside `pull()` because that is the one chokepoint every path to a new
+// image goes through: update, stepped upgrade hop, channel switch. On a fresh
+// install nothing is running, so it stands aside.
+
+/// Refuse to pull an image that is missing code the site has installed.
+///
+/// Every input is optional and every absence stands aside — this may only ever
+/// turn a *known* problem into a refusal, never a gap in knowledge:
+///
+/// - the target's `dev.atelier.extensions` label (absent on images built before
+///   it existed, and on anything that isn't in the registry),
+/// - the same label on the image running now, which is what makes the comparison
+///   core-safe: both lists are non-core, so `installed ∩ current` drops every core
+///   module before the diff and no core module can look "missing",
+/// - the site's own installed-extension list, unreadable if it isn't running.
+fn guard_missing_extensions(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    // Cheapest and most often decisive first: a fresh install has no site to
+    // protect, and this keeps the registry out of the install path entirely.
+    let Some(installed) = site_extensions(stack) else {
+        return Ok(());
+    };
+    let Some(target) = remote_probe(&stack.image()).ok().and_then(|p| p.extensions) else {
+        return Ok(());
+    };
+    // From the RUNNING CONTAINER, not from `stack.image()`: by the time we get
+    // here the configured image is already the target (a stepped hop calls
+    // `set_image` before pulling), so asking the config would compare the target
+    // against itself and find nothing missing, every time.
+    let Some(current) = running_image_extensions(stack) else {
+        return Ok(());
+    };
+
+    let mut missing: Vec<String> = installed
+        .into_iter()
+        .filter(|e| current.contains(e) && !target.contains(e))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    missing.dedup();
+
+    r.log("Checked the new image against the modules this site has installed.");
+    bail!(
+        "The image you're updating to no longer contains {} your site has installed:\n  \
+         {}\n\
+         Drupal can't start without an installed module's code, so this update would \
+         leave the site unable to boot. Nothing has been pulled and nothing has \
+         changed.\n\n\
+         Uninstall {} on the version you're running now — where the code still \
+         exists — then update:\n  \
+         atelier app open   (Extend → uninstall)\n\
+         Take a backup first: `atelier data backup`.",
+        if missing.len() == 1 { "a module" } else { "modules" },
+        missing.join(", "),
+        if missing.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// The [`EXTENSIONS_LABEL`] of the image the `app` container is actually running,
+/// read off the container so it survives `stack.set_image()` having already moved
+/// on. A container inherits its image's labels, so this needs no image lookup.
+/// `None` when the container isn't there or the label isn't (an older image).
+fn running_image_extensions(stack: &Stack) -> Option<Vec<String>> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-q", "app"]);
+    let cid = try_capture(ps)?;
+    let cid = cid.lines().next()?.trim();
+    if cid.is_empty() {
+        return None;
+    }
+    let mut c = docker::docker();
+    c.args([
+        "inspect",
+        cid,
+        "--format",
+        &format!("{{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{EXTENSIONS_LABEL}\"}}}}{{{{end}}}}"),
+    ]);
+    parse_extension_list(try_capture(c)?.trim())
+}
+
+/// The extensions the running site has INSTALLED, read the way converge reads
+/// them: `core.extension` straight out of the config table, with no bootstrap.
+/// `None` whenever the answer can't be had — not running, not Postgres, an empty
+/// result — because "unknown" must never be mistaken for "nothing installed".
+fn site_extensions(stack: &Stack) -> Option<Vec<String>> {
+    if !status(stack).running {
+        return None;
+    }
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"]).args(DRUSH).args([
+        "sql:query",
+        "SELECT convert_from(data, 'UTF8') FROM config WHERE name = 'core.extension';",
+    ]);
+    let out = try_capture(c)?;
+    let names = parse_serialized_extensions(&out);
+    (!names.is_empty()).then_some(names)
+}
+
+/// Pull extension names out of a serialized `core.extension` blob.
+///
+/// It serializes as `{module: {name: weight}, theme: {name: weight}, profile:
+/// "name"}`, so every `s:<len>:"<name>";i:<weight>;` pair in it is an extension
+/// and nothing else has that shape — the same rule `converge.sh` greps for.
+/// Themes are included deliberately: they fatal an unbootable site exactly the
+/// way modules do.
+/// Every slice here goes through `str::get`, never `[a..b]`. The lengths come
+/// from inside the blob — a database value — and a length that lands mid-UTF-8
+/// would panic the manager on an indexing slice. `get` yields `None` instead, and
+/// the parse stops or skips. Progress is guaranteed regardless: `i` advances past
+/// the `s:` that started each iteration, so no input can loop forever.
+fn parse_serialized_extensions(blob: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(found) = blob.get(i..).and_then(|rest| rest.find("s:")) {
+        let start = i + found + 2;
+        let Some(colon) = blob.get(start..).and_then(|rest| rest.find(':')) else { break };
+        i = start;
+        let Ok(len) = blob.get(start..start + colon).unwrap_or("").parse::<usize>() else {
+            continue;
+        };
+        let name_start = start + colon + 2; // past `:"`
+        let name_end = name_start + len;
+        let (Some(name), Some(rest)) = (blob.get(name_start..name_end), blob.get(name_end..)) else {
+            continue;
+        };
+        // Only a name followed by an integer WEIGHT is an extension entry. The
+        // profile is serialized as `s:7:"profile";s:7:"minimal";` — a string pair,
+        // so neither half may be mistaken for a module.
+        if !rest.starts_with("\";i:") {
+            continue;
+        }
+        if !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            out.push(name.to_string());
+        }
+        i = name_end;
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `docker compose up -d`.
@@ -941,10 +1105,26 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     let drush = DRUSH.join(" ");
     // A manifest identifying the archive as an AIncient snapshot and pinning the
     // image it was taken from — so a future restore can warn on a version skew.
-    // JSON has no single quotes, so it's safe inside the printf's single-quoted arg.
+    //
+    // The DIGEST is the load-bearing field, not the reference. Until 2026-08-06
+    // this recorded `stack.image()` alone, which on a moving tag (`:edge`,
+    // `:latest`) names no build at all — and a moving tag is exactly where skew is
+    // most likely. During the incident of that date, recovering the user's site
+    // meant resolving their local digests against the registry by hand, because
+    // their manifest said `…/atelier-cms:edge` and nothing more. A digest is
+    // content-addressable: it identifies the one image this database is known to
+    // run on, forever, and `install --image repo@sha256:…` restores onto it.
+    //
+    // Both extra fields are best-effort: an image that isn't inspectable (locally
+    // built, or already gone) records what we do know rather than failing a backup
+    // over provenance. JSON has no single quotes, so it's safe inside the printf's
+    // single-quoted arg, and every value here is docker-shaped (no quotes/escapes).
+    let probe = local_probe(&stack.image()).unwrap_or_default();
     let manifest = format!(
-        r#"{{"format":"aincient-snapshot","version":1,"created":"{ts}","image":"{image}"}}"#,
+        r#"{{"format":"aincient-snapshot","version":2,"created":"{ts}","image":"{image}","digest":"{digest}","atelier_version":"{version}"}}"#,
         image = stack.image(),
+        digest = probe.digest.clone().unwrap_or_default(),
+        version = probe.version.clone().unwrap_or_default(),
     );
 
     // Build the bundle inside the container, then copy it out (mirrors the
@@ -1089,6 +1269,15 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
     }
+    // Loud, but not a refusal: restoring onto a different image is sometimes
+    // exactly the intent (recovering onto a rescue stack), and the appliance now
+    // refuses to install over a populated database rather than wiping it. What
+    // was missing was the operator knowing which image the data came from.
+    if let Some(warning) = restore_skew(stack, file) {
+        for line in warning.lines() {
+            r.log(line);
+        }
+    }
     let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
     if is_snapshot_bundle(name) {
         return restore_bundle(stack, file, r);
@@ -1158,6 +1347,93 @@ fn restore_bundle(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()
     run_capture(run, "restore the snapshot")?;
 
     Ok(())
+}
+
+/// What a snapshot bundle's `manifest.json` records about where it came from.
+/// Every field is optional in practice: v1 archives (before 2026-08-06) carry
+/// only `image`, and a locally built image has no digest to record.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct SnapshotManifest {
+    /// The image reference configured when the backup was taken — possibly a
+    /// moving tag, which is why it is not enough on its own.
+    #[serde(default)]
+    pub image: String,
+    /// The content-addressable digest of that image. The field that actually
+    /// identifies the build this database is known to run on.
+    #[serde(default)]
+    pub digest: String,
+    /// `org.opencontainers.image.version` of that image, when it was stamped.
+    #[serde(default)]
+    pub atelier_version: String,
+    #[serde(default)]
+    pub created: String,
+}
+
+/// Read `manifest.json` out of a snapshot bundle without unpacking it. `tar -O`
+/// streams the one member to stdout; BSD tar (macOS) and GNU tar both take these
+/// flags. `None` for a legacy `.sql` dump, an unreadable archive, or a manifest
+/// this version can't parse — the caller treats all of those as "unknown
+/// provenance", never as "matches".
+pub fn snapshot_manifest(file: &Path) -> Option<SnapshotManifest> {
+    let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    if !is_snapshot_bundle(name) {
+        return None;
+    }
+    let out = Command::new("tar")
+        .arg("-xzOf")
+        .arg(file)
+        .arg("manifest.json")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<SnapshotManifest>(&out.stdout).ok()
+}
+
+/// A human-readable warning when a snapshot was taken on a different image than
+/// the one installed here, or `None` when they match or we can't tell.
+///
+/// The point is naming the image the data is known to work on. Recovering the
+/// 2026-08-06 incident took hours mostly because that fact existed nowhere: the
+/// manifest said `:edge`, which by then pointed at the build that had just
+/// destroyed the site.
+pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
+    let manifest = snapshot_manifest(file)?;
+    if manifest.digest.is_empty() {
+        return None;
+    }
+    let current = local_probe(&stack.image()).ok()?.digest?;
+    if current == manifest.digest {
+        return None;
+    }
+
+    let taken_on = if manifest.atelier_version.is_empty() {
+        manifest.image.clone()
+    } else {
+        format!("{} ({})", manifest.atelier_version, manifest.image)
+    };
+    // The bare repository, so the hint can re-pin it by digest. Strip a digest,
+    // then a tag — but only a real tag: the colon in a `host:5000/repo` registry
+    // is followed by a slash, and stripping there would name a different image.
+    let repo = stack.image().split('@').next().unwrap_or_default().to_string();
+    let repo = match repo.rsplit_once(':') {
+        Some((head, tail)) if !tail.contains('/') => head.to_string(),
+        _ => repo,
+    };
+    Some(format!(
+        "WARNING: this snapshot was taken on a DIFFERENT image than the one installed here.\n\
+         \x20 snapshot taken on: {taken_on}\n\
+         \x20   digest:          {snap}\n\
+         \x20 installed now:     {now}\n\
+         \x20   digest:          {cur}\n\
+         The restore will proceed, but if the site does not come up afterwards, run it\n\
+         on the image the data came from instead of changing anything else:\n\
+         \x20 atelier app install --image {repo}@{snap}\n",
+        snap = manifest.digest,
+        now = stack.image(),
+        cur = current,
+    ))
 }
 
 /// The in-container shell that builds a snapshot bundle. `drush --gzip` appends
@@ -1482,6 +1758,13 @@ const VERSION_LABEL: &str = "org.opencontainers.image.version";
 /// a file inside the image is only readable once the image is already downloaded.
 const FLOOR_LABEL: &str = "dev.atelier.upgrade.min-from";
 
+/// The label listing the NON-CORE extensions an image ships, comma-separated.
+/// Registry-readable for the same reason as [`FLOOR_LABEL`]: the decision it
+/// informs — is this image missing code the site has installed — has to be made
+/// before the ~500 MB pull, not after. Absent on images built before it existed
+/// and on local builds; absence is "unknown", never "ships nothing".
+const EXTENSIONS_LABEL: &str = "dev.atelier.extensions";
+
 /// What an image says about itself, from either side of the pull.
 #[derive(Debug, Default, Clone)]
 struct ImageProbe {
@@ -1492,6 +1775,8 @@ struct ImageProbe {
     /// [`FLOOR_LABEL`] as a parsed version. Absent means "declares no floor", and
     /// is the correct reading for every image built before this existed.
     floor: Option<Version>,
+    /// [`EXTENSIONS_LABEL`], split. `None` means the image doesn't say.
+    extensions: Option<Vec<String>>,
 }
 
 fn local_digest(image: &str) -> Option<String> {
@@ -1516,7 +1801,8 @@ fn local_probe(image: &str) -> std::result::Result<ImageProbe, String> {
         &format!(
             "{{{{if .RepoDigests}}}}{{{{index .RepoDigests 0}}}}{{{{end}}}}|\
              {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{FLOOR_LABEL}\"}}}}{{{{end}}}}"
+             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{FLOOR_LABEL}\"}}}}{{{{end}}}}|\
+             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{EXTENSIONS_LABEL}\"}}}}{{{{end}}}}"
         ),
     ]);
     Ok(parse_local_probe(&docker::probe(c)?))
@@ -1529,7 +1815,23 @@ fn parse_local_probe(out: &str) -> ImageProbe {
         digest: repo_digest.split('@').nth(1).map(str::to_string),
         version: non_empty(parts.next().unwrap_or_default().trim()),
         floor: parts.next().and_then(|f| Version::parse(f.trim())),
+        extensions: parts.next().and_then(parse_extension_list),
     }
+}
+
+/// Split the comma-separated [`EXTENSIONS_LABEL`] value. An empty label is `None`
+/// — "this image doesn't say", which every caller must treat as unknown rather
+/// than as an image that ships no extensions at all.
+fn parse_extension_list(raw: &str) -> Option<Vec<String>> {
+    let mut names: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
 }
 
 /// Read the registry's digest and version label for the same tag, without
@@ -1549,32 +1851,40 @@ fn remote_probe(image: &str) -> std::result::Result<ImageProbe, String> {
             "{{{{.Manifest.Digest}}}}|\
              {{{{range $img := .Image}}}}{{{{if $img.Config.Labels}}}}\
              {{{{index $img.Config.Labels \"{VERSION_LABEL}\"}}}};\
-             {{{{index $img.Config.Labels \"{FLOOR_LABEL}\"}}}}\
+             {{{{index $img.Config.Labels \"{FLOOR_LABEL}\"}}}};\
+             {{{{index $img.Config.Labels \"{EXTENSIONS_LABEL}\"}}}}\
              {{{{end}}}}|{{{{end}}}}"
         ),
     ]);
     Ok(parse_remote_probe(&docker::probe(c)?))
 }
 
-/// Split `digest|version;floor|version;floor|` — one `version;floor` pair per
-/// platform in a multi-arch tag. The pairs are identical across arches (verified:
-/// two differently-stamped builds share byte-identical layers), so the first
-/// populated one answers for the tag; ranging rather than naming a platform keeps
-/// this working on a host whose arch we didn't guess.
+/// Split `digest|version;floor;extensions|version;floor;extensions|` — one triple
+/// per platform in a multi-arch tag. The triples are identical across arches
+/// (verified: two differently-stamped builds share byte-identical layers), so the
+/// first populated one answers for the tag; ranging rather than naming a platform
+/// keeps this working on a host whose arch we didn't guess. `;` is the separator
+/// because none of the three values can contain one — the extension list is comma
+/// separated.
 fn parse_remote_probe(out: &str) -> ImageProbe {
     let mut parts = out.split('|');
     let digest = parts.next().unwrap_or_default();
-    let (version, floor) = parts
-        .map(|pair| {
-            let (v, f) = pair.split_once(';').unwrap_or((pair, ""));
-            (non_empty(v.trim()), Version::parse(f.trim()))
+    let (version, floor, extensions) = parts
+        .map(|triple| {
+            let mut fields = triple.splitn(3, ';');
+            (
+                non_empty(fields.next().unwrap_or_default().trim()),
+                Version::parse(fields.next().unwrap_or_default().trim()),
+                fields.next().and_then(parse_extension_list),
+            )
         })
-        .find(|(v, f)| v.is_some() || f.is_some())
-        .unwrap_or((None, None));
+        .find(|(v, f, e)| v.is_some() || f.is_some() || e.is_some())
+        .unwrap_or((None, None, None));
     ImageProbe {
         digest: non_empty(digest.trim()),
         version,
         floor,
+        extensions,
     }
 }
 
@@ -1594,7 +1904,8 @@ mod tests {
     use super::{
         backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_http_status,
         parse_local_probe, parse_remote_probe, plan_route, plan_route_with, registry_problem,
-        restore_bundle_script, waypoint_image, ImageProbe, Version, MAX_WAYPOINTS,
+        parse_extension_list, parse_serialized_extensions, restore_bundle_script, waypoint_image,
+        ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS,
     };
     use crate::stack::Stack;
 
@@ -1609,6 +1920,129 @@ mod tests {
             "generated shell failed to parse:\n{script}\n---\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// The comparison the pre-pull guard makes, isolated from Docker: which
+    /// installed extensions does the target no longer ship? Intersecting with the
+    /// CURRENT image's list first is what keeps core out of it — both labels are
+    /// non-core, so a core module is in neither and can never look missing.
+    fn missing_for(installed: &[&str], current: &[&str], target: &[&str]) -> Vec<String> {
+        installed
+            .iter()
+            .filter(|e| current.contains(e) && !target.contains(e))
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_pre_pull_guard_names_dropped_modules_and_ignores_core() {
+        // The 2026-08-06 shape: `ai`/`ai_agents` installed, still in the running
+        // image, gone from the target. `node` is core — in neither label.
+        let missing = missing_for(
+            &["node", "user", "aincient_core", "ai", "ai_agents"],
+            &["aincient_core", "ai", "ai_agents", "flowdrop"],
+            &["aincient_core", "flowdrop"],
+        );
+        assert_eq!(missing, vec!["ai", "ai_agents"]);
+    }
+
+    #[test]
+    fn an_extension_the_site_added_itself_is_not_blamed_on_the_release() {
+        // Installed but shipped by neither image (a module someone dropped in by
+        // hand): not something this update removes, so not this guard's business.
+        let missing = missing_for(&["node", "some_local_module"], &["flowdrop"], &["flowdrop"]);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn extension_lists_parse_and_an_empty_label_is_unknown() {
+        assert_eq!(
+            parse_extension_list("aincient_core, flowdrop ,ai"),
+            Some(vec!["ai".into(), "aincient_core".into(), "flowdrop".into()])
+        );
+        // The distinction the whole guard rests on: no label ≠ ships nothing.
+        assert_eq!(parse_extension_list(""), None);
+        assert_eq!(parse_extension_list("  , ,"), None);
+    }
+
+    #[test]
+    fn a_malformed_blob_cannot_panic_the_parser() {
+        // Lengths come from the database. A length that overruns the string, or
+        // lands inside a multi-byte character, must yield nothing — not a panic
+        // in the middle of an update.
+        assert!(parse_serialized_extensions("s:99:\"node\";i:0;").is_empty());
+        assert!(parse_serialized_extensions("s:2:\"é\";i:0;").is_empty());
+        assert!(parse_serialized_extensions("s:").is_empty());
+        assert!(parse_serialized_extensions("s:x:\"node\";i:0;").is_empty());
+        assert!(parse_serialized_extensions("").is_empty());
+    }
+
+    #[test]
+    fn installed_extensions_come_out_of_the_serialized_core_extension_blob() {
+        // Modules and themes; `profile` is a string pair, not a weight, so it and
+        // its value must not be mistaken for extensions.
+        let blob = "a:3:{s:6:\"module\";a:2:{s:4:\"node\";i:0;s:2:\"ai\";i:10;}\
+                    s:5:\"theme\";a:1:{s:14:\"aincient_theme\";i:0;}\
+                    s:7:\"profile\";s:7:\"minimal\";}";
+        assert_eq!(
+            parse_serialized_extensions(blob),
+            vec!["ai", "aincient_theme", "node"]
+        );
+    }
+
+    #[test]
+    fn a_remote_probe_reads_the_extension_label_beside_the_floor() {
+        let p = parse_remote_probe(
+            "sha256:413ed726a1a2|v0.5.1;0.3.0;aincient_core,flowdrop|v0.5.1;0.3.0;aincient_core,flowdrop|",
+        );
+        assert_eq!(p.version.as_deref(), Some("v0.5.1"));
+        assert_eq!(p.floor, Some(Version(0, 3, 0)));
+        assert_eq!(
+            p.extensions,
+            Some(vec!["aincient_core".into(), "flowdrop".into()])
+        );
+    }
+
+    #[test]
+    fn an_image_from_before_the_label_reports_no_extensions() {
+        let p = parse_remote_probe("sha256:a36250871de0|v0.4.0;0.3.0|v0.4.0;0.3.0|");
+        assert_eq!(p.version.as_deref(), Some("v0.4.0"));
+        assert!(p.extensions.is_none(), "absence must read as unknown");
+    }
+
+    #[test]
+    fn an_edge_stamp_compares_as_the_release_it_descends_from() {
+        // The stamp change that lets a floor gate an edge install at all.
+        assert_eq!(Version::parse("v0.5.1+edge.a1b2c3d"), Version::parse("0.5.1"));
+        assert!(Version::parse("v0.5.1+edge.a1b2c3d") < Version::parse("0.6.0"));
+        // The OLD stamp has no version before the `+` and stays unparseable —
+        // "no position in the version order", which is the honest answer for it.
+        assert_eq!(Version::parse("edge+f8bdcb9"), None);
+        assert_eq!(Version::parse("dev"), None);
+    }
+
+    #[test]
+    fn manifest_v2_records_the_digest_that_identifies_the_build() {
+        let m: SnapshotManifest = serde_json::from_str(
+            r#"{"format":"aincient-snapshot","version":2,"created":"20260805-152113",
+                "image":"ghcr.io/aincient-labs/atelier-cms:edge",
+                "digest":"sha256:e5dd6dbc","atelier_version":"edge+ee6a1cf"}"#,
+        )
+        .expect("parse v2");
+        assert_eq!(m.digest, "sha256:e5dd6dbc");
+        assert_eq!(m.atelier_version, "edge+ee6a1cf");
+    }
+
+    #[test]
+    fn a_v1_manifest_still_parses_and_simply_has_no_digest() {
+        // Archives taken before 2026-08-06. Absent provenance must read as
+        // "unknown" (no warning), never as "matches".
+        let m: SnapshotManifest = serde_json::from_str(
+            r#"{"format":"aincient-snapshot","version":1,"created":"x","image":"y"}"#,
+        )
+        .expect("parse v1");
+        assert!(m.digest.is_empty());
+        assert_eq!(m.image, "y");
     }
 
     #[test]
@@ -1794,6 +2228,7 @@ mod tests {
                 digest: Some("sha256:x".into()),
                 version: Some("v0.4.0".into()),
                 floor: Version::parse("0.3.0"),
+                extensions: None,
             },
             None,
         );

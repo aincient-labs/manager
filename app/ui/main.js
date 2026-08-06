@@ -383,28 +383,34 @@ function loadSettings() {
   renderChannel();
 }
 
-// Which images this install follows. A pinned image (a specific version, or one
-// built by hand) belongs to neither channel, so it gets its own option rather
-// than being misreported as one of the two — picking a real channel is how you
-// leave it.
+// Which images this install follows. The menu offers released versions and
+// nothing else: edge ships unreleased work and is not somewhere to end up by
+// picking a menu item (`atelier app channel edge` is the deliberate way in). A
+// pinned image, or an install already on edge, belongs to neither offer — each
+// gets its own option so the row tells the truth and shows the way back, rather
+// than being misreported as the supported channel.
 function renderChannel() {
   const select = $("channel-select");
   const hint = $("channel-hint");
   const channel = (lastStatus && lastStatus.channel) || "stable";
   select.querySelector('option[value="pinned"]')?.remove();
-  if (channel === "pinned") {
+  select.querySelector('option[value="edge"]')?.remove();
+  if (channel === "pinned" || channel === "edge") {
     const opt = document.createElement("option");
-    opt.value = "pinned";
-    opt.textContent = "This exact version (pinned)";
+    opt.value = channel;
+    opt.textContent =
+      channel === "edge"
+        ? "Every new build (unreleased)"
+        : "This exact version (pinned)";
     select.prepend(opt);
   }
   select.value = channel;
   hint.textContent =
     channel === "edge"
-      ? "Every new build off main, before it's released. Expect rough edges."
+      ? "Unreleased builds off main — for testing. Switch to released versions when you're done."
       : channel === "pinned"
         ? "Pinned to one image, so no updates arrive. Pick a channel to follow updates again."
-        : "Released versions only — the recommended choice.";
+        : "Released versions only — the supported choice.";
 }
 
 async function refreshLogs() {
@@ -794,14 +800,14 @@ document.addEventListener("click", (e) => {
 // channel the appliance isn't actually on.
 $("channel-select").addEventListener("change", async (e) => {
   const target = e.target.value;
-  if (target === "pinned") {
+  // The two self-describing options are where you already are, not somewhere to
+  // go — selecting one is a no-op that re-renders the row.
+  if (target === "pinned" || target === "edge") {
     renderChannel();
     return;
   }
   const msg =
-    target === "edge"
-      ? "Edge builds come straight off main and haven't been released — they can break. Atelier backs up and rolls back if an update fails. Switch to edge?"
-      : "Edge can be ahead of the newest release, and a site's database only migrates forward. Atelier snapshots first and rolls back if the switch fails. Switch to released versions?";
+    "Edge can be ahead of the newest release, and a site's database only migrates forward. Atelier snapshots first and rolls back if the switch fails. Switch to released versions?";
   if (!(await confirmModal(msg))) {
     renderChannel();
     return;

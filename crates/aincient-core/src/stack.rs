@@ -60,9 +60,21 @@ pub enum Channel {
 }
 
 impl Channel {
-    /// The two channels an operator can switch between. `Pinned` is deliberately
-    /// absent: you reach it by naming an image, not by choosing a channel.
-    pub const SWITCHABLE: [Channel; 2] = [Channel::Stable, Channel::Edge];
+    /// The channels a UI may OFFER. Only stable: `Edge` is still switchable by
+    /// name on the CLI, but it is not something to drift onto from a menu, and
+    /// `Pinned` is reached by naming an image rather than by choosing a channel.
+    ///
+    /// Edge is published (our own smoke/e2e lanes run on it) and is deliberately
+    /// not deleted — it is *demoted*. It ships unreleased work, and until an edge
+    /// build's stamp became version-comparable no upgrade floor could gate one at
+    /// all, which is how a six-week-old edge install walked into the 2026-08-06
+    /// data-loss incident. See `plans/channel-hardening.md`.
+    pub const OFFERED: [Channel; 1] = [Channel::Stable];
+
+    /// Whether this channel is one we support people following. False for `Edge`.
+    pub fn is_supported(self) -> bool {
+        !matches!(self, Channel::Edge)
+    }
 
     /// The moving tag this channel follows, if it is one.
     pub fn tag(self) -> Option<&'static str> {

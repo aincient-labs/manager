@@ -500,6 +500,12 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             Ok(())
         }
         DataCommand::Restore { file, yes } => {
+            // Provenance BEFORE the confirmation: which image this data came from
+            // is exactly what the operator needs to decide, and after the prompt
+            // it would be advice about something already done.
+            if let Some(skew) = ops::restore_skew(stack, &file) {
+                println!("{}", style::warn(&skew));
+            }
             if !confirm(
                 &format!(
                     "Restore will REPLACE the current database (and files, for a .tar.gz \
@@ -810,11 +816,12 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
         println!("  Channel:  {}", current.describe());
         println!("  Image:    {}", stack.image());
         match current {
-            Channel::Stable => println!(
-                "\nTo follow unreleased builds off main: `atelier app channel edge`."
-            ),
+            // Stable is the whole story on a supported install — edge is not
+            // advertised as somewhere to go next.
+            Channel::Stable => println!("\nThis is the supported channel."),
             Channel::Edge => println!(
-                "\nTo follow released versions only: `atelier app channel stable`."
+                "\nEdge is unreleased work off main, for testing. To follow released \
+                 versions only: `atelier app channel stable`."
             ),
             Channel::Pinned => println!(
                 "\nThis image never moves, so updates won't arrive. \
@@ -832,6 +839,26 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
             target.describe()
         );
         return Ok(());
+    }
+
+    // Going TO edge is a deliberate step off the supported path, so it asks. Edge
+    // is not offered in the GUI at all; the CLI keeps it (our own test lanes and
+    // anyone testing a fix need it) behind a confirmation that says what it costs.
+    if target == Channel::Edge {
+        println!(
+            "{}",
+            style::warn(
+                "Edge is unreleased work off main, rebuilt on every merge. It is for \
+                 testing, not for a site you care about: it can break, it can be ahead \
+                 of every release, and moving back to stable later hands an older \
+                 codebase a database a newer one already migrated — which only \
+                 migrates forward. Take a backup first: `atelier data backup`."
+            )
+        );
+        if !confirm("Follow unreleased edge builds anyway?", yes)? {
+            println!("{}", style::warn("Aborted."));
+            return Ok(());
+        }
     }
 
     // Edge is built from every merge, so it can be ahead of the newest release:
