@@ -334,6 +334,33 @@ impl ops::Reporter for CliReporter {
             _ => println!("{}", style::heading(message)),
         }
     }
+
+    /// Ask on the terminal, defaulting to no.
+    ///
+    /// A non-interactive run (a script, a pipe, CI) answers NO rather than
+    /// blocking forever on a stdin that will never carry an answer — and no is the
+    /// safe answer, since it leaves the install exactly as it was. `--yes` is
+    /// deliberately NOT consulted here: it exists to skip the confirmations of the
+    /// operation you asked for, and this question is about a *different* change the
+    /// manager noticed it could make to your install.
+    fn confirm(&mut self, question: &str) -> bool {
+        use std::io::IsTerminal;
+        if self.open_line {
+            println!();
+            self.open_line = false;
+        }
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "{}",
+                style::warn(&format!(
+                    "{question}\nNot asking — this isn't an interactive terminal. \
+                     Nothing changed; run `atelier app channel stable` when you want it."
+                ))
+            );
+            return false;
+        }
+        confirm(&format!("\n{question}"), false).unwrap_or(false)
+    }
 }
 
 fn run() -> Result<()> {

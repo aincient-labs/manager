@@ -12,7 +12,7 @@ use aincient_core::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 /// Locate the stack, surfacing errors as strings for the webview.
 fn stack() -> Result<Stack, String> {
@@ -61,6 +61,25 @@ impl Reporter for EventReporter {
                 fraction,
             },
         );
+    }
+
+    /// A native modal, defaulting to "Not now".
+    ///
+    /// Blocking is correct here and safe: the reporter lives on the blocking worker
+    /// thread, never the UI thread, and the operation genuinely must not continue
+    /// until this is answered. Routing it through the webview instead would mean
+    /// inventing a request/response channel for a question asked once, on adoption
+    /// of a legacy install.
+    fn confirm(&mut self, question: &str) -> bool {
+        self.app
+            .dialog()
+            .message(question)
+            .title("Switch this site to released versions?")
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Switch to releases".into(),
+                "Not now".into(),
+            ))
+            .blocking_show()
     }
 
     fn log(&mut self, line: &str) {

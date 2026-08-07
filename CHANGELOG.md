@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Moving an old install onto released versions now asks first.** An install made before there
+  were releases follows unreleased builds without ever having chosen to, and the Manager used to
+  move it onto released versions the first time it adopted one — silently changing which build
+  someone's existing site runs on, possibly by several versions at once. It now says what it
+  found and waits for an answer, and declining costs nothing: the install stays exactly where it
+  was and can be moved later with `atelier app channel stable`. A non-interactive run (a script,
+  a pipe) declines rather than hanging on an answer that will never come.
+
+### Fixed
+- **Readiness is judged from a route that can actually fail.** "Your site is ready" was decided by
+  asking for the front page, which is the one URL a site can serve from its page cache while every
+  other page is erroring — so the console could be announced as up moments before every link on it
+  returned an error. Readiness now asks for a page that cannot be cached, so it reflects whether
+  the site is really rendering.
+
 ## [0.6.0] - 2026-08-07
 
 ### Changed

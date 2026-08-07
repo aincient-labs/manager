@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::docker::{
     self, compose, preflight, run_capture, run_inherited, run_streaming, try_capture,
 };
-use crate::stack::{Channel, InstallOptions, Stack};
+use crate::stack::{Channel, InstallOptions, Stack, LEGACY_DEFAULT_IMAGE};
 
 /// drush, as invoked inside the `app` container.
 pub(crate) const DRUSH: &[&str] = &["/opt/drupal/vendor/bin/drush", "--root=/opt/drupal/web"];
@@ -65,6 +65,19 @@ pub trait Reporter {
     /// Whether docker's output should be captured and relayed via [`log`](Self::log)
     /// (a GUI feed), or left to inherit the terminal (the CLI). Default: inherit.
     fn captures_output(&self) -> bool {
+        false
+    }
+
+    /// Ask the operator to approve a step that changes the image their site runs
+    /// on. `true` means go ahead.
+    ///
+    /// **The default is NO, and that is the point.** A reporter that hasn't been
+    /// taught to ask cannot answer on the operator's behalf — the worst outcome of
+    /// the default is an install left exactly as it was, which is always a state
+    /// the site already survives. The alternative default silently moves someone's
+    /// running site to a different build, which is how the 2026-08-06 incident
+    /// started (`plans/converge-branch-guard.md`).
+    fn confirm(&mut self, _question: &str) -> bool {
         false
     }
 }
@@ -759,6 +772,10 @@ impl Reporter for ScaledReporter<'_> {
     fn captures_output(&self) -> bool {
         self.inner.captures_output()
     }
+
+    fn confirm(&mut self, question: &str) -> bool {
+        self.inner.confirm(question)
+    }
 }
 
 /// Run the one-time repairs an install made under an older manager needs — the
@@ -799,6 +816,31 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
         );
     }
     if !stack.pending_default_channel_migration() {
+        return Ok(());
+    }
+    // ASK FIRST. This is the one place the manager changes, on its own initiative,
+    // which build somebody's existing site runs on — it fires on ADOPTION of an
+    // install it did not create (`pending_default_channel_migration` requires
+    // `exists()`), so the site it moves is by definition one that already has data
+    // in it. On 2026-08-06 it moved an install six weeks forward in one step and
+    // converge reinstalled over the database. Both of those holes are now closed —
+    // the pre-pull guard refuses an image missing an installed module, and converge
+    // refuses to install over a populated database — but neither makes the move
+    // itself the manager's decision to take silently. Declining is free: the
+    // install stays on the image it is already running.
+    if !r.confirm(&format!(
+        "This install still follows {LEGACY_DEFAULT_IMAGE} — the old default, which \
+         is unreleased work off main rather than a release. Moving it to released \
+         versions changes the image your site runs on, and may step it forward by \
+         several versions. A full snapshot is taken first. Switch to released \
+         versions now?"
+    )) {
+        r.stage(
+            Stage::Scaffold,
+            "Staying on the channel this install was already following. \
+             `atelier app channel stable` moves it to released versions whenever you want.",
+            Some(0.09),
+        );
         return Ok(());
     }
     if status(stack).running {
@@ -1728,7 +1770,13 @@ fn http_ready(port: u16) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    let req = "GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    // `/user/login`, NOT `/`. The front page is anonymously page-cacheable, so it
+    // is the one URL that stays warm on a site whose every uncached route is
+    // throwing — which is how "the console is up" was announced to the reporter of
+    // manager#2 moments before every page they clicked returned a 500. A route that
+    // carries a form token cannot be served from the page cache, so a 200 here means
+    // the container actually rendered something.
+    let req = "GET /user/login HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -1908,6 +1956,76 @@ mod tests {
         ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS,
     };
     use crate::stack::Stack;
+
+    /// A reporter that answers the migration question however the test wants, and
+    /// remembers whether it was asked at all.
+    struct Answering {
+        answer: bool,
+        asked: Vec<String>,
+    }
+    impl super::Reporter for Answering {
+        fn confirm(&mut self, question: &str) -> bool {
+            self.asked.push(question.to_string());
+            self.answer
+        }
+    }
+
+    /// An install on the legacy default image, with no chosen channel — the exact
+    /// shape that `pending_default_channel_migration` fires on.
+    fn legacy_install(home: &std::path::Path) -> Stack {
+        std::fs::create_dir_all(home).unwrap();
+        let stack = Stack {
+            home: home.to_path_buf(),
+        };
+        std::fs::write(stack.compose_path(), crate::stack::COMPOSE_TEMPLATE).unwrap();
+        std::fs::write(
+            stack.env_path(),
+            format!(
+                "HASH_SALT={}\nAINCIENT_IMAGE={}\nHTTP_PORT=41221\n",
+                "a".repeat(64),
+                crate::stack::LEGACY_DEFAULT_IMAGE
+            ),
+        )
+        .unwrap();
+        stack
+    }
+
+    /// The incident's mechanism, under the operator's control: declining leaves the
+    /// install on the image it is already running, and writes nothing.
+    #[test]
+    fn declining_the_channel_migration_changes_nothing() {
+        let home = std::env::temp_dir().join(format!("atelier-confirm-no-{}", std::process::id()));
+        let stack = legacy_install(&home);
+        let mut r = Answering {
+            answer: false,
+            asked: vec![],
+        };
+
+        super::announce_legacy_migrations(&stack, &mut r).unwrap();
+
+        assert_eq!(r.asked.len(), 1, "the operator must actually be asked");
+        assert_eq!(
+            stack.env_get("AINCIENT_IMAGE").as_deref(),
+            Some(crate::stack::LEGACY_DEFAULT_IMAGE),
+            "declining must leave the image alone"
+        );
+        assert!(
+            stack.chosen_channel().is_none(),
+            "declining is not a channel choice — it must stay askable"
+        );
+        assert!(
+            stack.pending_default_channel_migration(),
+            "the migration is deferred, not cancelled"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A reporter that was never taught to ask cannot answer for the operator.
+    #[test]
+    fn a_reporter_that_cannot_ask_declines() {
+        use super::Reporter;
+        assert!(!super::Silent.confirm("switch channels?"));
+    }
 
     /// Syntax-check a shell snippet with `sh -n` (parse only; nothing executes).
     fn assert_valid_sh(script: &str) {
