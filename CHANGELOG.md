@@ -5,6 +5,15 @@ All notable changes to the Atelier CLI + Manager GUI are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-08-08
+
+### Fixed
+- **The desktop app's installers carry the right version again.** The GUI bundles (`.dmg`, `.deb`,
+  `.AppImage`, `.msi`, `.exe`, `.rpm`) had stopped tracking the release and were labelled with an
+  older version than the one you downloaded — so the installed app reported the wrong number. The
+  bundle version now follows the release automatically and can't drift apart from it again. (The CLI
+  was always correct; this was the desktop build only.)
+
 ## [0.7.0] - 2026-08-08
 
 ### Added
