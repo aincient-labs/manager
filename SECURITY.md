@@ -43,13 +43,14 @@ the supported version. Update with `brew upgrade atelier` or by downloading the 
 
 ## Verifying what you run
 
-Release binaries are code-signed:
+Signing status by platform:
 
-- **macOS** builds are **Developer ID signed and notarized** by Apple.
-- **Windows** builds are signed (via SignPath).
-
-Your OS verifies these signatures on first launch. If a build fails Gatekeeper or SmartScreen
-verification, don't run it — open a security report instead.
+- **macOS** builds are **Developer ID signed and notarized** by Apple. macOS verifies
+  the signature on first launch; if a build fails Gatekeeper verification, don't run it —
+  open a security report instead.
+- **Windows** builds are **not signed yet**. Authenticode signing (via the SignPath
+  Foundation) is a planned fast-follow. Until then, SmartScreen will warn on first launch;
+  verify a download against its published `.sha256` checksum before running it.
 
 ## Scope
 
