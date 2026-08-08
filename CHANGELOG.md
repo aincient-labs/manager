@@ -5,7 +5,7 @@ All notable changes to the Atelier CLI + Manager GUI are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] - 2026-08-08
 
 ### Changed
 - **Moving an old install onto released versions now asks first.** An install made before there
