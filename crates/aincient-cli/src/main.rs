@@ -775,7 +775,56 @@ fn parse_channel(name: &str) -> Result<Channel> {
 /// through versions they never chose, without saying so first, is how a routine
 /// update becomes a support conversation.
 fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
-    let plan = ops::plan_upgrade(stack, to.as_deref());
+    // A channel update (no explicit target) can be conclusively "nothing new" — and
+    // an update that always claims success can never tell the operator so. On a
+    // definite answer, short-circuit; fall through when the check is inconclusive.
+    // A pinned `--to` always proceeds — the operator named a specific image.
+    let plan = match &to {
+        Some(target) => ops::plan_upgrade(stack, Some(target)),
+        None => {
+            let check = ops::check_update(stack);
+            if check.update_available == Some(false) {
+                let at = check.current_version.unwrap_or_else(|| stack.image());
+                println!("{}", style::success(&format!("Already up to date ({at}).")));
+                return Ok(());
+            }
+            check.plan.unwrap_or_else(|| ops::plan_upgrade(stack, None))
+        }
+    };
+
+    // A site's database only migrates forward: an older release run against a schema
+    // a newer one already migrated breaks the site with no visible cause. Refuse a
+    // PROVEN backwards move outright — the way back to an older version is a restore,
+    // not a downgrade. (`is_downgrade` is false whenever either version is unknown,
+    // so a fork/local-build target or an unstamped install still passes through to
+    // converge's own refusal.)
+    if plan.is_downgrade() {
+        let from = plan
+            .from
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "the installed version".to_string());
+        let to_v = plan
+            .target_version()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "an older version".to_string());
+        anyhow::bail!(
+            "Refusing to move down from {from} to {to_v}. A site's database only \
+             migrates forward — running an older release against it breaks the site \
+             with no way back. To return to {to_v}, restore a backup taken on that \
+             version instead: `atelier data restore <file>`."
+        );
+    }
+
+    // Say what's about to change before touching anything. On a stepped route the
+    // printed plan below already shows from-and-hops, so this line is just the
+    // single-hop case.
+    if !plan.is_stepped() {
+        if let (Some(f), Some(t)) = (plan.from, plan.target_version()) {
+            if f != t {
+                println!("{}", style::heading(&format!("Updating {f} → {t}")));
+            }
+        }
+    }
 
     if plan.is_stepped() {
         println!("{}", style::heading("This upgrade takes more than one step"));
@@ -935,6 +984,9 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     line("Running", st.running);
     line("Console reachable", st.reachable);
     println!("  Console:  {}", style::url(&st.console_url));
+    if let Some(version) = &st.version {
+        println!("  Version:  {version}");
+    }
     println!("  Image:    {}", st.image);
     println!("  Channel:  {}", st.channel.describe());
     if !st.installed {

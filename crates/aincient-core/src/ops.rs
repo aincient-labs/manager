@@ -106,6 +106,11 @@ pub struct Status {
     pub channel: Channel,
     /// Local image digest (best effort).
     pub image_digest: Option<String>,
+    /// The `org.opencontainers.image.version` the running `app` container reports —
+    /// what the site actually calls itself (`v0.6.1`, `edge+f8bdcb9`). `None` when
+    /// nothing is running, or the image predates the stamp. Read off the container,
+    /// so it's the version genuinely serving, not whatever the tag now points at.
+    pub version: Option<String>,
 }
 
 /// The result of comparing the local image against the registry.
@@ -233,6 +238,22 @@ impl UpgradePlan {
         self.steps.len() > 1
     }
 
+    /// The version this plan lands on, when it's a stamped release. `None` for a
+    /// literal image reference (a fork, a local build) that carries no version.
+    pub fn target_version(&self) -> Option<Version> {
+        self.steps.last().and_then(|s| s.version)
+    }
+
+    /// True only when the target can be PROVEN older than what's installed — both
+    /// versions known and target < from. Unknown on either side is deliberately
+    /// `false`: a site's database only migrates forward, so a proven backwards move
+    /// is refused, but we never invent a downgrade we can't prove — `converge.sh`
+    /// remains the backstop for the cases we can't read (unstamped install, a
+    /// literal image target).
+    pub fn is_downgrade(&self) -> bool {
+        matches!((self.from, self.target_version()), (Some(from), Some(to)) if to < from)
+    }
+
     /// The waypoints — every hop that isn't the destination.
     pub fn waypoints(&self) -> impl Iterator<Item = &UpgradeStep> {
         self.steps.iter().filter(|s| !s.is_target)
@@ -302,6 +323,7 @@ pub fn status(stack: &Stack) -> Status {
         image: stack.image(),
         channel: stack.channel(),
         image_digest: local_digest(&stack.image()),
+        version: running.then(|| running_image_version(stack)).flatten(),
     }
 }
 
@@ -1006,6 +1028,30 @@ fn running_image_extensions(stack: &Stack) -> Option<Vec<String>> {
         &format!("{{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{EXTENSIONS_LABEL}\"}}}}{{{{end}}}}"),
     ]);
     parse_extension_list(try_capture(c)?.trim())
+}
+
+/// The [`VERSION_LABEL`] of the image the `app` container is actually running,
+/// read off the container the same way (and for the same reason) as
+/// [`running_image_extensions`]: it survives `stack.set_image()` having moved the
+/// tag on, so it's the version genuinely serving. `None` when the container isn't
+/// there or the label isn't (an image built before the stamp existed).
+fn running_image_version(stack: &Stack) -> Option<String> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-q", "app"]);
+    let cid = try_capture(ps)?;
+    let cid = cid.lines().next()?.trim();
+    if cid.is_empty() {
+        return None;
+    }
+    let mut c = docker::docker();
+    c.args([
+        "inspect",
+        cid,
+        "--format",
+        &format!("{{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}"),
+    ]);
+    let v = try_capture(c)?.trim().to_string();
+    (!v.is_empty()).then_some(v)
 }
 
 /// The extensions the running site has INSTALLED, read the way converge reads
@@ -2354,6 +2400,81 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         assert!(plan.steps[0].is_target);
         assert!(plan.problem.is_none());
+    }
+
+    /// A proven backwards move — installed newer than the target, both versions
+    /// known — is flagged so the update path can refuse it. A site's database only
+    /// migrates forward; recovery is a restore, not a downgrade.
+    #[test]
+    fn a_lower_target_than_the_installed_version_is_a_downgrade() {
+        let plan = plan_route(
+            Version::parse("0.6.0"),
+            "ghcr.io/aincient-labs/atelier-cms:v0.1.0".into(),
+            ImageProbe {
+                version: Some("v0.1.0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(plan.target_version(), Version::parse("0.1.0"));
+        assert!(plan.is_downgrade());
+    }
+
+    /// The ordinary forward update is not a downgrade.
+    #[test]
+    fn a_higher_target_than_the_installed_version_is_not_a_downgrade() {
+        let plan = plan_route(
+            Version::parse("0.1.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.6.0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!plan.is_downgrade());
+    }
+
+    /// Re-running the same version (a reconverge / digest refresh) is not a
+    /// downgrade — `to < from` is strict.
+    #[test]
+    fn the_same_version_is_not_a_downgrade() {
+        let plan = plan_route(
+            Version::parse("0.6.0"),
+            "img:latest".into(),
+            ImageProbe {
+                version: Some("v0.6.0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!plan.is_downgrade());
+    }
+
+    /// Unknown on either side cannot PROVE a downgrade, so it never claims one — the
+    /// appliance's own converge refusal covers the case we can't read.
+    #[test]
+    fn an_unprovable_downgrade_is_not_flagged() {
+        // Unknown installed version (an unstamped build).
+        let unknown_from = plan_route(
+            None,
+            "img:v0.1.0".into(),
+            ImageProbe {
+                version: Some("v0.1.0".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!unknown_from.is_downgrade());
+        // A literal image target that carries no version (a fork, a local build).
+        let unknown_to = plan_route(
+            Version::parse("0.6.0"),
+            "my-fork:dev".into(),
+            ImageProbe::default(),
+            None,
+        );
+        assert_eq!(unknown_to.target_version(), None);
+        assert!(!unknown_to.is_downgrade());
     }
 
     /// No floor at all (every image published before this mechanism) is also one

@@ -5,6 +5,26 @@ All notable changes to the Atelier CLI + Manager GUI are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`atelier app status` now shows the version your site is running** — the same `v0.6.1` the
+  console reports, read straight off the running container. It's the line to quote in a bug report,
+  and it means you no longer have to open the admin status page to find out what you're on.
+
+### Changed
+- **`atelier app update` tells you what it did.** It now says the version it's moving you from and
+  to before it starts, and when there's nothing newer to fetch it says so and stops — instead of
+  always reporting "Update complete." whether or not anything changed.
+
+### Fixed
+- **An update can no longer quietly move your site backwards.** Asking to update *to* an older
+  version than the one installed used to run the older release against a database a newer one had
+  already migrated — which breaks the site with no obvious cause and no way back. That move is now
+  refused outright, pointing you at `atelier data restore` instead, which is the safe way to return
+  to an earlier version. (A pinned fork or a locally built image, whose version can't be read, is
+  left to the appliance's own migration refusal as before.)
+
 ## [0.6.1] - 2026-08-08
 
 ### Changed
