@@ -230,6 +230,13 @@ pub struct UpgradePlan {
     /// falls back to the single direct hop, which is safe because the appliance
     /// refuses an impossible migration itself rather than half-performing one.
     pub problem: Option<String>,
+    /// Whether the operator named the target themselves (`--to`, a literal image
+    /// reference) rather than the channel resolving it. Decides whether applying
+    /// the plan may rewrite the configured image: a named target must be written
+    /// or it never runs, while a channel plan's target is `prospective_image()` —
+    /// writing that would apply a legacy migration the operator may just have
+    /// declined.
+    pub explicit_target: bool,
 }
 
 impl UpgradePlan {
@@ -509,7 +516,7 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
         ),
     };
 
-    match remote_probe(&target_image) {
+    let mut plan = match remote_probe(&target_image) {
         Ok(target) => plan_route(from, target_image, target, from_problem),
         Err(e) => {
             // No floors to read → the direct hop, and say why it wasn't verified.
@@ -519,7 +526,9 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
             plan.problem = Some(registry_problem(&target_image, &e));
             plan
         }
-    }
+    };
+    plan.explicit_target = to.is_some();
+    plan
 }
 
 /// Build the route from an already-probed target. Split out so [`check_update`]
@@ -629,6 +638,7 @@ fn plan_route_with(
         target_image,
         steps,
         problem,
+        explicit_target: false,
     }
 }
 
@@ -683,6 +693,20 @@ pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
 /// come up stops the route rather than pressing on — the site is left on the last
 /// version that did converge, which is a state the appliance guarantees (converge
 /// rolls its database back if the migration or the health check fails).
+/// Write a single-hop plan's image into the install before running it — but only
+/// when the operator named that image. The stepped loop writes each hop's image as
+/// it goes; the single-hop path historically wrote nothing, so `update --to X` on
+/// an install configured for another tag pulled the configured tag, told the
+/// operator it was now pinned to it, and never ran X at all. A channel plan must
+/// NOT be written here: its target is `prospective_image()`, and writing that
+/// would apply a legacy migration the operator may just have declined.
+fn retarget_single_hop(stack: &Stack, plan: &UpgradePlan) -> Result<()> {
+    if plan.explicit_target && stack.image() != plan.target_image {
+        stack.set_image(&plan.target_image)?;
+    }
+    Ok(())
+}
+
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
@@ -690,6 +714,7 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     announce_legacy_migrations(stack, r)?;
 
     if !plan.is_stepped() {
+        retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
         up(stack, r)?;
         return Ok(wait_until_ready(stack, READY_TIMEOUT, r));
@@ -2034,6 +2059,81 @@ mod tests {
         )
         .unwrap();
         stack
+    }
+
+    /// An install configured for `image`, for exercising the paths that read and
+    /// write `AINCIENT_IMAGE`.
+    fn install_on(home: &std::path::Path, image: &str) -> Stack {
+        std::fs::create_dir_all(home).unwrap();
+        let stack = Stack {
+            home: home.to_path_buf(),
+        };
+        std::fs::write(stack.compose_path(), crate::stack::COMPOSE_TEMPLATE).unwrap();
+        std::fs::write(
+            stack.env_path(),
+            format!(
+                "HASH_SALT={}\nAINCIENT_IMAGE={image}\nHTTP_PORT=41221\n",
+                "a".repeat(64),
+            ),
+        )
+        .unwrap();
+        stack
+    }
+
+    /// A one-step plan onto `target`, as `plan_upgrade` shapes it.
+    fn single_hop_plan(target: &str, explicit_target: bool) -> super::UpgradePlan {
+        super::UpgradePlan {
+            from: None,
+            target_image: target.to_string(),
+            steps: vec![super::UpgradeStep {
+                image: target.to_string(),
+                version: Version::parse("0.2.0"),
+                is_target: true,
+                reason: None,
+            }],
+            problem: None,
+            explicit_target,
+        }
+    }
+
+    /// The v0.6.0 rescue-stack incident: `update --to 0.2.0` on an install
+    /// configured for `:latest` planned `:v0.2.0` but pulled and pinned `:latest`,
+    /// because the single-hop path never wrote the target. The named image must be
+    /// configured before anything runs.
+    #[test]
+    fn an_explicit_single_hop_target_is_written_before_it_runs() {
+        let home = std::env::temp_dir().join(format!("atelier-retarget-{}", std::process::id()));
+        let stack = install_on(&home, "ghcr.io/aincient-labs/atelier-cms:latest");
+        let plan = single_hop_plan("ghcr.io/aincient-labs/atelier-cms:v0.2.0", true);
+
+        super::retarget_single_hop(&stack, &plan).unwrap();
+
+        assert_eq!(
+            stack.env_get("AINCIENT_IMAGE").as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms:v0.2.0"),
+            "the image the operator asked for must be the one that runs"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A channel plan targets `prospective_image()`, which on a legacy install is
+    /// the migration the operator gets asked about — and may decline. Applying the
+    /// plan must not write that target behind the decline.
+    #[test]
+    fn a_channel_plan_never_rewrites_the_configured_image() {
+        let home =
+            std::env::temp_dir().join(format!("atelier-no-retarget-{}", std::process::id()));
+        let stack = install_on(&home, crate::stack::LEGACY_DEFAULT_IMAGE);
+        let plan = single_hop_plan("ghcr.io/aincient-labs/atelier-cms:v0.7.1", false);
+
+        super::retarget_single_hop(&stack, &plan).unwrap();
+
+        assert_eq!(
+            stack.env_get("AINCIENT_IMAGE").as_deref(),
+            Some(crate::stack::LEGACY_DEFAULT_IMAGE),
+            "a target nobody named must never overwrite the configured image"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// The incident's mechanism, under the operator's control: declining leaves the

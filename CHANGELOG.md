@@ -5,6 +5,17 @@ All notable changes to the Atelier CLI + Manager GUI are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-08-10
+
+### Fixed
+- **`atelier app update --to <version>` now runs the version you asked for.** It planned the right
+  image, but then pulled and started whatever the install was already configured to run — on a
+  standard install, the newest release — and reported it had pinned you to *that*. So asking for a
+  specific version could silently install a different one. The version you name is now written to
+  the install before anything is pulled. If you used `--to` on 0.6.0–0.7.1, run `atelier app status`
+  to check what you're actually on. (Multi-step upgrade routes and plain `atelier app update` were
+  never affected.)
+
 ## [0.7.1] - 2026-08-08
 
 ### Fixed
