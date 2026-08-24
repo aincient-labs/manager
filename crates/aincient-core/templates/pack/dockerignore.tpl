@@ -1,4 +1,5 @@
 .git
 .github
 compose.dev.yaml
-node_modules
+compose.ci.yaml
+node_modules/

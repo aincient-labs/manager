@@ -85,6 +85,7 @@ pub fn scaffold_files(module: &str) -> Vec<(String, String)> {
         ("build/atelier/tokens.generated.css".into(), render(include_str!("../templates/pack/preset-placeholder.css.tpl"))),
         ("build/atelier/tw-palette.generated.css".into(), render(include_str!("../templates/pack/preset-placeholder.css.tpl"))),
         ("compose.dev.yaml".into(), render(include_str!("../templates/pack/compose.dev.yaml.tpl"))),
+        ("compose.ci.yaml".into(), render(include_str!("../templates/pack/compose.ci.yaml.tpl"))),
         ("dev/pack.yml".into(), render(include_str!("../templates/pack/packsd.yml.tpl"))),
         ("dev/zz-dev.ini".into(), render(include_str!("../templates/pack/zz-dev.ini.tpl"))),
         ("dev/services.dev.yml".into(), render(include_str!("../templates/pack/services.dev.yml.tpl"))),
@@ -296,6 +297,11 @@ mod tests {
         assert!(by_name["atelier.pack.yml"].contains("name: acme_pack"));
         assert!(by_name["dev/pack.yml"].contains("module: acme_pack"));
         assert!(by_name["Dockerfile"].contains("modules/custom/acme_pack"));
+        // The client image re-registers itself in the extensions label the
+        // manager's pre-pull diff reads — losing this breaks client updates.
+        assert!(by_name["Dockerfile"].contains("LABEL dev.atelier.extensions"));
+        assert!(by_name[".github/workflows/build.yml"].contains("ATELIER_EXTENSIONS"));
+        assert!(by_name["compose.ci.yaml"].contains("acme_pack:ci"));
         // The component declares the pack stylesheet it ships.
         assert!(by_name["components/showcase/showcase.component.yml"].contains("stylesheet: assets/acme_pack.css"));
         assert!(by_name.contains_key("assets/acme_pack.css"));
