@@ -7,3 +7,6 @@
 @source "../components/**/*.twig";
 @import "./atelier/tw-palette.generated.css";
 @import "./atelier/tokens.generated.css";
+/* Your own component rules — token-routed CSS lives here, not in assets/
+   (assets/__MODULE__.css is the BUILD OUTPUT; the watcher overwrites it). */
+@import "./pack.css";

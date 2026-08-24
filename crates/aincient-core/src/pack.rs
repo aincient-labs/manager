@@ -77,6 +77,9 @@ pub fn scaffold_files(module: &str) -> Vec<(String, String)> {
         ("atelier.pack.yml".into(), render(include_str!("../templates/pack/atelier.pack.yml.tpl"))),
         ("components/showcase/showcase.component.yml".into(), render(include_str!("../templates/pack/showcase.component.yml.tpl"))),
         ("components/showcase/showcase.twig".into(), render(include_str!("../templates/pack/showcase.twig.tpl"))),
+        // The SOURCE rules (imported by input.css) and the committed OUTPUT the
+        // appliance links — seeded identical; the dev watcher rebuilds the output.
+        ("build/pack.css".into(), render(include_str!("../templates/pack/pack.css.tpl"))),
         (format!("assets/{module}.css"), render(include_str!("../templates/pack/pack.css.tpl"))),
         ("build/input.css".into(), render(include_str!("../templates/pack/input.css.tpl"))),
         ("build/atelier/tokens.generated.css".into(), render(include_str!("../templates/pack/preset-placeholder.css.tpl"))),

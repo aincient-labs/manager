@@ -24,7 +24,10 @@ services:
     volumes:
       - ${PACK_DIR}:/pack
       - atelier-pack-npm:/root/.npm
-    command: ["npx", "-y", "@tailwindcss/cli@4", "-i", "build/input.css", "-o", "assets/${PACK_MODULE}.css", "--watch"]
+    # Installs into the pack's own gitignored node_modules (the CSS import
+    # of "tailwindcss" resolves upward from build/input.css); the named npm
+    # volume keeps the download warm across recreates.
+    command: ["sh", "-c", "npm install --no-save --no-package-lock --no-audit --no-fund tailwindcss@4 @tailwindcss/cli@4 && exec node_modules/.bin/tailwindcss -i build/input.css -o assets/${PACK_MODULE}.css --watch=always"]
     restart: unless-stopped
 volumes:
   atelier-pack-npm:

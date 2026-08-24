@@ -1,7 +1,7 @@
-/* __MODULE__ — PRE-COMPILED pack stylesheet. The appliance never runs your
-   build: this committed file is what ships. `atelier pack dev` keeps it fresh
-   via the Tailwind watcher (build/input.css); hand-written token-routed CSS
-   like the rules below works exactly as well.
+/* Your component rules — compiled (with any Tailwind utilities your Twig
+   uses) into assets/__MODULE__.css, the committed file that ships. The
+   appliance never runs your build; `atelier pack dev`'s watcher keeps the
+   output fresh.
    THE CONTRACT: route every colour/size through the design tokens (var(--…))
    so a rebrand reaches your markup. No hardcoded hex, no opacity-muted text —
    `atelier pack validate` lints for both. */
