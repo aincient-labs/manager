@@ -64,6 +64,42 @@ enum Command {
         #[command(subcommand)]
         command: AiCommand,
     },
+    /// Build a component pack — scaffold it, develop it live, validate it.
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
+    /// Serve the pack developer's MCP tools over stdio (for Claude Code,
+    /// Cursor, …). Needs a running dev stack (`atelier pack dev`).
+    Mcp,
+}
+
+/// The pack developer loop (see the Atelier bring-your-own-components docs).
+#[derive(Subcommand)]
+enum PackCommand {
+    /// Scaffold a new pack — an ordinary Drupal module with the atelier
+    /// metadata, dev overlay, Dockerfile and CI already in place.
+    New {
+        /// The module machine name (lowercase letters, digits, _).
+        name: String,
+    },
+    /// Bring up the appliance in DEV MODE with this pack mounted: Twig/PHP
+    /// edits visible on refresh, a Tailwind watcher, the component gallery,
+    /// and a schema watcher that rebuilds + re-validates on save.
+    /// Run from the pack's root.
+    Dev {
+        /// Bring the stack up and return instead of staying to watch.
+        #[arg(long)]
+        no_watch: bool,
+    },
+    /// Stop the pack dev stack. Run from the pack's root.
+    Down,
+    /// Run the appliance's admission gate + CSS lint + atelier.pack.yml check
+    /// against this pack (what a boot runs; what client CI should gate on).
+    Validate {
+        /// Pack module machine name; defaults to the pack in this directory.
+        module: Option<String>,
+    },
 }
 
 /// The appliance (Docker) lifecycle — the 90% commands.
@@ -373,6 +409,56 @@ fn run() -> Result<()> {
         Command::Site { command } => run_site(command, &stack),
         Command::Data { command } => run_data(command, &stack),
         Command::Ai { command } => run_ai(command, &stack),
+        Command::Pack { command } => run_pack(command, &stack),
+        Command::Mcp => aincient_core::mcp::serve(&stack),
+    }
+}
+
+/// `atelier pack …` — the component-pack developer loop.
+fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
+    use aincient_core::{pack, Pack};
+    match command {
+        PackCommand::New { name } => {
+            let dest = pack::scaffold(&std::env::current_dir()?, &name)?;
+            println!("{} {}", style::success("Pack scaffolded at"), dest.display());
+            println!("Next: cd {name} && atelier pack dev — then open the gallery and edit components/showcase/.");
+            Ok(())
+        }
+        PackCommand::Dev { no_watch } => {
+            let p = Pack::locate(&std::env::current_dir()?)?;
+            pack::dev_up(stack, &p)?;
+            println!(
+                "{} pack {} is mounted; dev mode is ON.",
+                style::success("Dev stack is up —"),
+                p.module
+            );
+            println!(
+                "Gallery: http://localhost:{}/atelier/packs/{}/gallery",
+                stack.http_port(),
+                p.module
+            );
+            match pack::sync_preset(stack, &p) {
+                Ok(()) => println!("Token preset synced into build/atelier/ (commit it — CI builds against it)."),
+                Err(e) => println!("{} {e:#}", style::warn("Preset sync failed (CSS build may miss utilities):")),
+            }
+            if no_watch {
+                return Ok(());
+            }
+            pack::watch(stack, &p, |line| println!("{line}"))
+        }
+        PackCommand::Down => {
+            let p = Pack::locate(&std::env::current_dir()?)?;
+            pack::dev_down(stack, &p)?;
+            println!("{}", style::success("Dev stack stopped."));
+            Ok(())
+        }
+        PackCommand::Validate { module } => {
+            let module = match module {
+                Some(m) => m,
+                None => Pack::locate(&std::env::current_dir()?)?.module,
+            };
+            pack::validate(stack, &module)
+        }
     }
 }
 

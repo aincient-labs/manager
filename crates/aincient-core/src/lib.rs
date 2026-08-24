@@ -12,7 +12,9 @@
 
 pub mod docker;
 pub mod doctor;
+pub mod mcp;
 pub mod ops;
+pub mod pack;
 pub mod stack;
 
 pub use docker::{preflight, Preflight};
@@ -24,4 +26,5 @@ pub use ops::{
     set_admin_password, start, status, stop, switch_channel, tail_logs, update, Backup,
     ExportOptions, ModelRole, Reporter, Silent, Stage, Status, UpdateCheck,
 };
+pub use pack::Pack;
 pub use stack::{Channel, InstallOptions, Stack, DEFAULT_IMAGE, DEFAULT_PORT};

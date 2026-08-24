@@ -5,6 +5,20 @@ All notable changes to the Atelier CLI + Manager GUI are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `atelier pack new|dev|down|validate` — the component-pack developer loop:
+  scaffold a pack (an ordinary Drupal module carrying `thirdPartySettings.atelier`),
+  run the pinned appliance image in dev mode with the pack mounted (Twig/PHP
+  edits visible on refresh, a Tailwind watcher, the component gallery at
+  `/atelier/packs/<module>/gallery`), and run the appliance's own admission
+  gate against it. Requires an appliance image with pack support (> 0.9.2).
+- `atelier mcp` — a stdio MCP server exposing the pack developer's
+  ground-truth tools (catalog, gate, prompt manifest, rendered examples,
+  design tokens, component scaffolding) to coding agents such as Claude Code
+  and Cursor. Works against a running `atelier pack dev` stack.
+
 ## [0.7.2] - 2026-08-10
 
 ### Fixed
