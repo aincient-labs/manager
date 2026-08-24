@@ -3,7 +3,7 @@
 api: 1
 name: __MODULE__
 requires:
-  atelier: '^0.9'
+  atelier: '^0.10'
 # What this pack carries. components | page_kinds | providers — a provider
 # payload must be declared here explicitly, it never rides in silently.
 provides: [components]
