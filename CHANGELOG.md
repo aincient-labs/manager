@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   component). The direct answer to "the agent won't use my component". Needs an
   AI provider connected on the dev appliance, and an appliance image with the
   `/atelier/dev/agent-eval` endpoint (> 0.9.2).
+- The pack scaffold's CI workflow is now the full client reference pipeline:
+  CSS drift gate (arms once the committed asset is a Tailwind build), image
+  build, boot against a throwaway database (`compose.ci.yaml`), the admission
+  gate + kind-check + gallery smoke inside the booted appliance, and — on
+  `main` — a push to `ghcr.io/<owner>/<repo>` with the `dev.atelier.extensions`
+  label re-stamped from the validated image so the manager's pre-pull extension
+  diff knows the pack ships. On an Atelier pin predating component packs the
+  gate steps skip with an explicit notice instead of failing.
 
 ## [0.7.2] - 2026-08-10
 
