@@ -42,7 +42,9 @@ against the committed preset and fails on drift.
 plus this pack baked in (see `Dockerfile`). Every push runs the reference
 pipeline (`.github/workflows/build.yml`):
 
-1. rebuild the CSS against the committed preset, fail on drift;
+1. rebuild the CSS against the committed preset and fail on drift (armed once
+   the committed `assets/` file is a Tailwind build — the scaffold's
+   hand-written file passes untouched);
 2. `docker build .`;
 3. boot that image against a throwaway database (`compose.ci.yaml`) and let
    converge enable the pack — the exact path a production boot takes;

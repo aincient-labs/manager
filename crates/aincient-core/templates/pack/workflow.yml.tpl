@@ -21,9 +21,23 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - name: Build CSS and assert no diff vs the committed file
+        # A real install, not bare npx: input.css `@import "tailwindcss"`
+        # resolves from node_modules, which npx alone does not provide.
+        #
+        # The drift gate only arms once the committed asset IS a Tailwind
+        # build (the dev watcher's output, carrying the tailwindcss banner).
+        # The scaffold ships a hand-written token-routed file instead — the
+        # build is optional — and diffing that against a build would fail
+        # every fresh scaffold forever.
         run: |
-          npx -y @tailwindcss/cli@4 -i build/input.css -o "assets/${MODULE}.css"
-          git diff --exit-code -- assets/
+          npm install --no-save --no-package-lock --no-audit --no-fund tailwindcss@4 @tailwindcss/cli@4
+          node_modules/.bin/tailwindcss -i build/input.css -o /tmp/built.css
+          if head -1 "assets/${MODULE}.css" | grep -q 'tailwindcss v'; then
+            diff -u "assets/${MODULE}.css" /tmp/built.css \
+              || { echo "committed assets/${MODULE}.css is not the built CSS — rebuild and commit it" >&2; exit 1; }
+          else
+            echo "hand-written assets/${MODULE}.css — drift gate armed once you commit a built file"
+          fi
   image:
     runs-on: ubuntu-latest
     needs: css
