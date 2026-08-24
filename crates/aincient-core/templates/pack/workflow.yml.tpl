@@ -68,14 +68,22 @@ jobs:
         run: |
           set -euo pipefail
           drush() { docker compose -f compose.ci.yaml exec -T app /opt/drupal/vendor/bin/drush --root=/opt/drupal/web "$@"; }
+          # The site actually serves.
+          curl -fsS -o /dev/null http://localhost:8080/
+          # An Atelier pinned from before component packs ships the pack's
+          # files but never enables or validates them — say so plainly
+          # instead of failing on a missing drush namespace.
+          if ! drush atelier:pack-validate --help >/dev/null 2>&1; then
+            echo "::notice title=Pack not active::this Atelier version predates component packs — the image ships the pack inert. Bump the Dockerfile FROM pin to a pack-aware Atelier; gate, kind-check and gallery smoke were skipped."
+            exit 0
+          fi
           # The exact gate a boot runs — a REJECTED component fails the build.
           drush atelier:pack-validate "$MODULE"
           # Catalog change vs stored pages: BREAKING orphans fail the build.
           # (Meaningful against real content: seed the database from a
           # production snapshot here if you have one.)
           drush atelier:kind-check
-          # The site actually serves, and every declared example renders.
-          curl -fsS -o /dev/null http://localhost:8080/
+          # Every declared example renders.
           curl -fsS -o /dev/null "http://localhost:8080/atelier/packs/${MODULE}/gallery"
 
       # The list stamped as dev.atelier.extensions — read out of the built
