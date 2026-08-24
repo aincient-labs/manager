@@ -47,7 +47,7 @@ pub fn serve(stack: &Stack) -> Result<()> {
                     "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05"),
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "atelier", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "Ground-truth tools for developing an Atelier CMS component pack against the LIVE dev appliance (`atelier pack dev` must be running). Validate with pack_validate after every component.yml change; read prompt_manifest to see exactly what the page agent sees."
+                    "instructions": "Ground-truth tools for developing an Atelier CMS component pack against the LIVE dev appliance (`atelier pack dev` must be running). Validate with pack_validate after every component.yml change; read prompt_manifest to see exactly what the page agent sees; prove placement with agent_eval (needs an AI provider connected)."
                 }
             }),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
@@ -121,6 +121,15 @@ fn tool_list() -> Value {
             }}
         },
         {
+            "name": "agent_eval",
+            "description": "Ask the site's REAL page agent model to compose against a kind's live palette, graded by the live catalog: would it place your component, with valid props, honouring the kind's opener? THE check for 'the agent won't use my component'. Needs an AI provider connected on the appliance.",
+            "inputSchema": { "type": "object", "required": ["ask"], "properties": {
+                "ask": { "type": "string", "description": "The user request to evaluate, e.g. 'add a spotlight for our spring launch'." },
+                "kind": { "type": "string", "description": "Page kind to evaluate against. Default: landing." },
+                "expect": { "type": "string", "description": "Component machine name that must appear in the placed sections for the eval to pass." }
+            }}
+        },
+        {
             "name": "scaffold_component",
             "description": "Add a new component skeleton (component.yml + twig with the atelier metadata block) to the pack in the current working directory. Local file write; validate with pack_validate after filling it in.",
             "inputSchema": { "type": "object", "required": ["name"], "properties": {
@@ -167,12 +176,44 @@ fn call_tool(port: u16, name: &str, args: &Value) -> Result<(String, bool)> {
             }
             get(path)
         }
+        "agent_eval" => {
+            let ask = args.get("ask").and_then(Value::as_str).unwrap_or_default();
+            if ask.is_empty() {
+                return Ok(("agent_eval needs an `ask` (the user request to evaluate).".into(), true));
+            }
+            let mut path = format!(
+                "/atelier/dev/agent-eval?kind={}&ask={}",
+                kind(),
+                percent_encode(ask)
+            );
+            if let Some(expect) = args.get("expect").and_then(Value::as_str) {
+                if !expect.is_empty() {
+                    path.push_str(&format!("&expect={}", percent_encode(expect)));
+                }
+            }
+            get(path)
+        }
         "scaffold_component" => {
             let new = args.get("name").and_then(Value::as_str).unwrap_or_default();
             scaffold_component(&std::env::current_dir()?, new)
         }
         _ => Ok((format!("unknown tool: {name}"), true)),
     }
+}
+
+/// Minimal query-string percent-encoding (RFC 3986 unreserved pass-through) —
+/// enough for the free-text `ask` without pulling a url crate in.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Write a component skeleton into the pack rooted at `dir`.
@@ -216,7 +257,7 @@ mod tests {
     fn tool_list_is_well_formed() {
         let tools = tool_list();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

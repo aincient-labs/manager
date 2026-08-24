@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ground-truth tools (catalog, gate, prompt manifest, rendered examples,
   design tokens, component scaffolding) to coding agents such as Claude Code
   and Cursor. Works against a running `atelier pack dev` stack.
+- `agent_eval` MCP tool — asks the appliance's real page-agent model to compose
+  against a kind's live palette and grades the answer with the live catalog
+  (unknown components, prop lint, the kind's opener, an optional expected
+  component). The direct answer to "the agent won't use my component". Needs an
+  AI provider connected on the dev appliance, and an appliance image with the
+  `/atelier/dev/agent-eval` endpoint (> 0.9.2).
 
 ## [0.7.2] - 2026-08-10
 
