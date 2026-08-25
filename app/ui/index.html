@@ -241,6 +241,20 @@
           </button>
         </div>
 
+        <!-- The manager's own update nudge — deliberately quieter than the
+             appliance banner above: this app is a convenience, the site is the
+             product. No updater plumbing; the button just opens the releases
+             page in the browser. -->
+        <div id="manager-update-banner" class="banner quiet hidden">
+          <div>
+            <b>Manager <span id="manager-update-version"></span> is available.</b>
+            <span class="banner-sub">That's this app — your site is separate.</span>
+          </div>
+          <button class="btn small" data-action="manager-release">
+            <svg class="ic"><use href="#i-open" /></svg>Get it
+          </button>
+        </div>
+
         <!-- Quiet, occasional actions — deliberately understated. -->
         <div class="quiet-row">
           <button class="btn ghost small" data-action="login">
@@ -459,6 +473,10 @@
               <span class="kv-label">Manager</span>
               <span id="manager-version-row" class="kv-value">—</span>
             </div>
+            <p id="manager-update-hint" class="hint hidden">
+              Manager <span id="manager-update-version-row"></span> is available —
+              <a href="https://github.com/aincient-labs/manager/releases/latest">get the update</a>.
+            </p>
             <!-- Which images this install follows. Released versions is the only
                  offer: edge ships unreleased work and is reached deliberately from
                  the CLI, never by picking a menu item. renderChannel() prepends a

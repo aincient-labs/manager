@@ -407,6 +407,45 @@ async function refreshUpdate() {
   }
 }
 
+// --- manager self-update nudge -----------------------------------------------
+// The manager has no updater of its own; the most we owe people is knowing a
+// newer one exists. One unauthenticated GitHub API call per launch (the 60/hr
+// rate limit is plenty), fired after first render, and every failure path is
+// silent — offline must look exactly like up to date.
+const MANAGER_RELEASES_PAGE = "https://github.com/aincient-labs/manager/releases/latest";
+let managerUpdateChecked = false;
+
+// True when `latest` is a plain X.Y.Z strictly newer than `current`. Our stable
+// tags carry no prerelease part, so anything that doesn't parse as three
+// numbers is treated as "not newer" rather than guessed at.
+function isNewerVersion(latest, current) {
+  const a = String(latest).split(".").map(Number);
+  const b = String(current).split(".").map(Number);
+  if (a.length !== 3 || b.length !== 3 || [...a, ...b].some(Number.isNaN)) return false;
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i];
+  return false;
+}
+
+async function checkManagerUpdate() {
+  if (managerUpdateChecked || !managerVersion) return;
+  managerUpdateChecked = true;
+  try {
+    const res = await fetch("https://api.github.com/repos/aincient-labs/manager/releases/latest", {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!res.ok) return;
+    const body = await res.json();
+    const latest = String(body.tag_name || "").replace(/^v/, "");
+    if (!isNewerVersion(latest, managerVersion)) return;
+    $("manager-update-version").textContent = latest;
+    $("manager-update-version-row").textContent = latest;
+    $("manager-update-banner").classList.remove("hidden");
+    $("manager-update-hint").classList.remove("hidden");
+  } catch {
+    // No network, rate-limited, API reshaped — all of these mean "say nothing".
+  }
+}
+
 // --- Publish panel ----------------------------------------------------------
 
 // Publish preferences are remembered between sessions (webview localStorage) so
@@ -652,6 +691,9 @@ function esc(s) {
 
 const actions = {
   recheck: () => refresh(),
+
+  "manager-release": () =>
+    invoke("open_url", { url: MANAGER_RELEASES_PAGE }).catch((e) => showError(String(e))),
 
   "dismiss-error": () => hideError(),
 
@@ -953,5 +995,7 @@ $("channel-select").addEventListener("change", async (e) => {
 });
 
 initPublishPrefs();
-showManagerVersion();
+// The nudge needs managerVersion to compare against, so it chains off the
+// version stamp — still fire-and-forget, nothing here delays first paint.
+showManagerVersion().then(checkManagerUpdate);
 refresh().catch((e) => showError(String(e)));

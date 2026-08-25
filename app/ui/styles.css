@@ -433,6 +433,14 @@ main {
   font-weight: 600;
 }
 
+/* The manager's own nudge sits below the appliance banner and must read as the
+   lesser of the two — plain paper, no accent wash. */
+.banner.quiet {
+  background: var(--surface);
+  border-color: var(--border);
+  font-weight: 500;
+}
+
 /* Buttons — the kit voices (Laws 07/08): a raised paper secondary is the
    default; `.primary` is the ONE cinnabar fill per view; destructive actions
    stay quiet until the modal's brick-filled CONFIRM step. Buttons lift off

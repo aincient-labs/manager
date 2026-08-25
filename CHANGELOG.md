@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The GUI now notices when a newer Manager is available and shows a quiet
+  banner on Home (plus a hint in Settings) linking to the releases page. One
+  GitHub API check per launch, after first render; offline or rate-limited it
+  stays silent and behaves exactly as before. The Manager still never updates
+  itself — the appliance banner remains about your site, this one is about the
+  app.
+
 ## [0.8.0] - 2026-08-25
 
 ### Fixed
