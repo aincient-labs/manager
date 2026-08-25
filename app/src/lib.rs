@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, Reporter, Stack, Stage,
-    Status, UpdateCheck,
+    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, PullEvent, Reporter,
+    Stack, Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -30,13 +30,16 @@ fn err(e: anyhow::Error) -> String {
 #[derive(Clone, Serialize)]
 struct ProgressEvent {
     /// `"stage"` — a milestone that advances the bar; `"log"` — a passed-through
-    /// docker line that only appends to the feed.
+    /// docker line that only appends to the feed; `"pull"` — a structured
+    /// per-layer pull event carried in `pull`.
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     stage: Option<Stage>,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fraction: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pull: Option<PullEvent>,
 }
 
 /// Relays core lifecycle progress to the webview. Lives on the blocking worker
@@ -59,6 +62,7 @@ impl Reporter for EventReporter {
                 stage: Some(stage),
                 message: message.to_string(),
                 fraction,
+                pull: None,
             },
         );
     }
@@ -90,6 +94,20 @@ impl Reporter for EventReporter {
                 stage: None,
                 message: line.to_string(),
                 fraction: None,
+                pull: None,
+            },
+        );
+    }
+
+    fn pull_progress(&mut self, ev: &PullEvent) {
+        let _ = self.app.emit(
+            "op-progress",
+            ProgressEvent {
+                kind: "pull",
+                stage: None,
+                message: String::new(),
+                fraction: None,
+                pull: Some(ev.clone()),
             },
         );
     }

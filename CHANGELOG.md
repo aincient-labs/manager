@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- The GUI's update/install log is now a real progress view: the image pull
+  renders one progress bar per layer (phase, bytes downloaded, percent) plus a
+  summary line, driven by Docker Compose's structured JSON progress instead of
+  raw text. Working layers fill cinnabar, finished ones settle jade, warnings
+  ochre, failures coral — and plain log lines (compose up, converge) are now
+  colour-classified so errors and warnings stand out. Requires Compose v2.30+
+  for the bars; older Compose falls back to the plain text feed. The CLI is
+  unchanged and keeps Docker's native progress rendering.
 - `atelier pack new|dev|down|validate` — the component-pack developer loop:
   scaffold a pack (an ordinary Drupal module carrying `thirdPartySettings.atelier`),
   run the pinned appliance image in dev mode with the pack mounted (Twig/PHP

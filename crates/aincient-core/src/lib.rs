@@ -17,7 +17,7 @@ pub mod ops;
 pub mod pack;
 pub mod stack;
 
-pub use docker::{preflight, Preflight};
+pub use docker::{preflight, Preflight, PullEvent};
 pub use doctor::{Check, Report, Repair, Severity, Tier};
 pub use ops::{
     admin_password, backup, check_update, down, export_static, install, list_backups,

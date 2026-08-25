@@ -813,6 +813,81 @@ select:focus {
   word-break: break-word;
 }
 
+/* Structured pull progress — one compact row per image layer (id · bar ·
+   phase/bytes), fed by compose's JSON progress events. Working rows fill
+   cinnabar, finished rows settle jade, warnings ochre, failures coral —
+   the same vocabulary as the main bar, so "is this going fine?" is a
+   colour-read, not a log-read. */
+.pull-summary {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+.pull-layers {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 132px;
+  overflow-y: auto;
+  margin: 0 0 10px;
+}
+.pull-row {
+  display: grid;
+  grid-template-columns: 82px 1fr 96px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.pull-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pull-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.pull-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.2s ease, background 0.2s;
+}
+.pull-row.pull-done .pull-bar-fill {
+  background: var(--jade);
+}
+.pull-row.pull-warn .pull-bar-fill {
+  background: var(--accent-2);
+}
+.pull-row.pull-fail .pull-bar-fill {
+  background: var(--danger);
+}
+.pull-row.pull-fail {
+  color: var(--danger);
+}
+.pull-meta {
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Log severity — errors coral, warnings ochre; routine chatter stays dim. */
+.progress-log .log-error {
+  color: var(--danger);
+}
+.progress-log .log-warn {
+  color: var(--accent-2);
+}
+
 /* ============================================================================
    Redesign additions — a welcoming, tabbed shell over the same Atelier kit.
    Plain-language screens for people who've never run a website: one calm

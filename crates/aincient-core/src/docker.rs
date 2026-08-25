@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::stack::Stack;
 
@@ -156,6 +156,56 @@ fn quiet(cmd: &mut Command) -> bool {
         .unwrap_or(false)
 }
 
+/// One structured progress event from `docker compose --progress json` — a
+/// per-layer (or per-image) status line with byte counts. Fields mirror what
+/// compose emits; everything but `id` is optional because different phases
+/// carry different subsets (a `Downloading` tick has bytes, a `Pull complete`
+/// doesn't).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullEvent {
+    /// Layer digest prefix, or `"Image <ref>"` for the image-level envelope.
+    pub id: String,
+    /// Set on layer events: the `"Image <ref>"` id they belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// `Working` / `Done` / `Error` / `Warning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// The phase: `Pulling fs layer`, `Downloading`, `Extracting`,
+    /// `Pull complete`, `Already exists`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+}
+
+impl PullEvent {
+    /// Render as a plain log line — the fallback for reporters that only know
+    /// how to append text.
+    pub fn to_line(&self) -> String {
+        let mut s = self.id.clone();
+        if let Some(t) = &self.text {
+            s.push(' ');
+            s.push_str(t);
+        }
+        if let Some(p) = self.percent {
+            s.push_str(&format!(" {p:.0}%"));
+        }
+        s
+    }
+}
+
+/// Whether the local Compose plugin understands `--progress json` (Compose
+/// v2.30+). Probed with a cheap `version` call so `pull` can fall back to the
+/// plain text feed on older installs instead of failing on an unknown flag value.
+pub fn compose_supports_json_progress() -> bool {
+    quiet(docker().args(["compose", "--progress", "json", "version"]))
+}
+
 /// Run to completion, streaming stdout/stderr to the inheriting process. For
 /// long, chatty operations (pull, up) where the user wants live progress.
 pub fn run_inherited(mut cmd: Command, action: &str) -> Result<()> {
@@ -265,5 +315,29 @@ pub fn try_capture(mut cmd: Command) -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PullEvent;
+
+    /// Real lines captured from `docker compose --progress json pull`.
+    #[test]
+    fn pull_event_parses_compose_json() {
+        let layer: PullEvent = serde_json::from_str(
+            r#"{"id":"3f26bc2dec0b","parent_id":"Image alpine:3.20","status":"Working","text":"Downloading","details":"2.309MB","current":2309499,"total":4092319,"percent":56}"#,
+        )
+        .unwrap();
+        assert_eq!(layer.parent_id.as_deref(), Some("Image alpine:3.20"));
+        assert_eq!(layer.current, Some(2309499));
+        assert_eq!(layer.percent, Some(56.0));
+
+        let image: PullEvent =
+            serde_json::from_str(r#"{"id":"Image alpine:3.20","status":"Done","text":"Pulled"}"#)
+                .unwrap();
+        assert!(image.parent_id.is_none());
+        assert_eq!(image.status.as_deref(), Some("Done"));
+        assert_eq!(image.to_line(), "Image alpine:3.20 Pulled");
     }
 }

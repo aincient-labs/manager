@@ -62,6 +62,13 @@ pub trait Reporter {
     fn stage(&mut self, _stage: Stage, _message: &str, _fraction: Option<f32>) {}
     /// A pass-through log line from the underlying tool (docker), no bar change.
     fn log(&mut self, _line: &str) {}
+    /// A structured pull-progress event (per-layer phase + bytes), emitted in
+    /// place of raw `log` lines when docker can produce them and the reporter
+    /// captures output. Default: degrade to a plain log line, so reporters that
+    /// only know `log` keep working unchanged.
+    fn pull_progress(&mut self, ev: &docker::PullEvent) {
+        self.log(&ev.to_line());
+    }
     /// Whether docker's output should be captured and relayed via [`log`](Self::log)
     /// (a GUI feed), or left to inherit the terminal (the CLI). Default: inherit.
     fn captures_output(&self) -> bool {
@@ -816,6 +823,10 @@ impl Reporter for ScaledReporter<'_> {
         self.inner.log(line);
     }
 
+    fn pull_progress(&mut self, ev: &docker::PullEvent) {
+        self.inner.pull_progress(ev);
+    }
+
     fn captures_output(&self) -> bool {
         self.inner.captures_output()
     }
@@ -949,9 +960,27 @@ pub fn switch_channel(
 fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     guard_missing_extensions(stack, r)?;
     r.stage(Stage::Pull, "Pulling the latest appliance image…", Some(0.12));
+    // A capturing reporter (the GUI) gets structured per-layer progress via
+    // compose's JSON progress stream; the CLI keeps inheriting docker's own TTY
+    // bars, and a compose too old for `--progress json` falls back to the plain
+    // text feed rather than failing on the flag.
+    let structured = r.captures_output() && docker::compose_supports_json_progress();
     let mut c = compose(stack);
+    if structured {
+        c.args(["--progress", "json"]);
+    }
     c.arg("pull");
-    run_step(c, "pull the image", r).map_err(|e| {
+    let run = if structured {
+        run_streaming(c, "pull the image", |line| {
+            match serde_json::from_str::<docker::PullEvent>(line) {
+                Ok(ev) => r.pull_progress(&ev),
+                Err(_) => r.log(line),
+            }
+        })
+    } else {
+        run_step(c, "pull the image", r)
+    };
+    run.map_err(|e| {
         if stack.image().starts_with("ghcr.io/") {
             e.context(
                 "If this is an authentication error, log in to the registry first:\n  \

@@ -120,6 +120,7 @@ function progressReset(title) {
   $("progressbar").classList.add("indeterminate"); // until a fraction arrives
   $("progress-stage").textContent = "Working…";
   $("progress-log").textContent = "";
+  resetPull();
   lastStage = null;
   sawFraction = false;
 }
@@ -132,10 +133,132 @@ function progressFinish() {
   $("progress-stage").textContent = "Done.";
 }
 
-function appendLog(line) {
+function appendLog(line, cls) {
   const log = $("progress-log");
-  log.textContent += (log.textContent ? "\n" : "") + line;
+  const row = document.createElement("div");
+  row.textContent = line;
+  if (cls) row.className = cls;
+  log.appendChild(row);
   log.scrollTop = log.scrollHeight;
+}
+
+// Colour a docker/converge line by what it reports, so a problem reads at a
+// glance: coral for errors, ochre for warnings, dim for routine chatter.
+function logClass(line) {
+  if (/\b(error|fatal|failed|failure|panic|denied|unauthorized)\b/i.test(line)) return "log-error";
+  if (/\b(warn|warning|deprecated|retrying)\b/i.test(line)) return "log-warn";
+  return "";
+}
+
+// --- structured pull progress -------------------------------------------
+// One row per image layer, driven by compose's `--progress json` events (id ·
+// bar · phase/bytes). `dlCur`/`dlTot` remember download bytes separately from
+// the live phase, so the summary's "X of Y downloaded" stays monotone while a
+// layer moves on to extraction.
+let pullLayers = new Map();
+let pullImage = null;
+let pullRenderQueued = false;
+
+function fmtBytes(n) {
+  if (n == null) return "";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`;
+}
+
+function resetPull() {
+  pullLayers = new Map();
+  pullImage = null;
+  $("pull-layers").innerHTML = "";
+  $("pull-layers").classList.add("hidden");
+  $("pull-summary").textContent = "";
+  $("pull-summary").classList.add("hidden");
+}
+
+function pullUpdate(ev) {
+  if (!ev) return;
+  // Image-level envelope ("Image ghcr.io/… Pulling/Pulled"). A new image means
+  // a new pull — stepped upgrades pull several — so start the panel fresh.
+  if (!ev.parent_id) {
+    if (ev.id !== pullImage) {
+      resetPull();
+      pullImage = ev.id;
+    }
+    const ref = ev.id.replace(/^Image /, "");
+    if (ev.status === "Done") appendLog(`✓ pulled ${ref}`);
+    if (ev.status === "Error") appendLog(`✗ ${ref} — ${ev.text || "pull failed"}`, "log-error");
+    return;
+  }
+  const rec = pullLayers.get(ev.id) || {};
+  rec.text = ev.text || rec.text;
+  rec.status = ev.status || rec.status;
+  rec.percent = ev.percent ?? rec.percent;
+  if (ev.text === "Downloading") {
+    rec.dlCur = ev.current;
+    rec.dlTot = ev.total;
+  } else if (ev.status === "Done" || ev.text === "Download complete") {
+    if (rec.dlTot != null) rec.dlCur = rec.dlTot;
+  }
+  pullLayers.set(ev.id, rec);
+  if (!pullRenderQueued) {
+    pullRenderQueued = true;
+    requestAnimationFrame(() => {
+      pullRenderQueued = false;
+      renderPull();
+    });
+  }
+}
+
+function renderPull() {
+  const panel = $("pull-layers");
+  const summary = $("pull-summary");
+  panel.classList.remove("hidden");
+  summary.classList.remove("hidden");
+
+  let done = 0, dlCur = 0, dlTot = 0;
+  const frag = document.createDocumentFragment();
+  for (const [id, rec] of pullLayers) {
+    if (rec.status === "Done") done++;
+    dlCur += rec.dlCur || 0;
+    dlTot += rec.dlTot || 0;
+
+    const row = document.createElement("div");
+    row.className = "pull-row";
+    if (rec.status === "Done") row.classList.add("pull-done");
+    else if (rec.status === "Warning") row.classList.add("pull-warn");
+    else if (rec.status === "Error") row.classList.add("pull-fail");
+
+    const idEl = document.createElement("span");
+    idEl.className = "pull-id";
+    idEl.textContent = id;
+
+    const bar = document.createElement("div");
+    bar.className = "pull-bar";
+    const fill = document.createElement("div");
+    fill.className = "pull-bar-fill";
+    const pct = rec.status === "Done" ? 100 : rec.percent ?? 0;
+    fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    bar.appendChild(fill);
+
+    const meta = document.createElement("span");
+    meta.className = "pull-meta";
+    meta.title = rec.text || "";
+    if (rec.status === "Error") meta.textContent = "failed";
+    else if (rec.text === "Already exists") meta.textContent = "cached";
+    else if (rec.status === "Done") meta.textContent = "done";
+    else if (rec.text === "Downloading" && rec.dlTot != null)
+      meta.textContent = `${fmtBytes(rec.dlCur)} / ${fmtBytes(rec.dlTot)}`;
+    else if (rec.text === "Extracting")
+      meta.textContent = `unpack ${Math.round(rec.percent ?? 0)}%`;
+    else meta.textContent = (rec.text || "…").toLowerCase();
+
+    row.append(idEl, bar, meta);
+    frag.appendChild(row);
+  }
+  panel.replaceChildren(frag);
+  const bytes = dlTot > 0 ? ` · ${fmtBytes(dlCur)} of ${fmtBytes(dlTot)}` : "";
+  summary.textContent = `${done} of ${pullLayers.size} layers done${bytes}`;
 }
 
 function progressUpdate(p) {
@@ -145,8 +268,12 @@ function progressUpdate(p) {
     $("progress-fill").style.width = `${Math.round(p.fraction * 100)}%`;
     if (p.fraction >= 1) $("progress-fill").classList.add("done");
   }
+  if (p.kind === "pull") {
+    pullUpdate(p.pull);
+    return;
+  }
   if (p.kind === "log") {
-    if (p.message.trim()) appendLog(p.message);
+    if (p.message.trim()) appendLog(p.message, logClass(p.message));
     return;
   }
   $("progress-stage").textContent = p.message;
