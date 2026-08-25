@@ -133,6 +133,17 @@ for pasting into an issue.
 > `app install`, `backup` → `data backup`, `model set` → `ai model set`, and so on. `doctor`
 > is unchanged.
 
+### Network calls the Manager makes on its own
+
+On launch, the GUI asks GitHub (`api.github.com`) whether a newer Manager release exists, so it
+can show a quiet "get the update" link when this app itself is stale. Nothing about you or your
+install is sent — no ID, no version, no OS details, just the request itself — and **we receive no
+data**: GitHub doesn't share API request logs with repository owners, so this can't even count
+installs. Offline or rate-limited, the check silently does nothing. The Manager never updates
+itself; the appliance update banner is about your site, this link is about the app. (The
+appliance's own `check-update` talks to the image registry the same way — a version lookup,
+nothing more.)
+
 ## Develop
 
 ```bash
