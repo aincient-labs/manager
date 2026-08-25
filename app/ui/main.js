@@ -62,6 +62,10 @@ function showError(msg) {
   $("error").classList.remove("hidden");
 }
 
+function hideError() {
+  $("error").classList.add("hidden");
+}
+
 // In-page confirm (the webview blocks native confirm() without the dialog plugin).
 // Pass { requireText: "confirm" } to gate a destructive action behind a typed word.
 function confirmModal(msg, opts = {}) {
@@ -286,6 +290,9 @@ function progressUpdate(p) {
 // Wrap any long op in the progress panel: stream its phases/steps via op-progress
 // events, then refresh. Returns whether the op completed without error.
 async function runProgressOp(title, fn) {
+  // A new attempt supersedes the previous failure — leaving the old banner up
+  // makes a retry that succeeds look like it failed.
+  hideError();
   progressReset(title);
   $("progress").classList.remove("hidden");
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
@@ -646,7 +653,7 @@ function esc(s) {
 const actions = {
   recheck: () => refresh(),
 
-  "dismiss-error": () => $("error").classList.add("hidden"),
+  "dismiss-error": () => hideError(),
 
   // "Edit my site" — drop the operator into the console signed in. A fresh
   // appliance's admin password is never shown, so a plain /atelier link would

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A failed operation's error banner (e.g. an export stopped by broken links)
+  now clears the moment a new operation starts, so a retry that succeeds — such
+  as re-exporting with the link check skipped — no longer looks like it failed.
+
 ### Added
 - The GUI's update/install log is now a real progress view: the image pull
   renders one progress bar per layer (phase, bytes downloaded, percent) plus a
