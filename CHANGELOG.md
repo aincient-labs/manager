@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `atelier pack dev` now runs an isolated per-pack appliance — its own compose
+  project (`atelier-pack-<module>`), its own port, and a throwaway demo
+  database — instead of switching your real site into dev mode. Pass
+  `--attach` to restore the old behavior (mount the pack into your live
+  appliance); `atelier pack down --purge` resets the isolated dev site.
+
 ## [0.9.0] - 2026-08-25
 
 ### Added

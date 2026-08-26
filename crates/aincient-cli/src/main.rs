@@ -91,9 +91,19 @@ enum PackCommand {
         /// Bring the stack up and return instead of staying to watch.
         #[arg(long)]
         no_watch: bool,
+        /// Reuse the machine's REAL appliance (~/.atelier) instead of the
+        /// isolated per-pack dev stack — the pack is mounted into your live
+        /// site and it is switched into dev mode.
+        #[arg(long)]
+        attach: bool,
     },
     /// Stop the pack dev stack. Run from the pack's root.
-    Down,
+    Down {
+        /// Also delete the isolated dev site's volumes (the throwaway demo
+        /// database + files) — resets it for the next `atelier pack dev`.
+        #[arg(long)]
+        purge: bool,
+    },
     /// Run the appliance's admission gate + CSS lint + atelier.pack.yml check
     /// against this pack (what a boot runs; what client CI should gate on).
     Validate {
@@ -410,7 +420,17 @@ fn run() -> Result<()> {
         Command::Data { command } => run_data(command, &stack),
         Command::Ai { command } => run_ai(command, &stack),
         Command::Pack { command } => run_pack(command, &stack),
-        Command::Mcp => aincient_core::mcp::serve(&stack),
+        Command::Mcp => {
+            // When launched from a pack, serve against whichever stack `pack
+            // dev` actually started (the isolated one if it exists); anywhere
+            // else, the real appliance as before.
+            let stack = std::env::current_dir()
+                .ok()
+                .and_then(|d| aincient_core::Pack::locate(&d).ok())
+                .map(|p| aincient_core::pack::resolve_stack(&p, &stack))
+                .unwrap_or(stack);
+            aincient_core::mcp::serve(&stack)
+        }
     }
 }
 
@@ -424,9 +444,32 @@ fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
             println!("Next: cd {name} && atelier pack dev — then open the gallery and edit components/showcase/.");
             Ok(())
         }
-        PackCommand::Dev { no_watch } => {
+        PackCommand::Dev { no_watch, attach } => {
             let p = Pack::locate(&std::env::current_dir()?)?;
-            pack::dev_up(stack, &p)?;
+            let stack = if attach {
+                println!(
+                    "{} your REAL appliance (~/.atelier) is being switched into dev mode — its containers are recreated with this pack mounted.",
+                    style::warn("--attach:")
+                );
+                pack::dev_up(stack, &p)?;
+                stack.clone()
+            } else {
+                let first_boot = !pack::dev_stack(&p).exists();
+                let dev = pack::ensure_dev_stack(&p, stack)?;
+                println!(
+                    "Isolated dev stack: compose project {} on port {} — your real appliance is untouched.",
+                    dev.project_name(),
+                    dev.http_port()
+                );
+                pack::dev_up(&dev, &p)?;
+                if first_boot {
+                    println!("First boot — a throwaway demo site is being installed.");
+                }
+                pack::wait_ready(&dev, std::time::Duration::from_secs(600), &mut |line| {
+                    println!("{line}")
+                });
+                dev
+            };
             println!(
                 "{} pack {} is mounted; dev mode is ON.",
                 style::success("Dev stack is up —"),
@@ -437,27 +480,52 @@ fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
                 stack.http_port(),
                 p.module
             );
-            match pack::sync_preset(stack, &p) {
+            match pack::sync_preset(&stack, &p) {
                 Ok(()) => println!("Token preset synced into build/atelier/ (commit it — CI builds against it)."),
                 Err(e) => println!("{} {e:#}", style::warn("Preset sync failed (CSS build may miss utilities):")),
             }
             if no_watch {
                 return Ok(());
             }
-            pack::watch(stack, &p, |line| println!("{line}"))
+            pack::watch(&stack, &p, |line| println!("{line}"))
         }
-        PackCommand::Down => {
+        PackCommand::Down { purge } => {
             let p = Pack::locate(&std::env::current_dir()?)?;
-            pack::dev_down(stack, &p)?;
-            println!("{}", style::success("Dev stack stopped."));
+            let resolved = pack::resolve_stack(&p, stack);
+            if purge {
+                // `down -v` deletes the compose project's volumes. Against the
+                // real appliance those volumes ARE the site — refuse rather
+                // than resolve there.
+                if resolved.home != pack::dev_home(&p) {
+                    anyhow::bail!(
+                        "--purge resets the ISOLATED dev site, and this pack has none — \
+                         refusing to delete your real appliance's data"
+                    );
+                }
+                pack::dev_down_purge(&resolved, &p)?;
+                println!(
+                    "{} volumes deleted — the next `atelier pack dev` boots a fresh demo site.",
+                    style::success("Dev stack stopped;")
+                );
+            } else {
+                pack::dev_down(&resolved, &p)?;
+                println!("{}", style::success("Dev stack stopped."));
+            }
             Ok(())
         }
         PackCommand::Validate { module } => {
-            let module = match module {
-                Some(m) => m,
-                None => Pack::locate(&std::env::current_dir()?)?.module,
-            };
-            pack::validate(stack, &module)
+            // From a pack root, validate against whichever stack `pack dev`
+            // started; an explicit module outside a pack keeps hitting the
+            // real appliance.
+            match (Pack::locate(&std::env::current_dir()?), module) {
+                (Ok(p), module) => {
+                    let resolved = pack::resolve_stack(&p, stack);
+                    let module = module.unwrap_or(p.module);
+                    pack::validate(&resolved, &module)
+                }
+                (Err(_), Some(module)) => pack::validate(stack, &module),
+                (Err(e), None) => Err(e),
+            }
         }
     }
 }

@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 
 use crate::docker::{self, compose, run_capture, run_inherited};
-use crate::stack::Stack;
+use crate::stack::{InstallOptions, Stack};
 
 /// A pack checkout on disk: the directory and the module machine name (taken
 /// from the `<module>.info.yml` at its root — the one Drupal itself trusts).
@@ -117,6 +117,101 @@ pub fn scaffold(parent: &Path, module: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
+/// Where the pack's ISOLATED dev appliance lives: a dot-directory inside the
+/// pack itself, one per pack. The basename `.atelier-pack-<module>` sanitizes
+/// (via [`Stack::project_name`]) to compose project `atelier-pack-<module>`,
+/// so the dev stack's containers and volumes can never collide with the
+/// machine's real appliance (`atelier`) or with another pack's.
+pub fn dev_home(pack: &Pack) -> PathBuf {
+    pack.dir.join(format!(".atelier-pack-{}", pack.module))
+}
+
+/// The pack's isolated dev stack — a plain [`Stack`], so every compose/env
+/// helper works on it unchanged.
+pub fn dev_stack(pack: &Pack) -> Stack {
+    Stack { home: dev_home(pack) }
+}
+
+/// The stack this pack's dev loop is actually running against: the isolated
+/// one once it has been laid down, else the real appliance (an `--attach`
+/// run, or a stack from before isolation existed). down/validate/watch/mcp
+/// resolve through this so they hit whichever stack `pack dev` started,
+/// never blindly the real one.
+pub fn resolve_stack(pack: &Pack, real: &Stack) -> Stack {
+    let dev = dev_stack(pack);
+    if dev.compose_path().exists() {
+        dev
+    } else {
+        real.clone()
+    }
+}
+
+/// The appliance image the pack's Dockerfile pins (`ARG ATELIER_IMAGE=…`) —
+/// the dev stack should run the exact image the pack deploys against, not
+/// whatever the machine's real appliance happens to follow.
+fn pack_pinned_image(pack: &Pack) -> Option<String> {
+    let text = fs::read_to_string(pack.dir.join("Dockerfile")).ok()?;
+    let value = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("ARG ATELIER_IMAGE="))?
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// First bindable localhost port in 41300..41400 that isn't in `avoid` (the
+/// real appliance's port — colliding with it would be a trap the moment both
+/// stacks run, bound right now or not). Falls back to 41300 if the whole
+/// range is busy: compose then fails visibly rather than us picking somewhere
+/// surprising.
+fn pick_free_port(avoid: &[u16]) -> u16 {
+    (41300..41400)
+        .find(|p| !avoid.contains(p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok())
+        .unwrap_or(41300)
+}
+
+/// Lay down (or adopt) the pack's isolated dev stack. A first run scaffolds
+/// it on the image the Dockerfile pins and a free port clear of the real
+/// appliance; a re-run passes no overrides so the stored port/image (and the
+/// HASH_SALT) stick — [`Stack::ensure_scaffold`] never clobbers an existing
+/// `.env`.
+pub fn ensure_dev_stack(pack: &Pack, real: &Stack) -> Result<Stack> {
+    let stack = dev_stack(pack);
+    let opts = if stack.env_path().is_file() {
+        InstallOptions::default()
+    } else {
+        InstallOptions {
+            image: pack_pinned_image(pack),
+            http_port: Some(pick_free_port(&[real.http_port()])),
+        }
+    };
+    stack.ensure_scaffold(&opts)?;
+    Ok(stack)
+}
+
+/// Poll the dev appliance until Drupal actually serves, or `timeout` elapses.
+/// Returns whether it became ready; `report` receives human-readable progress
+/// lines. Probes `/user/login`, NOT `/` — the front page is anonymously
+/// page-cacheable, so it can stay warm while every real route 500s (the same
+/// rationale as `ops::http_ready`); a form-bearing route proves the container
+/// rendered something.
+pub fn wait_ready(stack: &Stack, timeout: Duration, report: &mut impl FnMut(&str)) -> bool {
+    report("waiting for the dev appliance — a first boot installs a throwaway demo site, which can take a few minutes");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok((status, _)) = http_get(stack.http_port(), "/user/login") {
+            if status < 500 {
+                report("the dev appliance is up.");
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            report("timed out waiting for the dev appliance — check its logs with `docker compose logs` in the stack directory");
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// The `docker compose` invocation for a dev stack: the stack's own
 /// compose.yaml PLUS the pack's committed `compose.dev.yaml` overlay, with the
 /// `${PACK_DIR}`/`${PACK_MODULE}` interpolations the overlay expects.
@@ -149,6 +244,15 @@ pub fn dev_down(stack: &Stack, pack: &Pack) -> Result<()> {
     let mut c = dev_compose(stack, pack);
     c.args(["down"]);
     run_inherited(c, "stop the pack dev stack")
+}
+
+/// [`dev_down`] plus `-v`: also delete the compose project's volumes — the
+/// throwaway demo DB and files. The reset for the ISOLATED dev site; callers
+/// must never point it at the real appliance, whose volumes are the site.
+pub fn dev_down_purge(stack: &Stack, pack: &Pack) -> Result<()> {
+    let mut c = dev_compose(stack, pack);
+    c.args(["down", "-v"]);
+    run_inherited(c, "stop the pack dev stack and delete its volumes")
 }
 
 /// Copy the appliance's committed token/utility preset out of the RUNNING dev
@@ -302,6 +406,10 @@ mod tests {
         assert!(by_name["Dockerfile"].contains("LABEL dev.atelier.extensions"));
         assert!(by_name[".github/workflows/build.yml"].contains("ATELIER_EXTENSIONS"));
         assert!(by_name["compose.ci.yaml"].contains("acme_pack:ci"));
+        // The isolated dev-stack home never enters git or the image build
+        // context — it holds a .env with a HASH_SALT.
+        assert!(by_name[".gitignore"].contains(".atelier-pack-*/"));
+        assert!(by_name[".dockerignore"].contains(".atelier-pack-*"));
         // The component declares the pack stylesheet it ships.
         assert!(by_name["components/showcase/showcase.component.yml"].contains("stylesheet: assets/acme_pack.css"));
         assert!(by_name.contains_key("assets/acme_pack.css"));
@@ -322,6 +430,72 @@ mod tests {
         assert!(dest.join("compose.dev.yaml").is_file());
         assert!(scaffold(&tmp, "acme_pack").is_err(), "second scaffold must refuse");
         assert!(scaffold(&tmp, "in valid").is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dev_home_yields_the_isolated_compose_project() {
+        let pack = Pack {
+            dir: PathBuf::from("/somewhere/acme_pack"),
+            module: "acme_pack".into(),
+        };
+        assert_eq!(
+            dev_home(&pack),
+            PathBuf::from("/somewhere/acme_pack/.atelier-pack-acme_pack")
+        );
+        // The load-bearing fact: the basename sanitizes to a project name that
+        // can never collide with the real appliance's `atelier`.
+        assert_eq!(dev_stack(&pack).project_name(), "atelier-pack-acme_pack");
+    }
+
+    #[test]
+    fn pack_pinned_image_reads_the_dockerfile_arg() {
+        let tmp = std::env::temp_dir().join(format!("atelier-pin-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let pack = Pack {
+            dir: tmp.clone(),
+            module: "acme_pack".into(),
+        };
+        assert_eq!(pack_pinned_image(&pack), None, "no Dockerfile → no pin");
+
+        fs::write(
+            tmp.join("Dockerfile"),
+            "# a comment\nARG ATELIER_IMAGE=ghcr.io/aincient-labs/atelier-cms:v1.2.3\nFROM ${ATELIER_IMAGE}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            pack_pinned_image(&pack).as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms:v1.2.3")
+        );
+
+        fs::write(tmp.join("Dockerfile"), "ARG ATELIER_IMAGE=\nFROM scratch\n").unwrap();
+        assert_eq!(pack_pinned_image(&pack), None, "an empty pin is no pin");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_stack_falls_back_to_the_real_appliance() {
+        let tmp = std::env::temp_dir().join(format!("atelier-resolve-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let pack = Pack {
+            dir: tmp.clone(),
+            module: "acme_pack".into(),
+        };
+        let real = Stack {
+            home: PathBuf::from("/somewhere/.atelier"),
+        };
+
+        // No dev stack laid down yet → the real appliance (an --attach run).
+        assert_eq!(resolve_stack(&pack, &real).home, real.home);
+
+        // Once `pack dev` has scaffolded the isolated stack, everything
+        // (down/validate/watch/mcp) must hit it, not the real appliance.
+        let dev = dev_stack(&pack);
+        fs::create_dir_all(&dev.home).unwrap();
+        fs::write(dev.compose_path(), "name: x\n").unwrap();
+        assert_eq!(resolve_stack(&pack, &real).home, dev.home);
         let _ = fs::remove_dir_all(&tmp);
     }
 
