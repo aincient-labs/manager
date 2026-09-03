@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Publish could delete the folder you picked.** The Manager's "Where to save
+  it" picker passed the chosen folder straight to the exporter, which cleared
+  it before copying the site in — pick `~/Downloads` and Downloads was gone.
+  The site now goes into `aincient-site-export` *inside* the folder you pick,
+  and the engine (GUI and `atelier site export --out`) refuses to write into
+  any folder that is not empty or a previous Atelier export (identified by its
+  `.aincient-export.json` marker). The new export is copied beside the old one
+  and swapped in only once it is complete; nothing else on disk is ever removed.
+
 ### Changed
 
 - `atelier pack dev` now runs an isolated per-pack appliance — its own compose

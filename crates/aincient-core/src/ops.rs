@@ -1298,6 +1298,89 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
 /// copied out to the host.
 const EXPORT_CONTAINER_DIR: &str = "/tmp/aincient-site-export";
 
+/// Folder name the GUI exports into, under the folder the user picks. Exposed so
+/// the manager's picker can promise the same name the engine writes.
+pub const EXPORT_DIR_NAME: &str = "aincient-site-export";
+
+/// Marker the appliance's exporter writes at the root of every export
+/// (`aincient_export`'s `Exporter::MARKER`). Its presence is the only proof
+/// that a host directory is ours to replace.
+const EXPORT_MARKER: &str = ".aincient-export.json";
+
+/// Refuse to use `target` as an export destination unless it is absent, empty,
+/// or a previous export (carries [`EXPORT_MARKER`]). Everything else is
+/// somebody's data — `~/Downloads`, `~/Desktop`, a project folder — and the
+/// export must never touch it. (v0.9.0 and earlier ran `remove_dir_all` on the
+/// picked folder; a user who picked `~/Downloads` lost it.)
+fn check_export_target(target: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    if !meta.is_dir() {
+        bail!(
+            "{} exists and is not a folder — choose a different export location",
+            target.display()
+        );
+    }
+    if target.join(EXPORT_MARKER).is_file() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(target)
+        .with_context(|| format!("failed to read {}", target.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() != ".DS_Store");
+    if entries.next().is_none() {
+        return Ok(());
+    }
+    bail!(
+        "Refusing to export into {}: the folder is not empty and was not created by an \
+         Atelier export (no {} inside). Pick an empty folder, or move the folder's contents \
+         out of the way first. Nothing was changed.",
+        target.display(),
+        EXPORT_MARKER
+    )
+}
+
+/// Move a freshly copied export at `staged` into place at `target`, replacing a
+/// previous export. `target` must already have passed [`check_export_target`];
+/// it is re-checked here because time has passed. The staged copy must itself
+/// carry the marker, or the copy went somewhere unexpected and nothing is removed.
+fn install_export(staged: &Path, target: &Path) -> Result<()> {
+    if !staged.join(EXPORT_MARKER).is_file() {
+        bail!(
+            "the copied export at {} is missing {} — leaving {} untouched",
+            staged.display(),
+            EXPORT_MARKER,
+            target.display()
+        );
+    }
+    check_export_target(target)?;
+    if target.exists() {
+        std::fs::remove_dir_all(target)
+            .with_context(|| format!("failed to replace the previous export at {}", target.display()))?;
+    }
+    std::fs::rename(staged, target)
+        .with_context(|| format!("failed to move the export into {}", target.display()))
+}
+
+/// A not-yet-existing sibling of `target` (same parent, so the final rename is
+/// a same-filesystem move) for `docker cp` to create.
+fn staging_sibling(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| EXPORT_DIR_NAME.to_string());
+    let parent = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut n = 0u32;
+    loop {
+        let candidate = parent.join(format!(".{name}.atelier-export-{}-{n}", std::process::id()));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Options for [`export_static`] — a thin passthrough onto the appliance's
 /// `drush aincient:export` (the static-site exporter). Every field maps to a
 /// flag the exporter already understands, so the manager invents no behaviour.
@@ -1333,8 +1416,18 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
             .context("failed to read the current directory")?
             .join("aincient-export"),
     };
-    if let Some(parent) = host_out.parent() {
-        std::fs::create_dir_all(parent).ok();
+    // Fail before rendering anything if the destination isn't ours to write.
+    check_export_target(&host_out)?;
+    if let Some(parent) = host_out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let host_zip = host_out.with_extension("zip");
+    if opts.zip && host_zip.is_dir() {
+        bail!(
+            "{} is a folder, so the zip can't be written there — choose a different export location",
+            host_zip.display()
+        );
     }
     let container_zip = format!("{EXPORT_CONTAINER_DIR}.zip");
 
@@ -1374,15 +1467,23 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     run_step(build, "export the static site", r)?;
 
     r.log("Copying the exported site out of the container…");
-    // `docker compose cp` copies the source dir *as* the destination — so remove
-    // an existing target first, otherwise the export nests inside it.
-    let _ = std::fs::remove_dir_all(&host_out);
+    // `docker compose cp` copies the source dir *as* the destination when the
+    // destination doesn't exist, and *into* it when it does. Copy into a fresh
+    // staging sibling, then swap it into place — the previous export is only
+    // removed once the new one is verified on disk, and never anything else.
+    let staged = staging_sibling(&host_out);
     let mut cp = compose(stack);
-    cp.args(["cp", &format!("app:{EXPORT_CONTAINER_DIR}"), &host_out.to_string_lossy()]);
-    run_capture(cp, "copy the exported site out of the container")?;
+    cp.args(["cp", &format!("app:{EXPORT_CONTAINER_DIR}"), &staged.to_string_lossy()]);
+    if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(e);
+    }
+    if let Err(e) = install_export(&staged, &host_out) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(e);
+    }
 
     if opts.zip {
-        let host_zip = host_out.with_extension("zip");
         let mut cpz = compose(stack);
         cpz.args(["cp", &format!("app:{container_zip}"), &host_zip.to_string_lossy()]);
         run_capture(cpz, "copy the export zip out of the container")?;
@@ -2123,6 +2224,69 @@ mod tests {
             problem: None,
             explicit_target,
         }
+    }
+
+    /// The Downloads incident (Sept 2026): the GUI passed the folder the user
+    /// *picked* as the export target and the engine `remove_dir_all`'d it. The
+    /// engine must refuse any populated folder that isn't a previous export.
+    #[test]
+    fn export_refuses_a_populated_folder_that_is_not_an_export() {
+        let dir = std::env::temp_dir().join(format!("atelier-export-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tax-return.pdf"), b"precious").unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"").unwrap();
+
+        let err = super::check_export_target(&dir).unwrap_err().to_string();
+        assert!(err.contains("Refusing"), "{err}");
+        assert!(dir.join("tax-return.pdf").is_file(), "the guard must not touch anything");
+
+        // An `install_export` onto it must also refuse, even with a valid staged copy.
+        let staged = dir.with_extension("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join(super::EXPORT_MARKER), b"{}").unwrap();
+        assert!(super::install_export(&staged, &dir).is_err());
+        assert!(dir.join("tax-return.pdf").is_file());
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&staged).ok();
+    }
+
+    /// Absent, empty (a stray `.DS_Store` doesn't count), and marker-bearing
+    /// folders are all fine; a previous export is replaced by the staged one.
+    #[test]
+    fn export_replaces_only_a_previous_export() {
+        let base = std::env::temp_dir().join(format!("atelier-export-swap-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+
+        assert!(super::check_export_target(&base.join("absent")).is_ok());
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join(".DS_Store"), b"").unwrap();
+        assert!(super::check_export_target(&empty).is_ok());
+
+        let target = base.join("site");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(super::EXPORT_MARKER), b"{}").unwrap();
+        std::fs::write(target.join("old.html"), b"old").unwrap();
+        let staged = super::staging_sibling(&target);
+        assert_eq!(staged.parent(), target.parent());
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join(super::EXPORT_MARKER), b"{}").unwrap();
+        std::fs::write(staged.join("index.html"), b"new").unwrap();
+
+        super::install_export(&staged, &target).unwrap();
+        assert!(target.join("index.html").is_file());
+        assert!(!target.join("old.html").exists());
+        assert!(!staged.exists());
+
+        // A staged copy without the marker never replaces anything.
+        let bad = super::staging_sibling(&target);
+        std::fs::create_dir_all(&bad).unwrap();
+        assert!(super::install_export(&bad, &target).is_err());
+        assert!(target.join("index.html").is_file());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// The v0.6.0 rescue-stack incident: `update --to 0.2.0` on an install

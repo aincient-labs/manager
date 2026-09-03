@@ -214,8 +214,9 @@ enum AppCommand {
 enum SiteCommand {
     /// Export the public site to static HTML — the deploy-anywhere artifact.
     Export {
-        /// Host directory to write the static site into
-        /// (default: ./aincient-export).
+        /// Host directory to write the static site into (default:
+        /// ./aincient-export). Must be absent, empty, or a previous export —
+        /// anything else is refused, nothing is overwritten.
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
         /// Scheme + host to render absolute links against

@@ -365,8 +365,11 @@ async fn site_export(
 ) -> Result<String, String> {
     let s = stack()?;
     blocking(move || {
+        // The picker asks "where to save it" — the answer is a *parent* folder.
+        // The site goes into a named subfolder, so the engine's guard against
+        // replacing anything but a previous export never sees the user's own folder.
         let opts = ops::ExportOptions {
-            out: out.map(PathBuf::from),
+            out: out.map(|d| PathBuf::from(d).join(ops::EXPORT_DIR_NAME)),
             base_url: base_url.filter(|u| !u.trim().is_empty()),
             zip,
             include_config,
