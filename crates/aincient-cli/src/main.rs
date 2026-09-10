@@ -236,6 +236,44 @@ enum SiteCommand {
         #[arg(long)]
         skip_link_check: bool,
     },
+    /// Freeze the published site into a snapshot and serve it to visitors.
+    /// Logged-in users keep seeing the live site.
+    Freeze {
+        /// A name for this snapshot (becomes part of its id).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Mark the snapshot as kept: `prune` never removes it.
+        #[arg(long)]
+        keep: bool,
+        /// Take the snapshot but keep serving whatever is served now.
+        #[arg(long)]
+        no_serve: bool,
+        /// Serve it even if the export reported broken links or failures.
+        #[arg(long)]
+        force: bool,
+        /// Scheme + host to render absolute links against.
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
+    },
+    /// List snapshots and which one visitors see.
+    Snapshots {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve a snapshot (or "live") to visitors. Instant; nothing restarts.
+    Use {
+        /// A snapshot id from `site snapshots`, or `live`.
+        id: String,
+    },
+    /// Back to live: Drupal renders every visit. Snapshots are kept.
+    Live,
+    /// Delete old snapshots — keeps the newest N, every kept one, and the served one.
+    Prune {
+        /// How many recent unkept snapshots to retain.
+        #[arg(long, default_value_t = 10, value_name = "N")]
+        keep: u32,
+    },
 }
 
 /// Your data in and out — portable db + files snapshots. `export`/`import` are
@@ -670,6 +708,83 @@ fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
             done_export_banner(&path);
             Ok(())
         }
+        SiteCommand::Freeze {
+            label,
+            keep,
+            no_serve,
+            force,
+            base_url,
+        } => {
+            let opts = ops::FreezeOptions {
+                label,
+                keep,
+                no_serve,
+                force,
+                base_url,
+            };
+            ops::freeze(stack, &opts, &mut ops::Silent)?;
+            Ok(())
+        }
+        SiteCommand::Snapshots { json } => {
+            let list = ops::snapshots(stack)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+                return Ok(());
+            }
+            print_snapshots(&list);
+            Ok(())
+        }
+        SiteCommand::Use { id } => {
+            ops::use_snapshot(stack, &id, &mut ops::Silent)?;
+            if id == "live" {
+                println!("{}", style::success("Live: Drupal renders every visit."));
+            } else {
+                println!(
+                    "{} Visitors now see snapshot {id}. Logged-in users keep seeing the live site.",
+                    style::success("Frozen.")
+                );
+            }
+            Ok(())
+        }
+        SiteCommand::Live => {
+            ops::use_snapshot(stack, "live", &mut ops::Silent)?;
+            println!("{}", style::success("Live: Drupal renders every visit."));
+            Ok(())
+        }
+        SiteCommand::Prune { keep } => {
+            let deleted = ops::prune_snapshots(stack, keep, &mut ops::Silent)?;
+            if deleted.is_empty() {
+                println!("Nothing to prune.");
+            } else {
+                println!("{} {}", style::success("Deleted"), deleted.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The `site snapshots` table: Live first, then newest first, the served row marked.
+fn print_snapshots(list: &ops::SnapshotList) {
+    let mark = |serving: bool| if serving { "●" } else { " " };
+    println!(
+        "{} {:<34} {:<24} {:<26} {:>5}  {}",
+        mark(list.serving == "live"),
+        "live",
+        "Live (Drupal renders every visit)",
+        "",
+        "",
+        ""
+    );
+    for s in &list.snapshots {
+        println!(
+            "{} {:<34} {:<24} {:<26} {:>5}  {}",
+            mark(list.serving == s.id),
+            s.id,
+            s.label.clone().unwrap_or_default(),
+            s.frozen_at.clone().unwrap_or_default(),
+            s.pages,
+            if s.keep { "kept" } else { "" }
+        );
     }
 }
 

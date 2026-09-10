@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`atelier site freeze` / `snapshots` / `use` / `live` / `prune`.** Freeze & Live: the
+  appliance can serve visitors a frozen snapshot of the published site (plain files, kept as
+  versions) while logged-in users keep seeing the live site. These verbs are thin passthroughs
+  onto the appliance's `drush aincient:freeze` family; switching is instant and nothing restarts.
+  Needs an appliance image that carries the feature (cms `0.10.4` or later).
+
+### Changed
+
+- **`data backup` bundles the frozen snapshots** (`private/frozen/`, symlink included) and
+  `data restore` puts them back, so a restore also restores which snapshot visitors were seeing.
+
 ## [0.9.1] - 2026-09-03
 
 ### Fixed

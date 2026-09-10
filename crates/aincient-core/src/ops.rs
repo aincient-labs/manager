@@ -1501,6 +1501,145 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     Ok(host_out)
 }
 
+/// Options for [`freeze`] — a passthrough onto `drush aincient:freeze`.
+#[derive(Debug, Default, Clone)]
+pub struct FreezeOptions {
+    pub label: Option<String>,
+    pub keep: bool,
+    pub no_serve: bool,
+    pub force: bool,
+    pub base_url: Option<String>,
+}
+
+/// One frozen snapshot as `drush aincient:snapshots --format=json` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRow {
+    pub id: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub frozen_at: Option<String>,
+    #[serde(default)]
+    pub frozen_by: Option<String>,
+    #[serde(default)]
+    pub atelier_version: Option<String>,
+    #[serde(default)]
+    pub pages: u64,
+    #[serde(default)]
+    pub assets: u64,
+    #[serde(default)]
+    pub keep: bool,
+}
+
+/// What visitors are served plus every snapshot on disk, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotList {
+    /// A snapshot id, or `"live"`.
+    pub serving: String,
+    pub snapshots: Vec<SnapshotRow>,
+}
+
+/// Freeze & Live (DECISIONS 0416). Export the published site into a new
+/// snapshot inside the appliance and serve it to anonymous visitors; the
+/// appliance's web server does the switching, so nothing restarts.
+pub fn freeze(stack: &Stack, opts: &FreezeOptions, r: &mut dyn Reporter) -> Result<()> {
+    r.stage(Stage::Working, "Freezing the site…", None);
+    ensure_running(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"]).args(DRUSH).arg("aincient:freeze");
+    if let Some(label) = &opts.label {
+        c.arg(format!("--label={label}"));
+    }
+    if opts.keep {
+        c.arg("--keep");
+    }
+    if opts.no_serve {
+        c.arg("--no-serve");
+    }
+    if opts.force {
+        c.arg("--force");
+    }
+    if let Some(base) = &opts.base_url {
+        c.arg(format!("--base-url={base}"));
+    }
+    run_step(c, "freeze the site", r)
+}
+
+/// List snapshots and what is served. Numeric fields arrive as strings from the
+/// table-oriented drush formatter, so parse leniently.
+pub fn snapshots(stack: &Stack) -> Result<SnapshotList> {
+    ensure_running(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["aincient:snapshots", "--format=json"]);
+    let out = run_capture(c, "list the snapshots")?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(out.trim()).context("could not parse the snapshot list")?;
+    let mut serving = "live".to_string();
+    let mut snapshots = Vec::new();
+    for row in rows {
+        let id = row["id"].as_str().unwrap_or_default().to_string();
+        let is_serving = row["serving"].as_bool().unwrap_or(false);
+        if is_serving {
+            serving = id.clone();
+        }
+        if id == "live" {
+            continue;
+        }
+        let num = |v: &serde_json::Value| -> u64 {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0)
+        };
+        let opt = |v: &serde_json::Value| -> Option<String> {
+            v.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+        };
+        snapshots.push(SnapshotRow {
+            id,
+            label: opt(&row["label"]),
+            frozen_at: opt(&row["frozen_at"]),
+            frozen_by: opt(&row["frozen_by"]),
+            atelier_version: opt(&row["atelier_version"]),
+            pages: num(&row["pages"]),
+            assets: num(&row["assets"]),
+            keep: row["keep"].as_bool().unwrap_or(false),
+        });
+    }
+    Ok(SnapshotList { serving, snapshots })
+}
+
+/// Serve a snapshot id, or `"live"`. The appliance validates the id.
+pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()> {
+    r.stage(Stage::Working, "Switching what visitors see…", None);
+    ensure_running(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"]).args(DRUSH).args(["aincient:use", id]);
+    run_capture(c, "switch the served snapshot")?;
+    r.log(if id == "live" { "Live." } else { "Frozen." });
+    Ok(())
+}
+
+/// Delete old snapshots; returns the ids removed.
+pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result<Vec<String>> {
+    r.stage(Stage::Working, "Pruning snapshots…", None);
+    ensure_running(stack)?;
+    let before = snapshots(stack)?;
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["aincient:prune", &format!("--keep={keep}")]);
+    run_capture(c, "prune the snapshots")?;
+    let after = snapshots(stack)?;
+    let kept: std::collections::HashSet<&str> = after.snapshots.iter().map(|s| s.id.as_str()).collect();
+    Ok(before
+        .snapshots
+        .into_iter()
+        .filter(|s| !kept.contains(s.id.as_str()))
+        .map(|s| s.id)
+        .collect())
+}
+
 /// Restore the appliance from a host backup file. Destructive — confirm first.
 ///
 /// A `.tar.gz` **snapshot bundle** (from [`backup`]) restores the database
@@ -1693,8 +1832,10 @@ fn backup_script(drush: &str, manifest: &str) -> String {
          mkdir -p \"$STAGE\"\n\
          {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
          printf '%s\\n' '{manifest}' > \"$STAGE/manifest.json\"\n\
+         mkdir -p /opt/drupal/private/frozen\n\
          tar czf \"$ARCHIVE\" -C \"$STAGE\" manifest.json database.sql.gz \
-         -C /opt/drupal/web/sites/default files\n",
+         -C /opt/drupal/web/sites/default files \
+         -C /opt/drupal/private frozen\n",
     )
 }
 
@@ -1719,6 +1860,11 @@ fn restore_bundle_script(drush: &str) -> String {
          \x20 find \"$DEST\" -mindepth 1 -delete 2>/dev/null || true\n\
          \x20 cp -a \"$WORK/files/.\" \"$DEST/\"\n\
          \x20 chown -R www-data:www-data \"$DEST\"\n\
+         fi\n\
+         if [ -d \"$WORK/frozen\" ]; then\n\
+         \x20 rm -rf /opt/drupal/private/frozen\n\
+         \x20 cp -a \"$WORK/frozen\" /opt/drupal/private/frozen\n\
+         \x20 chown -R www-data:www-data /opt/drupal/private/frozen\n\
          fi\n\
          {drush} cache:rebuild || true\n\
          rm -rf \"$WORK\" \"$ARCHIVE\" || true\n",

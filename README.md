@@ -31,6 +31,10 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | `app status`             | Read-only health probe. (The full checkup is the flat `doctor`.)          |
 | `app start`/`stop`/`down`/`logs`/`open`/`password` | Everyday stack management.              |
 | `site export`            | Export the public site to static HTML — the deploy-anywhere artifact.      |
+| `site freeze [--label]`  | Freeze the published site into a snapshot inside the appliance and serve it to visitors; logged-in users keep seeing live. |
+| `site snapshots`         | List snapshots (`--json` for machines); ● marks what visitors see.         |
+| `site use <id>`/`live`   | Serve a snapshot, or go back to live. Instant; nothing restarts.           |
+| `site prune [--keep N]`  | Delete old snapshots; kept and served ones stay.                           |
 | `data backup`            | Portable `.tar.gz` snapshot (DB dump + uploaded files + manifest) → `~/.atelier/backups`. (alias `data export`) |
 | `data restore <file>`    | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). (alias `data import`) |
 | `data list`              | List snapshots on this host. (alias `data backups`)                       |
