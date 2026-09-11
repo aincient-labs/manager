@@ -1823,6 +1823,17 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
 /// packs the staged DB dump + manifest, then the live files tree, so `files/`
 /// lands at the archive root. `manifest` is JSON (no single quotes), so it's
 /// safe inside the single-quoted `printf` argument.
+/// The in-container script that builds the snapshot bundle: DB dump + manifest +
+/// the uploaded files tree + frozen snapshots.
+///
+/// `files/styles` is excluded on purpose. It is Drupal's image-derivative
+/// cache: a live site regenerates a missing derivative on first request, and a
+/// static export/freeze generates the ones it links on its own (the exporter's
+/// kernel-replay fallback). Packing it buys nothing on restore and it dominated
+/// the archive — 246 MB of a 261 MB local backup on 2026-09-11, most of it PNG
+/// derivatives no page referenced. Frozen snapshots under `private/frozen/`
+/// carry their own derivatives and are NOT affected by the exclude (the pattern
+/// is anchored to the `files` member).
 fn backup_script(drush: &str, manifest: &str) -> String {
     format!(
         "set -e\n\
@@ -1833,7 +1844,7 @@ fn backup_script(drush: &str, manifest: &str) -> String {
          {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
          printf '%s\\n' '{manifest}' > \"$STAGE/manifest.json\"\n\
          mkdir -p /opt/drupal/private/frozen\n\
-         tar czf \"$ARCHIVE\" -C \"$STAGE\" manifest.json database.sql.gz \
+         tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
          -C /opt/drupal/web/sites/default files \
          -C /opt/drupal/private frozen\n",
     )
@@ -2661,6 +2672,16 @@ mod tests {
             script.contains("-C /opt/drupal/web/sites/default files"),
             "packs the files tree"
         );
+        // The derivative cache is regenerable and was 94% of a real archive.
+        assert!(
+            script.contains("--exclude=files/styles"),
+            "skips the image-style derivative cache"
+        );
+        // The exclude must precede the members it applies to (GNU/busybox tar
+        // apply --exclude to everything that follows on the command line).
+        let exclude_at = script.find("--exclude=files/styles").unwrap();
+        let files_at = script.find("sites/default files").unwrap();
+        assert!(exclude_at < files_at, "exclude comes before the files member");
     }
 
     #[test]

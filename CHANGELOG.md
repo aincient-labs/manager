@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`atelier data backup` no longer packs image-style derivatives** (`files/styles`). They are a
+  cache Drupal rebuilds on first request, and they were 246 MB of a 261 MB archive on a small
+  site. Restore is unchanged; the first visit to a page after a restore regenerates what it needs.
+  Frozen snapshots stay in the bundle, derivatives included.
+
 - **`data backup` bundles the frozen snapshots** (`private/frozen/`, symlink included) and
   `data restore` puts them back, so a restore also restores which snapshot visitors were seeing.
 
