@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-12
+
 ### Added
 
 - **`atelier site freeze` / `snapshots` / `use` / `live` / `prune`.** Freeze & Live: the
   appliance can serve visitors a frozen snapshot of the published site (plain files, kept as
   versions) while logged-in users keep seeing the live site. These verbs are thin passthroughs
   onto the appliance's `drush aincient:freeze` family; switching is instant and nothing restarts.
-  Needs an appliance image that carries the feature (cms `0.10.4` or later).
+  Needs an appliance image that carries the feature (cms `0.11.0` or later).
+- **`edge` in the stack template.** A fresh install now lays down `compose.yaml` + `edge.conf` +
+  `.env`: an nginx `edge` service is the only published port, serving a frozen snapshot to anonymous
+  visitors without touching PHP and proxying everything else to `app` (cms Freeze & Live Phase 3).
+  `atelier doctor` gains `stack.files_current`: a stack written by an older manager (no `edge.conf`,
+  `app` publishing the port) is a warning, and `--fix` rewrites both files from the templates, keeping
+  the previous ones aside; `docker compose up -d` then applies the new topology. Data volumes are
+  untouched.
 
 ### Changed
 
@@ -469,7 +478,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/aincient-labs/manager/compare/v0.9.1...v0.10.0
+[0.9.1]: https://github.com/aincient-labs/manager/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/aincient-labs/manager/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/aincient-labs/manager/compare/v0.7.2...v0.8.0
 [0.6.0]: https://github.com/aincient-labs/manager/compare/v0.5.0...v0.6.0

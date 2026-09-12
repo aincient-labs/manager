@@ -155,7 +155,7 @@ impl Repair {
     /// What this repair does, in the user's language.
     pub fn describe(self) -> &'static str {
         match self {
-            Repair::Scaffold => "Restore the stack files (compose.yaml + .env)",
+            Repair::Scaffold => "Restore the stack files (compose.yaml + edge.conf + .env)",
             Repair::StartContainers => "Start the appliance containers",
             Repair::CacheRebuild => "Rebuild Drupal's caches",
             Repair::RunUpdates => "Run the pending database updates",
@@ -638,6 +638,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         };
         for (id, label) in [
             ("stack.compose_valid", "compose.yaml is valid"),
+            ("stack.files_current", "Stack files match this manager"),
             ("stack.db", "Database container healthy"),
             ("stack.app", "Appliance container running"),
         ] {
@@ -662,6 +663,25 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         )
         .detail(first_line(&e))
         .fixable(Repair::Scaffold),
+    });
+
+    // A stack laid down by an older manager still publishes `app` directly and
+    // has no `edge.conf`: it runs, but visitors miss the frozen-snapshot edge
+    // (cms 0416 Phase 3). A warning, fixable: the rewrite keeps the old files
+    // aside and never touches the data volumes.
+    out.push(if stack.stack_files_current() {
+        Check::ok("stack.files_current", Tier::Stack, "Stack files match this manager")
+    } else {
+        Check::bad(
+            "stack.files_current",
+            Tier::Stack,
+            "Stack files match this manager",
+            Severity::Warn,
+            "compose.yaml / edge.conf were written by an older manager (or edited by hand). \
+             Doctor can rewrite them from the built-in templates, keeping the current files \
+             aside; your data volumes are untouched. Then `docker compose up -d` applies it.",
+        )
+        .fixable(Repair::Scaffold)
     });
 
     out.push(check_container(stack, "db", "stack.db", "Database container healthy"));

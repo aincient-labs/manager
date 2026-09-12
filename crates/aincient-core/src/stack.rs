@@ -161,7 +161,11 @@ pub fn rename_legacy_repo(image: &str) -> Option<String> {
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
 /// step with the `cat > compose.yaml` heredoc in `docker/install.sh`: the slim
-/// runtime topology (app + db, no build context, no updater sidecar).
+/// runtime topology (edge + app + db, no build context, no updater sidecar).
+///
+/// `edge` (nginx) is the only published port: it serves a frozen snapshot to
+/// anonymous visitors without touching PHP and proxies everything else to `app`
+/// (cms DECISIONS 0416, Phase 3). Its rule lives in [`EDGE_CONF_TEMPLATE`].
 pub const COMPOSE_TEMPLATE: &str = r#"name: atelier
 services:
   db:
@@ -186,16 +190,125 @@ services:
       HASH_SALT: ${HASH_SALT:?set HASH_SALT in .env}
       AINCIENT_TRUSTED_HOSTS: ${AINCIENT_TRUSTED_HOSTS:-}
       AINCIENT_ADMIN_PASS: ${ADMIN_PASS:-}
-    ports:
-      - "${HTTP_PORT:-41221}:80"
+      AINCIENT_REVERSE_PROXY: "1"
     volumes:
       - files:/opt/drupal/web/sites/default/files
       - private:/opt/drupal/private
+    restart: unless-stopped
+  edge:
+    image: nginx:1.28-alpine
+    depends_on:
+      - app
+    ports:
+      - "${HTTP_PORT:-41221}:80"
+    volumes:
+      - ./edge.conf:/etc/nginx/conf.d/default.conf:ro
+      - private:/srv/private:ro
     restart: unless-stopped
 volumes:
   db-data:
   files:
   private:
+"#;
+
+/// The nginx rule the `edge` service mounts, written next to `compose.yaml` as
+/// `edge.conf`. Byte-for-byte the cms repo's `docker/edge.conf` (and the
+/// `install.sh` heredoc); the template's own comments explain the rule.
+pub const EDGE_CONF_TEMPLATE: &str = r#"# Atelier edge — the appliance's only published port (DECISIONS 0416, Phase 3).
+#
+# Frozen (private/frozen/current -> a snapshot): an anonymous GET/HEAD for a path
+# the snapshot has is answered here from disk — PHP never runs for visitors — and
+# a path the snapshot lacks gets the snapshot's own 404 page with a real 404.
+# Live (no symlink): everything proxies to `app`. Always proxied, frozen or not:
+# a request carrying a Drupal session cookie, a console/Drupal-owned path, a
+# non-GET method, dotfiles (the snapshot marker) and PHP-looking paths.
+# The Apache vhost in Dockerfile and the DDEV nginx config carry the same rule as
+# the in-container fallback; keep the three in step.
+
+# Docker's embedded DNS, re-resolved often: the updater recreates `app` with a
+# new address and nginx must follow without a reload.
+resolver 127.0.0.11 valid=5s ipv6=off;
+
+map $http_cookie $frz_cookie {
+    default 0;
+    "~*(^|;\s*)S?SESS[0-9a-f]+=" 1;
+}
+map $uri $frz_path {
+    default 0;
+    "~*^/(atelier|user|api|session|admin|system)(/|$)" 1;
+    "~(^|/)\." 1;
+    "~*\.ph(p[0-9]?|tml|ar)$" 1;
+}
+map $request_method $frz_method {
+    default 1;
+    GET 0;
+    HEAD 0;
+}
+# Any 1 = bypass the snapshot: a root that never exists sends try_files to @miss.
+map "$frz_cookie$frz_path$frz_method" $frz_root {
+    default /srv/private/frozen/current;
+    "~1" /nonexistent/frozen-bypass;
+}
+# Behind an outer TLS terminator, pass its scheme on; otherwise report our own.
+map $http_x_forwarded_proto $edge_proto {
+    default $http_x_forwarded_proto;
+    "" $scheme;
+}
+
+proxy_http_version 1.1;
+proxy_set_header Host $http_host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $edge_proto;
+proxy_set_header Connection "";
+# A console turn runs the agent loop inline: match Apache's Timeout / PHP's 600s.
+proxy_read_timeout 600s;
+proxy_send_timeout 600s;
+# Console responses stream; never hold them back.
+proxy_buffering off;
+# PHP enforces its own upload limits.
+client_max_body_size 0;
+
+server {
+    listen 80 default_server;
+    server_name _;
+    absolute_redirect off;
+
+    gzip on;
+    gzip_vary on;
+    gzip_types text/css text/plain text/xml application/xml application/javascript application/json image/svg+xml;
+
+    location / {
+        root $frz_root;
+        add_header X-Atelier-Served frozen;
+        add_header Cache-Control "public, max-age=300, stale-while-revalidate=86400";
+        try_files $uri/index.html $uri @miss;
+    }
+
+    # Nothing in the frozen tree: the request was bypassed, we are Live, or the
+    # snapshot lacks the path.
+    location @miss {
+        root $frz_root;
+        # Frozen: sealed. The snapshot's own 404 page, status 404, no PHP.
+        error_page 404 /404.html;
+        if (-f $document_root/404.html) {
+            return 404;
+        }
+        # Live or bypassed: Drupal. A variable target is resolved per request.
+        set $app http://app:80;
+        proxy_pass $app;
+        # `=`: answer with @updating's own 503, not the upstream's 502.
+        error_page 502 503 504 = @updating;
+    }
+
+    # `app` is restarting (an upgrade converging) or not up yet.
+    location @updating {
+        default_type text/html;
+        add_header Retry-After 5 always;
+        add_header Cache-Control "no-store" always;
+        return 503 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"5\"><title>Atelier is starting</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:15vh auto;max-width:32rem;padding:0 1.5rem;color:#222}h1{font-size:1.4rem}</style></head><body><h1>Atelier is starting</h1><p>The site is updating or has just been started. This page retries every few seconds.</p></body></html>";
+    }
+}
 "#;
 
 /// A located appliance stack directory.
@@ -227,6 +340,20 @@ impl Stack {
 
     pub fn compose_path(&self) -> PathBuf {
         self.home.join("compose.yaml")
+    }
+
+    /// The nginx rule the `edge` service mounts (see [`EDGE_CONF_TEMPLATE`]).
+    pub fn edge_conf_path(&self) -> PathBuf {
+        self.home.join("edge.conf")
+    }
+
+    /// True when both stack files are exactly this manager's templates. False
+    /// for a stack laid down by an older manager (pre-`edge`) or hand-edited —
+    /// `doctor` reports it and `--fix` rewrites them (keeping the originals).
+    pub fn stack_files_current(&self) -> bool {
+        std::fs::read_to_string(self.compose_path()).ok().as_deref() == Some(COMPOSE_TEMPLATE)
+            && std::fs::read_to_string(self.edge_conf_path()).ok().as_deref()
+                == Some(EDGE_CONF_TEMPLATE)
     }
 
     /// The Docker Compose **project name** for this stack — the namespace its
@@ -483,6 +610,12 @@ impl Stack {
             std::fs::write(&compose, COMPOSE_TEMPLATE)
                 .with_context(|| format!("could not write {}", compose.display()))?;
         }
+        // compose.yaml mounts it: a stack without it cannot start `edge`.
+        let edge = self.edge_conf_path();
+        if !edge.is_file() {
+            std::fs::write(&edge, EDGE_CONF_TEMPLATE)
+                .with_context(|| format!("could not write {}", edge.display()))?;
+        }
 
         let env_path = self.env_path();
 
@@ -562,28 +695,32 @@ impl Stack {
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
 
-        let compose = self.compose_path();
-        if compose.is_file() {
-            let current = std::fs::read_to_string(&compose).unwrap_or_default();
-            if current != COMPOSE_TEMPLATE {
-                let aside = self.home.join(format!(
-                    "compose.yaml.replaced-{}",
-                    chrono::Local::now().format("%Y%m%d-%H%M%S")
-                ));
-                std::fs::rename(&compose, &aside).with_context(|| {
-                    format!("could not move the old compose.yaml to {}", aside.display())
-                })?;
-                std::fs::write(&compose, COMPOSE_TEMPLATE)
-                    .with_context(|| format!("could not write {}", compose.display()))?;
-                changes.push(format!(
-                    "rewrote compose.yaml (previous kept as {})",
-                    aside.file_name().unwrap_or_default().to_string_lossy()
-                ));
+        for (path, template, name) in [
+            (self.compose_path(), COMPOSE_TEMPLATE, "compose.yaml"),
+            (self.edge_conf_path(), EDGE_CONF_TEMPLATE, "edge.conf"),
+        ] {
+            if path.is_file() {
+                let current = std::fs::read_to_string(&path).unwrap_or_default();
+                if current != template {
+                    let aside = self.home.join(format!(
+                        "{name}.replaced-{}",
+                        chrono::Local::now().format("%Y%m%d-%H%M%S")
+                    ));
+                    std::fs::rename(&path, &aside).with_context(|| {
+                        format!("could not move the old {name} to {}", aside.display())
+                    })?;
+                    std::fs::write(&path, template)
+                        .with_context(|| format!("could not write {}", path.display()))?;
+                    changes.push(format!(
+                        "rewrote {name} (previous kept as {})",
+                        aside.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+            } else {
+                std::fs::write(&path, template)
+                    .with_context(|| format!("could not write {}", path.display()))?;
+                changes.push(format!("wrote a fresh {name}"));
             }
-        } else {
-            std::fs::write(&compose, COMPOSE_TEMPLATE)
-                .with_context(|| format!("could not write {}", compose.display()))?;
-            changes.push("wrote a fresh compose.yaml".to_string());
         }
 
         // Fill in only what's missing. An existing salt is never regenerated —
@@ -673,6 +810,8 @@ mod tests {
 
         assert!(stack.exists());
         assert_eq!(std::fs::read_to_string(stack.compose_path()).unwrap(), COMPOSE_TEMPLATE);
+        assert_eq!(std::fs::read_to_string(stack.edge_conf_path()).unwrap(), EDGE_CONF_TEMPLATE);
+        assert!(stack.stack_files_current());
 
         let env = stack.read_env();
         assert_eq!(env.get("HASH_SALT").unwrap().len(), 64);
@@ -800,6 +939,31 @@ mod tests {
             .filter(|n| n.starts_with("compose.yaml.replaced-"))
             .collect();
         assert_eq!(kept.len(), 1, "the previous compose.yaml is preserved");
+    }
+
+    #[test]
+    fn a_pre_edge_stack_is_not_current_and_repair_brings_it_up_to_date() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        // What an older manager laid down: no edge.conf, a different topology.
+        std::fs::remove_file(stack.edge_conf_path()).unwrap();
+        std::fs::write(
+            stack.compose_path(),
+            COMPOSE_TEMPLATE.replace("  edge:\n", "  legacy-marker:\n"),
+        )
+        .unwrap();
+        assert!(!stack.stack_files_current());
+
+        let changes = stack.repair_scaffold().unwrap();
+
+        assert!(stack.stack_files_current());
+        assert!(changes.iter().any(|c| c.contains("rewrote compose.yaml")));
+        assert!(changes.iter().any(|c| c.contains("wrote a fresh edge.conf")));
+        assert!(
+            changes.iter().all(|c| !c.contains("HASH_SALT")),
+            "a stale topology must not rotate the salt"
+        );
     }
 
     #[test]
