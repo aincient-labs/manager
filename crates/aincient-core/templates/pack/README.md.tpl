@@ -52,7 +52,7 @@ Atelier 0.16 or later.
   `ctx.chat.send`, `ctx.nav`, `ctx.close`, `ctx.signal`). Anything not in it
   is internal. A studio built against another `apiVersion` shows a named
   placeholder instead of mounting — it never breaks the console.
-- Style it with system tokens only (`--ain-surface`, `--ain-text`, …).
+- Style it with system tokens only (`--ain-color-surface`, `--ain-color-text`, …).
 
 A pack studio is an island: no shared page draft, no editor lock, no preview
 pane, no chat cards. It composes the agent capabilities Atelier ships — a pack

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pack new --studio` styles the studio with token names that exist.** The scaffolded
+  `studio/studio.css` read the pre-0.16 names (`--ain-text`), which Atelier 0.17 no longer
+  defines, plus `--ain-text-muted`, which never existed, so the studio's text lost its colour. It
+  now reads `--ain-color-text` / `--ain-color-text-muted`; the contract and README examples match.
+
 ## [0.11.0] - 2026-10-03
 
 ### Added
