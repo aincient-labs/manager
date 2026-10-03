@@ -30,11 +30,33 @@ against the committed preset and fails on drift.
 
 - **Tokens, not hex.** Route every colour/size through the design tokens
   (`var(--…)`) so a site rebrand reaches your markup. `pack validate` lints.
-- **CSS only for now.** There is no JS channel yet (`script:` is reserved).
+- **No JS on the front end.** Components are Twig + CSS; the only JS channel
+  is a console studio (below).
 - **`use:` is the whole ballgame.** The agent places your component purely by
   its one-line hint and `examples:` — write them like you mean them.
 - **A pack is a module.** It runs with full Drupal power; installing one is
   exactly as much trust as installing any Drupal module. There is no sandbox.
+
+## A console studio (experimental)
+
+`atelier pack new <name> --studio` also scaffolds a hello-world studio — a
+rail in the Atelier console, gated by its own derived permission. It needs
+Atelier 0.16 or later.
+
+- `<module>.studios.yml` registers it. Its id is forever (it is in every
+  stored URL) and must be the module name or start with `<module>_`.
+- `studio/studio.js` is a plain ES module the console `import()`s:
+  `export const apiVersion = 1` and `export function mount(el, ctx)`. Render
+  into `el` with anything you like; React never crosses the boundary.
+- `studio/atelier-studio.d.ts` is the **whole contract** (`ctx.api.fetch`,
+  `ctx.chat.send`, `ctx.nav`, `ctx.close`, `ctx.signal`). Anything not in it
+  is internal. A studio built against another `apiVersion` shows a named
+  placeholder instead of mounting — it never breaks the console.
+- Style it with system tokens only (`--ain-surface`, `--ain-text`, …).
+
+A pack studio is an island: no shared page draft, no editor lock, no preview
+pane, no chat cards. It composes the agent capabilities Atelier ships — a pack
+cannot add new ones.
 
 ## Ship
 

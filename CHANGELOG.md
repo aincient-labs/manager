@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`atelier pack new <name> --studio`** (experimental). Also scaffolds a hello-world console
+  studio: `<name>.studios.yml`, a plain-JS `studio/studio.js` the console mounts through its
+  `mount(el, ctx)` boundary, and `studio/atelier-studio.d.ts`, the typed mount contract, so an
+  editor type-checks the studio out of the box. The manifest then declares `studios` and requires
+  Atelier `^0.16`, the first release that mounts a pack studio. Without the flag a pack is
+  unchanged.
+
 ## [0.10.0] - 2026-09-12
 
 ### Added

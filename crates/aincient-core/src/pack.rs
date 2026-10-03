@@ -62,7 +62,14 @@ pub fn valid_module_name(name: &str) -> bool {
 /// The scaffold: every file `atelier pack new` lays down, as
 /// (relative path, template) pairs after placeholder substitution.
 /// Public so the template-repo generator and tests can enumerate it.
-pub fn scaffold_files(module: &str) -> Vec<(String, String)> {
+///
+/// `studio` adds an EXPERIMENTAL hello-world console studio (DECISIONS 0448):
+/// `<module>.studios.yml`, a plain-JS `studio/studio.js` + its CSS, and
+/// `studio/atelier-studio.d.ts` — the mount contract, generated from the
+/// console's `contract.ts` by the umbrella's `bin/sync-pack-studio-dts`. It is
+/// opt-in because the mount boundary needs Atelier 0.16, and a pack that ships
+/// a studio puts a rail in every console that installs it.
+pub fn scaffold_files(module: &str, studio: bool) -> Vec<(String, String)> {
     let label = {
         let mut words = module.replace('_', " ");
         if let Some(first) = words.get_mut(0..1) {
@@ -71,8 +78,14 @@ pub fn scaffold_files(module: &str) -> Vec<(String, String)> {
         }
         words
     };
-    let render = |tpl: &str| tpl.replace("__MODULE__", module).replace("__LABEL__", &label);
-    vec![
+    let (provides, requires) = if studio { ("components, studios", "^0.16") } else { ("components", "^0.10") };
+    let render = |tpl: &str| {
+        tpl.replace("__MODULE__", module)
+            .replace("__LABEL__", &label)
+            .replace("__PROVIDES__", provides)
+            .replace("__REQUIRES__", requires)
+    };
+    let mut files = vec![
         (format!("{module}.info.yml"), render(include_str!("../templates/pack/module.info.yml.tpl"))),
         ("atelier.pack.yml".into(), render(include_str!("../templates/pack/atelier.pack.yml.tpl"))),
         ("components/showcase/showcase.component.yml".into(), render(include_str!("../templates/pack/showcase.component.yml.tpl"))),
@@ -94,12 +107,21 @@ pub fn scaffold_files(module: &str) -> Vec<(String, String)> {
         (".gitignore".into(), render(include_str!("../templates/pack/gitignore.tpl"))),
         (".github/workflows/build.yml".into(), render(include_str!("../templates/pack/workflow.yml.tpl"))),
         ("README.md".into(), render(include_str!("../templates/pack/README.md.tpl"))),
-    ]
+    ];
+    if studio {
+        files.extend([
+            (format!("{module}.studios.yml"), render(include_str!("../templates/pack/studios.yml.tpl"))),
+            ("studio/studio.js".into(), render(include_str!("../templates/pack/studio.js.tpl"))),
+            ("studio/studio.css".into(), render(include_str!("../templates/pack/studio.css.tpl"))),
+            ("studio/atelier-studio.d.ts".into(), include_str!("../templates/pack/atelier-studio.d.ts.tpl").to_string()),
+        ]);
+    }
+    files
 }
 
 /// `atelier pack new <module>`: scaffold into `<parent>/<module>`.
 /// Refuses to touch a directory that already exists — never overwrites work.
-pub fn scaffold(parent: &Path, module: &str) -> Result<PathBuf> {
+pub fn scaffold(parent: &Path, module: &str, studio: bool) -> Result<PathBuf> {
     if !valid_module_name(module) {
         bail!("\"{module}\" is not a valid module machine name (lowercase letters, digits and _, starting with a letter)");
     }
@@ -107,7 +129,7 @@ pub fn scaffold(parent: &Path, module: &str) -> Result<PathBuf> {
     if dest.exists() {
         bail!("{} already exists — refusing to overwrite it", dest.display());
     }
-    for (rel, content) in scaffold_files(module) {
+    for (rel, content) in scaffold_files(module, studio) {
         let path = dest.join(&rel);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
@@ -394,7 +416,7 @@ mod tests {
 
     #[test]
     fn scaffold_substitutes_and_lays_down_the_contract() {
-        let files = scaffold_files("acme_pack");
+        let files = scaffold_files("acme_pack", false);
         let by_name: BTreeMap<_, _> = files.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         // The four load-bearing files exist and carry the module name.
         assert!(by_name.contains_key("acme_pack.info.yml"));
@@ -413,6 +435,9 @@ mod tests {
         // The component declares the pack stylesheet it ships.
         assert!(by_name["components/showcase/showcase.component.yml"].contains("stylesheet: assets/acme_pack.css"));
         assert!(by_name.contains_key("assets/acme_pack.css"));
+        // A plain pack ships no studio and declares none.
+        assert!(by_name["atelier.pack.yml"].contains("provides: [components]\n"));
+        assert!(!files.iter().any(|(k, _)| k.starts_with("studio/") || k.ends_with(".studios.yml")));
         // No placeholder survives substitution anywhere.
         for (name, content) in &files {
             assert!(!content.contains("__MODULE__"), "{name} kept __MODULE__");
@@ -421,15 +446,42 @@ mod tests {
     }
 
     #[test]
+    fn studio_scaffold_lays_down_the_mount_contract() {
+        let files = scaffold_files("acme_pack", true);
+        let by_name: BTreeMap<_, _> = files.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        // Declared, so pack-validate does not warn "shipped but undeclared",
+        // and pinned to the release that first mounts a pack studio.
+        assert!(by_name["atelier.pack.yml"].contains("provides: [components, studios]"));
+        assert!(by_name["atelier.pack.yml"].contains("atelier: '^0.16'"));
+        // The id is the module name — pack-validate rejects an unprefixed one.
+        let manifest = by_name["acme_pack.studios.yml"];
+        assert!(manifest.contains("\nacme_pack:\n"));
+        assert!(manifest.contains("script: studio/studio.js"));
+        assert!(manifest.contains("style: studio/studio.css"));
+        // The module speaks the contract version the .d.ts describes.
+        let dts = by_name["studio/atelier-studio.d.ts"];
+        assert!(dts.contains("STUDIO_MOUNT_API_VERSION = 1;"));
+        assert!(dts.contains("export type StudioMountContext"));
+        let js = by_name["studio/studio.js"];
+        assert!(js.contains("export const apiVersion = 1;"));
+        assert!(js.contains("export function mount(el, ctx)"));
+        assert!(js.contains(r#"import("./atelier-studio")"#));
+        for (name, content) in &files {
+            assert!(!content.contains("__MODULE__"), "{name} kept __MODULE__");
+            assert!(!content.contains("__PROVIDES__"), "{name} kept __PROVIDES__");
+        }
+    }
+
+    #[test]
     fn scaffold_refuses_an_existing_directory() {
         let tmp = std::env::temp_dir().join(format!("atelier-pack-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        let dest = scaffold(&tmp, "acme_pack").unwrap();
+        let dest = scaffold(&tmp, "acme_pack", false).unwrap();
         assert!(dest.join("acme_pack.info.yml").is_file());
         assert!(dest.join("compose.dev.yaml").is_file());
-        assert!(scaffold(&tmp, "acme_pack").is_err(), "second scaffold must refuse");
-        assert!(scaffold(&tmp, "in valid").is_err());
+        assert!(scaffold(&tmp, "acme_pack", false).is_err(), "second scaffold must refuse");
+        assert!(scaffold(&tmp, "in valid", false).is_err());
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -82,6 +82,10 @@ enum PackCommand {
     New {
         /// The module machine name (lowercase letters, digits, _).
         name: String,
+        /// Also scaffold a hello-world console studio and its typed mount
+        /// contract (EXPERIMENTAL; needs Atelier 0.16+).
+        #[arg(long)]
+        studio: bool,
     },
     /// Bring up the appliance in DEV MODE with this pack mounted: Twig/PHP
     /// edits visible on refresh, a Tailwind watcher, the component gallery,
@@ -477,10 +481,16 @@ fn run() -> Result<()> {
 fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
     use aincient_core::{pack, Pack};
     match command {
-        PackCommand::New { name } => {
-            let dest = pack::scaffold(&std::env::current_dir()?, &name)?;
+        PackCommand::New { name, studio } => {
+            let dest = pack::scaffold(&std::env::current_dir()?, &name, studio)?;
             println!("{} {}", style::success("Pack scaffolded at"), dest.display());
             println!("Next: cd {name} && atelier pack dev — then open the gallery and edit components/showcase/.");
+            if studio {
+                println!(
+                    "{} the console studio (studio/) is experimental and needs Atelier 0.16+; the contract is studio/atelier-studio.d.ts.",
+                    style::warn("Studio:")
+                );
+            }
             Ok(())
         }
         PackCommand::Dev { no_watch, attach } => {
