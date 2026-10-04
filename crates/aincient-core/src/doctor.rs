@@ -295,7 +295,8 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
         Repair::StartContainers => {
             let mut c = compose(stack);
             c.args(["up", "-d"]);
-            probe(c)?;
+            // Not a probe: `up` may pull and recreate, so it gets no deadline.
+            docker::probe_unbounded(c)?;
             // Containers report "running" the instant they start, but the
             // entrypoint then runs converge (site install or migrations) for up
             // to minutes. Re-diagnosing immediately would ask a half-booted
@@ -323,7 +324,8 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
                 "www-data:www-data",
                 FILES_DIR,
             ]);
-            probe(c).map(|_| None)
+            // `chown -R` over every upload — runs as long as the tree is big.
+            docker::probe_unbounded(c).map(|_| None)
         }
         Repair::Converge => {
             // converge.sh is chatty and slow (snapshot, updatedb, config import,
@@ -980,7 +982,9 @@ fn check_site(stack: &Stack, app_up: bool, out: &mut Vec<Check>) {
     // the site is well.
     let mut hc = compose(stack);
     hc.args(["exec", "-T", "app", HEALTHCHECK]);
-    out.push(match probe(hc) {
+    // Unbounded like `drush`: it bootstraps Drupal, and a slow-but-healthy site
+    // timing out here would be "repaired" with a converge it never needed.
+    out.push(match docker::probe_unbounded(hc) {
         Ok(_) => Check::ok("site.health", Tier::Site, "Site health check"),
         Err(e) => Check::bad(
             "site.health",
@@ -1076,10 +1080,14 @@ fn check_ai(stack: &Stack) -> Check {
 // --- helpers -----------------------------------------------------------------
 
 /// Run drush inside the `app` container, returning stdout or the failure reason.
+///
+/// No deadline: the same helper runs the repairs (`cache:rebuild`, `updatedb -y`),
+/// which take as long as they take, and its read-only checks bootstrap Drupal,
+/// where a slow-but-healthy site timing out would be misdiagnosed as broken.
 fn drush(stack: &Stack, args: &[&str]) -> Result<String, String> {
     let mut c = compose(stack);
     c.args(["exec", "-T", "app"]).args(DRUSH).args(args);
-    probe(c)
+    docker::probe_unbounded(c)
 }
 
 fn flag(

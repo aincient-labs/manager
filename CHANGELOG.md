@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The update check can no longer hang on a flaky or missing connection** (manager#6). Before
+  asking the registry anything, the Manager and the CLI (`atelier status`, `atelier update
+  --check`) now check in about 2 seconds whether the registry is reachable at all. If it isn't,
+  they report "You're offline — couldn't reach the registry." without starting a registry read.
+  The registry read itself now stops after 10 seconds, and so does each step of an upgrade
+  route's lookups.
+- **Docker checks give up instead of freezing.** Every quick Docker check (`docker info`,
+  `compose ps`, image and container inspects) now stops after 15 seconds, so a stalled Docker
+  Desktop reads as "not running" instead of hanging. A check that times out is stopped along
+  with any helper processes it started, and the message names the command and how long it ran.
+  Long operations (pull, start, backup, restore, doctor's repairs) still run for as long as
+  they need.
+
 ## [0.11.1] - 2026-10-03
 
 ### Fixed

@@ -399,9 +399,11 @@ fn run_step(cmd: Command, action: &str, r: &mut dyn Reporter) -> Result<()> {
 ///
 /// Inconclusive is a legitimate outcome, but it must say why: an unattributed
 /// "couldn't check" is what made atelier-cms#7 undiagnosable from a bug report.
-/// Each failure is attributed to one of four causes — Docker unavailable, the
-/// image not pulled, `buildx` missing, the registry unreachable — since the fix
-/// differs for every one of them.
+/// Each failure is attributed to one of five causes — Docker unavailable, the
+/// image not pulled, `buildx` missing, the host offline (no connection to the
+/// registry at all, decided in ~2 s without spawning buildx), the registry
+/// unreachable — since the fix differs for every one of them. Every probe here
+/// has a deadline, so the check always comes back (manager#6).
 pub fn check_update(stack: &Stack) -> UpdateCheck {
     let image = stack.image();
     // What the registry gets asked about is where an update would *come from*, which
@@ -656,11 +658,21 @@ fn plan_route_with(
     }
 }
 
+/// The cause reported when the registry can't even be connected to — the
+/// connectivity pre-check in [`remote_probe`] failed, so no registry read was
+/// attempted. Also the error [`remote_probe`] returns in that case, which is how
+/// [`registry_problem`] recognises it.
+const REGISTRY_OFFLINE: &str = "You're offline — couldn't reach the registry.";
+
 /// Turn a failed registry read into advice. A missing `buildx` plugin is the
 /// common one — it ships with Docker Desktop but is a separate package on Linux
 /// (`docker-buildx-plugin`), and nothing else in the manager needs it, so a host
 /// without it works fine right up to the update check.
 fn registry_problem(image: &str, error: &str) -> String {
+    // Already phrased for the user, and the fix is the user's network, not Docker.
+    if error == REGISTRY_OFFLINE {
+        return REGISTRY_OFFLINE.to_string();
+    }
     let e = error.to_lowercase();
     if e.contains("buildx") && (e.contains("unknown command") || e.contains("not a docker command"))
     {
@@ -1146,7 +1158,9 @@ fn site_extensions(stack: &Stack) -> Option<Vec<String>> {
         "sql:query",
         "SELECT convert_from(data, 'UTF8') FROM config WHERE name = 'core.extension';",
     ]);
-    let out = try_capture(c)?;
+    // No probe deadline: this feeds a safety guard on the (user-initiated) update
+    // path, and a slow drush timing out would silently skip the guard.
+    let out = docker::probe_unbounded(c).ok().filter(|s| !s.is_empty())?;
     let names = parse_serialized_extensions(&out);
     (!names.is_empty()).then_some(names)
 }
@@ -2335,7 +2349,29 @@ fn parse_extension_list(raw: &str) -> Option<Vec<String>> {
 /// collected by ranging over it (identical across arches — verified: two
 /// differently-stamped builds share byte-identical layers) rather than by naming
 /// one platform the host may not be.
+///
+/// Fails fast when the registry can't be reached at all: a TCP connect to it
+/// (bounded by [`docker::CONNECTIVITY_TIMEOUT`]) runs first, and if that fails no
+/// buildx process is spawned and the error is [`REGISTRY_OFFLINE`]. The probe
+/// itself is bounded by [`docker::REMOTE_PROBE_TIMEOUT`] (manager#6). Every
+/// registry read — the update check, the route walk's per-hop floor lookups, the
+/// missing-extension guard — goes through here, so all of them inherit both.
 fn remote_probe(image: &str) -> std::result::Result<ImageProbe, String> {
+    let (host, port) = docker::registry_endpoint(image);
+    remote_probe_with(image, || {
+        docker::can_reach(&host, port, docker::CONNECTIVITY_TIMEOUT)
+    })
+}
+
+/// [`remote_probe`] over an injected connectivity check, so the offline path is
+/// testable without a network.
+fn remote_probe_with(
+    image: &str,
+    online: impl FnOnce() -> bool,
+) -> std::result::Result<ImageProbe, String> {
+    if !online() {
+        return Err(REGISTRY_OFFLINE.to_string());
+    }
     let mut c = docker::docker();
     c.args([
         "buildx",
@@ -2352,7 +2388,10 @@ fn remote_probe(image: &str) -> std::result::Result<ImageProbe, String> {
              {{{{end}}}}|{{{{end}}}}"
         ),
     ]);
-    Ok(parse_remote_probe(&docker::probe(c)?))
+    Ok(parse_remote_probe(&docker::probe_within(
+        c,
+        docker::REMOTE_PROBE_TIMEOUT,
+    )?))
 }
 
 /// Split `digest|version;floor;extensions|version;floor;extensions|` — one triple
@@ -2400,8 +2439,8 @@ mod tests {
     use super::{
         backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_extension_list,
         parse_http_status, parse_local_probe, parse_remote_probe, parse_serialized_extensions,
-        plan_route, plan_route_with, registry_problem, restore_bundle_script, waypoint_image,
-        ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS,
+        plan_route, plan_route_with, registry_problem, remote_probe_with, restore_bundle_script,
+        waypoint_image, ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
     };
     use crate::stack::Stack;
 
@@ -2693,6 +2732,19 @@ mod tests {
         assert_eq!(
             parse_serialized_extensions(blob),
             vec!["ai", "aincient_theme", "node"]
+        );
+    }
+
+    /// Offline is decided by the connectivity pre-check and reported in the user's
+    /// words; no registry read (no buildx) is attempted.
+    #[test]
+    fn an_offline_host_gets_the_offline_cause_without_a_registry_read() {
+        let err =
+            remote_probe_with("ghcr.io/aincient-labs/atelier-cms:stable", || false).unwrap_err();
+        assert_eq!(err, REGISTRY_OFFLINE);
+        assert_eq!(
+            registry_problem("ghcr.io/aincient-labs/atelier-cms:stable", &err),
+            "You're offline — couldn't reach the registry."
         );
     }
 
