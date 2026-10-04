@@ -26,7 +26,9 @@ fn paint(text: &str, stream: Stream, style: Style) -> String {
 
 /// Cinnabar, bold — section headings and the wordmark.
 pub fn heading(text: &str) -> String {
-    let s = Style::new().truecolor(CINNABAR.0, CINNABAR.1, CINNABAR.2).bold();
+    let s = Style::new()
+        .truecolor(CINNABAR.0, CINNABAR.1, CINNABAR.2)
+        .bold();
     paint(text, Stream::Stdout, s)
 }
 

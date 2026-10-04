@@ -18,12 +18,11 @@ pub mod pack;
 pub mod stack;
 
 pub use docker::{preflight, Preflight, PullEvent};
-pub use doctor::{Check, Report, Repair, Severity, Tier};
+pub use doctor::{Check, Repair, Report, Severity, Tier};
 pub use ops::{
-    admin_password, backup, check_update, down, export_static, install, list_backups,
-    logs_command, model_list, model_set, open_console, open_console_authed, open_login, open_url,
-    reinstall, restore,
-    set_admin_password, start, status, stop, switch_channel, tail_logs, update, Backup,
+    admin_password, backup, check_update, down, export_static, install, list_backups, logs_command,
+    model_list, model_set, open_console, open_console_authed, open_login, open_url, reinstall,
+    restore, set_admin_password, start, status, stop, switch_channel, tail_logs, update, Backup,
     ExportOptions, ModelRole, Reporter, Silent, Stage, Status, UpdateCheck,
 };
 pub use pack::Pack;

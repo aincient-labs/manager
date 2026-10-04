@@ -56,7 +56,9 @@ pub fn valid_module_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 50
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// The scaffold: every file `atelier pack new` lays down, as
@@ -78,7 +80,11 @@ pub fn scaffold_files(module: &str, studio: bool) -> Vec<(String, String)> {
         }
         words
     };
-    let (provides, requires) = if studio { ("components, studios", "^0.16") } else { ("components", "^0.10") };
+    let (provides, requires) = if studio {
+        ("components, studios", "^0.16")
+    } else {
+        ("components", "^0.10")
+    };
     let render = |tpl: &str| {
         tpl.replace("__MODULE__", module)
             .replace("__LABEL__", &label)
@@ -86,34 +92,103 @@ pub fn scaffold_files(module: &str, studio: bool) -> Vec<(String, String)> {
             .replace("__REQUIRES__", requires)
     };
     let mut files = vec![
-        (format!("{module}.info.yml"), render(include_str!("../templates/pack/module.info.yml.tpl"))),
-        ("atelier.pack.yml".into(), render(include_str!("../templates/pack/atelier.pack.yml.tpl"))),
-        ("components/showcase/showcase.component.yml".into(), render(include_str!("../templates/pack/showcase.component.yml.tpl"))),
-        ("components/showcase/showcase.twig".into(), render(include_str!("../templates/pack/showcase.twig.tpl"))),
+        (
+            format!("{module}.info.yml"),
+            render(include_str!("../templates/pack/module.info.yml.tpl")),
+        ),
+        (
+            "atelier.pack.yml".into(),
+            render(include_str!("../templates/pack/atelier.pack.yml.tpl")),
+        ),
+        (
+            "components/showcase/showcase.component.yml".into(),
+            render(include_str!("../templates/pack/showcase.component.yml.tpl")),
+        ),
+        (
+            "components/showcase/showcase.twig".into(),
+            render(include_str!("../templates/pack/showcase.twig.tpl")),
+        ),
         // The SOURCE rules (imported by input.css) and the committed OUTPUT the
         // appliance links — seeded identical; the dev watcher rebuilds the output.
-        ("build/pack.css".into(), render(include_str!("../templates/pack/pack.css.tpl"))),
-        (format!("assets/{module}.css"), render(include_str!("../templates/pack/pack.css.tpl"))),
-        ("build/input.css".into(), render(include_str!("../templates/pack/input.css.tpl"))),
-        ("build/atelier/tokens.generated.css".into(), render(include_str!("../templates/pack/preset-placeholder.css.tpl"))),
-        ("build/atelier/tw-palette.generated.css".into(), render(include_str!("../templates/pack/preset-placeholder.css.tpl"))),
-        ("compose.dev.yaml".into(), render(include_str!("../templates/pack/compose.dev.yaml.tpl"))),
-        ("compose.ci.yaml".into(), render(include_str!("../templates/pack/compose.ci.yaml.tpl"))),
-        ("dev/pack.yml".into(), render(include_str!("../templates/pack/packsd.yml.tpl"))),
-        ("dev/zz-dev.ini".into(), render(include_str!("../templates/pack/zz-dev.ini.tpl"))),
-        ("dev/services.dev.yml".into(), render(include_str!("../templates/pack/services.dev.yml.tpl"))),
-        ("Dockerfile".into(), render(include_str!("../templates/pack/Dockerfile.tpl"))),
-        (".dockerignore".into(), render(include_str!("../templates/pack/dockerignore.tpl"))),
-        (".gitignore".into(), render(include_str!("../templates/pack/gitignore.tpl"))),
-        (".github/workflows/build.yml".into(), render(include_str!("../templates/pack/workflow.yml.tpl"))),
-        ("README.md".into(), render(include_str!("../templates/pack/README.md.tpl"))),
+        (
+            "build/pack.css".into(),
+            render(include_str!("../templates/pack/pack.css.tpl")),
+        ),
+        (
+            format!("assets/{module}.css"),
+            render(include_str!("../templates/pack/pack.css.tpl")),
+        ),
+        (
+            "build/input.css".into(),
+            render(include_str!("../templates/pack/input.css.tpl")),
+        ),
+        (
+            "build/atelier/tokens.generated.css".into(),
+            render(include_str!("../templates/pack/preset-placeholder.css.tpl")),
+        ),
+        (
+            "build/atelier/tw-palette.generated.css".into(),
+            render(include_str!("../templates/pack/preset-placeholder.css.tpl")),
+        ),
+        (
+            "compose.dev.yaml".into(),
+            render(include_str!("../templates/pack/compose.dev.yaml.tpl")),
+        ),
+        (
+            "compose.ci.yaml".into(),
+            render(include_str!("../templates/pack/compose.ci.yaml.tpl")),
+        ),
+        (
+            "dev/pack.yml".into(),
+            render(include_str!("../templates/pack/packsd.yml.tpl")),
+        ),
+        (
+            "dev/zz-dev.ini".into(),
+            render(include_str!("../templates/pack/zz-dev.ini.tpl")),
+        ),
+        (
+            "dev/services.dev.yml".into(),
+            render(include_str!("../templates/pack/services.dev.yml.tpl")),
+        ),
+        (
+            "Dockerfile".into(),
+            render(include_str!("../templates/pack/Dockerfile.tpl")),
+        ),
+        (
+            ".dockerignore".into(),
+            render(include_str!("../templates/pack/dockerignore.tpl")),
+        ),
+        (
+            ".gitignore".into(),
+            render(include_str!("../templates/pack/gitignore.tpl")),
+        ),
+        (
+            ".github/workflows/build.yml".into(),
+            render(include_str!("../templates/pack/workflow.yml.tpl")),
+        ),
+        (
+            "README.md".into(),
+            render(include_str!("../templates/pack/README.md.tpl")),
+        ),
     ];
     if studio {
         files.extend([
-            (format!("{module}.studios.yml"), render(include_str!("../templates/pack/studios.yml.tpl"))),
-            ("studio/studio.js".into(), render(include_str!("../templates/pack/studio.js.tpl"))),
-            ("studio/studio.css".into(), render(include_str!("../templates/pack/studio.css.tpl"))),
-            ("studio/atelier-studio.d.ts".into(), include_str!("../templates/pack/atelier-studio.d.ts.tpl").to_string()),
+            (
+                format!("{module}.studios.yml"),
+                render(include_str!("../templates/pack/studios.yml.tpl")),
+            ),
+            (
+                "studio/studio.js".into(),
+                render(include_str!("../templates/pack/studio.js.tpl")),
+            ),
+            (
+                "studio/studio.css".into(),
+                render(include_str!("../templates/pack/studio.css.tpl")),
+            ),
+            (
+                "studio/atelier-studio.d.ts".into(),
+                include_str!("../templates/pack/atelier-studio.d.ts.tpl").to_string(),
+            ),
         ]);
     }
     files
@@ -127,7 +202,10 @@ pub fn scaffold(parent: &Path, module: &str, studio: bool) -> Result<PathBuf> {
     }
     let dest = parent.join(module);
     if dest.exists() {
-        bail!("{} already exists — refusing to overwrite it", dest.display());
+        bail!(
+            "{} already exists — refusing to overwrite it",
+            dest.display()
+        );
     }
     for (rel, content) in scaffold_files(module, studio) {
         let path = dest.join(&rel);
@@ -151,7 +229,9 @@ pub fn dev_home(pack: &Pack) -> PathBuf {
 /// The pack's isolated dev stack — a plain [`Stack`], so every compose/env
 /// helper works on it unchanged.
 pub fn dev_stack(pack: &Pack) -> Stack {
-    Stack { home: dev_home(pack) }
+    Stack {
+        home: dev_home(pack),
+    }
 }
 
 /// The stack this pack's dev loop is actually running against: the isolated
@@ -252,7 +332,10 @@ pub fn dev_up(stack: &Stack, pack: &Pack) -> Result<()> {
     docker::preflight().require()?;
     let overlay = pack.dir.join("compose.dev.yaml");
     if !overlay.is_file() {
-        bail!("{} is missing — is this a pack scaffolded by `atelier pack new`?", overlay.display());
+        bail!(
+            "{} is missing — is this a pack scaffolded by `atelier pack new`?",
+            overlay.display()
+        );
     }
     let mut c = dev_compose(stack, pack);
     c.args(["up", "-d", "--wait"]);
@@ -296,8 +379,14 @@ pub fn sync_preset(stack: &Stack, pack: &Pack) -> Result<()> {
 /// One drush invocation inside the app container, output inherited.
 fn drush_inherited(stack: &Stack, args: &[&str], action: &str) -> Result<()> {
     let mut c = compose(stack);
-    c.args(["exec", "-T", "app", "/opt/drupal/vendor/bin/drush", "--root=/opt/drupal/web"])
-        .args(args);
+    c.args([
+        "exec",
+        "-T",
+        "app",
+        "/opt/drupal/vendor/bin/drush",
+        "--root=/opt/drupal/web",
+    ])
+    .args(args);
     run_inherited(c, action)
 }
 
@@ -314,7 +403,11 @@ pub fn validate(stack: &Stack, module: &str) -> Result<()> {
 /// A cache rebuild — what a `.component.yml` edit needs before discovery sees
 /// the change (Twig/PHP/CSS edits need nothing: the dev overlays cover those).
 pub fn cache_rebuild(stack: &Stack) -> Result<()> {
-    drush_inherited(stack, &["cache:rebuild"], "rebuild caches after a component.yml change")
+    drush_inherited(
+        stack,
+        &["cache:rebuild"],
+        "rebuild caches after a component.yml change",
+    )
 }
 
 /// The dev watch loop: poll the pack for `*.component.yml` / `*.info.yml`
@@ -354,7 +447,9 @@ fn collect_mtimes(dir: &Path, map: &mut BTreeMap<PathBuf, SystemTime>, depth: u8
     if depth > 6 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -362,7 +457,10 @@ fn collect_mtimes(dir: &Path, map: &mut BTreeMap<PathBuf, SystemTime>, depth: u8
             if !name.starts_with('.') && name != "node_modules" {
                 collect_mtimes(&path, map, depth + 1);
             }
-        } else if name.ends_with(".component.yml") || name.ends_with(".info.yml") || name == "atelier.pack.yml" {
+        } else if name.ends_with(".component.yml")
+            || name.ends_with(".info.yml")
+            || name == "atelier.pack.yml"
+        {
             if let Ok(meta) = entry.metadata() {
                 if let Ok(mtime) = meta.modified() {
                     map.insert(path, mtime);
@@ -376,13 +474,19 @@ fn collect_mtimes(dir: &Path, map: &mut BTreeMap<PathBuf, SystemTime>, depth: u8
 /// server to proxy the AINCIENT_DEV endpoints. Deliberately dependency-free
 /// (localhost, no TLS), same posture as `ops::http_ready`.
 pub fn http_get(port: u16, path_and_query: &str) -> Result<(u16, String)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .with_context(|| format!("nothing is listening on 127.0.0.1:{port} — is the dev stack up? (`atelier pack dev`)"))?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).with_context(|| {
+        format!(
+            "nothing is listening on 127.0.0.1:{port} — is the dev stack up? (`atelier pack dev`)"
+        )
+    })?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     // HTTP/1.0: the server answers whole and closes — no chunked encoding to
     // parse. Read to EOF, split head from body.
-    write!(stream, "GET {path_and_query} HTTP/1.0\r\nHost: localhost\r\nAccept: */*\r\n\r\n")?;
+    write!(
+        stream,
+        "GET {path_and_query} HTTP/1.0\r\nHost: localhost\r\nAccept: */*\r\n\r\n"
+    )?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
     let text = String::from_utf8_lossy(&raw);
@@ -417,7 +521,10 @@ mod tests {
     #[test]
     fn scaffold_substitutes_and_lays_down_the_contract() {
         let files = scaffold_files("acme_pack", false);
-        let by_name: BTreeMap<_, _> = files.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let by_name: BTreeMap<_, _> = files
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         // The four load-bearing files exist and carry the module name.
         assert!(by_name.contains_key("acme_pack.info.yml"));
         assert!(by_name["atelier.pack.yml"].contains("name: acme_pack"));
@@ -433,11 +540,14 @@ mod tests {
         assert!(by_name[".gitignore"].contains(".atelier-pack-*/"));
         assert!(by_name[".dockerignore"].contains(".atelier-pack-*"));
         // The component declares the pack stylesheet it ships.
-        assert!(by_name["components/showcase/showcase.component.yml"].contains("stylesheet: assets/acme_pack.css"));
+        assert!(by_name["components/showcase/showcase.component.yml"]
+            .contains("stylesheet: assets/acme_pack.css"));
         assert!(by_name.contains_key("assets/acme_pack.css"));
         // A plain pack ships no studio and declares none.
         assert!(by_name["atelier.pack.yml"].contains("provides: [components]\n"));
-        assert!(!files.iter().any(|(k, _)| k.starts_with("studio/") || k.ends_with(".studios.yml")));
+        assert!(!files
+            .iter()
+            .any(|(k, _)| k.starts_with("studio/") || k.ends_with(".studios.yml")));
         // No placeholder survives substitution anywhere.
         for (name, content) in &files {
             assert!(!content.contains("__MODULE__"), "{name} kept __MODULE__");
@@ -448,7 +558,10 @@ mod tests {
     #[test]
     fn studio_scaffold_lays_down_the_mount_contract() {
         let files = scaffold_files("acme_pack", true);
-        let by_name: BTreeMap<_, _> = files.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let by_name: BTreeMap<_, _> = files
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         // Declared, so pack-validate does not warn "shipped but undeclared",
         // and pinned to the release that first mounts a pack studio.
         assert!(by_name["atelier.pack.yml"].contains("provides: [components, studios]"));
@@ -468,7 +581,10 @@ mod tests {
         assert!(js.contains(r#"import("./atelier-studio")"#));
         for (name, content) in &files {
             assert!(!content.contains("__MODULE__"), "{name} kept __MODULE__");
-            assert!(!content.contains("__PROVIDES__"), "{name} kept __PROVIDES__");
+            assert!(
+                !content.contains("__PROVIDES__"),
+                "{name} kept __PROVIDES__"
+            );
         }
     }
 
@@ -480,7 +596,10 @@ mod tests {
         let dest = scaffold(&tmp, "acme_pack", false).unwrap();
         assert!(dest.join("acme_pack.info.yml").is_file());
         assert!(dest.join("compose.dev.yaml").is_file());
-        assert!(scaffold(&tmp, "acme_pack", false).is_err(), "second scaffold must refuse");
+        assert!(
+            scaffold(&tmp, "acme_pack", false).is_err(),
+            "second scaffold must refuse"
+        );
         assert!(scaffold(&tmp, "in valid", false).is_err());
         let _ = fs::remove_dir_all(&tmp);
     }

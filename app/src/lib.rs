@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, PullEvent, Reporter,
-    Stack, Stage, Status, UpdateCheck,
+    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, PullEvent, Reporter, Stack,
+    Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -161,8 +161,10 @@ async fn set_admin_password(app: AppHandle, password: String) -> Result<(), Stri
         return Err("password cannot be empty".into());
     }
     let s = stack()?;
-    blocking(move || ops::set_admin_password(&s, &password, &mut EventReporter { app }).map_err(err))
-        .await
+    blocking(move || {
+        ops::set_admin_password(&s, &password, &mut EventReporter { app }).map_err(err)
+    })
+    .await
 }
 
 #[tauri::command]

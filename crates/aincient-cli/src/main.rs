@@ -483,7 +483,11 @@ fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
     match command {
         PackCommand::New { name, studio } => {
             let dest = pack::scaffold(&std::env::current_dir()?, &name, studio)?;
-            println!("{} {}", style::success("Pack scaffolded at"), dest.display());
+            println!(
+                "{} {}",
+                style::success("Pack scaffolded at"),
+                dest.display()
+            );
             println!("Next: cd {name} && atelier pack dev — then open the gallery and edit components/showcase/.");
             if studio {
                 println!(
@@ -530,8 +534,13 @@ fn run_pack(command: PackCommand, stack: &Stack) -> Result<()> {
                 p.module
             );
             match pack::sync_preset(&stack, &p) {
-                Ok(()) => println!("Token preset synced into build/atelier/ (commit it — CI builds against it)."),
-                Err(e) => println!("{} {e:#}", style::warn("Preset sync failed (CSS build may miss utilities):")),
+                Ok(()) => println!(
+                    "Token preset synced into build/atelier/ (commit it — CI builds against it)."
+                ),
+                Err(e) => println!(
+                    "{} {e:#}",
+                    style::warn("Preset sync failed (CSS build may miss utilities):")
+                ),
             }
             if no_watch {
                 return Ok(());
@@ -598,7 +607,10 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             if ops::install(stack, &opts, &mut CliReporter::default())? {
                 done_banner("Installed.", &stack.console_url());
             } else {
-                pending_banner("Installed — still finishing first boot.", &stack.console_url());
+                pending_banner(
+                    "Installed — still finishing first boot.",
+                    &stack.console_url(),
+                );
             }
             show_login(stack);
             Ok(())
@@ -619,7 +631,10 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             if ops::reinstall(stack, &opts, &mut CliReporter::default())? {
                 done_banner("Reinstalled.", &stack.console_url());
             } else {
-                pending_banner("Reinstalled — still finishing first boot.", &stack.console_url());
+                pending_banner(
+                    "Reinstalled — still finishing first boot.",
+                    &stack.console_url(),
+                );
             }
             show_login(stack);
             Ok(())
@@ -870,7 +885,11 @@ fn model_list(stack: &Stack, json: bool) -> Result<()> {
             style::url(&format!("{}:{}", r.provider, r.model))
         };
         let star = if r.is_default() { " *" } else { "" };
-        println!("  {} {}{star}", style::heading(&format!("{:<10}", r.role)), binding);
+        println!(
+            "  {} {}{star}",
+            style::heading(&format!("{:<10}", r.role)),
+            binding
+        );
     }
     println!("\n  * = default role (what the console inherits)");
     Ok(())
@@ -890,7 +909,10 @@ fn doctor(stack: &Stack, fix: bool, json: bool) -> Result<()> {
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&JsonReport::of(&report))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&JsonReport::of(&report))?
+        );
     } else {
         print_report(&report, fix);
     }
@@ -1107,7 +1129,10 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     }
 
     if plan.is_stepped() {
-        println!("{}", style::heading("This upgrade takes more than one step"));
+        println!(
+            "{}",
+            style::heading("This upgrade takes more than one step")
+        );
         print_route(&plan);
         println!(
             "\nEach step pulls its image, migrates, and is health-checked before the \
@@ -1131,7 +1156,10 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     if ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
         done_banner("Update complete.", &stack.console_url());
     } else {
-        pending_banner("Update applied — still finishing boot.", &stack.console_url());
+        pending_banner(
+            "Update applied — still finishing boot.",
+            &stack.console_url(),
+        );
     }
     if pinned_to {
         println!(
@@ -1189,11 +1217,7 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
 
     let target = parse_channel(&name)?;
     if target == current {
-        println!(
-            "{} {}",
-            style::success("Already on"),
-            target.describe()
-        );
+        println!("{} {}", style::success("Already on"), target.describe());
         return Ok(());
     }
 

@@ -35,7 +35,9 @@ pub fn serve(stack: &Stack) -> Result<()> {
             continue; // not JSON — nothing sane to answer
         };
         // Notifications (no id) get no response, per JSON-RPC.
-        let Some(id) = msg.get("id").cloned() else { continue };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         let response = match method {
@@ -51,7 +53,9 @@ pub fn serve(stack: &Stack) -> Result<()> {
                 }
             }),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tool_list() } }),
+            "tools/list" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tool_list() } })
+            }
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -179,7 +183,10 @@ fn call_tool(port: u16, name: &str, args: &Value) -> Result<(String, bool)> {
         "agent_eval" => {
             let ask = args.get("ask").and_then(Value::as_str).unwrap_or_default();
             if ask.is_empty() {
-                return Ok(("agent_eval needs an `ask` (the user request to evaluate).".into(), true));
+                return Ok((
+                    "agent_eval needs an `ask` (the user request to evaluate).".into(),
+                    true,
+                ));
             }
             let mut path = format!(
                 "/atelier/dev/agent-eval?kind={}&ask={}",
@@ -219,12 +226,18 @@ fn percent_encode(s: &str) -> String {
 /// Write a component skeleton into the pack rooted at `dir`.
 fn scaffold_component(dir: &Path, name: &str) -> Result<(String, bool)> {
     if !pack::valid_module_name(name) {
-        return Ok((format!("\"{name}\" is not a valid component machine name (lowercase, digits, _)"), true));
+        return Ok((
+            format!("\"{name}\" is not a valid component machine name (lowercase, digits, _)"),
+            true,
+        ));
     }
     let pack = Pack::locate(dir)?;
     let dest = pack.dir.join("components").join(name);
     if dest.exists() {
-        return Ok((format!("{} already exists — refusing to overwrite", dest.display()), true));
+        return Ok((
+            format!("{} already exists — refusing to overwrite", dest.display()),
+            true,
+        ));
     }
     std::fs::create_dir_all(&dest)?;
     let label = {
@@ -273,7 +286,9 @@ mod tests {
         std::fs::write(tmp.join("acme_pack.info.yml"), "name: Acme\n").unwrap();
         let (msg, is_err) = scaffold_component(&tmp, "banner_wide").unwrap();
         assert!(!is_err, "{msg}");
-        let yml = std::fs::read_to_string(tmp.join("components/banner_wide/banner_wide.component.yml")).unwrap();
+        let yml =
+            std::fs::read_to_string(tmp.join("components/banner_wide/banner_wide.component.yml"))
+                .unwrap();
         assert!(yml.contains("stylesheet: assets/acme_pack.css"));
         assert!(!yml.contains("showcase"));
         let (_, is_err) = scaffold_component(&tmp, "banner_wide").unwrap();

@@ -352,7 +352,9 @@ impl Stack {
     /// `doctor` reports it and `--fix` rewrites them (keeping the originals).
     pub fn stack_files_current(&self) -> bool {
         std::fs::read_to_string(self.compose_path()).ok().as_deref() == Some(COMPOSE_TEMPLATE)
-            && std::fs::read_to_string(self.edge_conf_path()).ok().as_deref()
+            && std::fs::read_to_string(self.edge_conf_path())
+                .ok()
+                .as_deref()
                 == Some(EDGE_CONF_TEMPLATE)
     }
 
@@ -620,7 +622,10 @@ impl Stack {
         let env_path = self.env_path();
 
         if !env_path.is_file() {
-            let image = opts.image.clone().unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+            let image = opts
+                .image
+                .clone()
+                .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
             let port = opts.http_port.unwrap_or(DEFAULT_PORT);
             // A fresh install has chosen its channel by definition — whatever the
             // image it was pointed at implies. Recording it here is what keeps the
@@ -731,13 +736,18 @@ impl Stack {
             env.insert("HASH_SALT".to_string(), hash_salt());
             changes.push("generated a new HASH_SALT".to_string());
         }
-        match env.get("AINCIENT_IMAGE").and_then(|i| rename_legacy_repo(i)) {
+        match env
+            .get("AINCIENT_IMAGE")
+            .and_then(|i| rename_legacy_repo(i))
+        {
             // A reference to the retired repository is a broken stack file in the same
             // sense as a missing key: it names somewhere that cannot answer. Repaired
             // here as well as in `migrate_image_repo` so a checkup fixes it without
             // requiring the operator to attempt an update first.
             Some(fixed) => {
-                changes.push(format!("repointed the image at {fixed} (the old name is retired)"));
+                changes.push(format!(
+                    "repointed the image at {fixed} (the old name is retired)"
+                ));
                 env.insert("AINCIENT_IMAGE".to_string(), fixed);
             }
             None if !env.contains_key("AINCIENT_IMAGE") => {
@@ -809,14 +819,27 @@ mod tests {
         stack.ensure_scaffold(&InstallOptions::default()).unwrap();
 
         assert!(stack.exists());
-        assert_eq!(std::fs::read_to_string(stack.compose_path()).unwrap(), COMPOSE_TEMPLATE);
-        assert_eq!(std::fs::read_to_string(stack.edge_conf_path()).unwrap(), EDGE_CONF_TEMPLATE);
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE
+        );
+        assert_eq!(
+            std::fs::read_to_string(stack.edge_conf_path()).unwrap(),
+            EDGE_CONF_TEMPLATE
+        );
         assert!(stack.stack_files_current());
 
         let env = stack.read_env();
         assert_eq!(env.get("HASH_SALT").unwrap().len(), 64);
-        assert!(env.get("HASH_SALT").unwrap().chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(env.get("AINCIENT_IMAGE").map(String::as_str), Some(DEFAULT_IMAGE));
+        assert!(env
+            .get("HASH_SALT")
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            env.get("AINCIENT_IMAGE").map(String::as_str),
+            Some(DEFAULT_IMAGE)
+        );
         assert_eq!(env.get("HTTP_PORT").map(String::as_str), Some("41221"));
         // No AI key is written — a provider is connected via in-app onboarding.
         assert_eq!(env.get("AINCIENT_AI_KEY"), None);
@@ -851,7 +874,11 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must be preserved");
+        assert_eq!(
+            stack.env_get("HASH_SALT"),
+            Some(salt),
+            "salt must be preserved"
+        );
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v2");
         assert_eq!(stack.http_port(), 9000);
     }
@@ -915,7 +942,11 @@ mod tests {
         let stack = &ts.0;
         stack.ensure_scaffold(&InstallOptions::default()).unwrap();
         let salt = stack.env_get("HASH_SALT").unwrap();
-        std::fs::write(stack.compose_path(), "services:\n  app:\n    image: [[[broken\n").unwrap();
+        std::fs::write(
+            stack.compose_path(),
+            "services:\n  app:\n    image: [[[broken\n",
+        )
+        .unwrap();
 
         let changes = stack.repair_scaffold().unwrap();
 
@@ -959,7 +990,9 @@ mod tests {
 
         assert!(stack.stack_files_current());
         assert!(changes.iter().any(|c| c.contains("rewrote compose.yaml")));
-        assert!(changes.iter().any(|c| c.contains("wrote a fresh edge.conf")));
+        assert!(changes
+            .iter()
+            .any(|c| c.contains("wrote a fresh edge.conf")));
         assert!(
             changes.iter().all(|c| !c.contains("HASH_SALT")),
             "a stale topology must not rotate the salt"
@@ -1060,7 +1093,10 @@ mod tests {
             Channel::Pinned
         );
         // Someone else's `:latest` is not our stable channel.
-        assert_eq!(Channel::of_image("example.com/fork/atelier-cms:latest"), Channel::Pinned);
+        assert_eq!(
+            Channel::of_image("example.com/fork/atelier-cms:latest"),
+            Channel::Pinned
+        );
         assert_eq!(Channel::of_image("atelier-cms-local"), Channel::Pinned);
     }
 
@@ -1077,7 +1113,11 @@ mod tests {
         assert_eq!(stack.image(), image);
         assert_eq!(stack.channel(), Channel::Edge);
         assert_eq!(stack.chosen_channel(), Some(Channel::Edge));
-        assert_eq!(stack.env_get("HASH_SALT"), Some(salt), "salt must survive a switch");
+        assert_eq!(
+            stack.env_get("HASH_SALT"),
+            Some(salt),
+            "salt must survive a switch"
+        );
     }
 
     #[test]
@@ -1110,7 +1150,10 @@ mod tests {
         std::fs::write(ts.0.compose_path(), COMPOSE_TEMPLATE).unwrap();
         std::fs::write(
             ts.0.env_path(),
-            format!("HASH_SALT={}\nAINCIENT_IMAGE={image}\nHTTP_PORT=41221\n", "a".repeat(64)),
+            format!(
+                "HASH_SALT={}\nAINCIENT_IMAGE={image}\nHTTP_PORT=41221\n",
+                "a".repeat(64)
+            ),
         )
         .unwrap();
         ts
@@ -1122,7 +1165,10 @@ mod tests {
         // repository must not be renamed into `…/atelier-cms-cms`.
         assert_eq!(rename_legacy_repo(DEFAULT_IMAGE), None);
         assert_eq!(rename_legacy_repo(LEGACY_DEFAULT_IMAGE), None);
-        assert_eq!(rename_legacy_repo("ghcr.io/aincient-labs/atelier-cms@sha256:abc"), None);
+        assert_eq!(
+            rename_legacy_repo("ghcr.io/aincient-labs/atelier-cms@sha256:abc"),
+            None
+        );
 
         assert_eq!(
             rename_legacy_repo("ghcr.io/aincient-labs/atelier:edge").as_deref(),
@@ -1144,7 +1190,10 @@ mod tests {
             Some("ghcr.io/aincient-labs/atelier-cms")
         );
         // Someone else's repository of the same name is not ours to rewrite.
-        assert_eq!(rename_legacy_repo("example.com/aincient-labs/atelier:edge"), None);
+        assert_eq!(
+            rename_legacy_repo("example.com/aincient-labs/atelier:edge"),
+            None
+        );
     }
 
     #[test]
@@ -1197,7 +1246,9 @@ mod tests {
         let stack = &ts.0;
         // An operator who asked for edge keeps edge — on the repository that answers.
         stack.set_channel(Channel::Edge).unwrap();
-        stack.set_image("ghcr.io/aincient-labs/atelier:edge").unwrap();
+        stack
+            .set_image("ghcr.io/aincient-labs/atelier:edge")
+            .unwrap();
 
         assert_eq!(stack.prospective_image(), LEGACY_DEFAULT_IMAGE);
         assert_eq!(
@@ -1205,7 +1256,11 @@ mod tests {
             Some(LEGACY_DEFAULT_IMAGE.to_string())
         );
         assert_eq!(stack.chosen_channel(), Some(Channel::Edge));
-        assert_eq!(stack.migrate_default_channel().unwrap(), None, "the choice stands");
+        assert_eq!(
+            stack.migrate_default_channel().unwrap(),
+            None,
+            "the choice stands"
+        );
     }
 
     #[test]
@@ -1213,7 +1268,10 @@ mod tests {
         let ts = legacy_stack("ghcr.io/aincient-labs/atelier:v0.1.1");
         let stack = &ts.0;
 
-        assert_eq!(stack.prospective_image(), "ghcr.io/aincient-labs/atelier-cms:v0.1.1");
+        assert_eq!(
+            stack.prospective_image(),
+            "ghcr.io/aincient-labs/atelier-cms:v0.1.1"
+        );
         stack.migrate_image_repo().unwrap();
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v0.1.1");
         // A pinned install was never a candidate for the channel move.

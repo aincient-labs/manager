@@ -67,8 +67,7 @@ impl Preflight {
 pub fn preflight() -> Preflight {
     let docker_installed = quiet(docker().arg("--version"));
     let docker_running = docker_installed && quiet(docker().arg("info"));
-    let compose_available =
-        docker_installed && quiet(docker().args(["compose", "version"]));
+    let compose_available = docker_installed && quiet(docker().args(["compose", "version"]));
     Preflight {
         docker_installed,
         docker_running,
@@ -128,10 +127,10 @@ fn augmented_path() -> String {
     }
     extras.extend(
         [
-            "/usr/local/bin",                                   // Docker Desktop, Homebrew (Intel), colima
-            "/opt/homebrew/bin",                                // Homebrew (Apple Silicon)
-            "/home/linuxbrew/.linuxbrew/bin",                   // Homebrew (Linux)
-            "/Applications/Docker.app/Contents/Resources/bin",  // Docker Desktop (macOS)
+            "/usr/local/bin",                 // Docker Desktop, Homebrew (Intel), colima
+            "/opt/homebrew/bin",              // Homebrew (Apple Silicon)
+            "/home/linuxbrew/.linuxbrew/bin", // Homebrew (Linux)
+            "/Applications/Docker.app/Contents/Resources/bin", // Docker Desktop (macOS)
         ]
         .iter()
         .map(PathBuf::from),

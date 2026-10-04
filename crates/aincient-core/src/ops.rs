@@ -180,7 +180,10 @@ impl Version {
         let mut parts = s.split('.');
         let mut next = || parts.next().filter(|p| !p.is_empty())?.parse::<u64>().ok();
         let (major, minor, patch) = (next()?, next()?, next()?);
-        parts.next().is_none().then_some(Version(major, minor, patch))
+        parts
+            .next()
+            .is_none()
+            .then_some(Version(major, minor, patch))
     }
 }
 
@@ -351,7 +354,11 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
     let port = stack.http_port();
     let started = Instant::now();
     let deadline = started + timeout;
-    r.stage(Stage::Booting, "Waiting for the console to finish booting…", Some(0.72));
+    r.stage(
+        Stage::Booting,
+        "Waiting for the console to finish booting…",
+        Some(0.72),
+    );
     loop {
         if http_ready(port) {
             r.stage(Stage::Ready, "The console is up.", Some(1.0));
@@ -734,7 +741,11 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     // converge's own per-hop rollback is the guarantee; this is the belt.
     let total = plan.steps.len();
     if status(stack).running {
-        r.stage(Stage::Working, "Backing up before the first step…", Some(0.03));
+        r.stage(
+            Stage::Working,
+            "Backing up before the first step…",
+            Some(0.03),
+        );
         match backup(stack, Some("before-stepped-upgrade"), r) {
             Ok(path) => r.stage(
                 Stage::Working,
@@ -902,7 +913,11 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
         return Ok(());
     }
     if status(stack).running {
-        r.stage(Stage::Working, "Backing up before switching channels…", Some(0.09));
+        r.stage(
+            Stage::Working,
+            "Backing up before switching channels…",
+            Some(0.09),
+        );
         match backup(stack, Some("before-channel-switch"), r) {
             Ok(path) => r.stage(
                 Stage::Working,
@@ -959,7 +974,11 @@ pub fn switch_channel(
 /// `docker compose pull`, with a registry-login hint for the private image.
 fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     guard_missing_extensions(stack, r)?;
-    r.stage(Stage::Pull, "Pulling the latest appliance image…", Some(0.12));
+    r.stage(
+        Stage::Pull,
+        "Pulling the latest appliance image…",
+        Some(0.12),
+    );
     // A capturing reporter (the GUI) gets structured per-layer progress via
     // compose's JSON progress stream; the CLI keeps inheriting docker's own TTY
     // bars, and a compose too old for `--progress json` falls back to the plain
@@ -1056,7 +1075,11 @@ fn guard_missing_extensions(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
          exists — then update:\n  \
          atelier app open   (Extend → uninstall)\n\
          Take a backup first: `atelier data backup`.",
-        if missing.len() == 1 { "a module" } else { "modules" },
+        if missing.len() == 1 {
+            "a module"
+        } else {
+            "modules"
+        },
         missing.join(", "),
         if missing.len() == 1 { "it" } else { "them" },
     )
@@ -1102,7 +1125,9 @@ fn running_image_version(stack: &Stack) -> Option<String> {
         "inspect",
         cid,
         "--format",
-        &format!("{{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}"),
+        &format!(
+            "{{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}"
+        ),
     ]);
     let v = try_capture(c)?.trim().to_string();
     (!v.is_empty()).then_some(v)
@@ -1143,14 +1168,21 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
     let mut i = 0;
     while let Some(found) = blob.get(i..).and_then(|rest| rest.find("s:")) {
         let start = i + found + 2;
-        let Some(colon) = blob.get(start..).and_then(|rest| rest.find(':')) else { break };
+        let Some(colon) = blob.get(start..).and_then(|rest| rest.find(':')) else {
+            break;
+        };
         i = start;
-        let Ok(len) = blob.get(start..start + colon).unwrap_or("").parse::<usize>() else {
+        let Ok(len) = blob
+            .get(start..start + colon)
+            .unwrap_or("")
+            .parse::<usize>()
+        else {
             continue;
         };
         let name_start = start + colon + 2; // past `:"`
         let name_end = name_start + len;
-        let (Some(name), Some(rest)) = (blob.get(name_start..name_end), blob.get(name_end..)) else {
+        let (Some(name), Some(rest)) = (blob.get(name_start..name_end), blob.get(name_end..))
+        else {
             continue;
         };
         // Only a name followed by an integer WEIGHT is an extension entry. The
@@ -1160,7 +1192,9 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
             continue;
         }
         if !name.is_empty()
-            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         {
             out.push(name.to_string());
         }
@@ -1279,14 +1313,23 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
 
     r.log("Copying the snapshot out of the container…");
     let mut cp = compose(stack);
-    cp.args(["cp", "app:/tmp/aincient-snapshot.tar.gz", &host_path.to_string_lossy()]);
+    cp.args([
+        "cp",
+        "app:/tmp/aincient-snapshot.tar.gz",
+        &host_path.to_string_lossy(),
+    ]);
     run_capture(cp, "copy the snapshot out of the container")?;
 
     // Best-effort cleanup of the in-container temp files.
     let mut rm = compose(stack);
     rm.args([
-        "exec", "-T", "app", "rm", "-rf",
-        "/tmp/aincient-snapshot", "/tmp/aincient-snapshot.tar.gz",
+        "exec",
+        "-T",
+        "app",
+        "rm",
+        "-rf",
+        "/tmp/aincient-snapshot",
+        "/tmp/aincient-snapshot.tar.gz",
     ]);
     let _ = rm.output();
 
@@ -1356,8 +1399,12 @@ fn install_export(staged: &Path, target: &Path) -> Result<()> {
     }
     check_export_target(target)?;
     if target.exists() {
-        std::fs::remove_dir_all(target)
-            .with_context(|| format!("failed to replace the previous export at {}", target.display()))?;
+        std::fs::remove_dir_all(target).with_context(|| {
+            format!(
+                "failed to replace the previous export at {}",
+                target.display()
+            )
+        })?;
     }
     std::fs::rename(staged, target)
         .with_context(|| format!("failed to move the export into {}", target.display()))
@@ -1454,8 +1501,13 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     // Clear any stale staging dir so a re-export is clean.
     let mut clean = compose(stack);
     clean.args([
-        "exec", "-T", "app", "rm", "-rf",
-        EXPORT_CONTAINER_DIR, container_zip.as_str(),
+        "exec",
+        "-T",
+        "app",
+        "rm",
+        "-rf",
+        EXPORT_CONTAINER_DIR,
+        container_zip.as_str(),
     ]);
     let _ = clean.output();
 
@@ -1473,7 +1525,11 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     // removed once the new one is verified on disk, and never anything else.
     let staged = staging_sibling(&host_out);
     let mut cp = compose(stack);
-    cp.args(["cp", &format!("app:{EXPORT_CONTAINER_DIR}"), &staged.to_string_lossy()]);
+    cp.args([
+        "cp",
+        &format!("app:{EXPORT_CONTAINER_DIR}"),
+        &staged.to_string_lossy(),
+    ]);
     if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(e);
@@ -1485,15 +1541,24 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
 
     if opts.zip {
         let mut cpz = compose(stack);
-        cpz.args(["cp", &format!("app:{container_zip}"), &host_zip.to_string_lossy()]);
+        cpz.args([
+            "cp",
+            &format!("app:{container_zip}"),
+            &host_zip.to_string_lossy(),
+        ]);
         run_capture(cpz, "copy the export zip out of the container")?;
     }
 
     // Best-effort cleanup of the in-container staging files.
     let mut rm = compose(stack);
     rm.args([
-        "exec", "-T", "app", "rm", "-rf",
-        EXPORT_CONTAINER_DIR, container_zip.as_str(),
+        "exec",
+        "-T",
+        "app",
+        "rm",
+        "-rf",
+        EXPORT_CONTAINER_DIR,
+        container_zip.as_str(),
     ]);
     let _ = rm.output();
 
@@ -1546,7 +1611,9 @@ pub fn freeze(stack: &Stack, opts: &FreezeOptions, r: &mut dyn Reporter) -> Resu
     r.stage(Stage::Working, "Freezing the site…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
-    c.args(["exec", "-T", "app"]).args(DRUSH).arg("aincient:freeze");
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .arg("aincient:freeze");
     if let Some(label) = &opts.label {
         c.arg(format!("--label={label}"));
     }
@@ -1614,7 +1681,9 @@ pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()>
     r.stage(Stage::Working, "Switching what visitors see…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
-    c.args(["exec", "-T", "app"]).args(DRUSH).args(["aincient:use", id]);
+    c.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["aincient:use", id]);
     run_capture(c, "switch the served snapshot")?;
     r.log(if id == "live" { "Live." } else { "Frozen." });
     Ok(())
@@ -1631,7 +1700,8 @@ pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result
         .args(["aincient:prune", &format!("--keep={keep}")]);
     run_capture(c, "prune the snapshots")?;
     let after = snapshots(stack)?;
-    let kept: std::collections::HashSet<&str> = after.snapshots.iter().map(|s| s.id.as_str()).collect();
+    let kept: std::collections::HashSet<&str> =
+        after.snapshots.iter().map(|s| s.id.as_str()).collect();
     Ok(before
         .snapshots
         .into_iter()
@@ -1660,7 +1730,10 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
             r.log(line);
         }
     }
-    let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    let name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if is_snapshot_bundle(name) {
         return restore_bundle(stack, file, r);
     }
@@ -1678,12 +1751,18 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
 
     r.log("Copying the backup into the container…");
     let mut cp = compose(stack);
-    cp.args(["cp", &file.to_string_lossy(), &format!("app:{container_tmp}")]);
+    cp.args([
+        "cp",
+        &file.to_string_lossy(),
+        &format!("app:{container_tmp}"),
+    ]);
     run_capture(cp, "copy the backup into the container")?;
 
     r.log("Dropping the current database…");
     let mut drop = compose(stack);
-    drop.args(["exec", "-T", "app"]).args(DRUSH).args(["sql:drop", "-y"]);
+    drop.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .args(["sql:drop", "-y"]);
     run_capture(drop, "drop the existing database")?;
 
     r.log("Loading the backup…");
@@ -1699,7 +1778,9 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
 
     r.log("Rebuilding caches…");
     let mut cr = compose(stack);
-    cr.args(["exec", "-T", "app"]).args(DRUSH).arg("cache:rebuild");
+    cr.args(["exec", "-T", "app"])
+        .args(DRUSH)
+        .arg("cache:rebuild");
     let _ = cr.output();
 
     let mut rm = compose(stack);
@@ -1719,7 +1800,11 @@ fn restore_bundle(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()
 
     r.log("Copying the snapshot into the container…");
     let mut cp = compose(stack);
-    cp.args(["cp", &file.to_string_lossy(), "app:/tmp/aincient-restore.tar.gz"]);
+    cp.args([
+        "cp",
+        &file.to_string_lossy(),
+        "app:/tmp/aincient-restore.tar.gz",
+    ]);
     run_capture(cp, "copy the snapshot into the container")?;
 
     r.log("Unpacking and restoring database + files…");
@@ -1757,7 +1842,10 @@ pub struct SnapshotManifest {
 /// this version can't parse — the caller treats all of those as "unknown
 /// provenance", never as "matches".
 pub fn snapshot_manifest(file: &Path) -> Option<SnapshotManifest> {
-    let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    let name = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if !is_snapshot_bundle(name) {
         return None;
     }
@@ -1798,7 +1886,12 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
     // The bare repository, so the hint can re-pin it by digest. Strip a digest,
     // then a tag — but only a real tag: the colon in a `host:5000/repo` registry
     // is followed by a slash, and stripping there would name a different image.
-    let repo = stack.image().split('@').next().unwrap_or_default().to_string();
+    let repo = stack
+        .image()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_string();
     let repo = match repo.rsplit_once(':') {
         Some((head, tail)) if !tail.contains('/') => head.to_string(),
         _ => repo,
@@ -2042,10 +2135,7 @@ pub fn open_console_authed(stack: &Stack) -> Result<()> {
 
     // drush prints the URL (occasionally alongside notices) — take the first
     // line that looks like one.
-    let url = out
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("http"));
+    let url = out.lines().map(str::trim).find(|l| l.starts_with("http"));
     match url {
         Some(url) => open_url(url),
         None => bail!("drush did not return a login link:\n{}", out.trim()),
@@ -2308,9 +2398,9 @@ fn sanitize(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_http_status,
-        parse_local_probe, parse_remote_probe, plan_route, plan_route_with, registry_problem,
-        parse_extension_list, parse_serialized_extensions, restore_bundle_script, waypoint_image,
+        backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_extension_list,
+        parse_http_status, parse_local_probe, parse_remote_probe, parse_serialized_extensions,
+        plan_route, plan_route_with, registry_problem, restore_bundle_script, waypoint_image,
         ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS,
     };
     use crate::stack::Stack;
@@ -2395,7 +2485,10 @@ mod tests {
 
         let err = super::check_export_target(&dir).unwrap_err().to_string();
         assert!(err.contains("Refusing"), "{err}");
-        assert!(dir.join("tax-return.pdf").is_file(), "the guard must not touch anything");
+        assert!(
+            dir.join("tax-return.pdf").is_file(),
+            "the guard must not touch anything"
+        );
 
         // An `install_export` onto it must also refuse, even with a valid staged copy.
         let staged = dir.with_extension("staged");
@@ -2471,8 +2564,7 @@ mod tests {
     /// plan must not write that target behind the decline.
     #[test]
     fn a_channel_plan_never_rewrites_the_configured_image() {
-        let home =
-            std::env::temp_dir().join(format!("atelier-no-retarget-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("atelier-no-retarget-{}", std::process::id()));
         let stack = install_on(&home, crate::stack::LEGACY_DEFAULT_IMAGE);
         let plan = single_hop_plan("ghcr.io/aincient-labs/atelier-cms:v0.7.1", false);
 
@@ -2627,7 +2719,10 @@ mod tests {
     #[test]
     fn an_edge_stamp_compares_as_the_release_it_descends_from() {
         // The stamp change that lets a floor gate an edge install at all.
-        assert_eq!(Version::parse("v0.5.1+edge.a1b2c3d"), Version::parse("0.5.1"));
+        assert_eq!(
+            Version::parse("v0.5.1+edge.a1b2c3d"),
+            Version::parse("0.5.1")
+        );
         assert!(Version::parse("v0.5.1+edge.a1b2c3d") < Version::parse("0.6.0"));
         // The OLD stamp has no version before the `+` and stays unparseable —
         // "no position in the version order", which is the honest answer for it.
@@ -2681,7 +2776,10 @@ mod tests {
         // apply --exclude to everything that follows on the command line).
         let exclude_at = script.find("--exclude=files/styles").unwrap();
         let files_at = script.find("sites/default files").unwrap();
-        assert!(exclude_at < files_at, "exclude comes before the files member");
+        assert!(
+            exclude_at < files_at,
+            "exclude comes before the files member"
+        );
     }
 
     #[test]
@@ -2690,7 +2788,10 @@ mod tests {
         let script = restore_bundle_script(drush);
         assert_valid_sh(&script);
         assert!(script.contains("sql:drop -y"), "drops before load");
-        assert!(script.contains("| /opt/drupal/vendor/bin/drush"), "loads the db");
+        assert!(
+            script.contains("| /opt/drupal/vendor/bin/drush"),
+            "loads the db"
+        );
         // The scotty gotcha: files written as root must be chowned back to www-data.
         assert!(
             script.contains("chown -R www-data:www-data"),
@@ -2739,8 +2840,14 @@ mod tests {
     #[test]
     fn parses_status_codes_from_the_status_line() {
         assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
-        assert_eq!(parse_http_status(b"HTTP/1.0 302 Found\r\nLocation: /x"), Some(302));
-        assert_eq!(parse_http_status(b"HTTP/1.1 503 Service Unavailable\r\n"), Some(503));
+        assert_eq!(
+            parse_http_status(b"HTTP/1.0 302 Found\r\nLocation: /x"),
+            Some(302)
+        );
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 503 Service Unavailable\r\n"),
+            Some(503)
+        );
     }
 
     #[test]
@@ -3027,7 +3134,10 @@ mod tests {
         );
         assert!(plan.is_stepped());
         assert_eq!(plan.steps.len(), 2);
-        assert_eq!(plan.steps[0].image, "ghcr.io/aincient-labs/atelier-cms:v0.3.0");
+        assert_eq!(
+            plan.steps[0].image,
+            "ghcr.io/aincient-labs/atelier-cms:v0.3.0"
+        );
         assert_eq!(plan.steps[0].version, Version::parse("0.3.0"));
         assert!(!plan.steps[0].is_target);
         assert!(plan.steps[0].reason.as_ref().unwrap().contains("0.4.0"));
@@ -3057,7 +3167,11 @@ mod tests {
         let route: Vec<_> = plan.steps.iter().map(|s| s.version).collect();
         assert_eq!(
             route,
-            vec![Version::parse("0.3.0"), Version::parse("0.5.0"), Version::parse("0.6.0")]
+            vec![
+                Version::parse("0.3.0"),
+                Version::parse("0.5.0"),
+                Version::parse("0.6.0")
+            ]
         );
         assert_eq!(plan.waypoints().count(), 2);
         assert!(plan.problem.is_none());
@@ -3152,6 +3266,9 @@ mod tests {
     fn any_other_registry_failure_carries_the_error_through() {
         let problem = registry_problem("img", "dial tcp: lookup ghcr.io: no such host");
         assert!(problem.contains("Couldn't reach the registry"), "{problem}");
-        assert!(problem.contains("no such host"), "keeps the cause: {problem}");
+        assert!(
+            problem.contains("no such host"),
+            "keeps the cause: {problem}"
+        );
     }
 }

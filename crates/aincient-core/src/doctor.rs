@@ -87,7 +87,15 @@ pub struct Check {
 
 impl Check {
     fn ok(id: &'static str, tier: Tier, label: &'static str) -> Self {
-        Check { id, tier, label, severity: Severity::Ok, detail: None, remedy: None, fix: None }
+        Check {
+            id,
+            tier,
+            label,
+            severity: Severity::Ok,
+            detail: None,
+            remedy: None,
+            fix: None,
+        }
     }
 
     fn bad(
@@ -160,7 +168,9 @@ impl Repair {
             Repair::CacheRebuild => "Rebuild Drupal's caches",
             Repair::RunUpdates => "Run the pending database updates",
             Repair::FixFilePermissions => "Repair ownership of the uploaded-files directory",
-            Repair::Converge => "Re-run the appliance's self-heal (snapshots first, rolls back on failure)",
+            Repair::Converge => {
+                "Re-run the appliance's self-heal (snapshots first, rolls back on failure)"
+            }
         }
     }
 }
@@ -190,7 +200,10 @@ impl Report {
     }
 
     pub fn count(&self, severity: Severity) -> usize {
-        self.checks.iter().filter(|c| c.severity == severity).count()
+        self.checks
+            .iter()
+            .filter(|c| c.severity == severity)
+            .count()
     }
 
     /// The repairs doctor could attempt, deduplicated and in ladder order — what
@@ -218,7 +231,10 @@ pub fn diagnose(stack: &Stack) -> Report {
     let stack_ok = check_stack(stack, host_ok, &mut checks);
     check_site(stack, stack_ok, &mut checks);
 
-    Report { checks, actions: Vec::new() }
+    Report {
+        checks,
+        actions: Vec::new(),
+    }
 }
 
 /// Diagnose, then climb the repair ladder one rung at a time, re-diagnosing
@@ -298,7 +314,15 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
         Repair::RunUpdates => drush(stack, &["updatedb", "-y"]).map(Some),
         Repair::FixFilePermissions => {
             let mut c = compose(stack);
-            c.args(["exec", "-T", "app", "chown", "-R", "www-data:www-data", FILES_DIR]);
+            c.args([
+                "exec",
+                "-T",
+                "app",
+                "chown",
+                "-R",
+                "www-data:www-data",
+                FILES_DIR,
+            ]);
             probe(c).map(|_| None)
         }
         Repair::Converge => {
@@ -325,20 +349,18 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
     // nothing; the version is what distinguishes a host where something works
     // from one where it doesn't, and it costs one extra probe on a command the
     // user ran on purpose.
-    out.push(
-        with_version(
-            flag(
-                "docker.installed",
-                Tier::Host,
-                "Docker installed",
-                pf.docker_installed,
-                Severity::Fail,
-                "Install Docker Desktop (Mac/Windows) or Docker Engine (Linux). Atelier runs as a \
+    out.push(with_version(
+        flag(
+            "docker.installed",
+            Tier::Host,
+            "Docker installed",
+            pf.docker_installed,
+            Severity::Fail,
+            "Install Docker Desktop (Mac/Windows) or Docker Engine (Linux). Atelier runs as a \
                  container, so Docker is required.",
-            ),
-            pf.docker_installed.then(docker_cli_version).flatten(),
         ),
-    );
+        pf.docker_installed.then(docker_cli_version).flatten(),
+    ));
     // The engine, not the CLI — they're separate programs and routinely differ
     // (a remote context, OrbStack, colima, or a Desktop mid-upgrade), which is
     // precisely the sort of skew a report needs to name.
@@ -424,7 +446,10 @@ fn docker_cli_version() -> Option<String> {
 
 fn parse_docker_cli_version(out: &str) -> Option<String> {
     // Take the token after "version", trimming the comma that precedes ", build".
-    let after = out.split_whitespace().skip_while(|w| !w.eq_ignore_ascii_case("version")).nth(1)?;
+    let after = out
+        .split_whitespace()
+        .skip_while(|w| !w.eq_ignore_ascii_case("version"))
+        .nth(1)?;
     non_empty(after.trim_end_matches(','))
 }
 
@@ -482,7 +507,9 @@ fn check_port(stack: &Stack, docker_running: bool) -> Check {
              free port with `atelier app install --port <PORT>`."
         ),
     )
-    .detail(format!("port {port} is in use by something that isn't Atelier"))
+    .detail(format!(
+        "port {port} is in use by something that isn't Atelier"
+    ))
 }
 
 fn port_free(port: u16) -> bool {
@@ -498,7 +525,12 @@ fn check_disk(stack: &Stack) -> Check {
     const NEEDED_MB: u64 = 4096;
 
     let Some(free_mb) = free_space_mb(&stack.home) else {
-        return Check::skipped(ID, Tier::Host, LABEL, "Couldn't read free space on this platform.");
+        return Check::skipped(
+            ID,
+            Tier::Host,
+            LABEL,
+            "Couldn't read free space on this platform.",
+        );
     };
     let detail = format!("{:.1} GB free", free_mb as f64 / 1024.0);
     if free_mb >= NEEDED_MB {
@@ -526,7 +558,11 @@ fn free_space_mb(path: &std::path::Path) -> Option<u64> {
     while !probe_path.exists() {
         probe_path = probe_path.parent()?;
     }
-    let out = Command::new("df").arg("-Pk").arg(probe_path).output().ok()?;
+    let out = Command::new("df")
+        .arg("-Pk")
+        .arg(probe_path)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -557,13 +593,12 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         // follows explains both "why do I have no updates" (pinned) and "why did
         // something change under me" (edge), and a pasted report should answer
         // those without a second command.
-        Check::ok("stack.present", Tier::Stack, "Stack files present")
-            .detail(format!(
-                "{} — {} ({})",
-                stack.home.display(),
-                stack.image(),
-                stack.channel().name()
-            ))
+        Check::ok("stack.present", Tier::Stack, "Stack files present").detail(format!(
+            "{} — {} ({})",
+            stack.home.display(),
+            stack.image(),
+            stack.channel().name()
+        ))
     } else {
         Check::bad(
             "stack.present",
@@ -580,7 +615,9 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     if scaffolded {
         let salt = stack.env_get("HASH_SALT");
         out.push(match salt {
-            Some(s) if s.len() >= 32 => Check::ok("stack.env", Tier::Stack, "Stack settings (.env)"),
+            Some(s) if s.len() >= 32 => {
+                Check::ok("stack.env", Tier::Stack, "Stack settings (.env)")
+            }
             _ => Check::bad(
                 "stack.env",
                 Tier::Stack,
@@ -616,7 +653,11 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             )
             .detail(format!("{from} → {to}"))
             .fixable(Repair::Scaffold),
-            None => Check::ok("stack.image_repo", Tier::Stack, "Appliance image name current"),
+            None => Check::ok(
+                "stack.image_repo",
+                Tier::Stack,
+                "Appliance image name current",
+            ),
         });
     } else {
         out.push(Check::skipped(
@@ -670,7 +711,11 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     // (cms 0416 Phase 3). A warning, fixable: the rewrite keeps the old files
     // aside and never touches the data volumes.
     out.push(if stack.stack_files_current() {
-        Check::ok("stack.files_current", Tier::Stack, "Stack files match this manager")
+        Check::ok(
+            "stack.files_current",
+            Tier::Stack,
+            "Stack files match this manager",
+        )
     } else {
         Check::bad(
             "stack.files_current",
@@ -684,7 +729,12 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         .fixable(Repair::Scaffold)
     });
 
-    out.push(check_container(stack, "db", "stack.db", "Database container healthy"));
+    out.push(check_container(
+        stack,
+        "db",
+        "stack.db",
+        "Database container healthy",
+    ));
 
     let app = check_container(stack, "app", "stack.app", "Appliance container running");
     let app_up = app.severity.is_ok();
@@ -734,8 +784,14 @@ fn check_container(stack: &Stack, service: &str, id: &'static str, label: &'stat
     let raw = match probe(inspect) {
         Ok(out) => out,
         Err(e) => {
-            return Check::bad(id, Tier::Stack, label, Severity::Fail, "Couldn't inspect the container.")
-                .detail(first_line(&e))
+            return Check::bad(
+                id,
+                Tier::Stack,
+                label,
+                Severity::Fail,
+                "Couldn't inspect the container.",
+            )
+            .detail(first_line(&e))
         }
     };
     let state = ContainerState::parse(&raw);
@@ -800,7 +856,11 @@ impl ContainerState {
         let mut parts = raw.trim().split('|');
         let status = parts.next().unwrap_or_default().trim().to_string();
         let restarts = parts.next().unwrap_or_default().trim().parse().unwrap_or(0);
-        let health = parts.next().map(str::trim).filter(|h| !h.is_empty()).map(str::to_string);
+        let health = parts
+            .next()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string);
         ContainerState {
             running: status == "running",
             status,
@@ -863,7 +923,12 @@ fn check_site(stack: &Stack, app_up: bool, out: &mut Vec<Check>) {
             ("site.health", "Site health check"),
             ("site.ai", "AI model connected"),
         ] {
-            out.push(Check::skipped(id, Tier::Site, label, "Drupal doesn't boot."));
+            out.push(Check::skipped(
+                id,
+                Tier::Site,
+                label,
+                "Drupal doesn't boot.",
+            ));
         }
         // Bootstrap failure that a cache rebuild may not cure — offer the hammer.
         out.push(
@@ -883,28 +948,30 @@ fn check_site(stack: &Stack, app_up: bool, out: &mut Vec<Check>) {
 
     // Pending updates mean an upgrade stopped halfway — the site runs on new
     // code against an old schema, which fails in ways that look unrelated.
-    out.push(match drush(stack, &["updatedb:status", "--format=string"]) {
-        Ok(s) if s.trim().is_empty() => {
-            Check::ok("site.updates", Tier::Site, "Database updates applied")
-        }
-        Ok(s) => Check::bad(
-            "site.updates",
-            Tier::Site,
-            "Database updates applied",
-            Severity::Fail,
-            "Database updates are pending — an upgrade didn't finish. Doctor will run them.",
-        )
-        .detail(first_line(&s))
-        .fixable(Repair::RunUpdates),
-        Err(e) => Check::bad(
-            "site.updates",
-            Tier::Site,
-            "Database updates applied",
-            Severity::Warn,
-            "Couldn't read the update status.",
-        )
-        .detail(first_line(&e)),
-    });
+    out.push(
+        match drush(stack, &["updatedb:status", "--format=string"]) {
+            Ok(s) if s.trim().is_empty() => {
+                Check::ok("site.updates", Tier::Site, "Database updates applied")
+            }
+            Ok(s) => Check::bad(
+                "site.updates",
+                Tier::Site,
+                "Database updates applied",
+                Severity::Fail,
+                "Database updates are pending — an upgrade didn't finish. Doctor will run them.",
+            )
+            .detail(first_line(&s))
+            .fixable(Repair::RunUpdates),
+            Err(e) => Check::bad(
+                "site.updates",
+                Tier::Site,
+                "Database updates applied",
+                Severity::Warn,
+                "Couldn't read the update status.",
+            )
+            .detail(first_line(&e)),
+        },
+    );
 
     out.push(check_files(stack));
 
@@ -951,8 +1018,14 @@ fn check_files(stack: &Stack) -> Check {
         )
         .detail(format!("owned by {}", owner.trim()))
         .fixable(Repair::FixFilePermissions),
-        Err(e) => Check::bad(ID, Tier::Site, LABEL, Severity::Warn, "Couldn't read the files directory.")
-            .detail(first_line(&e)),
+        Err(e) => Check::bad(
+            ID,
+            Tier::Site,
+            LABEL,
+            Severity::Warn,
+            "Couldn't read the files directory.",
+        )
+        .detail(first_line(&e)),
     }
 }
 
@@ -989,8 +1062,14 @@ fn check_ai(stack: &Stack) -> Check {
                 )
             }
         }
-        Err(e) => Check::bad(ID, Tier::Site, LABEL, Severity::Warn, "Couldn't read the model roles.")
-            .detail(first_line(&format!("{e:#}"))),
+        Err(e) => Check::bad(
+            ID,
+            Tier::Site,
+            LABEL,
+            Severity::Warn,
+            "Couldn't read the model roles.",
+        )
+        .detail(first_line(&format!("{e:#}"))),
     }
 }
 
@@ -1025,7 +1104,11 @@ fn non_empty(s: &str) -> Option<String> {
 }
 
 fn first_line(s: &str) -> String {
-    s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// healthcheck.sh prefixes its verdict (`[health] FAIL: …`); surface that line
@@ -1063,7 +1146,10 @@ mod tests {
     #[test]
     fn a_restart_loop_is_visible_even_though_the_status_says_running() {
         let s = ContainerState::parse("running|17|");
-        assert!(s.running, "a crash loop still reports running at any single glance");
+        assert!(
+            s.running,
+            "a crash loop still reports running at any single glance"
+        );
         assert!(s.restarts >= RESTART_LOOP_THRESHOLD);
     }
 
@@ -1171,7 +1257,11 @@ mod tests {
         };
         assert_eq!(
             report.available_repairs(),
-            vec![Repair::StartContainers, Repair::CacheRebuild, Repair::Converge]
+            vec![
+                Repair::StartContainers,
+                Repair::CacheRebuild,
+                Repair::Converge
+            ]
         );
     }
 
