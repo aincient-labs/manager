@@ -330,7 +330,9 @@ async function refresh() {
 
   renderStatus(status);
   setView("app");
-  // Best-effort, non-blocking enrichment.
+  // Best-effort, non-blocking enrichment. Reads the cached check only — refresh()
+  // runs after every lifecycle op, and must never start a registry check
+  // (manager#6); startUpdateRefresh() owns those.
   refreshUpdate();
 }
 
@@ -398,13 +400,42 @@ function renderStatus(status) {
   }
 }
 
+// Show/hide the Home update banner from a cache status ({fresh, checked_at,
+// check}) or null (never checked) — hidden unless the check says yes.
+function renderUpdateBanner(cached) {
+  $("update-banner").classList.toggle("hidden", !(cached && cached.check.update_available === true));
+}
+
+// Paint the banner from the on-disk cache — a file read, never the network.
 async function refreshUpdate() {
   try {
-    const u = await invoke("get_update");
-    $("update-banner").classList.toggle("hidden", u.update_available !== true);
+    renderUpdateBanner(await invoke("get_cached_update"));
   } catch {
     $("update-banner").classList.add("hidden");
   }
+}
+
+// Background registry checks (manager#6). One forced check shortly after first
+// paint, then a cheap poll: the backend only re-asks the registry once its cache
+// is older than UPDATE_CACHE_TTL (6 h, Rust-side) or holds no conclusive answer,
+// so most ticks are a file read. Single-flight in the backend, so a tick that
+// lands during another check just shares its result. Silent on failure.
+const UPDATE_POLL_MS = 30 * 60 * 1000;
+let updateRefreshStarted = false;
+
+async function backgroundUpdateRefresh(force) {
+  try {
+    renderUpdateBanner(await invoke("refresh_update_cache", { force }));
+  } catch {
+    /* offline / no stack / Docker down — the banner simply stays as it was. */
+  }
+}
+
+function startUpdateRefresh() {
+  if (updateRefreshStarted) return;
+  updateRefreshStarted = true;
+  backgroundUpdateRefresh(true);
+  setInterval(() => backgroundUpdateRefresh(false), UPDATE_POLL_MS);
 }
 
 // --- manager self-update nudge -----------------------------------------------
@@ -426,12 +457,19 @@ function isNewerVersion(latest, current) {
   return false;
 }
 
+// Give up on the GitHub call after this long (manager#6): a stalled connection
+// must not leave a request hanging for the life of the window.
+const MANAGER_UPDATE_TIMEOUT_MS = 5000;
+
 async function checkManagerUpdate() {
   if (managerUpdateChecked || !managerVersion) return;
   managerUpdateChecked = true;
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), MANAGER_UPDATE_TIMEOUT_MS);
   try {
     const res = await fetch("https://api.github.com/repos/aincient-labs/manager/releases/latest", {
       headers: { Accept: "application/vnd.github+json" },
+      signal: abort.signal,
     });
     if (!res.ok) return;
     const body = await res.json();
@@ -442,7 +480,9 @@ async function checkManagerUpdate() {
     $("manager-update-banner").classList.remove("hidden");
     $("manager-update-hint").classList.remove("hidden");
   } catch {
-    // No network, rate-limited, API reshaped — all of these mean "say nothing".
+    // No network, timed out, rate-limited, API reshaped — all mean "say nothing".
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -742,7 +782,22 @@ const actions = {
   update: async () => {
     let plan = null;
     try {
-      plan = (await invoke("get_update")).plan;
+      // Reuse the cached plan while it's fresh (manager#6) — the button must not
+      // wait on the registry. Otherwise recompute live: that check is deadlined
+      // backend-side, and if it finds no connection at all we say so and stop,
+      // since the update's own pull could only fail (or stall) offline.
+      const cached = await invoke("get_cached_update");
+      if (cached && cached.fresh) {
+        plan = cached.check.plan;
+      } else {
+        const u = await invoke("get_update");
+        if (u.offline) {
+          showError(u.problem || "You're offline — couldn't reach the registry.");
+          refreshUpdate();
+          return;
+        }
+        plan = u.plan;
+      }
     } catch {
       /* couldn't plan — update anyway; the appliance is the real gate. */
     }
@@ -998,4 +1053,8 @@ initPublishPrefs();
 // The nudge needs managerVersion to compare against, so it chains off the
 // version stamp — still fire-and-forget, nothing here delays first paint.
 showManagerVersion().then(checkManagerUpdate);
-refresh().catch((e) => showError(String(e)));
+// Background update checks start once the first refresh has painted (or failed),
+// so a slow registry can never delay the window (manager#6).
+refresh()
+  .catch((e) => showError(String(e)))
+  .finally(startUpdateRefresh);

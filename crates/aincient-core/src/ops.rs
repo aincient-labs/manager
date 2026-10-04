@@ -121,7 +121,10 @@ pub struct Status {
 }
 
 /// The result of comparing the local image against the registry.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` because the GUI caches the last one on disk (see
+/// [`crate::update_cache`]) and reads it back instead of re-asking the registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCheck {
     pub image: String,
     /// Local pulled digest.
@@ -144,6 +147,12 @@ pub struct UpdateCheck {
     /// back. Reported here so the operator sees a stepped upgrade coming before
     /// committing to it, rather than discovering it mid-run.
     pub plan: Option<UpgradePlan>,
+    /// True when the registry couldn't even be connected to (the ~2 s pre-check
+    /// failed), so a caller can say "you're offline" and stop — rather than start
+    /// an update whose pull is bound to fail. `default` so a cache written before
+    /// the field existed still reads.
+    #[serde(default)]
+    pub offline: bool,
 }
 
 /// A released version, as a comparable triple.
@@ -161,6 +170,15 @@ pub struct Version(u64, u64, u64);
 impl Serialize for Version {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         s.collect_str(self)
+    }
+}
+
+/// The inverse of the `Serialize` above — read back from the update cache.
+impl<'de> Deserialize<'de> for Version {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Version::parse(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("not a release version: {s:?}")))
     }
 }
 
@@ -200,7 +218,7 @@ pub fn waypoint_image(v: Version) -> String {
 }
 
 /// One hop of an upgrade: an image to converge onto before going further.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeStep {
     /// The image this hop runs.
     pub image: String,
@@ -227,7 +245,7 @@ pub struct UpgradeStep {
 /// FROM THE REGISTRY, WITHOUT PULLING (`dev.atelier.upgrade.min-from`), walks them
 /// backwards from the target until it reaches one this install satisfies, and
 /// applies the hops in order.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePlan {
     /// The version installed now, when the image says (unstamped builds don't).
     pub from: Option<Version>,
@@ -422,6 +440,7 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         update_available: None,
         problem: None,
         plan: None,
+        offline: false,
     };
 
     // Docker itself is the floor: without it neither probe can say anything, and
@@ -457,10 +476,12 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
             check.latest_version = probe.version.clone();
             target = Some(probe);
         }
-        Err(e) if check.problem.is_none() => {
-            check.problem = Some(registry_problem(&target_image, &e))
+        Err(e) => {
+            check.offline = e == REGISTRY_OFFLINE;
+            if check.problem.is_none() {
+                check.problem = Some(registry_problem(&target_image, &e));
+            }
         }
-        Err(_) => {}
     }
 
     check.update_available = match (&check.current, &check.latest) {
@@ -1011,6 +1032,12 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     } else {
         run_step(c, "pull the image", r)
     };
+    // A pulled image is a new local digest, so the cached update check (if any)
+    // now describes a machine that no longer exists — drop it rather than keep a
+    // stale "update available" banner up after the update itself.
+    if run.is_ok() {
+        crate::update_cache::invalidate(stack);
+    }
     run.map_err(|e| {
         if stack.image().starts_with("ghcr.io/") {
             e.context(

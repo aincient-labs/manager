@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with any helper processes it started, and the message names the command and how long it ran.
   Long operations (pull, start, backup, restore, doctor's repairs) still run for as long as
   they need.
+- **The Manager window no longer waits on the update check** (manager#6). The Home update
+  banner now reads the last check result, saved in the stack folder (`update-check.json`). The
+  Manager asks the registry again once shortly after the window opens, then only when that
+  result is more than 6 hours old. Start, Stop, Backup, Restore and the other actions no longer
+  start a new check. Only one check runs at a time, so a slow registry can't pile up background
+  processes. **Update** on Home reuses a recent result. Otherwise it checks again with the same
+  time limit, and if you're offline it says so instead of starting an update that can't download
+  anything. Settings → Check for updates still checks live. Docker readiness checks and the
+  backups list no longer run on the window's main thread, and the Manager's own new-version
+  check gives up after 5 seconds.
 
 ## [0.11.1] - 2026-10-03
 

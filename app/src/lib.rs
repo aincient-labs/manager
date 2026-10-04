@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, ops, Backup, Channel, InstallOptions, ModelRole, Preflight, PullEvent, Reporter, Stack,
-    Stage, Status, UpdateCheck,
+    doctor, ops, update_cache, Backup, CacheStatus, Channel, InstallOptions, ModelRole, Preflight,
+    PullEvent, Reporter, SingleFlight, Stack, Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -125,16 +125,20 @@ where
     }
 }
 
+/// `async` + [`blocking`]: a plain `fn` command runs on the main thread, and
+/// `docker info` can stall when Docker Desktop is wedged (manager#6).
 #[tauri::command]
-fn check_preflight() -> Preflight {
-    aincient_core::preflight()
+async fn check_preflight() -> Result<Preflight, String> {
+    blocking(|| Ok(aincient_core::preflight())).await
 }
 
 /// The first unmet Docker requirement, if any — the GUI shows this on its
 /// readiness screen instead of letting an op fail with a raw Docker error.
+/// Off the main thread for the same reason as [`check_preflight`]: `refresh()`
+/// awaits this before anything renders.
 #[tauri::command]
-fn preflight_problem() -> Option<String> {
-    aincient_core::preflight().problem()
+async fn preflight_problem() -> Result<Option<String>, String> {
+    blocking(|| Ok(aincient_core::preflight().problem())).await
 }
 
 #[tauri::command]
@@ -143,16 +147,42 @@ async fn get_status() -> Result<Status, String> {
     blocking(move || Ok(ops::status(&s))).await
 }
 
+/// The one registry check allowed in flight at a time (manager#6): every caller
+/// of [`get_update`] / [`refresh_update_cache`] that arrives while a check runs
+/// waits for it and shares its result, so a slow registry can't pile up
+/// `docker buildx imagetools` processes.
+static UPDATE_FLIGHT: SingleFlight<UpdateCheck> = SingleFlight::new();
+
+/// A LIVE registry check — the explicit "Check for updates" path. Deadlined in
+/// core, single-flight here, and its result refreshes the banner's cache.
 #[tauri::command]
 async fn get_update() -> Result<UpdateCheck, String> {
     let s = stack()?;
-    blocking(move || Ok(ops::check_update(&s))).await
+    blocking(move || Ok(update_cache::live_check(&s, &UPDATE_FLIGHT))).await
 }
 
+/// The cached update check, if any — a file read, never the network. What the
+/// Home banner (and the Home Update action, while it's fresh) reads.
 #[tauri::command]
-fn list_backups() -> Result<Vec<Backup>, String> {
+async fn get_cached_update() -> Result<Option<CacheStatus>, String> {
     let s = stack()?;
-    Ok(ops::list_backups(&s))
+    blocking(move || Ok(update_cache::status(&s))).await
+}
+
+/// The background refresh: re-asks the registry only when `force` is set (once
+/// after first paint) or the cache has gone stale, then returns the cache.
+#[tauri::command]
+async fn refresh_update_cache(force: bool) -> Result<Option<CacheStatus>, String> {
+    let s = stack()?;
+    blocking(move || Ok(update_cache::refresh(&s, &UPDATE_FLIGHT, force))).await
+}
+
+/// Off the main thread: a directory listing is quick, but a plain `fn` command
+/// runs on the main thread and nothing there may block (manager#6).
+#[tauri::command]
+async fn list_backups() -> Result<Vec<Backup>, String> {
+    let s = stack()?;
+    blocking(move || Ok(ops::list_backups(&s))).await
 }
 
 #[tauri::command]
@@ -489,6 +519,8 @@ pub fn run() {
             preflight_problem,
             get_status,
             get_update,
+            get_cached_update,
+            refresh_update_cache,
             list_backups,
             set_admin_password,
             do_install,

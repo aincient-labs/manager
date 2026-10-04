@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod ops;
 pub mod pack;
 pub mod stack;
+pub mod update_cache;
 
 pub use docker::{preflight, Preflight, PullEvent};
 pub use doctor::{Check, Repair, Report, Severity, Tier};
@@ -27,3 +28,4 @@ pub use ops::{
 };
 pub use pack::Pack;
 pub use stack::{Channel, InstallOptions, Stack, DEFAULT_IMAGE, DEFAULT_PORT};
+pub use update_cache::{CacheStatus, SingleFlight};
