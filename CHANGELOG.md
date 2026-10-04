@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`atelier mcp` finds your pack from any folder inside it.** It now looks upward from where it
+  was launched for the nearest `atelier.pack.yml`, so an editor or agent that starts it from a
+  subfolder (or elsewhere under the pack) still scaffolds into the right pack. If there is no
+  pack above, it says so: which file it looked for, from where, and to run it inside a pack or
+  start one with `atelier pack new`.
+- **`atelier app start` brings the appliance back after `atelier pack down`.** When the
+  containers no longer exist, Start now creates them again (`compose up -d`) instead of failing
+  with "no container found".
+
 - **The update check can no longer hang on a flaky or missing connection** (manager#6). Before
   asking the registry anything, the Manager and the CLI (`atelier status`, `atelier update
   --check`) now check in about 2 seconds whether the registry is reachable at all. If it isn't,

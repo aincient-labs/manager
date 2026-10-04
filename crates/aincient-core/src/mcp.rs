@@ -231,7 +231,7 @@ fn scaffold_component(dir: &Path, name: &str) -> Result<(String, bool)> {
             true,
         ));
     }
-    let pack = Pack::locate(dir)?;
+    let pack = Pack::locate_upward(dir)?;
     let dest = pack.dir.join("components").join(name);
     if dest.exists() {
         return Ok((
@@ -284,6 +284,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("acme_pack.info.yml"), "name: Acme\n").unwrap();
+        std::fs::write(tmp.join("atelier.pack.yml"), "name: acme_pack\n").unwrap();
         let (msg, is_err) = scaffold_component(&tmp, "banner_wide").unwrap();
         assert!(!is_err, "{msg}");
         let yml =
@@ -296,5 +297,28 @@ mod tests {
         let (_, is_err) = scaffold_component(&tmp, "Bad-Name").unwrap();
         assert!(is_err);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scaffold_component_from_a_nested_dir_lands_in_the_pack() {
+        let tmp = std::env::temp_dir().join(format!("atelier-mcp-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let nested = tmp.join("components/x");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(tmp.join("acme_pack.info.yml"), "name: Acme\n").unwrap();
+        std::fs::write(tmp.join("atelier.pack.yml"), "name: acme_pack\n").unwrap();
+        let (msg, is_err) = scaffold_component(&nested, "card_wide").unwrap();
+        assert!(!is_err, "{msg}");
+        assert!(tmp.join("components/card_wide/card_wide.twig").is_file());
+        // Outside any pack: an error, nothing written.
+        let other = std::env::temp_dir().join(format!("atelier-mcp-none-{}", std::process::id()));
+        std::fs::create_dir_all(&other).unwrap();
+        let err = scaffold_component(&other, "card_wide")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("atelier.pack.yml"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }

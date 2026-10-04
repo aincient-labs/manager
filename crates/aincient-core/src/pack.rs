@@ -28,6 +28,25 @@ pub struct Pack {
 }
 
 impl Pack {
+    /// Locate the pack that contains `start`: walk up from `start` to the
+    /// nearest directory holding an `atelier.pack.yml` (stopping at the
+    /// filesystem root), then [`Pack::locate`] it. MCP clients don't guarantee
+    /// the launch directory, so `atelier mcp` must not assume the pack root.
+    pub fn locate_upward(start: &Path) -> Result<Pack> {
+        let from = start
+            .canonicalize()
+            .with_context(|| format!("cannot resolve {}", start.display()))?;
+        for dir in from.ancestors() {
+            if dir.join("atelier.pack.yml").is_file() {
+                return Pack::locate(dir);
+            }
+        }
+        bail!(
+            "no atelier.pack.yml found in {} or any parent directory — run `atelier mcp` from inside a pack (the directory with atelier.pack.yml), or start one with `atelier pack new <name>`",
+            from.display()
+        )
+    }
+
     /// Locate the pack whose root is `dir` (typically the working directory).
     pub fn locate(dir: &Path) -> Result<Pack> {
         let dir = dir
@@ -681,6 +700,33 @@ mod tests {
         assert_eq!(pack.module, "acme_pack");
         fs::write(tmp.join("other.info.yml"), "name: Other\n").unwrap();
         assert!(Pack::locate(&tmp).is_err(), "two info.yml → error");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn locate_upward_finds_pack_from_cwd_and_subdirs_or_errors_clearly() {
+        let tmp = std::env::temp_dir().join(format!("atelier-upward-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pack_dir = tmp.join("mypack");
+        let nested = pack_dir.join("components/banner/deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(pack_dir.join("atelier.pack.yml"), "name: x\n").unwrap();
+        fs::write(pack_dir.join("acme_pack.info.yml"), "name: Acme\n").unwrap();
+
+        let canon = pack_dir.canonicalize().unwrap();
+        let here = Pack::locate_upward(&pack_dir).unwrap();
+        assert_eq!(here.dir, canon);
+        assert_eq!(here.module, "acme_pack");
+        let deep = Pack::locate_upward(&nested).unwrap();
+        assert_eq!(deep.dir, canon);
+
+        // A sibling dir outside any pack: actionable error naming file + origin.
+        let outside = tmp.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        let err = Pack::locate_upward(&outside).err().unwrap().to_string();
+        assert!(err.contains("atelier.pack.yml"), "{err}");
+        assert!(err.contains("elsewhere"), "{err}");
+        assert!(err.contains("atelier pack new"), "{err}");
         let _ = fs::remove_dir_all(&tmp);
     }
 }

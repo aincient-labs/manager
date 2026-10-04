@@ -469,7 +469,7 @@ fn run() -> Result<()> {
             // else, the real appliance as before.
             let stack = std::env::current_dir()
                 .ok()
-                .and_then(|d| aincient_core::Pack::locate(&d).ok())
+                .and_then(|d| aincient_core::Pack::locate_upward(&d).ok())
                 .map(|p| aincient_core::pack::resolve_stack(&p, &stack))
                 .unwrap_or(stack);
             aincient_core::mcp::serve(&stack)

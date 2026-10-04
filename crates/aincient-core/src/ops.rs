@@ -1263,14 +1263,72 @@ pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     run_step(c, "stop the appliance", r)
 }
 
-/// `docker compose start` — start previously-stopped containers. Returns whether
+/// What was observed of the stack's `app` container before starting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    /// The container exists and is running.
+    Running,
+    /// The container exists but is stopped.
+    Stopped,
+    /// No container exists (e.g. `pack down` / `down` removed it).
+    Missing,
+    /// The probe itself failed — nothing is known.
+    Unknown,
+}
+
+/// Which compose verb brings the stack up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAction {
+    /// `compose start` — revive existing containers.
+    Start,
+    /// `compose up -d` — (re)create the containers from the compose file.
+    Up,
+}
+
+/// Pure decision: `compose start` only works on containers that exist, so a
+/// removed container needs `up -d`. When the probe failed, keep the old
+/// behaviour (`start`).
+pub fn start_action(state: ContainerState) -> StartAction {
+    match state {
+        ContainerState::Missing => StartAction::Up,
+        ContainerState::Running | ContainerState::Stopped | ContainerState::Unknown => {
+            StartAction::Start
+        }
+    }
+}
+
+/// Classify `compose ps -a --format json` output for the `app` service.
+fn container_state_from_ps(out: &str) -> ContainerState {
+    match parse_ps(out).iter().find(|e| e.service == "app") {
+        None => ContainerState::Missing,
+        Some(e) if e.state.to_lowercase().contains("running") => ContainerState::Running,
+        Some(_) => ContainerState::Stopped,
+    }
+}
+
+fn observe_container(stack: &Stack) -> ContainerState {
+    let mut c = compose(stack);
+    c.args(["ps", "-a", "--format", "json"]);
+    match try_capture(c) {
+        Some(out) => container_state_from_ps(&out),
+        None => ContainerState::Unknown,
+    }
+}
+
+/// Start the appliance: `docker compose start` for existing containers, or
+/// `docker compose up -d` when none exist (after `pack down`). Returns whether
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
     r.stage(Stage::Starting, "Starting the appliance…", Some(0.4));
-    let mut c = compose(stack);
-    c.arg("start");
-    run_step(c, "start the appliance", r)?;
+    match start_action(observe_container(stack)) {
+        StartAction::Start => {
+            let mut c = compose(stack);
+            c.arg("start");
+            run_step(c, "start the appliance", r)?;
+        }
+        StartAction::Up => up(stack, r)?,
+    }
     Ok(wait_until_ready(stack, START_READY_TIMEOUT, r))
 }
 
@@ -2463,11 +2521,32 @@ fn sanitize(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_action_falls_back_to_up_only_when_no_container() {
+        assert_eq!(start_action(ContainerState::Missing), StartAction::Up);
+        assert_eq!(start_action(ContainerState::Stopped), StartAction::Start);
+        assert_eq!(start_action(ContainerState::Running), StartAction::Start);
+        assert_eq!(start_action(ContainerState::Unknown), StartAction::Start);
+    }
+
+    #[test]
+    fn container_state_from_compose_ps() {
+        assert_eq!(container_state_from_ps(""), ContainerState::Missing);
+        assert_eq!(container_state_from_ps("[]"), ContainerState::Missing);
+        let stopped = r#"{"Service":"app","State":"exited"}"#;
+        assert_eq!(container_state_from_ps(stopped), ContainerState::Stopped);
+        let running = r#"[{"Service":"db","State":"exited"},{"Service":"app","State":"running"}]"#;
+        assert_eq!(container_state_from_ps(running), ContainerState::Running);
+        let db_only = r#"{"Service":"db","State":"running"}"#;
+        assert_eq!(container_state_from_ps(db_only), ContainerState::Missing);
+    }
+
     use super::{
-        backup_script, is_backup_file, is_snapshot_bundle, list_backups, parse_extension_list,
-        parse_http_status, parse_local_probe, parse_remote_probe, parse_serialized_extensions,
-        plan_route, plan_route_with, registry_problem, remote_probe_with, restore_bundle_script,
-        waypoint_image, ImageProbe, SnapshotManifest, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        backup_script, container_state_from_ps, is_backup_file, is_snapshot_bundle, list_backups,
+        parse_extension_list, parse_http_status, parse_local_probe, parse_remote_probe,
+        parse_serialized_extensions, plan_route, plan_route_with, registry_problem,
+        remote_probe_with, restore_bundle_script, start_action, waypoint_image, ContainerState,
+        ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
     };
     use crate::stack::Stack;
 
