@@ -185,6 +185,12 @@ pub fn scaffold_files(module: &str, studio: bool) -> Vec<(String, String)> {
             ".github/workflows/build.yml".into(),
             render(include_str!("../templates/pack/workflow.yml.tpl")),
         ),
+        // MCP has no discovery: this is how an agent opened in the pack finds
+        // `atelier mcp`.
+        (
+            ".mcp.json".into(),
+            render(include_str!("../templates/pack/mcp.json.tpl")),
+        ),
         (
             "README.md".into(),
             render(include_str!("../templates/pack/README.md.tpl")),
@@ -727,6 +733,134 @@ mod tests {
         assert!(err.contains("atelier.pack.yml"), "{err}");
         assert!(err.contains("elsewhere"), "{err}");
         assert!(err.contains("atelier pack new"), "{err}");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Mirror of the appliance's advisory CSS lint (cms `StylesheetLint`):
+    /// hardcoded colours and fractional opacity, comments stripped, `var(…)`
+    /// fallbacks allowed. Returns the offending lines.
+    fn css_lint(css: &str) -> Vec<String> {
+        let mut css = css.to_string();
+        while let Some(a) = css.find("/*") {
+            let end = css[a..].find("*/").map_or(css.len(), |e| a + e + 2);
+            css.replace_range(a..end, "");
+        }
+        let mut issues = vec![];
+        for (i, line) in css.lines().enumerate() {
+            let mut bare = String::new();
+            let mut rest = line;
+            while let Some(a) = rest.find("var(") {
+                bare.push_str(&rest[..a]);
+                rest = rest[a..].find(')').map_or("", |e| &rest[a + e + 1..]);
+            }
+            bare.push_str(rest);
+            let hex = bare.match_indices('#').any(|(a, _)| {
+                let n = bare[a + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                (3..=8).contains(&n)
+            });
+            let fn_colour = ["rgb(", "rgba(", "hsl(", "hsla(", "oklch(", "oklab("]
+                .iter()
+                .any(|f| bare.contains(f));
+            let opacity = bare.find("opacity").is_some_and(|a| {
+                let v = bare[a + 7..].trim_start().trim_start_matches(':').trim();
+                v.starts_with('.') || v.starts_with("0.")
+            });
+            if hex || fn_colour || opacity {
+                issues.push(format!("line {}: {}", i + 1, line.trim()));
+            }
+        }
+        issues
+    }
+
+    #[test]
+    fn scaffold_writes_the_mcp_json() {
+        let tmp = std::env::temp_dir().join(format!("atelier-mcpjson-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let dest = scaffold(&tmp, "acme_pack", false).unwrap();
+        let raw = fs::read_to_string(dest.join(".mcp.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["mcpServers"]["atelier"]["command"], "atelier");
+        assert_eq!(
+            v["mcpServers"]["atelier"]["args"],
+            serde_json::json!(["mcp"])
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pristine_scaffold_authored_css_is_lint_clean() {
+        // The lint targets the AUTHORED stylesheet (build/pack.css); the
+        // seeded committed output is identical, so it is clean too. Build
+        // output (compiled Tailwind preflight) is a cms-side concern (W10d).
+        let tmp = std::env::temp_dir().join(format!("atelier-lint-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        for studio in [false, true] {
+            let name = if studio { "acme_studio" } else { "acme_pack" };
+            let dest = scaffold(&tmp, name, studio).unwrap();
+            let authored = fs::read_to_string(dest.join("build/pack.css")).unwrap();
+            let seeded = fs::read_to_string(dest.join(format!("assets/{name}.css"))).unwrap();
+            assert!(css_lint(&authored).is_empty(), "{:?}", css_lint(&authored));
+            assert!(css_lint(&seeded).is_empty(), "{:?}", css_lint(&seeded));
+            // The linter itself still bites.
+            assert!(!css_lint(".a { color: #fff; }").is_empty());
+            assert!(!css_lint(".a { opacity: .5; }").is_empty());
+            assert!(css_lint(".a { color: var(--x, #fff); } /* #000 */").is_empty());
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scaffold_prefills_prop_vocab_for_every_custom_prop() {
+        // Props the appliance's locked vocabulary already covers.
+        const LOCKED: [&str; 6] = [
+            "variant",
+            "tone",
+            "eyebrow",
+            "heading",
+            "cta_label",
+            "cta_url",
+        ];
+        let tmp = std::env::temp_dir().join(format!("atelier-vocab-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let dest = scaffold(&tmp, "acme_pack", false).unwrap();
+        let yml =
+            fs::read_to_string(dest.join("components/showcase/showcase.component.yml")).unwrap();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let section = |header: &str, ind: usize| -> Vec<String> {
+            let mut it = yml.lines().skip_while(|l| l.trim_end() != header);
+            let head = it.next().unwrap_or_else(|| panic!("no {header}"));
+            assert_eq!(indent(head), ind);
+            it.take_while(|l| l.trim().is_empty() || indent(l) > ind)
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .map(|l| l.trim().split(':').next().unwrap().to_string())
+                .collect()
+        };
+        let props: Vec<String> = section("  properties:", 2)
+            .into_iter()
+            .filter(|k| {
+                !k.starts_with('-') && k.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .collect();
+        assert!(props.contains(&"claim".to_string()), "{props:?}");
+        let vocab = section("    prop_vocab:", 4);
+        for p in props.iter().filter(|p| !LOCKED.contains(&p.as_str())) {
+            // Only the 2-deep property names count; nested keys (type, enum…)
+            // are not props.
+            if ["type", "enum", "default"].contains(&p.as_str()) {
+                continue;
+            }
+            assert!(
+                vocab.contains(p),
+                "custom prop {p} has no prop_vocab: {vocab:?}"
+            );
+        }
+        assert!(yml.contains("THE RULE"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }

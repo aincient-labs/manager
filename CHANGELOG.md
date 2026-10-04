@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`atelier pack new` writes a `.mcp.json`.** A fresh pack now carries an MCP config that
+  points an agent opened in the pack at `atelier mcp`, so the agent finds the pack tools
+  without you wiring anything up.
+- **The starter component teaches the `prop_vocab` rule.** Its `prop_vocab` block now states
+  the rule (every prop outside the locked vocabulary needs a one-line meaning) and has an
+  entry for each custom prop the starter defines, so a pristine pack validates and you learn
+  the rule by example rather than by rejection.
+- The starter's own CSS is checked to be free of hardcoded colours and fractional opacity, so
+  an untouched pack starts with no stylesheet warnings.
+
 ### Fixed
 
 - **`atelier mcp` finds your pack from any folder inside it.** It now looks upward from where it

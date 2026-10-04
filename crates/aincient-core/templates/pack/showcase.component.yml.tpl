@@ -39,6 +39,11 @@ thirdPartySettings:
       claim: ''
       cta_label: ''
       cta_url: ''
+    # THE RULE: every prop OUTSIDE the locked vocabulary (anchor, tone, variant,
+    # eyebrow, heading, subheading, body, label, image, cta_label, cta_url, …)
+    # needs a one-line meaning here, or `atelier pack validate` rejects the
+    # component. `claim` is this component's only custom prop — add a line for
+    # each prop you add.
     prop_vocab:
       claim: 'the single bold claim sentence under the heading.'
     stylesheet: assets/__MODULE__.css
