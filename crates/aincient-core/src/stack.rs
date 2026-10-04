@@ -312,9 +312,20 @@ server {
 "#;
 
 /// A located appliance stack directory.
+///
+/// `slug` / `label` / `project` are set when the directory is a registered site
+/// in `sites.toml` (see [`crate::sites`]); all three are `None` for an
+/// unregistered home, which keeps today's derived project name.
 #[derive(Debug, Clone)]
 pub struct Stack {
     pub home: PathBuf,
+    /// The site's registry slug, when registered.
+    pub slug: Option<String>,
+    /// The site's human label, when registered.
+    pub label: Option<String>,
+    /// The **pinned** Compose project, when registered. Never re-derived: a
+    /// relabel must not move the site off its volumes.
+    pub project: Option<String>,
 }
 
 /// Options for scaffolding a fresh stack.
@@ -327,15 +338,28 @@ pub struct InstallOptions {
 }
 
 impl Stack {
-    /// Resolve the stack directory: `ATELIER_HOME` if set, else `~/.atelier`.
+    /// An unregistered stack at `home` — its project is derived from the
+    /// directory name, exactly as before the registry existed.
+    pub fn at(home: impl Into<PathBuf>) -> Self {
+        Self {
+            home: home.into(),
+            slug: None,
+            label: None,
+            project: None,
+        }
+    }
+
+    /// Resolve the stack: `ATELIER_HOME` > the `sites.toml` active site >
+    /// `~/.atelier`. With no registry on disk this is exactly the historical
+    /// `ATELIER_HOME`-else-`~/.atelier` behaviour.
     pub fn locate() -> Result<Self> {
-        let home = match std::env::var_os("ATELIER_HOME") {
-            Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .context("could not determine your home directory")?
-                .join(".atelier"),
-        };
-        Ok(Self { home })
+        Self::locate_site(None)
+    }
+
+    /// [`locate`](Self::locate) with an explicit `--site <slug>`, which outranks
+    /// everything (see [`crate::sites::resolve`]).
+    pub fn locate_site(site: Option<&str>) -> Result<Self> {
+        Ok(crate::sites::locate(site)?.into_stack())
     }
 
     pub fn compose_path(&self) -> PathBuf {
@@ -368,7 +392,13 @@ impl Stack {
     /// silently share one appliance). The canonical `~/.atelier` sanitizes to
     /// `atelier`, matching the template's `name:`, so existing installs keep the
     /// exact same containers and volumes — this is backward compatible.
+    ///
+    /// A registered site returns its **pinned** project instead (registry sites
+    /// are `atelier-<slug>`; the adopted `~/.atelier` stays `atelier`).
     pub fn project_name(&self) -> String {
+        if let Some(project) = &self.project {
+            return project.clone();
+        }
         let base = self
             .home
             .file_name()
@@ -801,7 +831,7 @@ mod tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
-            TempStack(Stack { home: dir })
+            TempStack(Stack::at(dir))
         }
     }
     impl Drop for TempStack {
@@ -916,23 +946,25 @@ mod tests {
     fn project_name_defaults_to_atelier_for_canonical_home() {
         // ~/.atelier must sanitize to `atelier`, matching the template's `name:`,
         // so existing installs keep the same containers/volumes.
-        let stack = Stack {
-            home: PathBuf::from("/Users/someone/.atelier"),
-        };
+        let stack = Stack::at(PathBuf::from("/Users/someone/.atelier"));
         assert_eq!(stack.project_name(), "atelier");
     }
 
     #[test]
+    fn a_pinned_project_wins_over_the_derived_one() {
+        let mut stack = Stack::at("/home/u/.atelier/sites/blog");
+        assert_eq!(stack.project_name(), "blog", "derived, unregistered");
+        stack.project = Some("atelier-blog".to_string());
+        assert_eq!(stack.project_name(), "atelier-blog");
+    }
+
+    #[test]
     fn project_name_is_distinct_for_custom_home() {
-        let stack = Stack {
-            home: PathBuf::from("/tmp/atelier-staging"),
-        };
+        let stack = Stack::at(PathBuf::from("/tmp/atelier-staging"));
         assert_eq!(stack.project_name(), "atelier-staging");
 
         // Sanitizes odd characters and leading separators.
-        let odd = Stack {
-            home: PathBuf::from("/tmp/.My Stack!"),
-        };
+        let odd = Stack::at(PathBuf::from("/tmp/.My Stack!"));
         assert_eq!(odd.project_name(), "my-stack-");
     }
 

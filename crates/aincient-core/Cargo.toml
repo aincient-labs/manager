@@ -15,3 +15,5 @@ serde_json.workspace = true
 dirs = "5"
 getrandom = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# sites.toml — the multi-site registry (DECISIONS 0393). Already in the lock via Tauri.
+toml = "0.9"

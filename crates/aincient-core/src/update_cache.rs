@@ -293,7 +293,7 @@ mod tests {
                 N.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            TempStack(Stack { home: dir })
+            TempStack(Stack::at(dir))
         }
     }
     impl Drop for TempStack {
@@ -406,9 +406,7 @@ mod tests {
     #[test]
     fn writing_never_creates_the_stack_dir() {
         let ts = TempStack::new();
-        let missing = Stack {
-            home: ts.0.home.join("not-a-stack"),
-        };
+        let missing = Stack::at(ts.0.home.join("not-a-stack"));
         write(&missing, &CachedUpdate::new(check("img", Some(true)), NOW)).unwrap();
         assert!(!missing.home.exists());
     }

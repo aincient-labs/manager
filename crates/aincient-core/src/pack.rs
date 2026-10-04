@@ -254,9 +254,7 @@ pub fn dev_home(pack: &Pack) -> PathBuf {
 /// The pack's isolated dev stack — a plain [`Stack`], so every compose/env
 /// helper works on it unchanged.
 pub fn dev_stack(pack: &Pack) -> Stack {
-    Stack {
-        home: dev_home(pack),
-    }
+    Stack::at(dev_home(pack))
 }
 
 /// The stack this pack's dev loop is actually running against: the isolated
@@ -679,9 +677,7 @@ mod tests {
             dir: tmp.clone(),
             module: "acme_pack".into(),
         };
-        let real = Stack {
-            home: PathBuf::from("/somewhere/.atelier"),
-        };
+        let real = Stack::at(PathBuf::from("/somewhere/.atelier"));
 
         // No dev stack laid down yet → the real appliance (an --attach run).
         assert_eq!(resolve_stack(&pack, &real).home, real.home);

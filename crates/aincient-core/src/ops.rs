@@ -2567,9 +2567,7 @@ mod tests {
     /// shape that `pending_default_channel_migration` fires on.
     fn legacy_install(home: &std::path::Path) -> Stack {
         std::fs::create_dir_all(home).unwrap();
-        let stack = Stack {
-            home: home.to_path_buf(),
-        };
+        let stack = Stack::at(home.to_path_buf());
         std::fs::write(stack.compose_path(), crate::stack::COMPOSE_TEMPLATE).unwrap();
         std::fs::write(
             stack.env_path(),
@@ -2587,9 +2585,7 @@ mod tests {
     /// write `AINCIENT_IMAGE`.
     fn install_on(home: &std::path::Path, image: &str) -> Stack {
         std::fs::create_dir_all(home).unwrap();
-        let stack = Stack {
-            home: home.to_path_buf(),
-        };
+        let stack = Stack::at(home.to_path_buf());
         std::fs::write(stack.compose_path(), crate::stack::COMPOSE_TEMPLATE).unwrap();
         std::fs::write(
             stack.env_path(),
@@ -2985,7 +2981,7 @@ mod tests {
         std::fs::write(backups.join("aincient-new.tar.gz"), b"bundle").unwrap();
         std::fs::write(backups.join("README.txt"), b"nope").unwrap();
 
-        let listed = list_backups(&Stack { home: dir.clone() });
+        let listed = list_backups(&Stack::at(dir.clone()));
         let mut names: Vec<_> = listed.iter().map(|b| b.name.clone()).collect();
         names.sort();
         assert_eq!(names, ["aincient-new.tar.gz", "aincient-old.sql.gz"]);

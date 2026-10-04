@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod mcp;
 pub mod ops;
 pub mod pack;
+pub mod sites;
 pub mod stack;
 pub mod update_cache;
 
@@ -27,5 +28,6 @@ pub use ops::{
     ExportOptions, ModelRole, Reporter, Silent, Stage, Status, UpdateCheck,
 };
 pub use pack::Pack;
+pub use sites::{Registry, Resolution, Site};
 pub use stack::{Channel, InstallOptions, Stack, DEFAULT_IMAGE, DEFAULT_PORT};
 pub use update_cache::{CacheStatus, SingleFlight};
