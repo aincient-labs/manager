@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-04
+
 ### Added
 
 - **Several sites on one machine: `atelier sites`.** `atelier sites add blog` creates a second

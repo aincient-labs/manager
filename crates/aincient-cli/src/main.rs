@@ -1110,11 +1110,10 @@ fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
 fn print_snapshots(list: &ops::SnapshotList) {
     let mark = |serving: bool| if serving { "●" } else { " " };
     println!(
-        "{} {:<34} {:<24} {:<26} {:>5}  {}",
+        "{} {:<34} {:<24} {:<26} {:>5}  ",
         mark(list.serving == "live"),
         "live",
         "Live (Drupal renders every visit)",
-        "",
         "",
         ""
     );

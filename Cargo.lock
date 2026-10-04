@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aincient-core"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -112,7 +112,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "atelier"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "aincient-core",
  "anyhow",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-manager"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "aincient-core",
  "anyhow",
