@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use aincient_core::{doctor, ops, Channel, InstallOptions, Stack};
+use aincient_core::{doctor, ops, sites, Channel, InstallOptions, Stack};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -20,9 +20,15 @@ mod style;
     about = "Install and manage your Atelier CMS appliance.",
     long_about = "Install and manage your Atelier CMS appliance.\n\nAtelier runs as a \
                   Docker container; this command lays down and drives that stack \
-                  (default ~/.atelier, override with ATELIER_HOME)."
+                  (default ~/.atelier, override with ATELIER_HOME). Several sites can \
+                  live side by side: see `atelier sites`, and pick one per command \
+                  with --site."
 )]
 struct Cli {
+    /// Operate on this registered site (see `atelier sites list`). Outranks
+    /// ATELIER_HOME and the active site.
+    #[arg(long, global = true, value_name = "SLUG")]
+    site: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -49,6 +55,15 @@ enum Command {
         #[command(subcommand)]
         command: AppCommand,
     },
+    /// Your sites: list, add, choose the active one, rename, remove.
+    ///
+    /// Each site is its own appliance — its own containers, database, files,
+    /// port and backups. Commands operate on the active site unless you pass
+    /// --site <SLUG> (or set ATELIER_HOME).
+    Sites {
+        #[command(subcommand)]
+        command: SitesCommand,
+    },
     /// Publish the site you built — export it to static HTML (deploy anywhere).
     Site {
         #[command(subcommand)]
@@ -72,6 +87,47 @@ enum Command {
     /// Serve the pack developer's MCP tools over stdio (for Claude Code,
     /// Cursor, …). Needs a running dev stack (`atelier pack dev`).
     Mcp,
+}
+
+/// The multi-site registry (`~/.atelier/sites.toml`).
+#[derive(Subcommand)]
+enum SitesCommand {
+    /// List your sites: name, port, whether each is running, and its version.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new site under ~/.atelier/sites/<SLUG> on a free port, and
+    /// install it.
+    Add {
+        /// Short machine name, used with --site (lowercase letters, digits, -).
+        slug: String,
+        /// Display name (defaults to the slug).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// Console port (default: the first free one from 41221 up).
+        #[arg(long, value_name = "PORT")]
+        port: Option<u16>,
+    },
+    /// Make a site the active one — what commands use without --site.
+    Use {
+        /// The site's slug.
+        slug: String,
+    },
+    /// Change a site's display name. Its slug, folder and data stay as they are.
+    Rename {
+        /// The site's slug.
+        slug: String,
+        /// The new display name.
+        label: String,
+    },
+    /// Stop a site and remove it from the list. Deletes nothing: its folder,
+    /// database and files stay, and `sites add <SLUG>` brings it back.
+    Remove {
+        /// The site's slug.
+        slug: String,
+    },
 }
 
 /// The pack developer loop (see the Atelier bring-your-own-components docs).
@@ -164,8 +220,12 @@ enum AppCommand {
     Update {
         /// Stop at this version instead of the newest one your channel offers
         /// (e.g. `0.3.0`). Leaves the install pinned to it.
-        #[arg(long, value_name = "VERSION")]
+        #[arg(long, value_name = "VERSION", conflicts_with = "all")]
         to: Option<String>,
+        /// Update every installed site in `atelier sites list`, one after the
+        /// other, each along its own upgrade route.
+        #[arg(long)]
+        all: bool,
         /// Don't ask before walking a multi-step upgrade.
         #[arg(short = 'y', long)]
         yes: bool,
@@ -454,9 +514,32 @@ impl ops::Reporter for CliReporter {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let stack = Stack::locate()?;
+
+    // The registry commands name their site positionally and must keep working
+    // whatever the active site is — so they never resolve a stack.
+    if let Command::Sites { command } = cli.command {
+        if cli.site.is_some() {
+            anyhow::bail!(
+                "`atelier sites` takes the site as an argument — drop --site \
+                 (e.g. `atelier sites use blog`)"
+            );
+        }
+        return run_sites(command);
+    }
+    if let Command::App {
+        command: AppCommand::Update { all: true, yes, .. },
+    } = cli.command
+    {
+        if cli.site.is_some() {
+            anyhow::bail!("--all updates every site — drop --site, or drop --all");
+        }
+        return update_all(yes);
+    }
+
+    let stack = Stack::locate_site(cli.site.as_deref())?;
 
     match cli.command {
+        Command::Sites { .. } => unreachable!("handled above"),
         Command::Doctor { fix, json } => doctor(&stack, fix, json),
         Command::App { command } => run_app(command, &stack),
         Command::Site { command } => run_site(command, &stack),
@@ -474,6 +557,229 @@ fn run() -> Result<()> {
                 .unwrap_or(stack);
             aincient_core::mcp::serve(&stack)
         }
+    }
+}
+
+/// `atelier sites …` — the multi-site registry. The logic lives in
+/// [`aincient_core::sites`]; this only prints.
+fn run_sites(command: SitesCommand) -> Result<()> {
+    let uh = sites::user_home()?;
+    match command {
+        SitesCommand::List { json } => sites_list(&uh, json),
+        SitesCommand::Add { slug, label, port } => {
+            let added =
+                sites::add_site(&uh, &slug, label.as_deref(), port, sites::host_port_is_free)?;
+            let stack = added.site.stack();
+            if added.reregistered {
+                println!(
+                    "{} {} was set up here before — registered again with its existing data.",
+                    style::success("Found"),
+                    stack.home.display()
+                );
+            }
+            println!(
+                "{} {} ({}) — port {}, folder {}",
+                style::success("Added site"),
+                added.site.slug,
+                added.site.label,
+                added.port,
+                stack.home.display()
+            );
+            let installed = ops::install(
+                &stack,
+                &InstallOptions::default(),
+                &mut CliReporter::default(),
+            )
+            .with_context(|| {
+                format!(
+                    "the site is added but not installed — finish with \
+                         `atelier --site {slug} app install`"
+                )
+            })?;
+            if installed {
+                done_banner("Installed.", &stack.console_url());
+            } else {
+                pending_banner(
+                    "Installed — still finishing first boot.",
+                    &stack.console_url(),
+                );
+            }
+            show_login(&stack);
+            if added.activated {
+                println!("It is the active site: commands without --site use it.");
+            } else {
+                println!(
+                    "Use it with `atelier --site {slug} …`, or make it the default with \
+                     `atelier sites use {slug}`."
+                );
+            }
+            Ok(())
+        }
+        SitesCommand::Use { slug } => {
+            let site = sites::use_site(&uh, &slug)?;
+            println!(
+                "{} {} ({}) — console {}",
+                style::success("Active site:"),
+                site.slug,
+                site.label,
+                style::url(&site.stack().console_url())
+            );
+            warn_atelier_home();
+            Ok(())
+        }
+        SitesCommand::Rename { slug, label } => {
+            let site = sites::rename_site(&uh, &slug, &label)?;
+            println!(
+                "{} {} is now called \"{}\". Its folder and data are unchanged.",
+                style::success("Renamed."),
+                site.slug,
+                site.label
+            );
+            Ok(())
+        }
+        SitesCommand::Remove { slug } => {
+            let removed = sites::remove_site(&uh, &slug)?;
+            let stack = removed.site.stack();
+            // Stopping keeps containers and volumes (`compose stop`); it frees
+            // the port so it can't collide with a site added later. Only a
+            // running site is stopped, so a host without Docker stays quiet.
+            if stack.exists() && ops::status(&stack).running {
+                if let Err(e) = ops::stop(&stack, &mut ops::Silent) {
+                    println!(
+                        "{} {e:#}",
+                        style::warn("Removed from the list, but couldn't stop it:")
+                    );
+                }
+            }
+            println!(
+                "{} {} is no longer in your sites. Nothing was deleted: its folder ({}) and \
+                 its database and files (Docker project {}) are kept.",
+                style::success("Removed."),
+                removed.site.slug,
+                stack.home.display(),
+                removed.site.project
+            );
+            println!("Bring it back with `atelier sites add {slug}`.");
+            if removed.was_active {
+                println!(
+                    "No site is active now — commands use ~/.atelier until you run \
+                     `atelier sites use <SLUG>` or pass --site."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `atelier sites list` — the registry with each site's live state.
+fn sites_list(uh: &std::path::Path, json: bool) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Row {
+        #[serde(flatten)]
+        site: sites::SiteRow,
+        running: bool,
+        version: Option<String>,
+    }
+    let rows: Vec<Row> = sites::list_sites(uh)?
+        .into_iter()
+        .map(|site| {
+            let st = site.installed.then(|| ops::status(&site.stack()));
+            Row {
+                running: st.as_ref().is_some_and(|s| s.running),
+                version: st.and_then(|s| s.version),
+                site,
+            }
+        })
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "{}",
+            style::warn("No sites yet. Create one with `atelier sites add <SLUG>`.")
+        );
+        return Ok(());
+    }
+    println!(
+        "  {:<14} {:<22} {:<6} {:<14} VERSION",
+        "SITE", "NAME", "PORT", "STATE"
+    );
+    for r in &rows {
+        let state = if !r.site.installed {
+            "not installed"
+        } else if r.running {
+            "running"
+        } else {
+            "stopped"
+        };
+        println!(
+            "{} {:<14} {:<22} {:<6} {:<14} {}",
+            if r.site.active { "*" } else { " " },
+            r.site.slug,
+            r.site.label,
+            r.site.port.map(|p| p.to_string()).unwrap_or_default(),
+            state,
+            r.version
+                .clone()
+                .or_else(|| r.site.image.clone())
+                .unwrap_or_default()
+        );
+    }
+    let running = rows.iter().filter(|r| r.running).count();
+    println!("\n  * = active site (what commands use without --site)");
+    println!(
+        "  {running} running — each running site is its own app, database and web server \
+         containers, with its own Postgres."
+    );
+    warn_atelier_home();
+    Ok(())
+}
+
+/// Say so when `ATELIER_HOME` outranks the active site.
+fn warn_atelier_home() {
+    if let Some(home) = std::env::var_os("ATELIER_HOME") {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "ATELIER_HOME is set ({}), so commands without --site use that folder instead \
+                 of the active site.",
+                std::path::Path::new(&home).display()
+            ))
+        );
+    }
+}
+
+/// `atelier app update --all` — every installed site, one after the other, each
+/// along its own route. A failure on one site doesn't stop the rest; the run
+/// fails at the end if any did.
+fn update_all(yes: bool) -> Result<()> {
+    let uh = sites::user_home()?;
+    let rows: Vec<_> = sites::list_sites(&uh)?
+        .into_iter()
+        .filter(|r| r.installed)
+        .collect();
+    if rows.is_empty() {
+        println!("{}", style::warn("No installed sites to update."));
+        return Ok(());
+    }
+    let mut failed = Vec::new();
+    for row in &rows {
+        println!(
+            "\n{}",
+            style::heading(&format!("== {} ({}) ==", row.slug, row.label))
+        );
+        if let Err(e) = update_cmd(&row.stack(), None, yes) {
+            println!("{} {e:#}", style::error("error:"));
+            failed.push(row.slug.clone());
+        }
+    }
+    if failed.is_empty() {
+        println!("\n{}", style::success("Every site is done."));
+        Ok(())
+    } else {
+        anyhow::bail!("the update failed for: {}", failed.join(", "))
     }
 }
 
@@ -597,12 +903,24 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             image,
             port,
         } => {
+            // A registered site with no `.env` yet gets a port no other site
+            // claims; everything else keeps today's behaviour (DECISIONS 0393).
+            let user_home = sites::user_home().ok();
+            let registry = user_home
+                .as_deref()
+                .and_then(|uh| sites::Registry::load(uh).ok().flatten());
             let opts = InstallOptions {
                 image: match channel {
                     Some(name) => parse_channel(&name)?.image(),
                     None => image,
                 },
-                http_port: port,
+                http_port: sites::port_for_install(
+                    stack,
+                    port,
+                    registry.as_ref(),
+                    user_home.as_deref(),
+                    sites::host_port_is_free,
+                ),
             };
             if ops::install(stack, &opts, &mut CliReporter::default())? {
                 done_banner("Installed.", &stack.console_url());
@@ -615,7 +933,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             show_login(stack);
             Ok(())
         }
-        AppCommand::Update { to, yes } => update_cmd(stack, to, yes),
+        AppCommand::Update { to, yes, .. } => update_cmd(stack, to, yes),
         AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
@@ -1283,6 +1601,14 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&st)?);
         return Ok(());
+    }
+    // Name the site once there is a list to name it from — a single-site
+    // install that never touched `atelier sites` reads exactly as before.
+    let registry_exists = sites::user_home()
+        .map(|uh| sites::registry_path(&uh).is_file())
+        .unwrap_or(false);
+    if let (true, Some(slug), Some(label)) = (registry_exists, &stack.slug, &stack.label) {
+        println!("  Site:     {label} ({slug})");
     }
     line("Installed", st.installed);
     line("Running", st.running);

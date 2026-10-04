@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Several sites on one machine: `atelier sites`.** `atelier sites add blog` creates a second
+  site in `~/.atelier/sites/blog` on the first free port (41222, 41223, …) and installs it. Each
+  site has its own containers, database, uploaded files, port and backups. `atelier sites list`
+  shows every site with its port, whether it's running and its version. `atelier sites use blog`
+  picks which site commands use by default. `atelier sites rename blog "The Blog"` changes only the
+  display name. `atelier sites remove blog` stops the site and takes it off the list but deletes
+  nothing: its folder, database and files stay, and `atelier sites add blog` brings it back. The
+  list is kept in `~/.atelier/sites.toml`. An existing `~/.atelier` joins it as the site `default`
+  and stays exactly where it is, with its data.
+- **`--site <SLUG>` on every command**, e.g. `atelier --site blog app status` or
+  `atelier --site blog data backup`. Order of precedence: `--site`, then `ATELIER_HOME`, then the
+  active site, then `~/.atelier`. Without a second site nothing changes.
+- **`atelier app update --all`** updates every installed site one after the other, each along
+  its own upgrade route. If one site fails, the rest still run, and the command reports which
+  site failed.
+- **`atelier doctor` names a port another site is set up on.** If two sites share a console port,
+  only one can run at a time. Doctor now warns about this and gives the command that moves the
+  site to another port. The port check also confirms it's this site's own container holding the
+  port, not just any running Atelier.
+
 - **`atelier pack new` writes a `.mcp.json`.** A fresh pack now carries an MCP config that
   points an agent opened in the pack at `atelier mcp`, so the agent finds the pack tools
   without you wiring anything up.

@@ -39,13 +39,36 @@ Commands are grouped into noun namespaces so the surface stays maintainable as i
 | `data restore <file>`    | Restore a `.tar.gz` snapshot (DB + files, re-chowned) or a legacy `.sql`/`.sql.gz` dump (DB only). (alias `data import`) |
 | `data list`              | List snapshots on this host. (alias `data backups`)                       |
 | `ai model list`/`set`    | Inspect or bind the AI model per Atelier role.                            |
+| `sites list`/`add`/`use`/`rename`/`remove` | Several sites on one machine; `--site <slug>` picks one for any command. See [Several sites](#several-sites). |
 | `doctor`                 | Diagnose host + stack + site. `--fix` repairs safely, `--json` for bug reports. |
 
 `export`/`import` alias `data backup`/`restore` so either mental model works; `export` is
 never a bare top-level verb (it means one of three things — static site, db+files, db-only —
 so it's always qualified by its namespace). The stack directory defaults to `~/.atelier`
-(override with `ATELIER_HOME`) and holds the same `compose.yaml` + `.env` the
+(override with `ATELIER_HOME`, or pick a registered site with `--site`) and holds the same `compose.yaml` + `.env` the
 `docker/install.sh` bootstrapper writes.
+
+### Several sites
+
+One machine can run several independent sites — each its own appliance with its own containers,
+Postgres, files, port and backups. `~/.atelier/sites.toml` lists them and says which one is active:
+
+```
+atelier sites add blog --label "Blog"   # ~/.atelier/sites/blog, first free port, installed
+atelier sites list                      # slug, name, port, running, version
+atelier sites use blog                  # the active site — what commands use by default
+atelier --site blog app status          # any command, against one site
+atelier sites rename blog "The Blog"    # the label only; folder and project never change
+atelier sites remove blog               # stop + unregister; deletes nothing
+atelier app update --all                # every installed site, each on its own route
+```
+
+Which site a command acts on: `--site` > `ATELIER_HOME` > the active site > `~/.atelier`. An
+existing `~/.atelier` is registered **in place** as `default` the first time the list is changed —
+never moved, because its Compose project (and so its data) is keyed off its directory. New sites
+pin their project as `atelier-<slug>`. `sites remove` only takes a site off the list: its folder
+and volumes stay, and `sites add <slug>` registers it again where it is. `doctor` warns when two
+sites are set up on the same port.
 
 ### Channels
 

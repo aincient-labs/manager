@@ -25,8 +25,9 @@
 //! Compose project is derived from its directory name, so relocating one orphans
 //! its `db-data` volume — the site comes back empty while the bytes sit on disk
 //! under a name nothing reads. Legacy adoption therefore registers `~/.atelier`
-//! *where it is*; the only file this module ever writes is `sites.toml` itself,
-//! via temp file + rename in the same directory.
+//! *where it is*. This module writes `sites.toml` (via temp file + rename in the
+//! same directory) and, for [`add_site`] only, a new site's stack files into a
+//! new or empty `sites/<slug>/`. [`remove_site`] unregisters; it deletes nothing.
 //!
 //! Resolution order — explicit beats implicit:
 //! `--site <slug>` > `ATELIER_HOME` > `sites.toml` `active` > `~/.atelier`.
@@ -282,6 +283,18 @@ impl Registry {
         self.active.as_deref().and_then(|slug| self.get(slug))
     }
 
+    /// The registered site, other than the one at `except_home`, that claims
+    /// `port` in its `.env` — i.e. a site that cannot run at the same time.
+    pub fn port_claimant(&self, port: u16, except_home: &Path) -> Option<&Site> {
+        let except = normalize(except_home);
+        self.sites.iter().find(|s| {
+            normalize(&s.home) != except && {
+                let stack = s.stack();
+                stack.env_path().is_file() && stack.http_port() == port
+            }
+        })
+    }
+
     /// Every console port a registered site has claimed in its `.env`. A site
     /// with no `.env` yet (never installed) claims nothing; one whose `.env`
     /// lacks `HTTP_PORT` runs on — and so claims — [`DEFAULT_PORT`].
@@ -440,17 +453,66 @@ pub fn resolve(
 pub fn locate(site_flag: Option<&str>) -> Result<Resolution> {
     let atelier_home: Option<OsString> = std::env::var_os("ATELIER_HOME");
     let user_home = dirs::home_dir();
-    let registry = match (&user_home, site_flag, &atelier_home) {
-        (None, _, _) => None,
-        (Some(uh), None, Some(_)) => Registry::load(uh).ok().flatten(),
-        (Some(uh), _, _) => Registry::load(uh)?,
-    };
-    resolve(
+    locate_in(
         site_flag,
         atelier_home.as_deref().map(Path::new),
-        registry.as_ref(),
         user_home.as_deref(),
     )
+}
+
+/// [`locate`] with its inputs injected: reads the registry under `user_home`
+/// (as [`load_effective`] sees it) and resolves. What `locate` does after
+/// reading the process environment — split out so it is testable on a temp dir.
+pub fn locate_in(
+    site_flag: Option<&str>,
+    atelier_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Result<Resolution> {
+    let registry = match (user_home, site_flag, atelier_home) {
+        (None, _, _) => None,
+        (Some(uh), None, Some(_)) => load_effective(uh).ok().flatten(),
+        (Some(uh), _, _) => load_effective(uh)?,
+    };
+    resolve(site_flag, atelier_home, registry.as_ref(), user_home)
+}
+
+/// The registry as commands should see it: what is on disk plus — **in memory
+/// only** — the entry [`adopt_legacy`] would add for an installed, unregistered
+/// `~/.atelier`. Lets `--site default` and `sites list` work before anything
+/// has written `sites.toml`, without writing it. Resolution is unchanged by the
+/// preview: the legacy site's pinned project is the `atelier` it derives to.
+pub fn load_effective(user_home: &Path) -> Result<Option<Registry>> {
+    let loaded = Registry::load(user_home)?;
+    let Some(site) = legacy_candidate(loaded.as_ref(), user_home) else {
+        return Ok(loaded);
+    };
+    let mut registry = loaded.unwrap_or_default();
+    if registry.active.is_none() {
+        registry.active = Some(site.slug.clone());
+    }
+    registry.sites.insert(0, site);
+    Ok(Some(registry))
+}
+
+/// The entry adoption would add, or `None` when there is nothing to adopt (no
+/// installed `~/.atelier`, already registered, or the `default` slug is taken —
+/// which [`adopt_legacy`] reports as an error when it actually runs).
+fn legacy_candidate(registry: Option<&Registry>, user_home: &Path) -> Option<Site> {
+    let home = default_home(user_home);
+    if !Stack::at(home.clone()).exists() {
+        return None;
+    }
+    if let Some(r) = registry {
+        if r.find_by_home(&home).is_some() || r.get(DEFAULT_SLUG).is_some() {
+            return None;
+        }
+    }
+    Some(Site {
+        slug: DEFAULT_SLUG.to_string(),
+        label: DEFAULT_LABEL.to_string(),
+        home,
+        project: DEFAULT_PROJECT.to_string(),
+    })
 }
 
 /// The first port from [`DEFAULT_PORT`] upward that no registered site claims
@@ -509,6 +571,319 @@ pub fn adopt_legacy(user_home: &Path) -> Result<Option<Site>> {
     }
     registry.save(user_home)?;
     Ok(Some(site))
+}
+
+// --- `atelier sites …` -------------------------------------------------------
+//
+// Each command below runs [`adopt_legacy`] before it writes the registry, so the
+// first write on a machine with an existing `~/.atelier` registers it in place
+// first. None of them moves, renames or deletes a stack directory: `add` only
+// creates files in a new (or empty) `sites/<slug>/`, and everything else edits
+// `sites.toml` alone.
+
+/// One row of `atelier sites list` — everything that can be read from disk.
+/// Whether the site is running is Docker's to answer; the front-end asks it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SiteRow {
+    pub slug: String,
+    pub label: String,
+    pub home: PathBuf,
+    pub project: String,
+    /// The console port from the site's `.env`; `None` before it is set up.
+    pub port: Option<u16>,
+    /// A `compose.yaml` has been laid down.
+    pub installed: bool,
+    /// The image the site's `.env` names; `None` before it is set up.
+    pub image: Option<String>,
+    /// This is the registry's active site.
+    pub active: bool,
+}
+
+impl SiteRow {
+    /// This site's [`Stack`] (pinned project).
+    pub fn stack(&self) -> Stack {
+        Stack {
+            home: self.home.clone(),
+            slug: Some(self.slug.clone()),
+            label: Some(self.label.clone()),
+            project: Some(self.project.clone()),
+        }
+    }
+}
+
+/// The user's home directory — what every `sites` command is rooted at.
+pub fn user_home() -> Result<PathBuf> {
+    dirs::home_dir().context("could not determine your home directory")
+}
+
+/// Every registered site (plus an installed `~/.atelier` not yet adopted — see
+/// [`load_effective`]), in registry order. Read-only: writes nothing.
+pub fn list_sites(user_home: &Path) -> Result<Vec<SiteRow>> {
+    let Some(registry) = load_effective(user_home)? else {
+        return Ok(Vec::new());
+    };
+    Ok(registry
+        .sites
+        .iter()
+        .map(|site| {
+            let stack = site.stack();
+            let configured = stack.env_path().is_file();
+            SiteRow {
+                slug: site.slug.clone(),
+                label: site.label.clone(),
+                home: site.home.clone(),
+                project: site.project.clone(),
+                port: configured.then(|| stack.http_port()),
+                installed: stack.exists(),
+                image: configured.then(|| stack.image()),
+                active: registry.active.as_deref() == Some(site.slug.as_str()),
+            }
+        })
+        .collect())
+}
+
+/// What [`add_site`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedSite {
+    pub site: Site,
+    /// The console port the site was set up on.
+    pub port: u16,
+    /// `sites/<slug>/` already held a stack (a site removed earlier): it was
+    /// registered again where it is, with its data and its port.
+    pub reregistered: bool,
+    /// It became the active site (there was none).
+    pub activated: bool,
+}
+
+/// Register a new site `slug` at `~/.atelier/sites/<slug>`, pinned to project
+/// `atelier-<slug>`, and lay down its stack files on a port no other site
+/// claims — so `ops::install` on it pulls and starts without a collision.
+///
+/// - `port`: an explicit console port; refused when another registered site
+///   claims it or `is_free` says the host has it taken. `None` allocates with
+///   [`next_free_port`].
+/// - `is_free`: the host probe — [`host_port_is_free`] in production.
+///
+/// When `sites/<slug>/` already holds a stack (left behind by `sites remove`,
+/// which never deletes anything), it is registered again **in place** and keeps
+/// its port unless `port` says otherwise. A non-empty directory that is not a
+/// stack is refused untouched. The new site becomes active only when no site is.
+pub fn add_site(
+    user_home: &Path,
+    slug: &str,
+    label: Option<&str>,
+    port: Option<u16>,
+    mut is_free: impl FnMut(u16) -> bool,
+) -> Result<AddedSite> {
+    if !is_valid_slug(slug) {
+        bail!(
+            "`{slug}` is not a valid site name — use lowercase letters, digits and `-` \
+             (starting with a letter or digit, at most 40 characters)"
+        );
+    }
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    if registry.get(slug).is_some() {
+        bail!("a site named `{slug}` is already registered");
+    }
+
+    let site = Site {
+        slug: slug.to_string(),
+        label: label
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or(slug)
+            .to_string(),
+        home: site_home(user_home, slug),
+        project: project_for_slug(slug),
+    };
+    // Every collision the registry can name (project, directory) is refused
+    // before anything is written to disk.
+    let mut candidate = registry.clone();
+    candidate.sites.push(site.clone());
+    candidate.validate()?;
+
+    let stack = site.stack();
+    let reregistered = stack.exists();
+    if !reregistered && dir_has_entries(&site.home)? {
+        bail!(
+            "{} already exists and is not an Atelier site — nothing was changed. \
+             Pick another name.",
+            site.home.display()
+        );
+    }
+
+    let claimed = |p: u16| {
+        registry
+            .port_claimant(p, &site.home)
+            .map(|s| s.slug.clone())
+    };
+    let chosen = match port {
+        Some(p) => {
+            if let Some(other) = claimed(p) {
+                bail!("port {p} is already the console port of site `{other}`");
+            }
+            let own = reregistered && stack.env_path().is_file() && stack.http_port() == p;
+            if !own && !is_free(p) {
+                bail!("port {p} is in use on this machine — pick another with --port");
+            }
+            p
+        }
+        None if reregistered && stack.env_path().is_file() => {
+            let p = stack.http_port();
+            if let Some(other) = claimed(p) {
+                bail!(
+                    "{} is set up on port {p}, which site `{other}` now uses — \
+                     pass --port to give it another",
+                    site.home.display()
+                );
+            }
+            p
+        }
+        None => next_free_port(&registry.used_ports(), &mut is_free)
+            .context("no free port left to give the new site")?,
+    };
+
+    // Creates the directory and writes compose.yaml / edge.conf / .env where
+    // absent; on a re-registered stack only an explicit --port is written.
+    let explicit = port.is_some() || !stack.env_path().is_file();
+    stack.ensure_scaffold(&crate::stack::InstallOptions {
+        image: None,
+        http_port: explicit.then_some(chosen),
+    })?;
+
+    registry.sites.push(site.clone());
+    let activated = registry.active.is_none();
+    if activated {
+        registry.active = Some(site.slug.clone());
+    }
+    registry.save(user_home)?;
+    Ok(AddedSite {
+        site,
+        port: chosen,
+        reregistered,
+        activated,
+    })
+}
+
+/// Make `slug` the active site — what `atelier` operates on when neither
+/// `--site` nor `ATELIER_HOME` says otherwise.
+pub fn use_site(user_home: &Path, slug: &str) -> Result<Site> {
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    let site = registered(&registry, slug)?.clone();
+    registry.active = Some(site.slug.clone());
+    registry.save(user_home)?;
+    Ok(site)
+}
+
+/// Change a site's **label**. Its slug, directory and pinned Compose project
+/// are untouched — the label is the one thing nothing keys off.
+pub fn rename_site(user_home: &Path, slug: &str, label: &str) -> Result<Site> {
+    let label = label.trim();
+    if label.is_empty() {
+        bail!("the new name can't be empty");
+    }
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    registered(&registry, slug)?;
+    let site = registry
+        .sites
+        .iter_mut()
+        .find(|s| s.slug == slug)
+        .expect("checked above");
+    site.label = label.to_string();
+    let site = site.clone();
+    registry.save(user_home)?;
+    Ok(site)
+}
+
+/// What [`remove_site`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedSite {
+    /// The entry that was removed — its directory and volumes still exist.
+    pub site: Site,
+    /// It was the active site; nothing is active now (`~/.atelier` is the
+    /// fallback again).
+    pub was_active: bool,
+}
+
+/// **Unregister** `slug`: drop it from `sites.toml`. Nothing on disk or in
+/// Docker is deleted — the stack directory, its backups and its volumes stay,
+/// and `add_site` with the same slug registers it again in place.
+///
+/// The site at `~/.atelier` is refused: adoption registers it again on the next
+/// write, so removing it could never stick.
+pub fn remove_site(user_home: &Path, slug: &str) -> Result<RemovedSite> {
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    let site = registered(&registry, slug)?.clone();
+    if normalize(&site.home) == normalize(&default_home(user_home)) {
+        bail!(
+            "`{slug}` is the site in {}, which is always registered — it can't be removed",
+            site.home.display()
+        );
+    }
+    registry.sites.retain(|s| s.slug != slug);
+    let was_active = registry.active.as_deref() == Some(slug);
+    if was_active {
+        registry.active = None;
+    }
+    registry.save(user_home)?;
+    Ok(RemovedSite { site, was_active })
+}
+
+/// The console port `ops::install` should be given for `stack`, honouring the
+/// rule that `http_port: None` means *allocate* for a registry site:
+///
+/// - an explicit `--port` always wins;
+/// - a stack with a `.env` keeps the port it has (`None`) — re-running install
+///   must never move it;
+/// - a registered site under `sites/` that has no `.env` yet gets a port no
+///   other site claims;
+/// - anything else (`~/.atelier`, a hand-rolled `ATELIER_HOME`) keeps meaning
+///   [`DEFAULT_PORT`] (`None`).
+pub fn port_for_install(
+    stack: &Stack,
+    explicit: Option<u16>,
+    registry: Option<&Registry>,
+    user_home: Option<&Path>,
+    is_free: impl FnMut(u16) -> bool,
+) -> Option<u16> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if stack.env_path().is_file() || stack.slug.is_none() {
+        return None;
+    }
+    if user_home.is_some_and(|uh| normalize(&stack.home) == normalize(&default_home(uh))) {
+        return None;
+    }
+    let used = registry.map(Registry::used_ports).unwrap_or_default();
+    next_free_port(&used, is_free)
+}
+
+fn registered<'a>(registry: &'a Registry, slug: &str) -> Result<&'a Site> {
+    registry.get(slug).with_context(|| {
+        let known: Vec<&str> = registry.sites.iter().map(|s| s.slug.as_str()).collect();
+        format!(
+            "no site named `{slug}` (registered: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        )
+    })
+}
+
+/// Whether `dir` exists and holds anything. Absent is `false`.
+fn dir_has_entries(dir: &Path) -> Result<bool> {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("could not read {}", dir.display())),
+    }
 }
 
 #[cfg(test)]
@@ -924,5 +1299,323 @@ project = "atelier-blog"
         let r = Registry::load(uh).unwrap().unwrap();
         assert_eq!(r.active.as_deref(), Some("blog"));
         assert_eq!(r.sites, vec![legacy_site(uh), site(uh, "blog")]);
+    }
+
+    // --- `atelier sites …` ---------------------------------------------------
+
+    fn all_free(_: u16) -> bool {
+        true
+    }
+
+    #[test]
+    fn add_creates_a_pinned_site_on_a_free_port_and_adopts_legacy_first() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh); // on DEFAULT_PORT, unregistered
+        let busy = [DEFAULT_PORT + 1];
+
+        let added = add_site(uh, "blog", Some("  The Blog "), None, |p| {
+            !busy.contains(&p)
+        })
+        .unwrap();
+        assert_eq!(added.site.slug, "blog");
+        assert_eq!(added.site.label, "The Blog");
+        assert_eq!(added.site.home, site_home(uh, "blog"));
+        assert_eq!(added.site.project, "atelier-blog");
+        // DEFAULT_PORT is the legacy site's, +1 is busy on the host.
+        assert_eq!(added.port, DEFAULT_PORT + 2);
+        assert!(!added.reregistered);
+        assert!(!added.activated, "adoption made `default` active first");
+
+        let stack = added.site.stack();
+        assert!(stack.exists());
+        assert_eq!(stack.http_port(), DEFAULT_PORT + 2);
+        assert_eq!(stack.project_name(), "atelier-blog");
+
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.active.as_deref(), Some(DEFAULT_SLUG));
+        assert_eq!(r.sites[0], legacy_site(uh), "legacy adopted in place");
+        assert_eq!(r.sites[1], added.site);
+
+        // A second site gets the next port, and the label defaults to the slug.
+        let shop = add_site(uh, "shop", None, None, all_free).unwrap();
+        assert_eq!(shop.port, DEFAULT_PORT + 1);
+        assert_eq!(shop.site.label, "shop");
+    }
+
+    #[test]
+    fn add_on_a_fresh_machine_activates_the_first_site() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let added = add_site(uh, "blog", None, None, all_free).unwrap();
+        assert!(added.activated);
+        assert_eq!(added.port, DEFAULT_PORT);
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.active.as_deref(), Some("blog"));
+        assert_eq!(r.sites, vec![added.site]);
+        // ~/.atelier itself is NOT a stack — only the registry lives there.
+        assert!(!Stack::at(default_home(uh)).exists());
+    }
+
+    #[test]
+    fn add_refuses_bad_input_without_touching_disk() {
+        let th = TempHome::new();
+        let uh = th.path();
+        assert!(add_site(uh, "Bad Name", None, None, all_free).is_err());
+        assert!(!default_home(uh).exists());
+
+        add_site(uh, "blog", None, Some(41300), all_free).unwrap();
+        let before = std::fs::read(registry_path(uh)).unwrap();
+        // Same slug twice.
+        assert!(add_site(uh, "blog", None, None, all_free).is_err());
+        // An explicit port another site claims, or the host has taken.
+        assert!(add_site(uh, "shop", None, Some(41300), all_free).is_err());
+        assert!(add_site(uh, "shop", None, Some(41301), |_| false).is_err());
+        assert!(!site_home(uh, "shop").exists());
+        // A non-empty directory that isn't a stack is left alone.
+        let stray = site_home(uh, "notes");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("todo.txt"), b"mine").unwrap();
+        assert!(add_site(uh, "notes", None, None, all_free).is_err());
+        assert_eq!(std::fs::read(stray.join("todo.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read_dir(&stray).unwrap().count(), 1);
+
+        assert_eq!(std::fs::read(registry_path(uh)).unwrap(), before);
+    }
+
+    #[test]
+    fn use_sets_the_active_site() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        add_site(uh, "blog", None, None, all_free).unwrap();
+
+        let got = use_site(uh, "blog").unwrap();
+        assert_eq!(got.slug, "blog");
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.active.as_deref(), Some("blog"));
+
+        assert!(use_site(uh, "nope").is_err());
+        let r2 = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r2, r);
+    }
+
+    #[test]
+    fn use_adopts_legacy_before_its_first_write() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        // No sites.toml yet: `default` is only a preview…
+        assert!(!registry_path(uh).exists());
+        // …and using it writes the adopted entry, in place.
+        use_site(uh, DEFAULT_SLUG).unwrap();
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.sites, vec![legacy_site(uh)]);
+        assert_eq!(r.active.as_deref(), Some(DEFAULT_SLUG));
+    }
+
+    #[test]
+    fn rename_changes_only_the_label() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let added = add_site(uh, "blog", Some("Blog"), None, all_free).unwrap();
+        let before = snapshot(&added.site.home);
+
+        let renamed = rename_site(uh, "blog", "The Blog").unwrap();
+        assert_eq!(renamed.label, "The Blog");
+        assert_eq!(renamed.slug, "blog");
+        assert_eq!(renamed.home, added.site.home, "home must not move");
+        assert_eq!(renamed.project, "atelier-blog", "project must stay pinned");
+
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.get("blog"), Some(&renamed));
+        assert_eq!(
+            r.get("blog").unwrap().stack().project_name(),
+            "atelier-blog"
+        );
+        assert_eq!(snapshot(&added.site.home), before, "stack files untouched");
+        assert!(site_home(uh, "blog").is_dir());
+
+        assert!(rename_site(uh, "blog", "   ").is_err());
+        assert!(rename_site(uh, "nope", "X").is_err());
+    }
+
+    #[test]
+    fn remove_unregisters_and_leaves_the_directory_byte_identical() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        let added = add_site(uh, "blog", None, None, all_free).unwrap();
+        use_site(uh, "blog").unwrap();
+        let home = added.site.home.clone();
+        std::fs::create_dir_all(home.join("backups")).unwrap();
+        std::fs::write(home.join("backups/aincient-1.tar.gz"), b"precious").unwrap();
+        let before = snapshot(&home);
+        let legacy_before = {
+            let mut s = snapshot(&default_home(uh));
+            s.retain(|p, _| !p.starts_with(SITES_DIR) && p != Path::new(SITES_FILE));
+            s
+        };
+
+        let removed = remove_site(uh, "blog").unwrap();
+        assert_eq!(removed.site, added.site);
+        assert!(removed.was_active);
+
+        assert_eq!(snapshot(&home), before, "remove must not touch the stack");
+        let mut legacy_after = snapshot(&default_home(uh));
+        legacy_after.retain(|p, _| !p.starts_with(SITES_DIR) && p != Path::new(SITES_FILE));
+        assert_eq!(legacy_after, legacy_before);
+
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.get("blog"), None);
+        assert_eq!(r.active, None);
+        // Nothing active: resolution falls back to ~/.atelier.
+        let got = resolve(None, None, Some(&r), Some(uh)).unwrap();
+        assert_eq!(got.home, default_home(uh));
+
+        // The site at ~/.atelier can't be removed (adoption would bring it back).
+        assert!(remove_site(uh, DEFAULT_SLUG).is_err());
+        assert!(remove_site(uh, "blog").is_err(), "already gone");
+    }
+
+    #[test]
+    fn a_removed_site_is_re_added_in_place_with_its_port() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let first = add_site(uh, "blog", None, Some(41290), all_free).unwrap();
+        let salt = first.site.stack().env_get("HASH_SALT").unwrap();
+        remove_site(uh, "blog").unwrap();
+
+        // Even with the host port taken (its own container could hold it).
+        let again = add_site(uh, "blog", None, None, |_| false).unwrap();
+        assert!(again.reregistered);
+        assert_eq!(again.port, 41290);
+        assert_eq!(again.site, first.site);
+        assert_eq!(again.site.stack().env_get("HASH_SALT").unwrap(), salt);
+    }
+
+    #[test]
+    fn list_shows_sites_with_ports_and_the_unadopted_legacy() {
+        let th = TempHome::new();
+        let uh = th.path();
+        assert_eq!(list_sites(uh).unwrap(), Vec::new());
+
+        install_legacy(uh);
+        let rows = list_sites(uh).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, DEFAULT_SLUG);
+        assert_eq!(rows[0].project, DEFAULT_PROJECT);
+        assert_eq!(rows[0].port, Some(DEFAULT_PORT));
+        assert!(rows[0].installed && rows[0].active);
+        assert!(!registry_path(uh).exists(), "list must not write");
+
+        add_site(uh, "blog", Some("Blog"), None, all_free).unwrap();
+        let rows = list_sites(uh).unwrap();
+        let slugs: Vec<_> = rows.iter().map(|r| r.slug.as_str()).collect();
+        assert_eq!(slugs, ["default", "blog"]);
+        assert_eq!(rows[1].label, "Blog");
+        assert_eq!(rows[1].port, Some(DEFAULT_PORT + 1));
+        assert!(rows[1].image.is_some());
+        assert!(!rows[1].active);
+    }
+
+    #[test]
+    fn site_flag_precedence_end_to_end() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        // Before any write, `--site default` already resolves (preview).
+        let got = locate_in(Some(DEFAULT_SLUG), None, Some(uh)).unwrap();
+        assert_eq!(
+            (got.source, got.home.clone()),
+            (Source::Flag, default_home(uh))
+        );
+        assert_eq!(got.project(), "atelier");
+
+        add_site(uh, "blog", None, None, all_free).unwrap();
+        add_site(uh, "shop", None, None, all_free).unwrap();
+        use_site(uh, "shop").unwrap();
+        let hand_rolled = uh.join("elsewhere");
+
+        // --site beats ATELIER_HOME and the active site.
+        let got = locate_in(Some("blog"), Some(&hand_rolled), Some(uh)).unwrap();
+        assert_eq!(got.source, Source::Flag);
+        assert_eq!(got.home, site_home(uh, "blog"));
+        let stack = got.into_stack();
+        assert_eq!(stack.project_name(), "atelier-blog");
+        assert_eq!(stack.slug.as_deref(), Some("blog"));
+        assert_eq!(stack.http_port(), DEFAULT_PORT + 1);
+
+        // ATELIER_HOME beats the active site; an unregistered one stays derived.
+        let got = locate_in(None, Some(&hand_rolled), Some(uh)).unwrap();
+        assert_eq!((got.source, got.site.clone()), (Source::Env, None));
+        assert_eq!(got.project(), "elsewhere");
+
+        // The active site beats the ~/.atelier default.
+        let got = locate_in(None, None, Some(uh)).unwrap();
+        assert_eq!(got.source, Source::Active);
+        assert_eq!(got.project(), "atelier-shop");
+
+        // An unknown --site is an error, never a fall-through.
+        assert!(locate_in(Some("nope"), None, Some(uh)).is_err());
+        assert!(locate_in(Some("nope"), Some(&hand_rolled), Some(uh)).is_err());
+    }
+
+    #[test]
+    fn install_allocates_only_for_an_unconfigured_registry_site() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh); // claims DEFAULT_PORT
+        adopt_legacy(uh).unwrap();
+        let mut r = Registry::load(uh).unwrap().unwrap();
+        // A registered site with no .env yet (e.g. registry edited by hand).
+        r.sites.push(site(uh, "blog"));
+        r.save(uh).unwrap();
+
+        let blog = r.get("blog").unwrap().stack();
+        assert_eq!(
+            port_for_install(&blog, None, Some(&r), Some(uh), all_free),
+            Some(DEFAULT_PORT + 1)
+        );
+        assert_eq!(
+            port_for_install(&blog, Some(41400), Some(&r), Some(uh), all_free),
+            Some(41400)
+        );
+        // ~/.atelier keeps meaning the default; a configured stack keeps its port.
+        let legacy = r.get(DEFAULT_SLUG).unwrap().stack();
+        assert_eq!(
+            port_for_install(&legacy, None, Some(&r), Some(uh), all_free),
+            None
+        );
+        blog.ensure_scaffold(&crate::stack::InstallOptions {
+            http_port: Some(41250),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            port_for_install(&blog, None, Some(&r), Some(uh), all_free),
+            None
+        );
+        // An unregistered hand-rolled home is today's behaviour.
+        let hand = Stack::at(uh.join("hand"));
+        assert_eq!(
+            port_for_install(&hand, None, Some(&r), Some(uh), all_free),
+            None
+        );
+    }
+
+    #[test]
+    fn port_claimant_names_another_site_on_the_same_port() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let blog = add_site(uh, "blog", None, Some(41260), all_free).unwrap();
+        let r = Registry::load(uh).unwrap().unwrap();
+        let shop = site_home(uh, "shop");
+        assert_eq!(
+            r.port_claimant(41260, &shop).map(|s| s.slug.as_str()),
+            Some("blog")
+        );
+        assert_eq!(r.port_claimant(41260, &blog.site.home), None, "not itself");
+        assert_eq!(r.port_claimant(41261, &shop), None);
     }
 }

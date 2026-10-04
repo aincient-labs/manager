@@ -28,6 +28,6 @@ pub use ops::{
     ExportOptions, ModelRole, Reporter, Silent, Stage, Status, UpdateCheck,
 };
 pub use pack::Pack;
-pub use sites::{Registry, Resolution, Site};
+pub use sites::{AddedSite, Registry, RemovedSite, Resolution, Site, SiteRow};
 pub use stack::{Channel, InstallOptions, Stack, DEFAULT_IMAGE, DEFAULT_PORT};
 pub use update_cache::{CacheStatus, SingleFlight};

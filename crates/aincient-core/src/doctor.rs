@@ -22,7 +22,6 @@
 //! Deliberately NOT in the ladder, at any flag: `down -v`, reinstall, restore.
 //! Those destroy data, so doctor only ever *names* them as the next step.
 
-use std::net::{Ipv4Addr, TcpListener};
 use std::process::Command;
 
 use serde::Serialize;
@@ -484,38 +483,99 @@ fn parse_buildx_version(out: &str) -> Option<String> {
     non_empty(token.trim_start_matches('v'))
 }
 
-/// Is the console's port usable? Occupied is only a problem when it *isn't* our
-/// own appliance holding it — a running Atelier is supposed to own that port.
+/// Is the console's port usable? Occupied is only a problem when it *isn't*
+/// this stack's own container holding it — a running site is supposed to own
+/// its port. With several sites registered, a port another site is set up on is
+/// a collision waiting for both to run at once, so it is named too.
 fn check_port(stack: &Stack, docker_running: bool) -> Check {
-    const ID: &str = "host.port";
-    const LABEL: &str = "Console port available";
     let port = stack.http_port();
-
-    if port_free(port) {
-        return Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port}"));
-    }
-    // Something is listening. If it's our own app container, that's the healthy
-    // case, not a conflict.
-    if docker_running && stack.exists() && ops::status(stack).running {
-        return Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port} — held by Atelier"));
-    }
-    Check::bad(
-        ID,
-        Tier::Host,
-        LABEL,
-        Severity::Fail,
-        format!(
-            "Another program is already listening on port {port}. Stop it, or move Atelier to a \
-             free port with `atelier app install --port <PORT>`."
-        ),
-    )
-    .detail(format!(
-        "port {port} is in use by something that isn't Atelier"
-    ))
+    let free = crate::sites::host_port_is_free(port);
+    let ours = !free && docker_running && stack.exists() && publishes_port(stack, port);
+    let claimant = dirs::home_dir()
+        .and_then(|uh| crate::sites::Registry::load(&uh).ok().flatten())
+        .and_then(|r| r.port_claimant(port, &stack.home).map(|s| s.slug.clone()));
+    port_verdict(port, free, ours, claimant.as_deref(), stack.slug.as_deref())
 }
 
-fn port_free(port: u16) -> bool {
-    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
+/// Does this stack's own container publish `port`? Asks Compose (scoped to the
+/// stack's project) for the host side of the console mapping: `edge` on current
+/// stacks, `app` on a stack laid down before `edge` existed.
+fn publishes_port(stack: &Stack, port: u16) -> bool {
+    ["edge", "app"].iter().any(|service| {
+        let mut c = compose(stack);
+        c.args(["port", service, "80"]);
+        probe(c).ok().and_then(|out| parse_published_port(&out)) == Some(port)
+    })
+}
+
+/// The host port in `docker compose port` output (`0.0.0.0:41221`, possibly
+/// followed by an IPv6 line `[::]:41221`).
+fn parse_published_port(out: &str) -> Option<u16> {
+    out.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.rsplit(':').next())
+        .and_then(|p| p.parse().ok())
+}
+
+/// The `host.port` verdict from what was observed — pure, so every branch is
+/// testable without a Docker host.
+///
+/// - `free`: the port can be bound on this machine right now;
+/// - `ours`: this stack's own container publishes it;
+/// - `claimant`: another registered site is set up on the same port;
+/// - `slug`: this stack's site slug, so the remedy can name `--site`.
+fn port_verdict(
+    port: u16,
+    free: bool,
+    ours: bool,
+    claimant: Option<&str>,
+    slug: Option<&str>,
+) -> Check {
+    const ID: &str = "host.port";
+    const LABEL: &str = "Console port available";
+    let move_cmd = match slug {
+        Some(slug) => format!("`atelier --site {slug} app install --port <PORT>`"),
+        None => "`atelier app install --port <PORT>`".to_string(),
+    };
+
+    if !free && !ours {
+        let detail = match claimant {
+            Some(other) => format!(
+                "port {port} is in use by something that isn't this site (site `{other}` is set \
+                 up on the same port)"
+            ),
+            None => format!("port {port} is in use by something that isn't Atelier"),
+        };
+        return Check::bad(
+            ID,
+            Tier::Host,
+            LABEL,
+            Severity::Fail,
+            format!(
+                "Another program is already listening on port {port}. Stop it, or move this \
+                 site to a free port with {move_cmd}."
+            ),
+        )
+        .detail(detail);
+    }
+    if let Some(other) = claimant {
+        return Check::bad(
+            ID,
+            Tier::Host,
+            LABEL,
+            Severity::Warn,
+            format!(
+                "Site `{other}` is set up on port {port} too, so only one of them can run at a \
+                 time. Give this one its own port with {move_cmd}."
+            ),
+        )
+        .detail(format!("port {port} — shared with site `{other}`"));
+    }
+    if ours {
+        return Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port} — held by Atelier"));
+    }
+    Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port}"))
 }
 
 /// Free space where the stack (and Docker's volumes, on Linux) lives. The image
@@ -1133,6 +1193,62 @@ fn health_detail(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_check_free_or_held_by_this_site_is_ok() {
+        let c = port_verdict(41222, true, false, None, Some("blog"));
+        assert_eq!(c.severity, Severity::Ok);
+        assert_eq!(c.detail.as_deref(), Some("port 41222"));
+
+        let c = port_verdict(41222, false, true, None, Some("blog"));
+        assert_eq!(c.severity, Severity::Ok);
+        assert!(c.detail.unwrap().contains("held by Atelier"));
+    }
+
+    #[test]
+    fn port_check_fails_when_something_else_holds_the_port() {
+        let c = port_verdict(41222, false, false, None, Some("blog"));
+        assert_eq!(c.severity, Severity::Fail);
+        assert!(c
+            .detail
+            .unwrap()
+            .contains("port 41222 is in use by something that isn't Atelier"));
+        assert!(c
+            .remedy
+            .unwrap()
+            .contains("atelier --site blog app install --port"));
+
+        // Unregistered stack: no --site in the remedy. Another site holding it
+        // is named.
+        let c = port_verdict(41221, false, false, Some("shop"), None);
+        assert_eq!(c.severity, Severity::Fail);
+        assert!(c.detail.unwrap().contains("site `shop`"));
+        let remedy = c.remedy.unwrap();
+        assert!(
+            remedy.contains("`atelier app install --port <PORT>`"),
+            "{remedy}"
+        );
+    }
+
+    #[test]
+    fn port_check_warns_when_another_site_shares_the_port() {
+        for (free, ours) in [(true, false), (false, true)] {
+            let c = port_verdict(41222, free, ours, Some("shop"), Some("blog"));
+            assert_eq!(c.severity, Severity::Warn, "free={free} ours={ours}");
+            assert!(c.remedy.unwrap().contains("Site `shop`"));
+        }
+    }
+
+    #[test]
+    fn compose_port_output_parses() {
+        assert_eq!(parse_published_port("0.0.0.0:41221\n"), Some(41221));
+        assert_eq!(
+            parse_published_port("0.0.0.0:41222\n[::]:41222\n"),
+            Some(41222)
+        );
+        assert_eq!(parse_published_port(""), None);
+        assert_eq!(parse_published_port("no port 80/tcp"), None);
+    }
 
     #[test]
     fn container_state_reads_status_restarts_and_health() {
