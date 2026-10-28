@@ -21,6 +21,8 @@ let exportDir = null; // folder chosen for the static export
 let lastExportPath = null; // where the last export landed, for "Open the folder"
 let lastExportHadBaseUrl = false; // did that export get a real website address?
 let managerVersion = ""; // this app's own version, shown in the chrome
+let siteRows = []; // list_sites rows, for the header switcher
+let selectedSlug = null; // the site this window operates on (registry slug)
 
 // Stamp the manager's version into the title bar once, before anything else can
 // fail. It's compile-time constant — no Docker, no stack — so it must still show
@@ -73,6 +75,7 @@ function confirmModal(msg, opts = {}) {
     const requireText = opts.requireText || null;
     const yes = $("confirm-yes");
     const input = $("confirm-input");
+    showSiteLine($("confirm-site"));
     $("confirm-msg").textContent = msg;
     if (requireText) {
       $("confirm-word").textContent = requireText;
@@ -118,6 +121,7 @@ let lastStage = null;
 let sawFraction = false;
 
 function progressReset(title) {
+  showSiteLine($("progress-site"));
   $("progress-title").textContent = title;
   $("progress-fill").style.width = "0%";
   $("progress-fill").classList.remove("done");
@@ -314,6 +318,7 @@ async function runProgressOp(title, fn) {
 // --- status -----------------------------------------------------------------
 
 async function refresh() {
+  await refreshSites();
   const problem = await invoke("preflight_problem");
   if (problem) {
     $("docker-msg").textContent = problem;
@@ -324,6 +329,7 @@ async function refresh() {
   const status = await invoke("get_status");
   lastStatus = status;
   if (!status.installed) {
+    renderInstall();
     setView("install");
     return;
   }
@@ -334,6 +340,225 @@ async function refresh() {
   // runs after every lifecycle op, and must never start a registry check
   // (manager#6); startUpdateRefresh() owns those.
   refreshUpdate();
+}
+
+// --- sites (header switcher) -----------------------------------------------
+// One Manager, several sites (DECISIONS 0475 · M1). The backend holds which site
+// this window operates on; every command resolves its stack from that, and the
+// header always names it — so no action can land on a site you aren't looking at.
+
+function currentSite() {
+  return siteRows.find((r) => r.slug === selectedSlug) || null;
+}
+
+// Where a site runs, in words. Only this computer for now; remote sites add a
+// host name here.
+function siteHost(row) {
+  return row && row.host ? row.host : "This computer";
+}
+
+function siteState(row) {
+  if (!row.installed) return "Not set up yet";
+  return row.running ? "Running" : "Stopped";
+}
+
+// "Blog · This computer" above a confirm or a running op. Only once there is more
+// than one site — with one, the line would just repeat the obvious.
+function showSiteLine(el) {
+  const row = currentSite();
+  const show = !!row && siteRows.length > 1;
+  el.classList.toggle("hidden", !show);
+  el.textContent = show ? `${row.label} · ${siteHost(row)}` : "";
+}
+
+async function refreshSites() {
+  try {
+    const view = await invoke("list_sites");
+    siteRows = view.sites || [];
+    const before = selectedSlug;
+    selectedSlug = view.selected || null;
+    // The first answer (or an outside change) names the site: its own publish
+    // preferences replace whatever the form showed.
+    if (selectedSlug !== before) loadPublishPrefs();
+  } catch {
+    // The switcher is an addition, never a gate: a broken registry still leaves
+    // the selected site's screens working (they report the error themselves).
+    siteRows = [];
+  }
+  renderSites();
+}
+
+function renderSites() {
+  const row = currentSite();
+  $("site-switcher").classList.toggle("hidden", !row);
+  if (!row) return;
+  $("site-current-label").textContent = row.label;
+  $("site-current-host").textContent = `${siteHost(row)} · ${siteState(row)}`;
+  $("site-current-dot").className = `dot ${row.running ? "up" : "down"}`;
+  $("site-current").title = `${row.label} (${row.slug}) — ${row.home}`;
+
+  const list = $("site-list");
+  const frag = document.createDocumentFragment();
+  for (const r of siteRows) {
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.className = "site-option";
+    btn.setAttribute("role", "menuitemradio");
+    btn.setAttribute("aria-checked", String(r.slug === selectedSlug));
+    btn.dataset.action = "select-site";
+    btn.dataset.slug = r.slug;
+    btn.title = r.home;
+    btn.innerHTML =
+      `<span class="dot ${r.running ? "up" : "down"}"></span>` +
+      `<span class="site-option-text"><span class="site-option-label">${esc(r.label)}</span>` +
+      `<span class="site-option-meta">${esc(siteHost(r))} · ${esc(siteState(r))}</span></span>` +
+      `<svg class="ic tick" aria-hidden="true"><use href="#i-tick" /></svg>`;
+    li.appendChild(btn);
+    frag.appendChild(li);
+  }
+  list.replaceChildren(frag);
+}
+
+function setSiteMenu(open) {
+  $("site-menu").classList.toggle("hidden", !open);
+  $("site-current").setAttribute("aria-expanded", String(open));
+  if (open) {
+    const checked = $("site-list").querySelector('[aria-checked="true"]');
+    (checked || $("site-list").querySelector("button"))?.focus();
+  }
+}
+
+// Forget everything the window learned about the previous site, so nothing from
+// it (an export path, a checkup, a log, an update answer) shows under the new one.
+function resetSiteUi() {
+  lastStatus = null;
+  lastExportPath = null;
+  $("publish-result").classList.add("hidden");
+  $("update-status").classList.add("hidden");
+  $("update-banner").classList.add("hidden");
+  $("doctor-summary").classList.add("hidden");
+  $("doctor-results").classList.add("hidden");
+  $("doctor-fix").classList.add("hidden");
+  $("logs-view").textContent = "Tap Refresh to load the latest activity.";
+  $("down-wipe").checked = false;
+  loadPublishPrefs();
+}
+
+async function switchSite(slug) {
+  setSiteMenu(false);
+  if (slug === selectedSlug) return;
+  hideError();
+  try {
+    await invoke("select_site", { slug });
+  } catch (e) {
+    return showError(String(e));
+  }
+  selectedSlug = slug;
+  resetSiteUi();
+  currentTab = "home";
+  setView("loading");
+  await refresh().catch((e) => showError(String(e)));
+  backgroundUpdateRefresh(false);
+}
+
+// A short name from a display name: "My Blog!" → "my-blog".
+function slugify(label) {
+  return label
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+}
+
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
+let slugEdited = false; // stop deriving the short name once someone types one
+
+function openAddSite() {
+  setSiteMenu(false);
+  slugEdited = false;
+  $("add-site-label").value = "";
+  $("add-site-slug").value = "";
+  $("add-site-error").classList.add("hidden");
+  $("add-site").classList.remove("hidden");
+  setTimeout(() => $("add-site-label").focus(), 0);
+}
+
+async function submitAddSite() {
+  const label = $("add-site-label").value.trim();
+  const slug = $("add-site-slug").value.trim();
+  const errEl = $("add-site-error");
+  const fail = (msg) => {
+    errEl.textContent = msg;
+    errEl.classList.remove("hidden");
+  };
+  if (!label) return fail("Give the site a name.");
+  if (!SLUG_RE.test(slug))
+    return fail("The short name needs lowercase letters, digits and dashes, starting with a letter or digit.");
+  if (siteRows.some((r) => r.slug === slug)) return fail(`There's already a site called "${slug}".`);
+  $("add-site-submit").disabled = true;
+  try {
+    await invoke("add_site", { slug, label });
+  } catch (e) {
+    return fail(String(e));
+  } finally {
+    $("add-site-submit").disabled = false;
+  }
+  $("add-site").classList.add("hidden");
+  selectedSlug = slug;
+  resetSiteUi();
+  currentTab = "home";
+  await refresh().catch((e) => showError(String(e)));
+}
+
+function openRenameSite() {
+  setSiteMenu(false);
+  const row = currentSite();
+  if (!row) return;
+  $("rename-site-label").value = row.label;
+  $("rename-site-error").classList.add("hidden");
+  $("rename-site").classList.remove("hidden");
+  setTimeout(() => $("rename-site-label").select(), 0);
+}
+
+async function submitRenameSite() {
+  const row = currentSite();
+  const label = $("rename-site-label").value.trim();
+  const errEl = $("rename-site-error");
+  if (!row) return;
+  if (!label) {
+    errEl.textContent = "The name can't be empty.";
+    errEl.classList.remove("hidden");
+    return;
+  }
+  try {
+    await invoke("rename_site", { slug: row.slug, label });
+  } catch (e) {
+    errEl.textContent = String(e);
+    errEl.classList.remove("hidden");
+    return;
+  }
+  $("rename-site").classList.add("hidden");
+  await refreshSites();
+}
+
+// The set-up screen, for whichever site is selected. A first run is a welcome;
+// a site added next to others is named, and its console port is the one it was
+// given — so "Set up" never moves it onto a port another site holds.
+let installPortDefault = null;
+
+function renderInstall() {
+  const row = currentSite();
+  const others = siteRows.length > 1;
+  $("install-title").textContent = others && row ? `Set up ${row.label}` : "Welcome to Atelier";
+  $("install-lede").textContent = others
+    ? "This downloads Atelier and starts this site next to your others — it gets its own pages, backups and address."
+    : "Let's set up your website. This downloads Atelier and starts it right here on your computer — the first time takes a minute or two. You'll choose your AI assistant afterward, inside Atelier.";
+  $("install-btn-label").textContent = others ? "Set up this site" : "Set up Atelier";
+  installPortDefault = (row && row.port) || 41221;
+  $("install-port").value = installPortDefault;
 }
 
 // Paint the Home hero from the current status — and adapt the one primary action
@@ -492,23 +717,37 @@ async function checkManagerUpdate() {
 // a repeat export doesn't ask for the same folder and address every time. The
 // website address especially matters — localhost isn't a place anyone can visit,
 // so links must be rendered against where the site will actually live.
+//
+// Kept per site: each site lives at its own address, so one site's website
+// address must never be offered for another's export. The unscoped keys from
+// before multi-site belong to the first site (`default`) and are read as its own.
 const PREF_URL = "atelier.publish.baseUrl";
 const PREF_DIR = "atelier.publish.dir";
 
+function prefKey(base) {
+  return selectedSlug ? `${base}.${selectedSlug}` : base;
+}
+
+function readPref(base) {
+  const own = localStorage.getItem(prefKey(base));
+  if (own !== null || (selectedSlug && selectedSlug !== "default")) return own;
+  return localStorage.getItem(base);
+}
+
+function loadPublishPrefs() {
+  $("export-baseurl").value = readPref(PREF_URL) || "";
+  exportDir = readPref(PREF_DIR);
+  $("export-dir").value = exportDir || "";
+  $("export-btn").disabled = !exportDir;
+}
+
 function initPublishPrefs() {
-  const url = localStorage.getItem(PREF_URL);
-  if (url) $("export-baseurl").value = url;
-  const dir = localStorage.getItem(PREF_DIR);
-  if (dir) {
-    exportDir = dir;
-    $("export-dir").value = dir;
-    $("export-btn").disabled = false;
-  }
+  loadPublishPrefs();
   // Remember the address as it's typed, not only on export.
   $("export-baseurl").addEventListener("input", (e) => {
     const v = e.target.value.trim();
-    if (v) localStorage.setItem(PREF_URL, v);
-    else localStorage.removeItem(PREF_URL);
+    if (v) localStorage.setItem(prefKey(PREF_URL), v);
+    else localStorage.removeItem(prefKey(PREF_URL));
   });
 }
 
@@ -732,6 +971,13 @@ function esc(s) {
 const actions = {
   recheck: () => refresh(),
 
+  "toggle-sites": () => setSiteMenu($("site-menu").classList.contains("hidden")),
+  "select-site": (el) => switchSite(el.dataset.slug),
+  "add-site-open": () => openAddSite(),
+  "add-site-cancel": () => $("add-site").classList.add("hidden"),
+  "rename-site-open": () => openRenameSite(),
+  "rename-site-cancel": () => $("rename-site").classList.add("hidden"),
+
   "manager-release": () =>
     invoke("open_url", { url: MANAGER_RELEASES_PAGE }).catch((e) => showError(String(e))),
 
@@ -769,7 +1015,10 @@ const actions = {
   },
 
   install: () => {
-    const port = parseInt($("install-port").value, 10) || null;
+    // Only an edited port is sent: the backend gives a site without one the
+    // port it was registered on, or a free one.
+    const typed = parseInt($("install-port").value, 10) || null;
+    const port = typed === installPortDefault ? null : typed;
     return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }));
   },
 
@@ -835,7 +1084,7 @@ const actions = {
       exportDir = dir;
       $("export-dir").value = dir;
       $("export-btn").disabled = false;
-      localStorage.setItem(PREF_DIR, dir);
+      localStorage.setItem(prefKey(PREF_DIR), dir);
     } catch (e) {
       showError(String(e));
     }
@@ -998,6 +1247,8 @@ const actions = {
 
 // Event delegation for tabs and every [data-action] control.
 document.addEventListener("click", (e) => {
+  if (!e.target.closest("#site-switcher")) setSiteMenu(false);
+
   const navItem = e.target.closest(".nav-item");
   if (navItem) {
     showTab(navItem.dataset.tab);
@@ -1047,6 +1298,31 @@ $("channel-select").addEventListener("change", async (e) => {
   // is re-rendered from what the appliance now reports, not from the click.
   await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }));
   renderChannel();
+});
+
+$("add-site-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  submitAddSite();
+});
+$("rename-site-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  submitRenameSite();
+});
+// The short name follows the name until someone edits it by hand.
+$("add-site-label").addEventListener("input", (e) => {
+  if (!slugEdited) $("add-site-slug").value = slugify(e.target.value);
+});
+$("add-site-slug").addEventListener("input", () => {
+  slugEdited = true;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$("site-menu").classList.contains("hidden")) {
+    setSiteMenu(false);
+    $("site-current").focus();
+  }
+  $("add-site").classList.add("hidden");
+  $("rename-site").classList.add("hidden");
 });
 
 initPublishPrefs();

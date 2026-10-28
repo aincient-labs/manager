@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Site switcher in the Manager window.** The top bar names the site the window works on: its
+  name, where it runs and whether it's running. Its menu lists every site in `sites.toml`,
+  switches between them, adds a site (name + short name, next free port, then its set-up screen)
+  and renames one. Every action runs against the site shown, and with more than one site each
+  confirmation and progress panel names it. Switching also makes it the active site for the CLI;
+  an `atelier sites use` in a terminal doesn't move an open window.
+
+### Changed
+
+- The GUI's set-up screen installs a newly added site on the port it was registered with, the
+  same rule as `atelier app install`, instead of always offering 41221.
+- The Publish form remembers its folder and website address per site.
+
+### Fixed
+
+- A background update check for one site can no longer answer for another: the single-flight
+  guard is now per site.
+
 ## [0.12.0] - 2026-10-04
 
 ### Added

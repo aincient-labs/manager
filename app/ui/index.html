@@ -90,6 +90,12 @@
       <symbol id="i-check" viewBox="0 0 24 24">
         <path d="M21.801 10A10 10 0 1 1 17 3.335" /><path d="m9 11 3 3L22 4" />
       </symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14" /><path d="M12 5v14" /></symbol>
+      <symbol id="i-pencil" viewBox="0 0 24 24">
+        <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
+        <path d="m15 5 4 4" />
+      </symbol>
+      <symbol id="i-tick" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></symbol>
     </svg>
 
     <header class="topbar">
@@ -121,7 +127,36 @@
         <!-- The manager's own version rides in the chrome, so it appears in ANY
              screenshot — including the Docker-not-ready and first-run screens,
              where a bug report is most likely to start. -->
-        <span class="app-role whisper">Manager<span id="manager-version" class="version-tag"></span></span>
+        <div class="topbar-end">
+          <!-- Site switcher (multi-site, DECISIONS 0475 · M1). Every action in
+               the window runs against the site named here; there is no hidden
+               default. Hidden until at least one site exists, so a first run
+               stays a single calm "set up your website" screen. -->
+          <div id="site-switcher" class="site-switcher hidden">
+            <button id="site-current" class="site-current" data-action="toggle-sites"
+                    aria-haspopup="menu" aria-expanded="false" aria-controls="site-menu">
+              <span id="site-current-dot" class="dot"></span>
+              <span class="site-current-text">
+                <span id="site-current-label" class="site-current-label">—</span>
+                <span id="site-current-host" class="site-current-host">This computer</span>
+              </span>
+              <svg class="ic chev-down" aria-hidden="true"><use href="#i-chevron" /></svg>
+            </button>
+            <div id="site-menu" class="site-menu hidden" role="menu" aria-label="Your sites">
+              <p class="site-menu-head whisper">Your sites</p>
+              <ul id="site-list" class="site-list"></ul>
+              <div class="site-menu-foot">
+                <button class="site-menu-action" role="menuitem" data-action="rename-site-open">
+                  <svg class="ic"><use href="#i-pencil" /></svg><span>Rename this site…</span>
+                </button>
+                <button class="site-menu-action" role="menuitem" data-action="add-site-open">
+                  <svg class="ic"><use href="#i-plus" /></svg><span>Add a site…</span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <span class="app-role whisper">Manager<span id="manager-version" class="version-tag"></span></span>
+        </div>
       </div>
     </header>
 
@@ -181,8 +216,8 @@
       <!-- First run — a warm welcome, not an "installer". -->
       <section id="screen-install" class="screen center hidden">
         <div class="card welcome">
-          <h2>Welcome to Atelier</h2>
-          <p class="muted">
+          <h2 id="install-title">Welcome to Atelier</h2>
+          <p class="muted" id="install-lede">
             Let's set up your website. This downloads Atelier and starts it right
             here on your computer — the first time takes a minute or two. You'll
             choose your AI assistant afterward, inside Atelier.
@@ -200,7 +235,7 @@
           </details>
         </div>
         <button class="btn primary big" data-action="install">
-          <svg class="ic"><use href="#i-download" /></svg>Set up Atelier
+          <svg class="ic"><use href="#i-download" /></svg><span id="install-btn-label">Set up Atelier</span>
         </button>
         <a class="link centered" href="https://aincient-labs.com/docs/quickstart" target="_blank" rel="noreferrer">
           <svg class="ic"><use href="#i-book" /></svg>What happens next?
@@ -578,6 +613,7 @@
     <div id="progress" class="overlay hidden">
       <div class="progress-panel">
         <div class="progress-body">
+          <p id="progress-site" class="modal-site whisper hidden"></p>
           <h3 class="modal-title" id="progress-title">Working…</h3>
           <div id="progressbar" class="progressbar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
             <div id="progress-fill" class="progressbar-fill"></div>
@@ -590,9 +626,11 @@
       </div>
     </div>
 
-    <!-- Confirm modal -->
+    <!-- Confirm modal. The site line names which site the action touches, so a
+         confirm can never be read as being about some other site (D-07). -->
     <div id="confirm" class="overlay hidden">
       <div class="modal">
+        <p id="confirm-site" class="modal-site whisper hidden"></p>
         <p id="confirm-msg"></p>
         <label id="confirm-typecheck" class="confirm-type hidden">
           <span>Type <b id="confirm-word">confirm</b> to continue</span>
@@ -616,6 +654,47 @@
           <button class="btn primary" data-action="reset-pw-submit">Set password</button>
         </div>
       </div>
+    </div>
+
+    <!-- Add-site modal -->
+    <div id="add-site" class="overlay hidden">
+      <form class="modal" id="add-site-form">
+        <h3 class="modal-title">Add a site</h3>
+        <p class="muted">
+          Each site is its own Atelier on this computer, with its own pages,
+          backups and address. Nothing changes on your other sites.
+        </p>
+        <label class="field modal-field">
+          <span>Name</span>
+          <input id="add-site-label" type="text" placeholder="My blog" autocomplete="off" spellcheck="false" />
+        </label>
+        <label class="field modal-field">
+          <span>Short name <em>— lowercase letters, digits and dashes; used by the <code>atelier</code> command</em></span>
+          <input id="add-site-slug" type="text" placeholder="my-blog" autocomplete="off" spellcheck="false" />
+        </label>
+        <p id="add-site-error" class="modal-error hidden" role="alert"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="add-site-cancel">Cancel</button>
+          <button type="submit" class="btn primary" id="add-site-submit">Add the site</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Rename-site modal -->
+    <div id="rename-site" class="overlay hidden">
+      <form class="modal" id="rename-site-form">
+        <h3 class="modal-title">Rename this site</h3>
+        <p class="muted">Only the name you see changes. The short name, folder and data stay as they are.</p>
+        <label class="field modal-field">
+          <span>Name</span>
+          <input id="rename-site-label" type="text" autocomplete="off" spellcheck="false" />
+        </label>
+        <p id="rename-site-error" class="modal-error hidden" role="alert"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="rename-site-cancel">Cancel</button>
+          <button type="submit" class="btn primary">Rename</button>
+        </div>
+      </form>
     </div>
 
     <script src="main.js"></script>

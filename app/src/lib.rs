@@ -4,19 +4,58 @@
 //! engine the `atelier` CLI uses. Long-running operations (install, update,
 //! backup, restore) run on a blocking thread so the UI never freezes.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use aincient_core::{
-    doctor, ops, update_cache, Backup, CacheStatus, Channel, InstallOptions, ModelRole, Preflight,
-    PullEvent, Reporter, SingleFlight, Stack, Stage, Status, UpdateCheck,
+    doctor, ops, sites, update_cache, Backup, CacheStatus, Channel, InstallOptions, ModelRole,
+    Preflight, PullEvent, Reporter, SingleFlight, SiteRow, Stack, Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-/// Locate the stack, surfacing errors as strings for the webview.
-fn stack() -> Result<Stack, String> {
-    Stack::locate().map_err(|e| format!("{e:#}"))
+/// The site this window operates on — its registry slug, or `None` when nothing
+/// is registered (a fresh machine, a hand-rolled `ATELIER_HOME`), which keeps
+/// the single-site behaviour of `Stack::locate`.
+///
+/// Held by the window rather than read from `sites.toml` on every call: an
+/// `atelier sites use` in a terminal must not move the GUI to another site
+/// between two clicks. Every command resolves its stack from this, so no action
+/// runs against a site the header isn't showing.
+struct Selected(Mutex<Option<String>>);
+
+impl Selected {
+    /// Start on the site the CLI would pick right now (`ATELIER_HOME` > the
+    /// registry's active site > `~/.atelier`).
+    fn from_resolution() -> Self {
+        let slug = sites::locate(None)
+            .ok()
+            .and_then(|r| r.site)
+            .map(|s| s.slug);
+        Self(Mutex::new(slug))
+    }
+
+    fn get(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set(&self, slug: String) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(slug);
+    }
+}
+
+/// Locate the selected site's stack, surfacing errors as strings for the webview.
+fn stack(sel: &Selected) -> Result<Stack, String> {
+    match sel.get() {
+        Some(slug) => Stack::locate_site(Some(&slug)),
+        None => Stack::locate(),
+    }
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Render an anyhow error (with its context chain) as a single string.
@@ -142,55 +181,74 @@ async fn preflight_problem() -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-async fn get_status() -> Result<Status, String> {
-    let s = stack()?;
+async fn get_status(sel: State<'_, Selected>) -> Result<Status, String> {
+    let s = stack(&sel)?;
     blocking(move || Ok(ops::status(&s))).await
 }
 
-/// The one registry check allowed in flight at a time (manager#6): every caller
-/// of [`get_update`] / [`refresh_update_cache`] that arrives while a check runs
-/// waits for it and shares its result, so a slow registry can't pile up
-/// `docker buildx imagetools` processes.
-static UPDATE_FLIGHT: SingleFlight<UpdateCheck> = SingleFlight::new();
+/// The one registry check allowed in flight at a time **per site** (manager#6):
+/// every caller of [`get_update`] / [`refresh_update_cache`] that arrives while
+/// that site's check runs waits for it and shares its result, so a slow registry
+/// can't pile up `docker buildx imagetools` processes. Keyed by stack directory,
+/// because sites follow different images — one global flight would hand a check
+/// of site A to someone who just switched to site B.
+fn update_flight(stack: &Stack) -> Arc<SingleFlight<UpdateCheck>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<PathBuf, Arc<SingleFlight<UpdateCheck>>>>> =
+        OnceLock::new();
+    FLIGHTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(stack.home.clone())
+        .or_default()
+        .clone()
+}
 
 /// A LIVE registry check — the explicit "Check for updates" path. Deadlined in
 /// core, single-flight here, and its result refreshes the banner's cache.
 #[tauri::command]
-async fn get_update() -> Result<UpdateCheck, String> {
-    let s = stack()?;
-    blocking(move || Ok(update_cache::live_check(&s, &UPDATE_FLIGHT))).await
+async fn get_update(sel: State<'_, Selected>) -> Result<UpdateCheck, String> {
+    let s = stack(&sel)?;
+    blocking(move || Ok(update_cache::live_check(&s, &update_flight(&s)))).await
 }
 
 /// The cached update check, if any — a file read, never the network. What the
 /// Home banner (and the Home Update action, while it's fresh) reads.
 #[tauri::command]
-async fn get_cached_update() -> Result<Option<CacheStatus>, String> {
-    let s = stack()?;
+async fn get_cached_update(sel: State<'_, Selected>) -> Result<Option<CacheStatus>, String> {
+    let s = stack(&sel)?;
     blocking(move || Ok(update_cache::status(&s))).await
 }
 
 /// The background refresh: re-asks the registry only when `force` is set (once
 /// after first paint) or the cache has gone stale, then returns the cache.
 #[tauri::command]
-async fn refresh_update_cache(force: bool) -> Result<Option<CacheStatus>, String> {
-    let s = stack()?;
-    blocking(move || Ok(update_cache::refresh(&s, &UPDATE_FLIGHT, force))).await
+async fn refresh_update_cache(
+    force: bool,
+    sel: State<'_, Selected>,
+) -> Result<Option<CacheStatus>, String> {
+    let s = stack(&sel)?;
+    blocking(move || Ok(update_cache::refresh(&s, &update_flight(&s), force))).await
 }
 
 /// Off the main thread: a directory listing is quick, but a plain `fn` command
 /// runs on the main thread and nothing there may block (manager#6).
 #[tauri::command]
-async fn list_backups() -> Result<Vec<Backup>, String> {
-    let s = stack()?;
+async fn list_backups(sel: State<'_, Selected>) -> Result<Vec<Backup>, String> {
+    let s = stack(&sel)?;
     blocking(move || Ok(ops::list_backups(&s))).await
 }
 
 #[tauri::command]
-async fn set_admin_password(app: AppHandle, password: String) -> Result<(), String> {
+async fn set_admin_password(
+    app: AppHandle,
+    password: String,
+    sel: State<'_, Selected>,
+) -> Result<(), String> {
     if password.trim().is_empty() {
         return Err("password cannot be empty".into());
     }
-    let s = stack()?;
+    let s = stack(&sel)?;
     blocking(move || {
         ops::set_admin_password(&s, &password, &mut EventReporter { app }).map_err(err)
     })
@@ -202,12 +260,26 @@ async fn do_install(
     app: AppHandle,
     image: Option<String>,
     port: Option<u16>,
+    sel: State<'_, Selected>,
 ) -> Result<(), String> {
-    let s = stack()?;
+    let s = stack(&sel)?;
     blocking(move || {
+        // A registered site without a `.env` gets a port no other site claims;
+        // everything else keeps today's behaviour — the same rule as
+        // `atelier app install` (DECISIONS 0393).
+        let user_home = sites::user_home().ok();
+        let registry = user_home
+            .as_deref()
+            .and_then(|uh| sites::Registry::load(uh).ok().flatten());
         let opts = InstallOptions {
             image,
-            http_port: port,
+            http_port: sites::port_for_install(
+                &s,
+                port,
+                registry.as_ref(),
+                user_home.as_deref(),
+                sites::host_port_is_free,
+            ),
         };
         // `install` reports each phase (and holds until Drupal serves) through the
         // reporter, so the UI's progress bar/log only finish on real readiness —
@@ -219,8 +291,8 @@ async fn do_install(
 }
 
 #[tauri::command]
-async fn do_update(app: AppHandle) -> Result<(), String> {
-    let s = stack()?;
+async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || {
         ops::update(&s, &mut EventReporter { app }).map_err(err)?;
         Ok(())
@@ -235,11 +307,15 @@ async fn do_update(app: AppHandle) -> Result<(), String> {
 /// The frontend confirms first — a move from edge to stable can hand an older
 /// codebase a database a newer one already migrated.
 #[tauri::command]
-async fn set_channel(app: AppHandle, channel: String) -> Result<String, String> {
+async fn set_channel(
+    app: AppHandle,
+    channel: String,
+    sel: State<'_, Selected>,
+) -> Result<String, String> {
     let target = Channel::parse(&channel)
         .filter(|c| *c != Channel::Pinned)
         .ok_or_else(|| format!("unknown channel {channel:?} — use \"stable\" or \"edge\""))?;
-    let s = stack()?;
+    let s = stack(&sel)?;
     blocking(move || {
         ops::switch_channel(&s, target, true, &mut EventReporter { app })
             .map(|(image, _ready)| image)
@@ -249,8 +325,12 @@ async fn set_channel(app: AppHandle, channel: String) -> Result<String, String> 
 }
 
 #[tauri::command]
-async fn do_backup(app: AppHandle, label: Option<String>) -> Result<String, String> {
-    let s = stack()?;
+async fn do_backup(
+    app: AppHandle,
+    label: Option<String>,
+    sel: State<'_, Selected>,
+) -> Result<String, String> {
+    let s = stack(&sel)?;
     blocking(move || {
         ops::backup(&s, label.as_deref(), &mut EventReporter { app })
             .map(|p: PathBuf| p.to_string_lossy().into_owned())
@@ -260,8 +340,8 @@ async fn do_backup(app: AppHandle, label: Option<String>) -> Result<String, Stri
 }
 
 #[tauri::command]
-async fn do_restore(app: AppHandle, path: String) -> Result<(), String> {
-    let s = stack()?;
+async fn do_restore(app: AppHandle, path: String, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || {
         ops::restore(&s, std::path::Path::new(&path), &mut EventReporter { app }).map_err(err)
     })
@@ -322,8 +402,8 @@ async fn export_backup(app: AppHandle, source: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn do_reinstall(app: AppHandle) -> Result<(), String> {
-    let s = stack()?;
+async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || {
         let opts = InstallOptions::default();
         ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
@@ -333,8 +413,8 @@ async fn do_reinstall(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn do_start(app: AppHandle) -> Result<(), String> {
-    let s = stack()?;
+async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || {
         ops::start(&s, &mut EventReporter { app }).map_err(err)?;
         Ok(())
@@ -343,8 +423,8 @@ async fn do_start(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn do_stop(app: AppHandle) -> Result<(), String> {
-    let s = stack()?;
+async fn do_stop(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
 }
 
@@ -352,16 +432,20 @@ async fn do_stop(app: AppHandle) -> Result<(), String> {
 /// data volumes (database, files, admin password) — a harder teardown than a
 /// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
 #[tauri::command]
-async fn do_down(wipe: bool) -> Result<(), String> {
-    let s = stack()?;
+async fn do_down(wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || ops::down(&s, wipe).map_err(err)).await
 }
 
 /// Read back the most recent appliance log lines for the Activity view.
 /// `service` narrows to one container (`app`/`db`); `None` shows everything.
 #[tauri::command]
-async fn get_logs(service: Option<String>, lines: Option<usize>) -> Result<String, String> {
-    let s = stack()?;
+async fn get_logs(
+    service: Option<String>,
+    lines: Option<usize>,
+    sel: State<'_, Selected>,
+) -> Result<String, String> {
+    let s = stack(&sel)?;
     let n = lines.unwrap_or(400);
     blocking(move || ops::tail_logs(&s, service.as_deref(), n).map_err(err)).await
 }
@@ -394,8 +478,9 @@ async fn site_export(
     include_config: bool,
     include_users: bool,
     skip_link_check: bool,
+    sel: State<'_, Selected>,
 ) -> Result<String, String> {
-    let s = stack()?;
+    let s = stack(&sel)?;
     blocking(move || {
         // The picker asks "where to save it" — the answer is a *parent* folder.
         // The site goes into a named subfolder, so the engine's guard against
@@ -419,15 +504,20 @@ async fn site_export(
 /// appliance running (it asks Drupal), so it may fail with a friendly error the
 /// AI view surfaces as "start your site first."
 #[tauri::command]
-async fn get_model_roles() -> Result<Vec<ModelRole>, String> {
-    let s = stack()?;
+async fn get_model_roles(sel: State<'_, Selected>) -> Result<Vec<ModelRole>, String> {
+    let s = stack(&sel)?;
     blocking(move || ops::model_list(&s).map_err(err)).await
 }
 
 /// Bind one role (reasoning|task|fast) to a provider + model.
 #[tauri::command]
-async fn set_model_role(role: String, provider: String, model: String) -> Result<(), String> {
-    let s = stack()?;
+async fn set_model_role(
+    role: String,
+    provider: String,
+    model: String,
+    sel: State<'_, Selected>,
+) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || ops::model_set(&s, &role, &provider, &model).map_err(err)).await
 }
 
@@ -446,8 +536,8 @@ fn manager_version() -> &'static str {
 /// Diagnose the appliance — host, stack and site — without changing anything.
 /// Runs off the UI thread: it shells several docker/drush probes.
 #[tauri::command]
-async fn run_doctor() -> Result<doctor::Report, String> {
-    let s = stack()?;
+async fn run_doctor(sel: State<'_, Selected>) -> Result<doctor::Report, String> {
+    let s = stack(&sel)?;
     blocking(move || Ok(doctor::diagnose(&s))).await
 }
 
@@ -458,14 +548,17 @@ async fn run_doctor() -> Result<doctor::Report, String> {
 /// Nothing here deletes data — the destructive recoveries (remove, reinstall,
 /// restore) stay behind their own confirmations elsewhere in the UI.
 #[tauri::command]
-async fn run_doctor_fix(app: AppHandle) -> Result<doctor::Report, String> {
-    let s = stack()?;
+async fn run_doctor_fix(
+    app: AppHandle,
+    sel: State<'_, Selected>,
+) -> Result<doctor::Report, String> {
+    let s = stack(&sel)?;
     blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await
 }
 
 #[tauri::command]
-fn open_console() -> Result<(), String> {
-    let s = stack()?;
+fn open_console(sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     ops::open_console(&s).map_err(err)
 }
 
@@ -473,8 +566,8 @@ fn open_console() -> Result<(), String> {
 /// container (a `drush` exec, so it runs off the UI thread) and opens it, so a
 /// fresh operator lands in `/atelier` authenticated instead of access-denied.
 #[tauri::command]
-async fn open_console_authed() -> Result<(), String> {
-    let s = stack()?;
+async fn open_console_authed(sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     blocking(move || ops::open_console_authed(&s).map_err(err)).await
 }
 
@@ -496,8 +589,8 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_login() -> Result<(), String> {
-    let s = stack()?;
+fn open_login(sel: State<'_, Selected>) -> Result<(), String> {
+    let s = stack(&sel)?;
     ops::open_login(&s).map_err(err)
 }
 
@@ -510,10 +603,110 @@ fn open_url(url: String) -> Result<(), String> {
     ops::open_url(&url).map_err(err)
 }
 
+// --- sites -------------------------------------------------------------------
+
+/// One row of the header's site switcher: what the registry knows, plus whether
+/// the site is running. `host` is `None` for a site on this machine — the only
+/// kind there is until remote sites land.
+#[derive(Serialize)]
+struct SiteView {
+    #[serde(flatten)]
+    row: SiteRow,
+    host: Option<String>,
+    running: bool,
+}
+
+#[derive(Serialize)]
+struct SitesView {
+    /// The slug this window operates on, when it is a registered site.
+    selected: Option<String>,
+    sites: Vec<SiteView>,
+}
+
+/// Every registered site (plus an installed, not yet adopted `~/.atelier`) and
+/// which one this window shows. One `compose ps` per installed site when Docker
+/// is up — no HTTP probes — so it's cheap enough to run on every refresh.
+#[tauri::command]
+async fn list_sites(sel: State<'_, Selected>) -> Result<SitesView, String> {
+    let chosen = sel.get();
+    blocking(move || {
+        let user_home = sites::user_home().map_err(err)?;
+        let rows = sites::list_sites(&user_home).map_err(err)?;
+        let docker_up = rows.iter().any(|r| r.installed) && aincient_core::preflight().ok();
+        // Nothing chosen yet (a fresh machine that has since installed, or a
+        // legacy `~/.atelier`): show whichever row the fallback stack is.
+        let selected = chosen.or_else(|| {
+            let home = Stack::locate().ok()?.home;
+            rows.iter().find(|r| r.home == home).map(|r| r.slug.clone())
+        });
+        let sites = rows
+            .into_iter()
+            .map(|row| {
+                let running = docker_up && row.installed && ops::is_running(&row.stack());
+                SiteView {
+                    row,
+                    host: None,
+                    running,
+                }
+            })
+            .collect();
+        Ok(SitesView { selected, sites })
+    })
+    .await
+}
+
+/// Switch this window to `slug`, and make it the registry's active site, so the
+/// Manager reopens on it and a bare `atelier` command in a terminal agrees.
+#[tauri::command]
+async fn select_site(slug: String, sel: State<'_, Selected>) -> Result<(), String> {
+    let chosen = slug.clone();
+    blocking(move || {
+        let user_home = sites::user_home().map_err(err)?;
+        sites::use_site(&user_home, &chosen)
+            .map(|_| ())
+            .map_err(err)
+    })
+    .await?;
+    sel.set(slug);
+    Ok(())
+}
+
+/// Register a new site on a free port and switch to it. Lays down its stack
+/// files only; the window then shows the set-up screen for it, exactly as on a
+/// first run.
+#[tauri::command]
+async fn add_site(slug: String, label: String, sel: State<'_, Selected>) -> Result<(), String> {
+    let chosen = slug.clone();
+    blocking(move || {
+        let user_home = sites::user_home().map_err(err)?;
+        let label = Some(label.trim()).filter(|l| !l.is_empty());
+        sites::add_site(&user_home, &chosen, label, None, sites::host_port_is_free).map_err(err)?;
+        sites::use_site(&user_home, &chosen)
+            .map(|_| ())
+            .map_err(err)
+    })
+    .await?;
+    sel.set(slug);
+    Ok(())
+}
+
+/// Change a site's display name. Its slug, folder and data stay as they are.
+#[tauri::command]
+async fn rename_site(slug: String, label: String) -> Result<(), String> {
+    blocking(move || {
+        let user_home = sites::user_home().map_err(err)?;
+        sites::rename_site(&user_home, &slug, &label)
+            .map(|_| ())
+            .map_err(err)
+    })
+    .await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(Selected::from_resolution())
         .invoke_handler(tauri::generate_handler![
             check_preflight,
             preflight_problem,
@@ -547,6 +740,10 @@ pub fn run() {
             open_console_authed,
             open_login,
             open_url,
+            list_sites,
+            select_site,
+            add_site,
+            rename_site,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Atelier Manager");

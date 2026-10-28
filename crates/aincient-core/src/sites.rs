@@ -1519,6 +1519,31 @@ project = "atelier-blog"
         assert!(!rows[1].active);
     }
 
+    /// The Manager GUI's path (DECISIONS 0475 · M1): it picks its site once with
+    /// `locate_in(None, …)`, then resolves every command by that slug. On a
+    /// single legacy install both must land on today's stack and project, and
+    /// nothing may write `sites.toml` or touch the site.
+    #[test]
+    fn gui_selection_of_a_single_legacy_site_is_todays_stack_and_writes_nothing() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let legacy = install_legacy(uh);
+        let before = snapshot(&default_home(uh));
+
+        let started = locate_in(None, None, Some(uh)).unwrap();
+        let slug = started.site.as_ref().map(|s| s.slug.clone());
+        assert_eq!(slug.as_deref(), Some(DEFAULT_SLUG));
+        let per_command = locate_in(slug.as_deref(), None, Some(uh))
+            .unwrap()
+            .into_stack();
+
+        assert_eq!(per_command.home, legacy.home);
+        assert_eq!(per_command.project_name(), legacy.project_name());
+        assert_eq!(per_command.project_name(), DEFAULT_PROJECT);
+        assert!(!registry_path(uh).exists(), "selection must not write");
+        assert_eq!(snapshot(&default_home(uh)), before);
+    }
+
     #[test]
     fn site_flag_precedence_end_to_end() {
         let th = TempHome::new();

@@ -334,18 +334,7 @@ struct PsEntry {
 /// Current appliance status. Cheap probes only; never mutates the stack.
 pub fn status(stack: &Stack) -> Status {
     let installed = stack.exists();
-    let pf = preflight();
-
-    let mut running = false;
-    if installed && pf.ok() {
-        let mut c = compose(stack);
-        c.args(["ps", "--format", "json"]);
-        if let Some(out) = try_capture(c) {
-            running = parse_ps(&out)
-                .iter()
-                .any(|e| e.service == "app" && e.state.to_lowercase().contains("running"));
-        }
-    }
+    let running = installed && preflight().ok() && is_running(stack);
 
     let reachable = running && http_ready(stack.http_port());
 
@@ -360,6 +349,19 @@ pub fn status(stack: &Stack) -> Status {
         image_digest: local_digest(&stack.image()),
         version: running.then(|| running_image_version(stack)).flatten(),
     }
+}
+
+/// Is the stack's `app` container running? One `compose ps`, no HTTP probe —
+/// cheap enough to ask for every site in a list. Assumes Docker is up; a failed
+/// probe reads as not running.
+pub fn is_running(stack: &Stack) -> bool {
+    let mut c = compose(stack);
+    c.args(["ps", "--format", "json"]);
+    try_capture(c).is_some_and(|out| {
+        parse_ps(&out)
+            .iter()
+            .any(|e| e.service == "app" && e.state.to_lowercase().contains("running"))
+    })
 }
 
 /// Poll the console until it serves a healthy response, or `timeout` elapses,
