@@ -881,11 +881,11 @@ impl Reporter for ScaledReporter<'_> {
 }
 
 /// Run the one-time repairs an install made under an older manager needs — the
-/// retired-repository rename and the legacy-`:edge` → stable move — and say so out
-/// loud.
+/// retired-repository rename, the move off an unmaintained nginx for `edge`, and the
+/// legacy-`:edge` → stable move — and say so out loud.
 ///
-/// Both rewrite `AINCIENT_IMAGE`, and neither can be reached by changing a default:
-/// the value was baked into `.env` at install time and nothing re-reads it. So this
+/// None of them can be reached by changing a default: the image names were baked
+/// into `.env` and `compose.yaml` at install time and nothing re-reads them. So this
 /// is the only path by which those installs are ever corrected, which is why it sits
 /// on install and upgrade rather than behind a flag.
 ///
@@ -915,6 +915,18 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
                  longer answers, which is why checking for updates had been failing.",
             ),
             Some(0.07),
+        );
+    }
+    // Same kind of repair: a web server line nginx no longer fixes is nobody's
+    // choice, and it changes no Atelier version, so no snapshot and no question.
+    // The `pull` + `up` that follow fetch it and recreate `edge`.
+    if let Some((from, to)) = stack.migrate_edge_image()? {
+        r.stage(
+            Stage::Scaffold,
+            &format!(
+                "Moving the web server in front of your site to {to}. It was on {from},                  an nginx line that no longer receives security fixes (ATELIER-SA-2026-002).",
+            ),
+            Some(0.075),
         );
     }
     if !stack.pending_default_channel_migration() {
