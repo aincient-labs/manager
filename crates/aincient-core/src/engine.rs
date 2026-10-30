@@ -55,6 +55,12 @@ pub const IMAGE_ENV: &str = "ATELIER_ENGINE_IMAGE";
 /// `X-Forwarded-For` edge believes (m7-4): IPs or CIDRs, separated by commas
 /// or spaces. The owner's key: unset or empty trusts nobody, so the client is
 /// the TCP peer. Edge then hands the engine that one address as `X-Real-IP`.
+/// List only addresses no untrusted client can arrive as: a proxy on the
+/// host's network reaching edge's published port arrives as the Docker
+/// network's gateway, and so does every other connection to that port that
+/// goes through docker-proxy (IPv6 clients, host processes). Trusting the
+/// gateway is safe only while the port is closed to the outside on IPv4 and
+/// IPv6 (the m7-e3 run found it open over IPv6).
 pub const TRUSTED_PROXIES_ENV: &str = "ATELIER_TRUSTED_PROXIES";
 /// The engine refuses to start unless this is `1` (m7-2). Only
 /// [`ENGINE_COMPOSE_TEMPLATE`] sets it, so a copied compose file that drops the

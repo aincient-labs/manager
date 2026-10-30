@@ -1,7 +1,8 @@
 # The Atelier engine sidecar: EXPERIMENTAL, opt-in only (DECISIONS 0483).
 # Built locally by engine/build.sh as atelier-engine:dev and never pushed;
-# slice C pins the shipped image by digest (plan m7-4). Context: the manager
-# repo root. Base images are pinned by digest (tag kept for the reader).
+# `atelier engine enable` pins the stack to this build's image ID, never the
+# tag (ATELIER_ENGINE_IMAGE in .env, plan m7-4). Context: the manager repo
+# root. Base images are pinned by digest (tag kept for the reader).
 FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
