@@ -4,7 +4,13 @@
 # (`atelier --site <slug> engine enable --experimental`). Each check prints
 # PASS or FAIL with what it saw; the exit status is the number of failures.
 #
-#   engine/attack.sh <project> <port>     # e.g. atelier-engine-test 41223
+#   engine/attack.sh <project> <port> [base-url]
+#     e.g. engine/attack.sh atelier-engine-test 41223
+#          engine/attack.sh atelier 41221 https://site.example   # through its TLS proxy
+#
+# base-url defaults to http://localhost:<port>. Set EXPECT_IP to the address
+# edge should see for this machine (behind a trusted proxy: this machine's
+# public address) and section 2b checks the audit log names exactly it.
 #
 # It changes the site: it pairs, sets a wake code, rests, locks down, wakes and
 # revokes. Run it on a test site only, never one you care about. Takes a few
@@ -12,7 +18,8 @@
 set -uo pipefail
 P=${1:?compose project, e.g. atelier-engine-test}
 PORT=${2:?the site HTTP port}
-EDGE="http://localhost:$PORT"
+EDGE="${3:-http://localhost:$PORT}"
+EDGE="${EDGE%/}"
 API="$EDGE/_atelier/engine/v1"
 NET="${P}_engine"
 ENGINE="$P-engine-1"
@@ -71,6 +78,12 @@ rc=$?
 if [[ $rc -ne 0 && "$out" == *"refusing to start"* ]]; then pass "without ATELIER_ENGINE_EXPERIMENTAL=1 the engine exits: ${out%%.*}"; else fail "the engine started without the flag (exit $rc): $out"; fi
 r=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$ENGINE" | grep -c '^ATELIER_ENGINE_EXPERIMENTAL=1$')
 expect "the running engine was started with the flag" 1 "$r"
+# m7-4: the engine runs the image ID .env pins, never a mutable tag.
+cfg=$(docker inspect -f '{{.Config.Image}}' "$ENGINE")
+img=$(docker inspect -f '{{.Image}}' "$ENGINE")
+stackdir=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$ENGINE" | sed -n 's/^ATELIER_STACK_DIR=//p')
+pin=$(sed -n 's/^ATELIER_ENGINE_IMAGE=//p' "$stackdir/.env" 2>/dev/null)
+if [[ "$cfg" =~ ^sha256:[0-9a-f]{64}$ && "$cfg" == "$img" && "$cfg" == "$pin" ]]; then pass "the engine runs its pinned image ID ($cfg)"; else fail "image: config $cfg, running $img, .env pin ${pin:-none}"; fi
 
 # A known start: no pairings, unlocked, wake not paused, awake.
 docker restart "$ENGINE" >/dev/null
@@ -134,6 +147,17 @@ done
 expect "DELETE audit (nothing truncates the log)" 405 "$(code -X DELETE "$API/audit")"
 expect "outside v1 is 404 at edge" 404 "$(code "$EDGE/_atelier/engine/status")"
 expect "another API version is 404" 404 "$(code "$EDGE/_atelier/engine/v2/status")"
+
+section "2b. Client address (m7-4): a client can't choose the address it is audited and limited by"
+spoof_name="spoof-check-$$"
+r=$(code -X POST -H 'X-Forwarded-For: 203.0.113.66' -H 'X-Real-IP: 203.0.113.67' -d "{\"name\":\"$spoof_name\"}" "$API/pair/request")
+expect "a pairing request with spoofed X-Forwarded-For and X-Real-IP" 201 "$r"
+seen=$(docker exec "$ENGINE" grep "$spoof_name" /state/audit.log | tail -1)
+seen_ip=$(echo "$seen" | sed -n 's/.*"ip":"\([^"]*\)".*/\1/p')
+if [[ -n "$seen_ip" && "$seen_ip" != 203.0.113.6[67] ]]; then pass "the audit log names $seen_ip, not the spoofed address"; else fail "audit: $seen"; fi
+if [[ -n "${EXPECT_IP:-}" ]]; then expect "the audited address is this client's own" "$EXPECT_IP" "$seen_ip"; fi
+r=$(docker exec "$EDGE_C" sh -c 'grep -c "set_real_ip_from" /etc/nginx/conf.d/default.conf')
+pass "edge believes X-Forwarded-For from ${r:-0} listed proxies (ATELIER_TRUSTED_PROXIES), nobody else"
 
 section "3. Edge path tricks (decoded, slash-merged, dot-resolved before matching)"
 for p in "//_atelier/engine/v1/status" "/_atelier//engine/v1/status" \

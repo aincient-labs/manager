@@ -655,11 +655,12 @@ fn run() -> Result<()> {
         return update_all(yes);
     }
 
-    // Inside the engine container there is no site to locate.
+    // Inside the engine container there is no site to locate; `engine probe`
+    // names its site by URL.
     #[cfg(unix)]
     let cli = match cli.command {
-        Command::Engine { command } if engine::is_in_container(&command) => {
-            return engine::run_in_container(command);
+        Command::Engine { command } if engine::needs_no_site(&command) => {
+            return engine::run_without_site(command);
         }
         command => Cli { command, ..cli },
     };
@@ -2238,6 +2239,9 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                         "engine serve/admin",
                         "runs inside the engine container",
                     ))
+                }
+                engine::EngineCommand::Probe { .. } => {
+                    unreachable!("probe names its site by URL: no site lookup")
                 }
             }
         }

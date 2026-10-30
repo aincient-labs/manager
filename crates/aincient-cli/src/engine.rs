@@ -5,6 +5,10 @@
 //!   `aincient-engine` crate).
 //! - `enable`, `disable`: on the host, for a local stack: write or remove the
 //!   opt-in files ([`aincient_core::engine`]) and apply them with compose.
+//! - `probe <domain>`: the Manager's engine client against a site's URL,
+//!   read-only (`version`, or with `--ask` an anonymous pairing request):
+//!   shows the floor the client keeps (https only, no redirects, the API
+//!   major) on a real server before pairing is in the Manager (M4).
 //! - `remove`: the Manager's one action that takes the engine off and puts
 //!   today's stack back (m3-6, C-09): wake, disable, `up --remove-orphans`,
 //!   verify ([`aincient_core::engine_admin::remove`]). For a remote site the
@@ -13,12 +17,12 @@
 //! Every subcommand that changes the stack takes `--experimental` (m7-3), so
 //! no one adds or takes away the root-holding sidecar by a stray command.
 
-use aincient_core::docker::{compose, docker, run_capture, run_inherited};
+use aincient_core::docker::{compose, run_inherited};
 use aincient_core::engine::{self as optin, ENGINE_IMAGE};
 use aincient_core::engine_admin::{self, LocalRemove};
 use aincient_core::{ChangeGuard, Stack};
 use aincient_engine::admin::AdminCommand;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -47,6 +51,18 @@ pub enum EngineCommand {
         /// Say you mean to change the experimental engine.
         #[arg(long)]
         experimental: bool,
+    },
+    /// Call a site's engine with the Manager's client: `GET version` and the
+    /// API-major check, or with --ask an anonymous pairing request. Changes
+    /// nothing on this computer. The client refuses plain http:// unless
+    /// the host is loopback.
+    Probe {
+        /// The site: a host name, https://host[:port], or loopback http://.
+        domain: String,
+        /// Ask to be paired under this name (POST pair/request): the engine
+        /// answers a code to show and a handle, never a key.
+        #[arg(long)]
+        ask: Option<String>,
     },
     /// Take the engine off this site and put today's stack back: wake a
     /// resting site, disable, restart, check edge, app and db run. Refused
@@ -93,24 +109,26 @@ pub const REMOVE_QUESTION: &str = "Remove the engine from {site}?";
 pub const REMOVE_DETAIL: &str = "The engine is taken off and the stack restarted as edge, app \
      and db (a resting site is woken first). Paired Managers stop working; its volumes are kept.";
 
-/// Whether the command runs inside the container, before any site lookup.
-pub fn is_in_container(cmd: &EngineCommand) -> bool {
+/// Whether the command runs without a site lookup: inside the container, or
+/// `probe`, which names its site by URL.
+pub fn needs_no_site(cmd: &EngineCommand) -> bool {
     matches!(
         cmd,
-        EngineCommand::Serve { .. } | EngineCommand::Admin { .. }
+        EngineCommand::Serve { .. } | EngineCommand::Admin { .. } | EngineCommand::Probe { .. }
     )
 }
 
-pub fn run_in_container(cmd: EngineCommand) -> Result<()> {
+pub fn run_without_site(cmd: EngineCommand) -> Result<()> {
     match cmd {
         EngineCommand::Serve { listen } => {
             aincient_engine::serve(&listen, |k| std::env::var(k).ok())
         }
         EngineCommand::Admin { command } => aincient_engine::admin(command),
+        EngineCommand::Probe { domain, ask } => probe(&domain, ask.as_deref()),
         EngineCommand::Enable { .. }
         | EngineCommand::Disable { .. }
         | EngineCommand::Remove { .. } => {
-            unreachable!("host commands go through run_on_host")
+            unreachable!("site commands go through run_on_host")
         }
     }
 }
@@ -139,8 +157,8 @@ pub fn run_on_host(cmd: EngineCommand, stack: &Stack, confirm: Confirm) -> Resul
             engine_admin::remove(&mut LocalRemove::new(stack), &mut |line| println!("{line}"))?;
             Ok(())
         }
-        EngineCommand::Serve { .. } | EngineCommand::Admin { .. } => {
-            unreachable!("container commands go through run_in_container")
+        EngineCommand::Serve { .. } | EngineCommand::Admin { .. } | EngineCommand::Probe { .. } => {
+            unreachable!("these go through run_without_site")
         }
     }
 }
@@ -149,12 +167,9 @@ fn enable(stack: &Stack, experimental: bool) -> Result<()> {
     if !experimental {
         return Err(needs_experimental("enable"));
     }
-    let mut probe = docker();
-    probe.args(["image", "inspect", ENGINE_IMAGE]);
-    if run_capture(probe, "find the engine image").is_err() {
-        bail!("no {ENGINE_IMAGE} image — build it first with engine/build.sh");
-    }
-    optin::enable(stack)?;
+    let id = engine_admin::local_image_id()?;
+    optin::enable(stack, &id)?;
+    println!("Engine image pinned: {ENGINE_IMAGE} = {id}");
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
     run_inherited(c, "start the stack with the engine")?;
@@ -166,6 +181,41 @@ fn enable(stack: &Stack, experimental: bool) -> Result<()> {
         "Pair the first Manager with: docker exec {}-engine-1 atelier engine admin install-code",
         stack.project_name()
     );
+    Ok(())
+}
+
+/// `engine probe`: the Manager's client, its floor checked before anything
+/// is sent ([`EngineUrl::from_domain`], then `ensure_secure` per request).
+fn probe(domain: &str, ask: Option<&str>) -> Result<()> {
+    use aincient_core::engine_client::{Auth, EngineClient, EngineUrl, Https, Method};
+    let base = EngineUrl::from_domain(domain).map_err(|e| anyhow::anyhow!("refused: {e}"))?;
+    let client = EngineClient::new(base.clone(), Https::new());
+    let v = client
+        .ensure_compatible()
+        .map_err(|e| anyhow::anyhow!("{}: {e}", base.url("version")))?;
+    println!(
+        "{} → api {}, engine {}, experimental {}",
+        base.url("version"),
+        v.api,
+        v.engine,
+        v.experimental
+    );
+    if let Some(name) = ask {
+        let out: serde_json::Value = client
+            .call(
+                Method::Post,
+                "pair/request",
+                Auth::None,
+                Some(&serde_json::json!({ "name": name })),
+            )
+            .map_err(|e| anyhow::anyhow!("{}: {e}", base.url("pair/request")))?;
+        println!(
+            "{} → pending; show the code {} to the primary (expires in {}s)",
+            base.url("pair/request"),
+            out["code"].as_str().unwrap_or("?"),
+            out["expires_in"]
+        );
+    }
     Ok(())
 }
 
@@ -200,12 +250,13 @@ mod tests {
 
     #[test]
     fn container_commands_skip_the_site_lookup() {
-        assert!(is_in_container(&parse(&["serve"])));
-        assert!(is_in_container(&parse(&["admin", "install-code"])));
-        assert!(is_in_container(&parse(&["admin", "approve", "ABCD-EFGH"])));
-        assert!(!is_in_container(&parse(&["enable", "--experimental"])));
-        assert!(!is_in_container(&parse(&["disable", "--experimental"])));
-        assert!(!is_in_container(&parse(&["remove", "--experimental"])));
+        assert!(needs_no_site(&parse(&["serve"])));
+        assert!(needs_no_site(&parse(&["admin", "install-code"])));
+        assert!(needs_no_site(&parse(&["admin", "approve", "ABCD-EFGH"])));
+        assert!(needs_no_site(&parse(&["probe", "example.com"])));
+        assert!(!needs_no_site(&parse(&["enable", "--experimental"])));
+        assert!(!needs_no_site(&parse(&["disable", "--experimental"])));
+        assert!(!needs_no_site(&parse(&["remove", "--experimental"])));
     }
 
     #[test]
