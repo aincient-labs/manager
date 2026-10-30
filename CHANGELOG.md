@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A background update check for one site can no longer answer for another: the single-flight
   guard is now per site.
 
+## [0.12.1] - 2026-10-29
+
+### Security
+
+- **The web server in front of your site moves to nginx 1.30** (ATELIER-SA-2026-002). Every site
+  installed so far runs its `edge` web server on nginx 1.28, which no longer receives security
+  fixes. `atelier app update` now moves it to `nginx:1.30-alpine`, even when there is no new
+  Atelier version, by changing only that one line in `compose.yaml`. Your own edits to the file
+  stay. Only the web server container restarts. New installs start on 1.30.
+- **`atelier doctor` warns about an unmaintained web server** ("Web server receives security
+  fixes") and names the line it would move to.
+
 ## [0.12.0] - 2026-10-04
 
 ### Added
