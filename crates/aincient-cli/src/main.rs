@@ -13,6 +13,8 @@ use aincient_core::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(unix)]
+mod engine;
 mod style;
 
 #[derive(Parser)]
@@ -96,6 +98,13 @@ enum Command {
     /// Serve the pack developer's MCP tools over stdio (for Claude Code,
     /// Cursor, …). Needs a running dev stack (`atelier pack dev`).
     Mcp,
+    /// The engine sidecar: EXPERIMENTAL, opt-in only (DECISIONS 0483).
+    #[cfg(unix)]
+    #[command(hide = true)]
+    Engine {
+        #[command(subcommand)]
+        command: engine::EngineCommand,
+    },
 }
 
 /// The multi-site registry (`~/.atelier/sites.toml`).
@@ -628,6 +637,15 @@ fn run() -> Result<()> {
         return update_all(yes);
     }
 
+    // Inside the engine container there is no site to locate.
+    #[cfg(unix)]
+    let cli = match cli.command {
+        Command::Engine { command } if engine::is_in_container(&command) => {
+            return engine::run_in_container(command);
+        }
+        command => Cli { command, ..cli },
+    };
+
     let resolution = sites::locate(cli.site.as_deref())?;
     if let Some(site) = remote_site(&resolution) {
         return run_remote(cli.command, site);
@@ -654,6 +672,8 @@ fn run() -> Result<()> {
                 .unwrap_or(stack);
             aincient_core::mcp::serve(&stack)
         }
+        #[cfg(unix)]
+        Command::Engine { command } => engine::run_on_host(command, &stack),
     }
 }
 
@@ -2079,6 +2099,8 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                 "serves tools for a dev stack on this machine",
             ))
         }
+        #[cfg(unix)]
+        Command::Engine { .. } => return Err(on_server("engine enable")),
     })
 }
 

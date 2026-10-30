@@ -20,3 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 owo-colors.workspace = true
 clap = { version = "4", features = ["derive"] }
+
+# The engine sidecar (EXPERIMENTAL, DECISIONS 0483): `atelier engine serve`
+# runs in a Linux container only, so none of this reaches the Windows build.
+[target.'cfg(unix)'.dependencies]
+aincient-engine = { path = "../aincient-engine" }
