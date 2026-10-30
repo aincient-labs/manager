@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The registry repository every published appliance image comes from.
 pub const IMAGE_REPO: &str = "ghcr.io/aincient-labs/atelier-cms";
@@ -48,7 +48,7 @@ pub const DEFAULT_PORT: u16 = 41221;
 /// anything that isn't one of the two moving tags (a version tag, a digest, a
 /// locally-built image) is [`Pinned`](Channel::Pinned): it doesn't move on its
 /// own, so no update can arrive through it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     /// `:latest` — released versions only. The default.

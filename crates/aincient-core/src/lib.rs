@@ -15,7 +15,9 @@ pub mod doctor;
 pub mod mcp;
 pub mod ops;
 pub mod pack;
+pub mod remote;
 pub mod sites;
+pub mod ssh_key;
 pub mod stack;
 pub mod update_cache;
 

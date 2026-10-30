@@ -244,10 +244,20 @@ fn describe(cmd: &Command) -> String {
 /// keep running for as long as they need — they use [`run_streaming`],
 /// [`run_inherited`] or [`run_capture`], which have no deadline.
 pub fn output_within(cmd: &mut Command, deadline: Duration) -> Result<Output, RunError> {
+    output_within_input(cmd, deadline, Stdio::null())
+}
+
+/// [`output_within`] with `stdin` as the child's standard input — e.g. a file
+/// streamed to a remote `cat` over SSH. Same deadline, same cleanup.
+pub fn output_within_input(
+    cmd: &mut Command,
+    deadline: Duration,
+    stdin: Stdio,
+) -> Result<Output, RunError> {
     let started = Instant::now();
     let command = describe(cmd);
     let program = cmd.get_program().to_string_lossy().into_owned();
-    cmd.stdin(Stdio::null())
+    cmd.stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]

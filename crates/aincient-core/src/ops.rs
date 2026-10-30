@@ -94,7 +94,10 @@ pub struct Silent;
 impl Reporter for Silent {}
 
 /// A snapshot of the appliance's current state.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` because a remote site's status is the server's own
+/// `atelier app status --json`, read back over SSH (M2, D-01).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     /// Has a stack been laid down (`compose.yaml` present)?
     pub installed: bool,

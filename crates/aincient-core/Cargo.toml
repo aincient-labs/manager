@@ -14,6 +14,21 @@ serde.workspace = true
 serde_json.workspace = true
 dirs = "5"
 getrandom = "0.2"
+# Verifies a downloaded remote engine against its release `.sha256` (M2).
+sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # sites.toml — the multi-site registry (DECISIONS 0393). Already in the lock via Tauri.
 toml = "0.9"
+
+# Guided per-server SSH keys live in the OS keychain, never on disk (M2, D-05).
+# keyring 3.x: 4.x needs rustc 1.88, above our MSRV. On Linux the pure-Rust zbus
+# Secret Service backend, so the binary (which is also the server-side engine)
+# never links libdbus.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
