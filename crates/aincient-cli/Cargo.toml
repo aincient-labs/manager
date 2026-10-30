@@ -14,7 +14,7 @@ name = "atelier"
 path = "src/main.rs"
 
 [dependencies]
-aincient-core = { path = "../aincient-core" }
+aincient-core = { path = "../aincient-core", features = ["engine-client"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -31,6 +31,11 @@ use crate::stack::{Stack, EDGE_CONF_TEMPLATE};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
+/// The engine API major this Manager speaks (m3-3, C-08). The engine's own
+/// `API_MAJOR` (`aincient-engine`) is tested equal to it, so a major bump on
+/// one side can't ship without the other.
+pub const CLIENT_API_MAJOR: u32 = 1;
+
 /// The opt-in compose file, merged over `compose.yaml` through `COMPOSE_FILE`.
 pub const ENGINE_COMPOSE_FILE: &str = "compose.engine.yaml";
 /// The edge config used instead of `edge.conf` while the engine is on.

@@ -198,13 +198,13 @@ pub fn authorize_command(public_line: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
     #[derive(Default)]
-    struct Memory(RefCell<HashMap<String, String>>);
+    pub(crate) struct Memory(RefCell<HashMap<String, String>>);
     impl SecretStore for Memory {
         fn get(&self, account: &str) -> Result<Option<String>> {
             Ok(self.0.borrow().get(account).cloned())

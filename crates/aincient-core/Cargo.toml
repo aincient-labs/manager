@@ -19,6 +19,15 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # sites.toml — the multi-site registry (DECISIONS 0393). Already in the lock via Tauri.
 toml = "0.9"
+# The Manager's HTTPS client for the engine sidecar's API (m3-3, m7-4): small,
+# blocking, rustls with the webpki roots (no "accept invalid certs" knob is
+# ever set). Optional, so the engine server crate never links it; the CLI and
+# the GUI turn it on. ~3.2: 3.3+ needs rustc 1.85, above our MSRV.
+ureq = { version = "~3.2", default-features = false, features = ["rustls"], optional = true }
+
+[features]
+# The engine client's real HTTPS transport (`engine_client::Https`).
+engine-client = ["dep:ureq"]
 
 # Guided per-server SSH keys live in the OS keychain, never on disk (M2, D-05).
 # keyring 3.x: 4.x needs rustc 1.88, above our MSRV. On Linux the pure-Rust zbus
