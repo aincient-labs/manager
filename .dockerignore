@@ -1,0 +1,4 @@
+# engine/build.sh sends the repo root as context: keep it small.
+/target
+/.git
+/app/gen
