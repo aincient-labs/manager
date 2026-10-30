@@ -1,0 +1,28 @@
+[package]
+name = "aincient-engine"
+description = "The Atelier engine sidecar: a closed HTTP API in front of the host's Docker socket. EXPERIMENTAL, opt-in only (DECISIONS 0483)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A library linked into the `atelier` binary (`atelier engine serve`); nothing
+# for cargo-dist to ship on its own.
+[package.metadata.dist]
+dist = false
+
+# The engine runs only in its Linux container; on other targets the crate is
+# empty, so none of this reaches the Windows build or the Manager GUI.
+[target.'cfg(unix)'.dependencies]
+aincient-core = { path = "../aincient-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+argon2 = "0.5"
+sha2 = "0.10"
+getrandom = "0.2"
+libc = "0.2"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aincient-core",
     "crates/aincient-cli",
+    "crates/aincient-engine",
     "app",
 ]
 
@@ -31,3 +32,10 @@ lto = "thin"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Argon2id is slow unoptimised: the engine's tests verify wake codes, so the
+# hashing crates build optimised even in dev and test profiles.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
