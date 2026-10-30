@@ -316,19 +316,29 @@ impl Engine {
         Ok(())
     }
 
-    /// The client's address: edge's `X-Real-IP` (it overwrites whatever came
-    /// in, and only edge gets this far), else the TCP peer. Anything that
-    /// isn't an address is ignored, so it can't key the per-address state.
-    /// (Behind an outer proxy this is the proxy: `real_ip`, slice C.)
-    fn client_ip(req: &Request) -> String {
-        req.header("X-Real-IP")
-            .and_then(|v| v.parse::<IpAddr>().ok())
-            .unwrap_or_else(|| req.peer.ip())
-            .to_string()
+    /// The client's address, which keys every per-address cap and goes in
+    /// the audit log (m7-4). Edge's `X-Real-IP` is its `$remote_addr`: the TCP
+    /// peer, or behind a listed TLS proxy the address that proxy forwarded
+    /// (`set_real_ip_from`, [`aincient_core::engine::edge_conf`]). The header
+    /// is believed only when the peer is edge and it is one well-formed
+    /// address, sent once; otherwise the peer is the client. Edge overwrites
+    /// whatever a client sent under that name, so nothing past edge can pick
+    /// its own address.
+    pub fn client_ip(&self, req: &Request) -> String {
+        let mut sent = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("X-Real-IP"))
+            .map(|(_, v)| v.parse::<IpAddr>().ok());
+        let forwarded = match (sent.next(), sent.next()) {
+            (Some(Some(ip)), None) if self.is_edge(&req.peer) => Some(ip),
+            _ => None,
+        };
+        forwarded.unwrap_or_else(|| req.peer.ip()).to_string()
     }
 
     pub fn handle(self: &Arc<Self>, req: Request) -> Reply {
-        let ip = Self::client_ip(&req);
+        let ip = self.client_ip(&req);
         let route = route(&req.method, &req.url);
         let form = req
             .header("Content-Type")

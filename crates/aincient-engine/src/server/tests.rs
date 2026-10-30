@@ -69,6 +69,8 @@ struct T {
 }
 
 const OWNER_IP: &str = "192.0.2.10";
+/// Edge's address in these tests: the peer of every request [`T::req`] sends.
+const EDGE_IP_PORT: &str = "172.20.0.3:80";
 
 fn engine() -> T {
     let d = TempDir::new();
@@ -82,7 +84,7 @@ fn engine() -> T {
         store,
         inbox,
         Box::new(Shared(Arc::clone(&fake))),
-        "127.0.0.1:80",
+        EDGE_IP_PORT,
     )
     .unwrap();
     T {
@@ -254,7 +256,7 @@ fn edge_names_exactly_the_engine_routes() {
     let mut ours = PATHS.to_vec();
     ours.sort();
     assert_eq!(edge, ours);
-    let conf = aincient_core::engine::edge_conf();
+    let conf = aincient_core::engine::edge_conf(&["172.18.0.1".into()]);
     for p in PATHS {
         let concrete = p.replace("[0-9a-z]{12}", "abcdefghjkmn");
         assert!(
@@ -967,7 +969,7 @@ fn a_junk_real_ip_header_falls_back_to_the_peer() {
 #[test]
 fn only_edge_may_connect() {
     let t = engine();
-    assert!(t.e.is_edge(&"127.0.0.1:4000".parse().unwrap()));
+    assert!(t.e.is_edge(&"172.20.0.3:4000".parse().unwrap()));
     assert!(!t.e.is_edge(&"10.0.0.9:4000".parse().unwrap()));
 
     // Over a real socket: an engine whose edge is elsewhere closes us unread.
@@ -991,7 +993,16 @@ fn only_edge_may_connect() {
     );
 
     // And one whose edge is us answers.
-    let near = Arc::clone(&t.e);
+    let d2 = TempDir::new();
+    let near = Arc::new(
+        Engine::new(
+            Store::at(d2.0.join("s")).unwrap(),
+            Inbox::at(d2.0.join("i"), d2.0.join("o")),
+            Box::new(Shared(Arc::new(Fake::default()))),
+            "127.0.0.1:80",
+        )
+        .unwrap(),
+    );
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     thread::spawn(move || near.serve(l));
@@ -1013,4 +1024,68 @@ fn internal_errors_reach_the_audit_log_not_the_client() {
     // Unreadable state counts as locked down: a verb is refused, not run.
     assert_eq!(t.call("POST", "/v1/freeze", Some(&owner), "").0, 409);
     assert!(t.fake.calls().is_empty());
+}
+
+/// A request as it reaches the engine from `peer`, with `headers`.
+fn from_peer(peer: &str, headers: &[(&str, &str)]) -> Request {
+    Request {
+        method: "POST".into(),
+        url: "/v1/pair/request".into(),
+        headers: headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        body: br#"{"name":"x"}"#.to_vec(),
+        peer: peer.parse().unwrap(),
+    }
+}
+
+/// m7-4: only edge says who the client is. A spoofed `X-Real-IP` from any
+/// other peer, a repeated one, or an `X-Forwarded-For` the engine never reads
+/// leaves the TCP peer as the client: in the caps and in the audit log.
+#[test]
+fn a_forwarded_address_counts_only_from_edge() {
+    let t = engine();
+    let e = &t.e;
+    let edge = "172.20.0.3:5000";
+    let other = "172.20.0.9:5000";
+    assert_eq!(
+        e.client_ip(&from_peer(edge, &[("X-Real-IP", "203.0.113.7")])),
+        "203.0.113.7"
+    );
+    assert_eq!(
+        e.client_ip(&from_peer(other, &[("X-Real-IP", "203.0.113.7")])),
+        "172.20.0.9"
+    );
+    assert_eq!(
+        e.client_ip(&from_peer(
+            edge,
+            &[("X-Real-IP", "203.0.113.7"), ("x-real-ip", "198.51.100.1")]
+        )),
+        "172.20.0.3",
+        "two answers are none"
+    );
+    assert_eq!(
+        e.client_ip(&from_peer(edge, &[("X-Forwarded-For", "203.0.113.7")])),
+        "172.20.0.3",
+        "the engine reads no X-Forwarded-For: edge resolves it"
+    );
+    assert_eq!(
+        e.client_ip(&from_peer(edge, &[("X-Real-IP", "203.0.113.7, 10.0.0.1")])),
+        "172.20.0.3"
+    );
+
+    // Through handle: a peer that isn't edge can't spread its requests over
+    // made-up addresses to escape the per-address cap, and the audit log
+    // names the peer, never the spoofed address.
+    for i in 0..state::REQUESTS_PER_IP {
+        let spoof = format!("198.51.100.{i}");
+        let r = e.handle(from_peer(other, &[("X-Real-IP", &spoof)]));
+        assert_eq!(r.status, 201);
+    }
+    let r = e.handle(from_peer(other, &[("X-Real-IP", "198.51.100.200")]));
+    assert_eq!(r.status, 429, "all counted against the peer");
+    let log = t.audit_text();
+    assert!(log.contains("172.20.0.9"), "{log}");
+    assert!(!log.contains("198.51.100."), "{log}");
 }
