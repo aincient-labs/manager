@@ -254,11 +254,26 @@ pub fn output_within_input(
     deadline: Duration,
     stdin: Stdio,
 ) -> Result<Output, RunError> {
+    output_within_io(cmd, deadline, stdin, None)
+}
+
+/// [`output_within_input`] with the child's stdout written straight into
+/// `stdout_to` (the returned `stdout` is then empty) — e.g. a large file
+/// streamed from a remote `cat` over SSH without holding it in memory.
+pub fn output_within_io(
+    cmd: &mut Command,
+    deadline: Duration,
+    stdin: Stdio,
+    stdout_to: Option<std::fs::File>,
+) -> Result<Output, RunError> {
     let started = Instant::now();
     let command = describe(cmd);
     let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.stdin(stdin)
-        .stdout(Stdio::piped())
+        .stdout(match stdout_to {
+            Some(file) => Stdio::from(file),
+            None => Stdio::piped(),
+        })
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {

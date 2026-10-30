@@ -27,9 +27,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::docker::{output_within, output_within_input, stream_lines_within, Pipe, RunError};
+use crate::docker::{
+    output_within, output_within_input, output_within_io, stream_lines_within, Pipe, RunError,
+};
 use crate::doctor::{Check, HostTier, Report, Severity, Tier};
-use crate::ops::{ExportOptions, FreezeOptions, SnapshotList, Status, UpdateCheck};
+use crate::ops::{
+    check_identity, sha256_file, snapshot_manifest, BackupInfo, ExportOptions, FreezeOptions,
+    IdentityCheck, SnapshotList, Status, UpdateCheck,
+};
 use crate::sites::{KeyMode, Remote, Site};
 use crate::ssh_key::{self, KeyFile, SecretStore};
 
@@ -88,6 +93,16 @@ pub trait Transport {
         deadline: Duration,
         sink: &mut dyn FnMut(Pipe, &str),
     ) -> std::result::Result<ExitStatus, RunError>;
+
+    /// Run `script` with stdin closed and its stdout written into the local
+    /// file `dest` (created or truncated) — a server file streamed home
+    /// without being held in memory. The returned `stdout` is empty.
+    fn download(
+        &self,
+        script: &str,
+        dest: &Path,
+        deadline: Duration,
+    ) -> std::result::Result<Output, RunError>;
 }
 
 /// The real transport: the system `ssh`.
@@ -233,6 +248,38 @@ impl Transport for Ssh {
         self.start_master();
         stream_lines_within(&mut self.command(script), deadline, sink)
     }
+
+    fn download(
+        &self,
+        script: &str,
+        dest: &Path,
+        deadline: Duration,
+    ) -> std::result::Result<Output, RunError> {
+        self.start_master();
+        let file = create_private(dest).map_err(|source| RunError::Io {
+            program: dest.display().to_string(),
+            source,
+        })?;
+        output_within_io(
+            &mut self.command(script),
+            deadline,
+            Stdio::null(),
+            Some(file),
+        )
+    }
+}
+
+/// Create (or truncate) `path` readable by its owner only: a backup is the
+/// whole site's database.
+fn create_private(path: &Path) -> std::io::Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 /// `~/.atelier/ssh/%C`: the multiplexing socket, in a 0700 directory. `None`
@@ -427,12 +474,13 @@ pub enum Action {
     Start,
     /// `app stop`.
     Stop,
-    /// `data backup [--label L]` — the backup stays on the server (m2-5 moves it).
-    Backup { label: Option<String> },
+    /// `data backup [--label L] [--json]` — see [`Session::backup`].
+    Backup { label: Option<String>, json: bool },
     /// `data list` — the server's backups.
     BackupList,
-    /// `data restore <FILE> --yes`, FILE being a path on the server.
-    Restore { file: String },
+    /// `data restore --yes [--other-site] -- <FILE>`, FILE being a path on the
+    /// server (an uploaded one: [`Session::restore_upload`]).
+    Restore { file: String, other_site: bool },
     /// `site export …` — written on the server.
     Export(ExportOptions),
     /// `site freeze …`.
@@ -488,10 +536,19 @@ impl Action {
                     v.push("--yes".into());
                 }
             }
-            Action::Backup { label } => opt("--label", label),
-            Action::Restore { file } => {
+            Action::Backup { label, json } => {
+                opt("--label", label);
+                if *json {
+                    v.push("--json".into());
+                }
+            }
+            Action::Restore { file, other_site } => {
+                v.push("--yes".into());
+                if *other_site {
+                    v.push("--other-site".into());
+                }
                 // `--` so a file named like a flag stays a file.
-                v.extend(["--yes".into(), "--".into(), file.clone()]);
+                v.extend(["--".into(), file.clone()]);
             }
             Action::Export(o) => {
                 opt(
@@ -855,6 +912,620 @@ impl<T: Transport> Session<T> {
             );
         }
         Ok(st)
+    }
+}
+
+/// What [`Session::backup`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBackup {
+    /// The archive as the server reports it (path on the server).
+    pub server: BackupInfo,
+    /// The verified copy on this machine; `None` when asked to keep it
+    /// server-only.
+    pub local: Option<PathBuf>,
+}
+
+/// Prints `<sha256 hex> <size>` for the file in `$p` (set before it), with
+/// whichever of `sha256sum` / `shasum` the server has.
+const DIGEST_SCRIPT: &str = r#"[ -f "$p" ] || { echo "no such file: $p" >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum < "$p"); else s=$(shasum -a 256 < "$p"); fi || exit 1
+printf '%s %s\n' "${s%% *}" "$(wc -c < "$p" | tr -d ' ')""#;
+
+/// Parse [`DIGEST_SCRIPT`]'s answer.
+fn parse_digest(stdout: &str) -> Option<(String, u64)> {
+    let mut words = stdout.split_whitespace();
+    let sha = words.next()?.to_ascii_lowercase();
+    let size = words.next()?.parse().ok()?;
+    (sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some((sha, size))
+}
+
+/// A file name safe to create locally or on the server: only
+/// `[A-Za-z0-9._-]`, never starting with `.`, extension kept.
+fn safe_file_name(name: &str) -> Option<String> {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim_start_matches('.').to_string();
+    (!clean.is_empty() && clean.len() <= 200).then_some(clean)
+}
+
+impl<T: Transport> Session<T> {
+    /// SHA-256 and size of a file on the server, computed there.
+    pub fn remote_digest(&self, path: &str) -> Result<(String, u64)> {
+        let script = format!("p={}\n{DIGEST_SCRIPT}", sh_quote(path));
+        let out = checked(
+            &self.transport,
+            "checking the archive on the server",
+            self.transport.exec(&script, None, DATA_DEADLINE),
+        )?;
+        parse_digest(&String::from_utf8_lossy(&out.stdout)).with_context(|| {
+            format!(
+                "{} didn't report a SHA-256 for {path}",
+                self.transport.target()
+            )
+        })
+    }
+
+    /// `data backup` on the server (m2-5, D-03), then — unless `home` is
+    /// `None` — a verified copy into `home` on this machine. The server's
+    /// progress goes to `sink`; its `--json` answer says which archive it
+    /// wrote. A server whose CLI has no `data backup --json` is asked without
+    /// it and the path read from its "Backup written to" line.
+    pub fn backup(
+        &self,
+        label: Option<String>,
+        home: Option<&Path>,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> Result<RemoteBackup> {
+        let server = self.backup_on_server(label, sink)?;
+        let local = match home {
+            Some(dir) => Some(fetch_backup(&self.transport, &server, dir)?),
+            None => None,
+        };
+        Ok(RemoteBackup { server, local })
+    }
+
+    fn backup_on_server(
+        &self,
+        label: Option<String>,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> Result<BackupInfo> {
+        let host = self.transport.target().to_string();
+        let mut stdout = String::new();
+        let mut no_json_flag = false;
+        let action = Action::Backup {
+            label: label.clone(),
+            json: true,
+        };
+        let result = self.run_action(&action, &mut |pipe, line| match pipe {
+            Pipe::Stdout => {
+                stdout.push_str(line);
+                stdout.push('\n');
+            }
+            Pipe::Stderr => {
+                if line.contains("--json") && line.contains("unexpected argument") {
+                    no_json_flag = true;
+                }
+                sink(pipe, line)
+            }
+        });
+        match result {
+            Ok(()) => {
+                return serde_json::from_str(&stdout).with_context(|| {
+                    format!(
+                    "{host} answered `data backup --json` with something the Manager can't read"
+                )
+                })
+            }
+            Err(e)
+                if no_json_flag && e.downcast_ref::<RemoteExit>().is_some_and(|x| x.code == 2) => {}
+            Err(e) => return Err(e),
+        }
+        // An engine from before `--json`: the human line names the archive.
+        let mut path = None;
+        self.run_action(&Action::Backup { label, json: false }, &mut |pipe, line| {
+            let plain = strip_ansi(line);
+            if let Some(rest) = plain.trim().strip_prefix("Backup written to ") {
+                path = Some(rest.trim().to_string());
+            }
+            sink(pipe, line)
+        })?;
+        let path = path.with_context(|| {
+            format!("{host} made a backup but didn't say where — find it with `atelier --site <SLUG> data list` there")
+        })?;
+        let (sha256, size) = self.remote_digest(&path)?;
+        Ok(BackupInfo {
+            name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+            path,
+            size,
+            sha256,
+            site_id: None,
+            site_name: None,
+        })
+    }
+
+    /// Whether the local archive `file` may be restored onto this site
+    /// (m2-6, D-04): its manifest against the server's own `site_id`. Run
+    /// before the upload, so another site's archive is refused without
+    /// moving a byte; the server's restore checks again.
+    pub fn check_restore_identity(&self, file: &Path, other_site: bool) -> Result<IdentityCheck> {
+        let st = self.status()?;
+        check_identity(
+            snapshot_manifest(file).as_ref(),
+            st.site_id.as_deref(),
+            &format!("site `{}` on {}", self.remote_slug, self.transport.target()),
+            other_site,
+        )
+    }
+
+    /// Restore the local archive `file` onto this site: upload it to a private
+    /// temp dir on the server (`umask 077`, `mktemp -d`), check its SHA-256
+    /// there, run the server's `data restore` on it (with `--other-site` when
+    /// asked), and remove the temp dir whatever happened.
+    pub fn restore_upload(
+        &self,
+        file: &Path,
+        other_site: bool,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> Result<()> {
+        let host = self.transport.target().to_string();
+        let original = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let name = safe_file_name(&original).unwrap_or_else(|| "backup.tar.gz".to_string());
+        let (size, sha256) = sha256_file(file)?;
+        let upload = format!(
+            "umask 077\nd=$(mktemp -d \"${{TMPDIR:-/tmp}}/atelier-restore.XXXXXX\") || exit 1\n\
+             cat > \"$d\"/{name} || {{ rm -rf \"$d\"; exit 1; }}\n\
+             printf '%s\\n' \"$d\"",
+            name = sh_quote(&name)
+        );
+        let out = checked(
+            &self.transport,
+            "uploading the backup",
+            self.transport.exec(&upload, Some(file), DATA_DEADLINE),
+        )?;
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !dir.starts_with('/') || dir.contains('\n') {
+            bail!("{host} didn't say where it put the uploaded backup");
+        }
+        let remote_file = format!("{dir}/{name}");
+        let outcome = (|| {
+            let (theirs, their_size) = self.remote_digest(&remote_file)?;
+            if theirs != sha256 || their_size != size {
+                bail!(
+                    "the upload to {host} arrived damaged ({their_size} bytes, sha256 {theirs}; \
+                     sent {size} bytes, sha256 {sha256}) — nothing was restored"
+                );
+            }
+            self.run_action(
+                &Action::Restore {
+                    file: remote_file.clone(),
+                    other_site,
+                },
+                sink,
+            )
+        })();
+        let _ = self.transport.exec(
+            &format!("rm -rf -- {}", sh_quote(&dir)),
+            None,
+            PROBE_DEADLINE,
+        );
+        outcome
+    }
+}
+
+/// Copy the server's archive `info` into `dir` on this machine: stream it
+/// with `cat` into a temp name, check its size and SHA-256 against what the
+/// server computed, then rename it into place. On any failure the temp file
+/// is removed and nothing named like a backup is left behind.
+pub fn fetch_backup<T: Transport>(transport: &T, info: &BackupInfo, dir: &Path) -> Result<PathBuf> {
+    let host = transport.target();
+    let name = info
+        .path
+        .rsplit('/')
+        .next()
+        .and_then(safe_file_name)
+        .with_context(|| {
+            format!(
+                "{host} named its backup `{}`, not a usable file name",
+                info.path
+            )
+        })?;
+    create_private_dir(dir)?;
+    let dest = dir.join(&name);
+    let tmp = dir.join(format!(".{name}.part-{}", std::process::id()));
+    let result = (|| {
+        let out = transport
+            .download(
+                &format!("cat -- {}", sh_quote(&info.path)),
+                &tmp,
+                DATA_DEADLINE,
+            )
+            .map_err(|e| anyhow!("copying the backup from {host}: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "copying the backup from {host} failed: {}",
+                err.lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or("no message")
+                    .trim()
+            );
+        }
+        // Owner-only whatever the transport created it with: it is the
+        // site's whole database.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("could not make {} private", tmp.display()))?;
+        }
+        let (size, sha) = sha256_file(&tmp)?;
+        if size != info.size || sha != info.sha256.to_ascii_lowercase() {
+            bail!(
+                "the copy from {host} doesn't match the server's archive ({size} bytes, sha256 \
+                 {sha}; the server has {} bytes, sha256 {}) — not kept. The backup is still on \
+                 {host}: {}",
+                info.size,
+                info.sha256,
+                info.path
+            );
+        }
+        std::fs::rename(&tmp, &dest)
+            .with_context(|| format!("could not move the copy into {}", dest.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map(|()| dest)
+}
+
+/// `dir` and its parents, `dir` itself private to the owner.
+fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("could not make {} private", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// `line` without ANSI colour escapes.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Where a remote site's backups are kept on this machine:
+/// `~/.atelier/remote/<slug>/backups` (D-03).
+pub fn local_backups_dir(site: &Site) -> PathBuf {
+    site.stack().backups_dir()
+}
+
+// --- Open console (m2-4, D-02) ----------------------------------------------
+
+/// How the console of a remote site is reached from this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleRoute {
+    /// The domain recorded for the site: open these directly.
+    Domain {
+        console_url: String,
+        site_url: String,
+    },
+    /// No domain: an SSH tunnel from a local port in
+    /// [`crate::sites::TUNNEL_PORTS`] to the appliance's port on the server.
+    Tunnel {
+        /// The appliance's published port on the server (from its status).
+        server_port: u16,
+        /// The console's path, as the server's own console URL has it.
+        console_path: String,
+    },
+}
+
+/// Split `scheme://authority/path` into (`scheme://authority`, `/path`).
+fn split_url(url: &str) -> Option<(&str, &str)> {
+    let after = url.find("://")? + 3;
+    match url[after..].find('/') {
+        Some(i) => Some((&url[..after + i], &url[after + i..])),
+        None => Some((url, "")),
+    }
+}
+
+/// The port in an `http(s)://host[:port]` authority (80/443 by scheme).
+fn port_of(base: &str) -> Option<u16> {
+    let (scheme, authority) = base.split_once("://")?;
+    let host_port = authority.rsplit('@').next()?;
+    match host_port.rsplit_once(':') {
+        Some((_, port)) if !port.contains(']') => port.parse().ok(),
+        _ => match scheme {
+            "http" => Some(80),
+            "https" => Some(443),
+            _ => None,
+        },
+    }
+}
+
+/// A recorded domain as a URL base: `https://` unless it names a scheme.
+pub fn domain_base(domain: &str) -> String {
+    let d = domain.trim().trim_end_matches('/');
+    if d.starts_with("http://") || d.starts_with("https://") {
+        d.to_string()
+    } else {
+        format!("https://{d}")
+    }
+}
+
+/// Decide how to reach a remote site's console. The PATH always comes from
+/// the server's own status (the same `Stack::console_url` derivation a local
+/// site uses), so nothing here hardcodes `/atelier`; only the origin changes.
+pub fn console_route(remote: &Remote, status: &Status) -> Result<ConsoleRoute> {
+    let (server_base, console_path) = split_url(&status.console_url).with_context(|| {
+        format!(
+            "{} reported a console URL the Manager can't read: `{}`",
+            remote.host, status.console_url
+        )
+    })?;
+    let site_path = split_url(&status.site_url).map(|(_, p)| p).unwrap_or("");
+    if let Some(domain) = &remote.domain {
+        let base = domain_base(domain);
+        return Ok(ConsoleRoute::Domain {
+            console_url: format!("{base}{console_path}"),
+            site_url: format!("{base}{site_path}"),
+        });
+    }
+    let server_port = port_of(server_base).with_context(|| {
+        format!(
+            "{} reported a console URL without a port: `{}`",
+            remote.host, status.console_url
+        )
+    })?;
+    Ok(ConsoleRoute::Tunnel {
+        server_port,
+        console_path: console_path.to_string(),
+    })
+}
+
+/// The server's status as this machine sees it: with a recorded domain, the
+/// console and site URLs on that domain; without one, both empty (only a
+/// tunnel reaches it — `app open`), never the server's own localhost URLs.
+pub fn status_for_here(remote: &Remote, mut status: Status) -> (Status, ConsoleRoute) {
+    let route = console_route(remote, &status).unwrap_or(ConsoleRoute::Tunnel {
+        server_port: 0,
+        console_path: String::new(),
+    });
+    match &route {
+        ConsoleRoute::Domain {
+            console_url,
+            site_url,
+        } => {
+            status.console_url = console_url.clone();
+            status.site_url = site_url.clone();
+        }
+        ConsoleRoute::Tunnel { .. } => {
+            status.console_url = String::new();
+            status.site_url = String::new();
+        }
+    }
+    (status, route)
+}
+
+/// How long a new tunnel may take to start listening.
+pub const TUNNEL_READY: Duration = Duration::from_secs(CONNECT_TIMEOUT_SECS + 5);
+/// How many tunnel ports to try when one is taken between probe and bind.
+const TUNNEL_ATTEMPTS: usize = 3;
+
+impl Ssh {
+    /// `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<server_port> <target>`, with
+    /// its own connection (never the shared master: a forward held by the
+    /// master would outlive this tunnel) and `ExitOnForwardFailure`, so a
+    /// port someone else took makes it exit instead of idling uselessly.
+    pub fn tunnel_command(&self, local_port: u16, server_port: u16) -> Command {
+        let mut cmd = Command::new("ssh");
+        let mut args = self.base_args();
+        // Drop the ControlPath the base args may carry.
+        if let Some(i) = args
+            .iter()
+            .position(|a| a.to_str().is_some_and(|s| s.starts_with("ControlPath=")))
+        {
+            args.drain(i - 1..=i);
+        }
+        cmd.args(args)
+            .args(["-o", "ControlPath=none"])
+            .args(["-o", "ExitOnForwardFailure=yes"])
+            .arg("-N")
+            .arg("-L")
+            .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{server_port}"))
+            .arg("--")
+            .arg(&self.target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        cmd
+    }
+}
+
+/// A running SSH tunnel to a remote console. Dropping it closes the tunnel;
+/// a front-end holds it for as long as the console should stay reachable.
+#[derive(Debug)]
+pub struct Tunnel {
+    child: std::process::Child,
+    /// The local port it listens on (127.0.0.1 only).
+    pub local_port: u16,
+    /// The console through it: `http://127.0.0.1:<port><path>`. 127.0.0.1,
+    /// not `localhost`, so its cookies stay apart from local sites'.
+    pub url: String,
+}
+
+impl Tunnel {
+    /// Block until the tunnel ends (the connection drops, or the process is
+    /// interrupted). An error carries ssh's last words.
+    pub fn wait(&mut self) -> Result<()> {
+        let status = self.child.wait().context("waiting for the ssh tunnel")?;
+        if status.success() {
+            return Ok(());
+        }
+        let mut err = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            use std::io::Read;
+            let _ = pipe.read_to_string(&mut err);
+        }
+        bail!(
+            "the tunnel closed: {}",
+            err.lines()
+                .rfind(|l| !l.trim().is_empty())
+                .unwrap_or("ssh exited")
+                .trim()
+        )
+    }
+
+    /// Whether ssh is still running.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn `cmd` and wait until something accepts on 127.0.0.1:`port`, within
+/// `ready`. `Ok(None)` when the child exited first (e.g. the port was taken
+/// after all, under `ExitOnForwardFailure`) — with its stderr — so the caller
+/// can try another port.
+pub fn spawn_until_listening(
+    mut cmd: Command,
+    port: u16,
+    url: String,
+    ready: Duration,
+) -> Result<std::result::Result<Tunnel, String>> {
+    let mut child = cmd
+        .spawn()
+        .context("couldn't run ssh — is OpenSSH installed?")?;
+    let until = Instant::now() + ready;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            let mut err = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                use std::io::Read;
+                let _ = pipe.read_to_string(&mut err);
+            }
+            return Ok(Err(err.trim().to_string()));
+        }
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+            return Ok(Ok(Tunnel {
+                child,
+                local_port: port,
+                url,
+            }));
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "the tunnel didn't start listening on 127.0.0.1:{port} within {}s",
+                ready.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Open a tunnel to `server_port` on `ssh`'s server, on the first free port of
+/// [`crate::sites::TUNNEL_PORTS`], and wait until it answers.
+pub fn open_tunnel(ssh: &Ssh, server_port: u16, console_path: &str) -> Result<Tunnel> {
+    let mut tried = Vec::new();
+    let mut last_err = String::new();
+    for _ in 0..TUNNEL_ATTEMPTS {
+        let port = crate::sites::next_tunnel_port(|p| {
+            !tried.contains(&p) && crate::sites::loopback_port_is_free(p)
+        })
+        .with_context(|| {
+            format!(
+                "every tunnel port ({}–{}) on this machine is in use",
+                crate::sites::TUNNEL_PORTS.start(),
+                crate::sites::TUNNEL_PORTS.end()
+            )
+        })?;
+        tried.push(port);
+        let url = format!("http://127.0.0.1:{port}{console_path}");
+        match spawn_until_listening(
+            ssh.tunnel_command(port, server_port),
+            port,
+            url,
+            TUNNEL_READY,
+        )? {
+            Ok(tunnel) => return Ok(tunnel),
+            Err(err) => last_err = err,
+        }
+    }
+    bail!(
+        "couldn't open an SSH tunnel to {}: {}",
+        ssh.target(),
+        if last_err.is_empty() {
+            "ssh exited"
+        } else {
+            &last_err
+        }
+    )
+}
+
+/// What opening a remote console gives a front-end: the URL to open, and —
+/// when it goes through a tunnel — the [`Tunnel`] to hold while it is used.
+#[derive(Debug)]
+pub struct ConsoleAccess {
+    pub url: String,
+    pub tunnel: Option<Tunnel>,
+}
+
+/// Reach `site`'s console (m2-4, D-02): its recorded domain, else a tunnel.
+/// The server's status supplies the console path and its port.
+pub fn console_access(site: &Site) -> Result<ConsoleAccess> {
+    let remote = remote_of(site)?;
+    let session = open(site, &EngineOptions::from_env())?;
+    let status = session.status()?;
+    match console_route(remote, &status)? {
+        ConsoleRoute::Domain { console_url, .. } => Ok(ConsoleAccess {
+            url: console_url,
+            tunnel: None,
+        }),
+        ConsoleRoute::Tunnel {
+            server_port,
+            console_path,
+        } => {
+            let ssh = Ssh::new(remote, &ssh_key::Keychain)?;
+            let tunnel = open_tunnel(&ssh, server_port, &console_path)?;
+            Ok(ConsoleAccess {
+                url: tunnel.url.clone(),
+                tunnel: Some(tunnel),
+            })
+        }
     }
 }
 
@@ -1328,6 +1999,11 @@ mod tests {
             }
             Ok(out.status)
         }
+        fn download(&self, script: &str, dest: &Path, deadline: Duration) -> Reply {
+            let mut out = self.exec(script, None, deadline)?;
+            std::fs::write(dest, std::mem::take(&mut out.stdout)).unwrap();
+            Ok(out)
+        }
     }
 
     fn probe_reply(clis: &str) -> Reply {
@@ -1696,17 +2372,34 @@ mod tests {
             (
                 Action::Backup {
                     label: Some("pre move".into()),
+                    json: true,
                 },
-                "data backup --label 'pre move'",
+                "data backup --label 'pre move' --json",
                 DATA_DEADLINE,
             ),
-            (Action::Backup { label: None }, "data backup", DATA_DEADLINE),
+            (
+                Action::Backup {
+                    label: None,
+                    json: false,
+                },
+                "data backup",
+                DATA_DEADLINE,
+            ),
             (Action::BackupList, "data list", CLI_DEADLINE),
             (
                 Action::Restore {
                     file: "/home/deploy/.atelier/backups/a b.tar.gz".into(),
+                    other_site: false,
                 },
                 "data restore --yes -- '/home/deploy/.atelier/backups/a b.tar.gz'",
+                DATA_DEADLINE,
+            ),
+            (
+                Action::Restore {
+                    file: "/tmp/x.tar.gz".into(),
+                    other_site: true,
+                },
+                "data restore --yes --other-site -- /tmp/x.tar.gz",
                 DATA_DEADLINE,
             ),
             (
@@ -1771,9 +2464,13 @@ mod tests {
         let s = session(&fake);
         let mut seen = Vec::new();
         let err = s
-            .run_action(&Action::Backup { label: None }, &mut |p, l| {
-                seen.push((p, l.to_string()))
-            })
+            .run_action(
+                &Action::Backup {
+                    label: None,
+                    json: false,
+                },
+                &mut |p, l| seen.push((p, l.to_string())),
+            )
             .unwrap_err();
         let exit = err.downcast_ref::<RemoteExit>().expect("typed exit");
         assert_eq!(exit.code, 3);
@@ -1970,5 +2667,391 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("older than this Manager"));
+    }
+
+    // --- m2-4 console ---------------------------------------------------------
+
+    fn status_with(console_url: &str, site_url: &str) -> Status {
+        let mut st: Status = serde_json::from_str(STATUS_JSON).unwrap();
+        st.console_url = console_url.into();
+        st.site_url = site_url.into();
+        st
+    }
+
+    fn remote_with(domain: Option<&str>) -> Remote {
+        Remote {
+            host: "deploy@example.com".into(),
+            slug: "prod".into(),
+            key: KeyMode::Ssh,
+            domain: domain.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_recorded_domain_opens_the_console_there_with_the_servers_path() {
+        let st = status_with("http://localhost:41221/atelier", "http://localhost:41221");
+        let route = console_route(&remote_with(Some("cms.example.com")), &st).unwrap();
+        assert_eq!(
+            route,
+            ConsoleRoute::Domain {
+                console_url: "https://cms.example.com/atelier".into(),
+                site_url: "https://cms.example.com".into(),
+            }
+        );
+        // An explicit scheme/port is kept; the path still comes from the server.
+        let st = status_with("http://localhost:41230/console", "http://localhost:41230/");
+        let route = console_route(&remote_with(Some("http://10.0.0.5:8080/")), &st).unwrap();
+        assert_eq!(
+            route,
+            ConsoleRoute::Domain {
+                console_url: "http://10.0.0.5:8080/console".into(),
+                site_url: "http://10.0.0.5:8080/".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn no_domain_means_a_tunnel_to_the_servers_console_port() {
+        let st = status_with("http://localhost:41230/atelier", "http://localhost:41230");
+        assert_eq!(
+            console_route(&remote_with(None), &st).unwrap(),
+            ConsoleRoute::Tunnel {
+                server_port: 41230,
+                console_path: "/atelier".into(),
+            }
+        );
+        assert!(console_route(&remote_with(None), &status_with("garbage", "")).is_err());
+    }
+
+    #[test]
+    fn remote_status_never_shows_the_servers_localhost() {
+        let st = status_with("http://localhost:41221/atelier", "http://localhost:41221");
+        let (here, route) = status_for_here(&remote_with(None), st.clone());
+        assert!(matches!(route, ConsoleRoute::Tunnel { .. }));
+        assert_eq!(
+            (here.console_url.as_str(), here.site_url.as_str()),
+            ("", "")
+        );
+        let (here, _) = status_for_here(&remote_with(Some("cms.example.com")), st);
+        assert_eq!(here.console_url, "https://cms.example.com/atelier");
+    }
+
+    #[test]
+    fn the_tunnel_listens_on_loopback_in_its_own_range_without_the_shared_master() {
+        let ssh = Ssh::with_identity("deploy@example.com", None);
+        let cmd = ssh.tunnel_command(41300, 41221);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("-N -L 127.0.0.1:41300:127.0.0.1:41221 -- deploy@example.com"),
+            "{joined}"
+        );
+        assert!(joined.contains("ExitOnForwardFailure=yes"), "{joined}");
+        assert!(joined.contains("BatchMode=yes"), "{joined}");
+        assert_eq!(
+            args.iter()
+                .filter(|a| a.starts_with("ControlPath="))
+                .collect::<Vec<_>>(),
+            vec!["ControlPath=none"],
+            "{joined}"
+        );
+        assert!(!joined.contains("ControlMaster"), "{joined}");
+    }
+
+    #[test]
+    fn a_tunnel_is_ready_once_its_port_answers_and_closes_on_drop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stderr(Stdio::piped());
+        let mut tunnel = spawn_until_listening(cmd, port, "u".into(), Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(tunnel.local_port, port);
+        assert!(tunnel.is_alive());
+        let pid = tunnel.child.id();
+        drop(tunnel);
+        // Reaped on drop: the pid no longer names a live `sleep`.
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "tunnel process outlived its handle");
+
+        // ssh exiting first (port taken, login refused) is reported, not waited out.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unused = free.local_addr().unwrap().port();
+        drop(free);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo 'bind: Address already in use' >&2; exit 255"])
+            .stderr(Stdio::piped());
+        let got = spawn_until_listening(cmd, unused, "u".into(), Duration::from_secs(5)).unwrap();
+        assert_eq!(got.unwrap_err(), "bind: Address already in use");
+    }
+
+    // --- m2-5 backups home ----------------------------------------------------
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    const ARCHIVE: &[u8] = b"pretend this is a tar.gz of the whole site";
+    const SERVER_PATH: &str = "/home/deploy/.atelier/backups/aincient-20261030-101500.tar.gz";
+
+    fn backup_json(sha: &str, size: usize) -> String {
+        serde_json::to_string(&BackupInfo {
+            path: SERVER_PATH.into(),
+            name: "aincient-20261030-101500.tar.gz".into(),
+            size: size as u64,
+            sha256: sha.into(),
+            site_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            site_name: Some("prod".into()),
+        })
+        .unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_backup_is_copied_home_and_verified() {
+        let json = backup_json(&sha_hex(ARCHIVE), ARCHIVE.len());
+        let fake = with_cli(Fake::new())
+            .on("data backup --json", move || out(0, &json, "Backing up…\n"))
+            .on("cat --", || {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: ARCHIVE.to_vec(),
+                    stderr: Vec::new(),
+                })
+            });
+        let home = PrivateDir::new("atelier-backup-home").unwrap();
+        let dir = home.path().join("remote/prod/backups");
+        let mut progress = Vec::new();
+        let got = session(&fake)
+            .backup(None, Some(&dir), &mut |_, l| progress.push(l.to_string()))
+            .unwrap();
+        assert_eq!(got.server.path, SERVER_PATH);
+        let local = got.local.unwrap();
+        assert_eq!(local, dir.join("aincient-20261030-101500.tar.gz"));
+        assert_eq!(std::fs::read(&local).unwrap(), ARCHIVE);
+        assert_eq!(files_in(&dir), vec!["aincient-20261030-101500.tar.gz"]);
+        assert!(progress.contains(&"Backing up…".to_string()));
+        assert!(fake.ran(&format!("cat -- {SERVER_PATH}")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&local).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_damaged_copy_is_removed_and_reported() {
+        let json = backup_json(&sha_hex(ARCHIVE), ARCHIVE.len());
+        let fake = with_cli(Fake::new())
+            .on("data backup --json", move || out(0, &json, ""))
+            .on("cat --", || {
+                out(0, "pretend this is a tar.gz of the whole sitf", "")
+            });
+        let home = PrivateDir::new("atelier-backup-home").unwrap();
+        let dir = home.path().join("backups");
+        let err = session(&fake)
+            .backup(None, Some(&dir), &mut |_, _| {})
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("doesn't match") && text.contains(SERVER_PATH),
+            "{text}"
+        );
+        assert!(files_in(&dir).is_empty(), "{:?}", files_in(&dir));
+
+        // A failed transfer leaves nothing behind either.
+        let json = backup_json(&sha_hex(ARCHIVE), ARCHIVE.len());
+        let fake = with_cli(Fake::new())
+            .on("data backup --json", move || out(0, &json, ""))
+            .on("cat --", || out(1, "partial", "cat: Permission denied\n"));
+        let err = session(&fake)
+            .backup(None, Some(&dir), &mut |_, _| {})
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Permission denied"), "{err:#}");
+        assert!(files_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn no_copy_keeps_the_backup_on_the_server() {
+        let json = backup_json(&sha_hex(ARCHIVE), ARCHIVE.len());
+        let fake =
+            with_cli(Fake::new()).on("data backup --label pre --json", move || out(0, &json, ""));
+        let got = session(&fake)
+            .backup(Some("pre".into()), None, &mut |_, _| {})
+            .unwrap();
+        assert!(got.local.is_none());
+        assert!(fake.ran("data backup --label pre --json"));
+        assert!(!fake.ran("cat --"));
+    }
+
+    #[test]
+    fn an_engine_without_backup_json_still_gets_its_backup_fetched() {
+        let sha = sha_hex(ARCHIVE);
+        let digest = format!("{sha} {}\n", ARCHIVE.len());
+        let fake = with_cli(Fake::new())
+            .on("data backup --json", || {
+                out(2, "", "error: unexpected argument '--json' found\n")
+            })
+            .on("data backup", || {
+                out(
+                    0,
+                    &format!("\u{1b}[32mBackup written to\u{1b}[0m {SERVER_PATH}\n"),
+                    "",
+                )
+            })
+            .on("sha256sum", move || out(0, &digest, ""))
+            .on("cat --", || {
+                out(0, std::str::from_utf8(ARCHIVE).unwrap(), "")
+            });
+        let home = PrivateDir::new("atelier-backup-home").unwrap();
+        let got = session(&fake)
+            .backup(None, Some(home.path()), &mut |_, _| {})
+            .unwrap();
+        assert_eq!(got.server.path, SERVER_PATH);
+        assert_eq!(got.server.sha256, sha);
+        assert_eq!(std::fs::read(got.local.unwrap()).unwrap(), ARCHIVE);
+    }
+
+    // --- m2-6 restore of a laptop archive ---------------------------------------
+
+    fn local_archive(dir: &Path, name: &str, manifest: &str) -> PathBuf {
+        let stage = dir.join(format!("stage-{name}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("manifest.json"), manifest).unwrap();
+        let file = dir.join(name);
+        assert!(Command::new("tar")
+            .arg("czf")
+            .arg(&file)
+            .arg("-C")
+            .arg(&stage)
+            .arg("manifest.json")
+            .status()
+            .unwrap()
+            .success());
+        file
+    }
+
+    const TMP_DIR: &str = "/tmp/atelier-restore.Ab12Cd";
+
+    #[test]
+    fn a_laptop_archive_is_uploaded_verified_restored_and_cleaned_up() {
+        let scratch = PrivateDir::new("atelier-upload").unwrap();
+        let file = local_archive(scratch.path(), "aincient-x.tar.gz", "{}");
+        let bytes = std::fs::read(&file).unwrap();
+        let digest = format!("{} {}\n", sha_hex(&bytes), bytes.len());
+        let fake = with_cli(Fake::new())
+            .on("mktemp -d", || out(0, &format!("{TMP_DIR}\n"), ""))
+            .on("sha256sum", move || out(0, &digest, ""))
+            .on("data restore", || out(0, "Restore complete.\n", ""))
+            .on("rm -rf --", || out(0, "", ""));
+        session(&fake)
+            .restore_upload(&file, true, &mut |_, _| {})
+            .unwrap();
+        let calls = fake.calls.borrow();
+        let scripts: Vec<&str> = calls.iter().skip(1).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(scripts.len(), 4, "{scripts:#?}");
+        // 1. upload under umask 077 into a fresh mktemp dir, from the local file.
+        assert!(scripts[0].starts_with("umask 077") && scripts[0].contains("mktemp -d"));
+        assert_eq!(calls[1].1.as_deref(), Some(file.as_path()));
+        // 2. verified on the server, 3. restored from there, 4. removed.
+        assert!(scripts[1].contains(&format!("p={TMP_DIR}/aincient-x.tar.gz")));
+        assert!(scripts[2].ends_with(&format!(
+            "data restore --yes --other-site -- {TMP_DIR}/aincient-x.tar.gz"
+        )));
+        assert_eq!(scripts[3], format!("rm -rf -- {TMP_DIR}"));
+    }
+
+    #[test]
+    fn a_damaged_upload_is_not_restored_and_still_cleaned_up() {
+        let scratch = PrivateDir::new("atelier-upload").unwrap();
+        let file = local_archive(scratch.path(), "b.tar.gz", "{}");
+        let fake = with_cli(Fake::new())
+            .on("mktemp -d", || out(0, &format!("{TMP_DIR}\n"), ""))
+            .on("sha256sum", || {
+                out(0, &format!("{} 3\n", "0".repeat(64)), "")
+            })
+            .on("data restore", || {
+                panic!("must not restore a damaged upload")
+            })
+            .on("rm -rf --", || out(0, "", ""));
+        let err = session(&fake)
+            .restore_upload(&file, false, &mut |_, _| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("arrived damaged"), "{err}");
+        assert_eq!(last(&fake), format!("rm -rf -- {TMP_DIR}"));
+
+        // A failing restore also cleans up, and keeps the server's exit code.
+        let bytes = std::fs::read(&file).unwrap();
+        let digest = format!("{} {}\n", sha_hex(&bytes), bytes.len());
+        let fake = with_cli(Fake::new())
+            .on("mktemp -d", || out(0, &format!("{TMP_DIR}\n"), ""))
+            .on("sha256sum", move || out(0, &digest, ""))
+            .on("data restore", || out(4, "", "error: refused\n"))
+            .on("rm -rf --", || out(0, "", ""));
+        let err = session(&fake)
+            .restore_upload(&file, false, &mut |_, _| {})
+            .unwrap_err();
+        assert_eq!(err.downcast_ref::<RemoteExit>().map(|e| e.code), Some(4));
+        assert_eq!(last(&fake), format!("rm -rf -- {TMP_DIR}"));
+    }
+
+    #[test]
+    fn a_laptop_archive_from_another_site_is_refused_before_upload() {
+        let scratch = PrivateDir::new("atelier-upload").unwrap();
+        let theirs = local_archive(
+            scratch.path(),
+            "theirs.tar.gz",
+            r#"{"site_id":"22222222-2222-4222-8222-222222222222","site_slug":"blog"}"#,
+        );
+        let ours = local_archive(
+            scratch.path(),
+            "ours.tar.gz",
+            r#"{"site_id":"11111111-1111-4111-8111-111111111111"}"#,
+        );
+        let st = STATUS_JSON.replace(
+            r#""version":"v0.20.0""#,
+            r#""version":"v0.20.0","site_id":"11111111-1111-4111-8111-111111111111""#,
+        );
+        let fake = with_cli(Fake::new()).on("app status --json", move || out(0, &st, ""));
+        let s = session(&fake);
+        let err = s.check_restore_identity(&theirs, false).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("blog") && text.contains("`prod` on deploy@example.com"),
+            "{text}"
+        );
+        assert!(matches!(
+            s.check_restore_identity(&theirs, true).unwrap(),
+            IdentityCheck::OtherAllowed(_)
+        ));
+        assert_eq!(
+            s.check_restore_identity(&ours, false).unwrap(),
+            IdentityCheck::Same
+        );
+        assert!(!fake.ran("mktemp"), "nothing uploaded");
     }
 }
