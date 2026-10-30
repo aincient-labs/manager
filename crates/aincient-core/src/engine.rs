@@ -12,7 +12,7 @@
 //!
 //! | file | what it does |
 //! |---|---|
-//! | [`ENGINE_COMPOSE_FILE`] | adds the `engine` service (Docker socket, no published port, internal `engine` network), puts `edge` on that network, gives `app` the inbox (rw) and outbox (ro) volumes, and mounts [`ENGINE_EDGE_FILE`] over edge's `default.conf` |
+//! | [`ENGINE_COMPOSE_FILE`] | adds the `engine` service (Docker socket, no published port, internal `engine` network), puts `edge` on that network, gives `app` the inbox (rw) and outbox (ro) volumes, and mounts [`ENGINE_EDGE_FILE`] over edge's `default.conf`; with trusted proxies, also publishes edge on loopback only ([`engine_compose`], m7-10) |
 //! | [`ENGINE_EDGE_FILE`] | [`EDGE_CONF_TEMPLATE`] plus the engine's rate-limit zones and its `/_atelier/engine/` locations |
 //!
 //! Without the opt-in, edge has no `/_atelier/engine/` location at all: such a
@@ -58,9 +58,11 @@ pub const IMAGE_ENV: &str = "ATELIER_ENGINE_IMAGE";
 /// List only addresses no untrusted client can arrive as: a proxy on the
 /// host's network reaching edge's published port arrives as the Docker
 /// network's gateway, and so does every other connection to that port that
-/// goes through docker-proxy (IPv6 clients, host processes). Trusting the
-/// gateway is safe only while the port is closed to the outside on IPv4 and
-/// IPv6 (the m7-e3 run found it open over IPv6).
+/// goes through docker-proxy (IPv6 clients, host processes). The m7-e3 run
+/// found the port open over IPv6, so while this list is non-empty the engine's
+/// compose file publishes edge on `127.0.0.1` only ([`engine_compose`], m7-10):
+/// the only way in from outside is the proxy. Host processes can still claim
+/// an address; that is the owner's machine.
 pub const TRUSTED_PROXIES_ENV: &str = "ATELIER_TRUSTED_PROXIES";
 /// The engine refuses to start unless this is `1` (m7-2). Only
 /// [`ENGINE_COMPOSE_TEMPLATE`] sets it, so a copied compose file that drops the
@@ -162,6 +164,89 @@ networks:
     # No route out: the engine talks to Docker over the socket, not the network.
     internal: true
 "#;
+
+/// What [`engine_compose`] adds to edge while [`TRUSTED_PROXIES_ENV`] lists
+/// a proxy (m7-10). `!override` replaces compose.yaml's `ports` list instead
+/// of appending to it (Compose 2.24+; [`enable`] checks the merged result).
+/// `HTTP_PORT` stays a port number: the Manager's URLs read it as one.
+pub const EDGE_LOOPBACK_PORTS: &str = r#"    # ATELIER_TRUSTED_PROXIES is set: edge believes X-Forwarded-For from those
+    # addresses, and every connection to the published port arrives as the
+    # Docker gateway. So the port is published on loopback only, and the proxy
+    # is the only way in from outside (m7-10). `!override` replaces the ports of
+    # compose.yaml rather than adding to them.
+    ports: !override
+      - "127.0.0.1:${HTTP_PORT:-41221}:80"
+"#;
+
+/// The opt-in compose file for edge behind the `trusted` proxies:
+/// [`ENGINE_COMPOSE_TEMPLATE`] as is with none, plus [`EDGE_LOOPBACK_PORTS`]
+/// with any.
+pub fn engine_compose(trusted: &[String]) -> String {
+    if trusted.is_empty() {
+        return ENGINE_COMPOSE_TEMPLATE.to_string();
+    }
+    insert_at(
+        ENGINE_COMPOSE_TEMPLATE,
+        "  edge:\n",
+        EDGE_LOOPBACK_PORTS,
+        false,
+    )
+}
+
+/// Whether a published port's host address is loopback. An empty or
+/// missing one means every interface.
+fn is_loopback_host(ip: &str) -> bool {
+    ip.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The ports `service` publishes beyond loopback, from
+/// `docker compose config --format json` (`host_ip:published` each).
+pub fn config_ports_beyond_loopback(config_json: &str, service: &str) -> Result<Vec<String>> {
+    let v: serde_json::Value =
+        serde_json::from_str(config_json).context("read `docker compose config` output")?;
+    let svc = v
+        .get("services")
+        .and_then(|s| s.get(service))
+        .with_context(|| format!("`docker compose config` has no {service} service"))?;
+    Ok(svc
+        .get("ports")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let ip = p.get("host_ip").and_then(|i| i.as_str()).unwrap_or("");
+            let port = match p.get("published") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(n) => n.to_string(),
+                None => String::new(),
+            };
+            (!is_loopback_host(ip))
+                .then(|| format!("{}:{port}", if ip.is_empty() { "*" } else { ip }))
+        })
+        .collect())
+}
+
+/// The host bindings beyond loopback in a container's
+/// `docker inspect --format '{{json .NetworkSettings.Ports}}'`
+/// (`{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"41221"}]}`), as `ip:port`.
+pub fn bindings_beyond_loopback(ports_json: &str) -> Result<Vec<String>> {
+    let v: serde_json::Value =
+        serde_json::from_str(ports_json.trim()).context("read the container's port bindings")?;
+    let mut out = Vec::new();
+    for bindings in v.as_object().into_iter().flat_map(|m| m.values()) {
+        for b in bindings.as_array().into_iter().flatten() {
+            let ip = b.get("HostIp").and_then(|i| i.as_str()).unwrap_or("");
+            let port = b.get("HostPort").and_then(|p| p.as_str()).unwrap_or("");
+            if !is_loopback_host(ip) {
+                out.push(format!("{}:{port}", if ip.is_empty() { "*" } else { ip }));
+            }
+        }
+    }
+    Ok(out)
+}
 
 const EDGE_ZONES: &str = r#"# Atelier engine (EXPERIMENTAL, DECISIONS 0483): limits for its prefix. This
 # file replaces edge.conf only while the engine is enabled. An empty key isn't
@@ -414,7 +499,7 @@ pub fn files_current(stack: &Stack) -> bool {
     let Ok(trusted) = trusted_proxies(stack) else {
         return false;
     };
-    read(&compose_path(stack)).as_deref() == Some(ENGINE_COMPOSE_TEMPLATE)
+    read(&compose_path(stack)) == Some(engine_compose(&trusted))
         && read(&edge_path(stack)) == Some(edge_conf(&trusted))
         && pinned_image(stack).is_some()
 }
@@ -455,7 +540,14 @@ fn refuse_unless_shipped(stack: &Stack) -> Result<()> {
 /// already sets `COMPOSE_FILE` to something else, and when a
 /// `compose.override.yaml` is present (`COMPOSE_FILE` would silently stop
 /// loading it).
-pub fn enable(stack: &Stack, image_id: &str) -> Result<()> {
+///
+/// With trusted proxies it also refuses unless edge would be published on
+/// loopback only (m7-10): the candidate compose file is merged by the real
+/// Compose first, through `config` ([`ComposeConfig`]), and every port edge
+/// publishes must be on a loopback address. A Compose too old for
+/// `!override` (it appends, or fails) is refused here, before any file is
+/// written.
+pub fn enable(stack: &Stack, image_id: &str, config: ComposeConfig) -> Result<()> {
     refuse_unless_shipped(stack)?;
     if !is_image_id(image_id) {
         bail!("the engine image must be pinned by its full ID (sha256:<64 hex>), not {image_id:?}");
@@ -485,8 +577,12 @@ pub fn enable(stack: &Stack, image_id: &str) -> Result<()> {
         .filter(|h| !h.contains(':') && !h.contains(char::is_whitespace))
         .context("the stack directory's path has a ':' or a space, which compose can't mount")?
         .to_string();
+    let compose_text = engine_compose(&trusted);
+    if !trusted.is_empty() {
+        refuse_unless_loopback_only(stack, &compose_text, &home, image_id, config)?;
+    }
     write_atomic(&edge_path(stack), &edge_conf(&trusted), 0o644)?;
-    write_atomic(&compose_path(stack), ENGINE_COMPOSE_TEMPLATE, 0o644)?;
+    write_atomic(&compose_path(stack), &compose_text, 0o644)?;
     let mut text = env_without_ours(stack);
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -502,6 +598,52 @@ pub fn enable(stack: &Stack, image_id: &str) -> Result<()> {
         text.push_str(&format!("{k}={v}\n"));
     }
     write_atomic(&stack.env_path(), &text, 0o600)
+}
+
+/// Runs `docker compose -f <files…> config --format json` in the stack
+/// directory with these extra environment variables, and returns its stdout
+/// ([`crate::engine_admin::compose_config_json`]; a fake in tests).
+pub type ComposeConfig<'a> = &'a dyn Fn(&[PathBuf], &[(&str, String)]) -> Result<String>;
+
+/// [`enable`]'s m7-10 refusal: merge compose.yaml with `compose_text` (from a
+/// temporary file next to it, removed after) and refuse unless edge
+/// publishes on loopback only.
+fn refuse_unless_loopback_only(
+    stack: &Stack,
+    compose_text: &str,
+    home: &str,
+    image_id: &str,
+    config: ComposeConfig,
+) -> Result<()> {
+    let candidate = stack.home.join(format!(
+        ".{ENGINE_COMPOSE_FILE}.check-{}",
+        std::process::id()
+    ));
+    write_atomic(&candidate, compose_text, 0o644)?;
+    let merged = config(
+        &[stack.compose_path(), candidate.clone()],
+        &[
+            (IMAGE_ENV, image_id.to_string()),
+            ("ATELIER_STACK_DIR", home.to_string()),
+            ("ATELIER_PROJECT", stack.project_name()),
+        ],
+    );
+    let _ = std::fs::remove_file(&candidate);
+    let refuse = |why: String| {
+        anyhow::anyhow!(
+            "{TRUSTED_PROXIES_ENV} is set, so edge must be published on loopback only              (127.0.0.1) with the TLS proxy as the only way in, but {why}. Nothing was              written. Docker Compose 2.24 or newer is needed (`docker compose version`);              or empty {TRUSTED_PROXIES_ENV} in .env."
+        )
+    };
+    let merged = merged.map_err(|e| refuse(format!("`docker compose config` failed: {e:#}")))?;
+    let beyond =
+        config_ports_beyond_loopback(&merged, "edge").map_err(|e| refuse(format!("{e:#}")))?;
+    if !beyond.is_empty() {
+        return Err(refuse(format!(
+            "Compose would also publish it on {}",
+            beyond.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// The comment [`enable`] puts above its `.env` lines.
@@ -580,6 +722,35 @@ mod tests {
 
     const ID: &str = "sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529";
 
+    /// `docker compose config --format json`'s edge ports for these files, as
+    /// Compose 2.24+ merges them: the engine file's `ports: !override`
+    /// replaces compose.yaml's list, anything else leaves it.
+    fn fake(files: &[PathBuf], env: &[(&str, String)]) -> Result<String> {
+        assert_eq!(files.len(), 2);
+        assert_eq!(std::fs::read_to_string(&files[0])?, COMPOSE_TEMPLATE);
+        assert!(env.iter().any(|(k, v)| *k == IMAGE_ENV && is_image_id(v)));
+        let engine = std::fs::read_to_string(&files[1])?;
+        let ip = if engine.contains("    ports: !override\n      - \"127.0.0.1:") {
+            r#""host_ip":"127.0.0.1","#
+        } else {
+            ""
+        };
+        Ok(format!(
+            r#"{{"services":{{"edge":{{"ports":[{{"mode":"ingress",{ip}"target":80,"published":"41221","protocol":"tcp"}}]}}}}}}"#
+        ))
+    }
+
+    /// Compose before 2.24 appends the engine file's list to compose.yaml's.
+    fn appending(_: &[PathBuf], _: &[(&str, String)]) -> Result<String> {
+        Ok(r#"{"services":{"edge":{"ports":[{"target":80,"published":"41221"},{"host_ip":"127.0.0.1","target":80,"published":"41221"}]}}}"#.to_string())
+    }
+
+    fn set_proxies(s: &Stack, value: &str) {
+        let mut text = std::fs::read_to_string(s.env_path()).unwrap();
+        text.push_str(&format!("{TRUSTED_PROXIES_ENV}={value}\n"));
+        std::fs::write(s.env_path(), text).unwrap();
+    }
+
     struct TempStack(Stack);
     impl TempStack {
         fn new() -> Self {
@@ -629,7 +800,7 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         let env_before = s.read_env();
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         assert!(is_enabled(s) && files_current(s));
         assert_eq!(
             std::fs::read_to_string(s.compose_path()).unwrap(),
@@ -652,7 +823,7 @@ mod tests {
         assert!(names.contains(&ENGINE_COMPOSE_FILE.to_string()));
         assert!(names.contains(&ENGINE_EDGE_FILE.to_string()));
         assert!(!names.iter().any(|n| n.contains(".tmp-")), "{names:?}");
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         assert!(files_current(s), "idempotent");
     }
 
@@ -661,7 +832,7 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         let before = snapshot(&s.home);
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         disable(s).unwrap();
         assert!(!is_enabled(s));
         assert_eq!(snapshot(&s.home), before);
@@ -674,11 +845,11 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         std::fs::write(s.edge_conf_path(), "# edited by hand\n").unwrap();
-        let e = enable(s, ID).unwrap_err().to_string();
+        let e = enable(s, ID, &fake).unwrap_err().to_string();
         assert!(e.contains("doctor"), "{e}");
         assert!(!compose_path(s).exists() && !edge_path(s).exists());
         assert!(disable(s).is_err());
-        assert!(enable(&Stack::at(s.home.join("missing")), ID).is_err());
+        assert!(enable(&Stack::at(s.home.join("missing")), ID, &fake).is_err());
     }
 
     #[test]
@@ -686,12 +857,15 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         std::fs::write(s.home.join("compose.override.yaml"), "services: {}\n").unwrap();
-        assert!(enable(s, ID).unwrap_err().to_string().contains("override"));
+        assert!(enable(s, ID, &fake)
+            .unwrap_err()
+            .to_string()
+            .contains("override"));
         std::fs::remove_file(s.home.join("compose.override.yaml")).unwrap();
         let mut text = std::fs::read_to_string(s.env_path()).unwrap();
         text.push_str("COMPOSE_FILE=mine.yaml\n");
         std::fs::write(s.env_path(), text).unwrap();
-        assert!(enable(s, ID).is_err());
+        assert!(enable(s, ID, &fake).is_err());
         assert!(disable(s).is_err(), "not ours to remove");
         assert_eq!(s.read_env()["COMPOSE_FILE"], "mine.yaml");
         assert!(!compose_path(s).exists());
@@ -777,10 +951,10 @@ mod tests {
             "sha256:700e4087",
             "",
         ] {
-            assert!(enable(s, bad).is_err(), "{bad:?}");
+            assert!(enable(s, bad, &fake).is_err(), "{bad:?}");
             assert!(!compose_path(s).exists(), "nothing written for {bad:?}");
         }
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         assert_eq!(pinned_image(s).as_deref(), Some(ID));
         assert_eq!(s.read_env()[IMAGE_ENV], ID);
         // A pin edited into a tag no longer counts as current.
@@ -851,20 +1025,20 @@ mod tests {
     fn files_current_follows_the_trusted_proxies_in_env() {
         let t = TempStack::new();
         let s = &t.0;
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         assert!(files_current(s));
         let mut text = std::fs::read_to_string(s.env_path()).unwrap();
         text.push_str(&format!("{TRUSTED_PROXIES_ENV}=172.18.0.1\n"));
         std::fs::write(s.env_path(), &text).unwrap();
         assert!(!files_current(s), "a new proxy list needs enable again");
-        enable(s, ID).unwrap();
+        enable(s, ID, &fake).unwrap();
         assert!(files_current(s));
         assert!(std::fs::read_to_string(edge_path(s))
             .unwrap()
             .contains("set_real_ip_from 172.18.0.1;"));
         std::fs::write(s.env_path(), text.replace("172.18.0.1", "0.0.0.0/0")).unwrap();
         assert!(!files_current(s));
-        assert!(enable(s, ID)
+        assert!(enable(s, ID, &fake)
             .unwrap_err()
             .to_string()
             .contains("every address"));
@@ -874,5 +1048,111 @@ mod tests {
             Some("0.0.0.0/0"),
             "the owner's key stays"
         );
+    }
+
+    #[test]
+    fn with_trusted_proxies_edge_is_published_on_loopback_only() {
+        assert_eq!(
+            engine_compose(&[]),
+            ENGINE_COMPOSE_TEMPLATE,
+            "no list, no change"
+        );
+        let c = engine_compose(&["172.18.0.1".to_string()]);
+        assert!(c.contains("  edge:\n    # ATELIER_TRUSTED_PROXIES is set"));
+        assert!(c.contains(
+            "    ports: !override\n      - \"127.0.0.1:${HTTP_PORT:-41221}:80\"\n    networks:\n      - default\n      - engine\n"
+        ));
+        assert_eq!(c.matches("ports:").count(), 1);
+        assert_eq!(c.replace(EDGE_LOOPBACK_PORTS, ""), ENGINE_COMPOSE_TEMPLATE);
+        // The default stack stays as install.sh writes it: every interface.
+        assert!(COMPOSE_TEMPLATE.contains("    ports:\n      - \"${HTTP_PORT:-41221}:80\"\n"));
+        assert!(!COMPOSE_TEMPLATE.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn enable_writes_the_loopback_publish_with_proxies_and_drops_it_without() {
+        let t = TempStack::new();
+        let s = &t.0;
+        set_proxies(s, "172.18.0.1");
+        enable(s, ID, &fake).unwrap();
+        let written = std::fs::read_to_string(compose_path(s)).unwrap();
+        assert!(written.contains("ports: !override\n      - \"127.0.0.1:"));
+        assert!(files_current(s));
+        // The check's temporary file is gone.
+        let names: Vec<String> = snapshot(&s.home).into_iter().map(|(n, _)| n).collect();
+        assert!(!names.iter().any(|n| n.contains(".check-")), "{names:?}");
+        // HTTP_PORT stays a port number.
+        assert_eq!(s.http_port(), crate::stack::DEFAULT_PORT);
+        // The owner empties the list: doctor sees stale files, enable rewrites them.
+        let text = std::fs::read_to_string(s.env_path())
+            .unwrap()
+            .replace(&format!("{TRUSTED_PROXIES_ENV}=172.18.0.1\n"), "");
+        std::fs::write(s.env_path(), text).unwrap();
+        assert!(!files_current(s));
+        let never = |_: &[PathBuf], _: &[(&str, String)]| -> Result<String> {
+            panic!("no proxies, no check")
+        };
+        enable(s, ID, &never).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(compose_path(s)).unwrap(),
+            ENGINE_COMPOSE_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn enable_refuses_proxies_unless_compose_publishes_edge_on_loopback_only() {
+        let t = TempStack::new();
+        let s = &t.0;
+        set_proxies(s, "172.18.0.1");
+        let before = snapshot(&s.home);
+        let e = enable(s, ID, &appending).unwrap_err().to_string();
+        assert!(e.contains("loopback only") && e.contains("*:41221"), "{e}");
+        assert_eq!(snapshot(&s.home), before, "nothing written");
+        let failing = |_: &[PathBuf], _: &[(&str, String)]| -> Result<String> {
+            bail!("yaml: unknown tag !override")
+        };
+        let e = enable(s, ID, &failing).unwrap_err().to_string();
+        assert!(e.contains("unknown tag") && e.contains("2.24"), "{e}");
+        assert_eq!(snapshot(&s.home), before, "nothing written");
+        let junk = |_: &[PathBuf], _: &[(&str, String)]| Ok("not json".to_string());
+        assert!(enable(s, ID, &junk).is_err());
+        assert_eq!(snapshot(&s.home), before);
+        // An already-enabled stack keeps its files when a re-enable is refused.
+        enable(s, ID, &fake).unwrap();
+        let on = snapshot(&s.home);
+        assert!(enable(s, ID, &appending).is_err());
+        assert_eq!(snapshot(&s.home), on);
+    }
+
+    #[test]
+    fn published_ports_beyond_loopback_are_named() {
+        let json = r#"{"services":{"edge":{"ports":[
+            {"host_ip":"127.0.0.1","published":"41221"},
+            {"host_ip":"::1","published":"41221"},
+            {"published":"41221"},
+            {"host_ip":"0.0.0.0","published":41222},
+            {"host_ip":"::","published":"41223"}]}}}"#;
+        assert_eq!(
+            config_ports_beyond_loopback(json, "edge").unwrap(),
+            ["*:41221", "0.0.0.0:41222", ":::41223"]
+        );
+        assert!(config_ports_beyond_loopback(json, "app").is_err());
+        assert!(
+            config_ports_beyond_loopback(r#"{"services":{"edge":{}}}"#, "edge")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(config_ports_beyond_loopback("", "edge").is_err());
+
+        let open = r#"{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"41221"},{"HostIp":"::","HostPort":"41221"}]}"#;
+        assert_eq!(
+            bindings_beyond_loopback(open).unwrap(),
+            ["0.0.0.0:41221", ":::41221"]
+        );
+        let closed = "{\"80/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"41221\"}]}\n";
+        assert!(bindings_beyond_loopback(closed).unwrap().is_empty());
+        assert!(bindings_beyond_loopback("{}").unwrap().is_empty());
+        assert!(bindings_beyond_loopback("null").unwrap().is_empty());
+        assert!(bindings_beyond_loopback("garbage").is_err());
     }
 }

@@ -330,13 +330,34 @@ pub fn local_image_id() -> Result<String> {
     Ok(id)
 }
 
+/// The real [`engine::ComposeConfig`]: `docker compose -f <files…> config
+/// --format json` for the stack's project, in its directory, with `env` set.
+/// Named files outrank `.env`'s `COMPOSE_FILE`; `.env` still interpolates.
+pub fn compose_config_json(
+    stack: &Stack,
+    files: &[std::path::PathBuf],
+    env: &[(&str, String)],
+) -> Result<String> {
+    let mut c = compose(stack);
+    for f in files {
+        c.arg("-f").arg(f);
+    }
+    c.args(["config", "--format", "json"]);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    crate::docker::run_capture(c, "merge the engine's compose file")
+}
+
 /// Turn the engine on for a stack on this computer and start it: the image
 /// must be there, pinned by its ID ([`local_image_id`]), then
 /// [`engine::enable`], then `compose up -d --remove-orphans`. The caller has
 /// the user's opt-in (the CLI's `--experimental`, the GUI's setting).
 pub fn enable_local(stack: &Stack) -> Result<()> {
     let id = local_image_id()?;
-    engine::enable(stack, &id)?;
+    engine::enable(stack, &id, &|files, env| {
+        compose_config_json(stack, files, env)
+    })?;
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
     crate::docker::run_capture(c, "start the stack with the engine").map(|_| ())
@@ -502,6 +523,38 @@ impl RemoveSteps for LocalRemove<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// The real Compose on this machine merges the engine file as m7-10
+    /// needs: loopback only with proxies, every interface without. Needs
+    /// Docker: `cargo test -p aincient-core -- --ignored real_compose`.
+    #[test]
+    #[ignore]
+    fn real_compose_publishes_edge_on_loopback_only_behind_proxies() {
+        let dir = std::env::temp_dir().join(format!("atelier-m7-10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Stack::at(&dir);
+        s.ensure_scaffold(&crate::stack::InstallOptions::default())
+            .unwrap();
+        let id = "sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529";
+        let real = |f: &[std::path::PathBuf], e: &[(&str, String)]| compose_config_json(&s, f, e);
+        engine::enable(&s, id, &real).unwrap();
+        let merged = compose_config_json(&s, &[], &[]).unwrap();
+        let open = engine::config_ports_beyond_loopback(&merged, "edge").unwrap();
+        println!("no proxies: edge beyond loopback = {open:?}");
+        assert_eq!(open, ["*:41221"]);
+        let mut env = std::fs::read_to_string(s.env_path()).unwrap();
+        env.push_str("ATELIER_TRUSTED_PROXIES=172.18.0.1\n");
+        std::fs::write(s.env_path(), env).unwrap();
+        engine::enable(&s, id, &real).unwrap();
+        let merged = compose_config_json(&s, &[], &[]).unwrap();
+        let v: Value = serde_json::from_str(&merged).unwrap();
+        println!("proxies: edge ports = {}", v["services"]["edge"]["ports"]);
+        assert!(engine::config_ports_beyond_loopback(&merged, "edge")
+            .unwrap()
+            .is_empty());
+        assert_eq!(v["services"]["edge"]["ports"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use std::cell::RefCell;
     use std::os::unix::process::ExitStatusExt;

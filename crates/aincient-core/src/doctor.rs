@@ -923,6 +923,9 @@ fn check_engine(stack: &Stack) -> Vec<Check> {
         )
         .detail(why)
     }];
+    if let Some(c) = check_engine_port(stack) {
+        out.push(c);
+    }
     let Some(pin) = engine::pinned_image(stack) else {
         out.push(
             Check::bad(
@@ -970,6 +973,66 @@ fn check_engine(stack: &Stack) -> Vec<Check> {
         .detail(format!("pinned {pin}")),
     });
     out
+}
+
+/// While `.env` trusts proxies, edge must be published on loopback only
+/// (m7-10): every connection to its port arrives as the Docker gateway, so
+/// one from outside could choose its own audited and rate-limited address.
+/// Reads the running edge container's actual host bindings. `None` without a
+/// proxy list (or an unreadable one: the files check reports that).
+fn check_engine_port(stack: &Stack) -> Option<Check> {
+    use crate::engine;
+    if engine::trusted_proxies(stack).ok()?.is_empty() {
+        return None;
+    }
+    let mut ps = compose(stack);
+    ps.args(["ps", "-q", "edge"]);
+    let ports = probe(ps).ok().and_then(|o| {
+        let id = o.trim().lines().next()?.to_string();
+        let mut inspect = docker::docker();
+        inspect.args([
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Ports}}",
+            &id,
+        ]);
+        probe(inspect).ok()
+    });
+    Some(engine_port_verdict(ports.as_deref()))
+}
+
+/// The `stack.engine_port` verdict from edge's `.NetworkSettings.Ports` JSON
+/// (`None`: no running edge to read).
+fn engine_port_verdict(ports_json: Option<&str>) -> Check {
+    const ID: &str = "stack.engine_port";
+    const LABEL: &str = "Site port on loopback only behind trusted proxies (EXPERIMENTAL)";
+    let Some(json) = ports_json else {
+        return Check::skipped(ID, Tier::Stack, LABEL, "edge isn't running");
+    };
+    match crate::engine::bindings_beyond_loopback(json) {
+        Ok(beyond) if beyond.is_empty() => Check::ok(ID, Tier::Stack, LABEL),
+        Ok(beyond) => Check::bad(
+            ID,
+            Tier::Stack,
+            LABEL,
+            Severity::Fail,
+            "ATELIER_TRUSTED_PROXIES is set, so edge believes X-Forwarded-For from the Docker \
+             gateway, but its port is published beyond loopback: any client reaching it \
+             directly arrives as the gateway and can pick the address the engine audits and \
+             rate-limits. Run `atelier engine enable --experimental` (it publishes edge on \
+             127.0.0.1 only and recreates it), or empty ATELIER_TRUSTED_PROXIES and enable again.",
+        )
+        .detail(format!("edge publishes on {}", beyond.join(", "))),
+        Err(e) => Check::bad(
+            ID,
+            Tier::Stack,
+            LABEL,
+            Severity::Warn,
+            "Doctor couldn't read edge's port bindings; check `docker inspect` of the edge \
+             container by hand.",
+        )
+        .detail(format!("{e:#}")),
+    }
 }
 
 /// Inspect one compose service: is its container up, and (if it declares a
@@ -1405,6 +1468,28 @@ mod tests {
             assert_eq!(c.severity, Severity::Warn, "free={free} ours={ours}");
             assert!(c.remedy.unwrap().contains("Site `shop`"));
         }
+    }
+
+    #[test]
+    fn engine_port_check_fails_on_a_binding_beyond_loopback() {
+        let c = engine_port_verdict(Some(
+            r#"{"80/tcp":[{"HostIp":"0.0.0.0","HostPort":"41221"},{"HostIp":"::","HostPort":"41221"}]}"#,
+        ));
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("edge publishes on 0.0.0.0:41221, :::41221")
+        );
+        assert!(c.remedy.unwrap().contains("engine enable"));
+        let c = engine_port_verdict(Some(
+            "{\"80/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"41221\"}]}\n",
+        ));
+        assert_eq!(c.severity, Severity::Ok);
+        assert_eq!(engine_port_verdict(None).severity, Severity::Skipped);
+        assert_eq!(
+            engine_port_verdict(Some("garbage")).severity,
+            Severity::Warn
+        );
     }
 
     #[test]

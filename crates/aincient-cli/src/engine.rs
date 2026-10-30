@@ -168,7 +168,9 @@ fn enable(stack: &Stack, experimental: bool) -> Result<()> {
         return Err(needs_experimental("enable"));
     }
     let id = engine_admin::local_image_id()?;
-    optin::enable(stack, &id)?;
+    optin::enable(stack, &id, &|files, env| {
+        engine_admin::compose_config_json(stack, files, env)
+    })?;
     println!("Engine image pinned: {ENGINE_IMAGE} = {id}");
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
