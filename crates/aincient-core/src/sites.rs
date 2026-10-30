@@ -26,6 +26,7 @@
 //! host = "deploy@example.com"   # an ssh target or ~/.ssh/config alias
 //! remote_site = "default"       # its slug on the server
 //! key = "guided"                # omitted = the user's own ssh setup (D-05)
+//! domain = "cms.example.com"    # optional: where its console is public (D-02)
 //! ```
 //!
 //! A remote site is driven through the server's own `atelier` CLI over SSH
@@ -48,6 +49,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::net::TcpListener;
+use std::ops::RangeInclusive;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -57,6 +59,10 @@ use crate::stack::{Stack, DEFAULT_PORT};
 
 /// The registry's file name, inside the default stack directory.
 pub const SITES_FILE: &str = "sites.toml";
+/// Local ports SSH tunnels to remote consoles listen on (D-02). Local sites
+/// never get one of these ([`next_free_port`] skips the range and `sites add
+/// --port` refuses it), so a tunnel can never take a local site's port.
+pub const TUNNEL_PORTS: RangeInclusive<u16> = 41300..=41399;
 /// Name of the default stack directory under the user's home.
 pub const DEFAULT_DIR: &str = ".atelier";
 /// Sub-directory of the default stack that holds every site created from now on.
@@ -142,6 +148,27 @@ pub struct Remote {
     pub slug: String,
     /// How to authenticate.
     pub key: KeyMode,
+    /// Where the site's console is public, as the user recorded it: a host
+    /// (`cms.example.com`, https assumed) or an `http(s)://host[:port]` base.
+    /// `None`: the console is reached through an SSH tunnel (D-02).
+    pub domain: Option<String>,
+}
+
+/// Whether `domain` is a usable public base for a remote console: a host name
+/// (optionally `:port`), optionally prefixed by `http://` or `https://`, with
+/// no path, credentials, whitespace or anything a shell or URL would reinterpret.
+pub fn is_valid_domain(domain: &str) -> bool {
+    let host = domain
+        .strip_prefix("https://")
+        .or_else(|| domain.strip_prefix("http://"))
+        .unwrap_or(domain)
+        .trim_end_matches('/');
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with(['-', '.', ':'])
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c))
 }
 
 /// Whether `host` is an ssh target we are willing to pass to `ssh`: printable,
@@ -202,6 +229,7 @@ impl Site {
                 host: host.to_string(),
                 slug: remote_slug.unwrap_or(slug).to_string(),
                 key,
+                domain: None,
             }),
         }
     }
@@ -254,6 +282,8 @@ struct SiteEntry {
     remote_site: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
 }
 
 /// Where a remote site's placeholder `home` points: `~/.atelier/remote/<slug>`.
@@ -307,12 +337,16 @@ impl Registry {
                 ));
                 // `new_remote` falls back to the slug for an empty label; keep
                 // the file's label verbatim.
-                sites.last_mut().expect("just pushed").label = entry.label;
+                let site = sites.last_mut().expect("just pushed");
+                site.label = entry.label;
+                if let Some(remote) = site.remote.as_mut() {
+                    remote.domain = entry.domain;
+                }
                 continue;
             }
-            if entry.remote_site.is_some() || entry.key.is_some() {
+            if entry.remote_site.is_some() || entry.key.is_some() || entry.domain.is_some() {
                 bail!(
-                    "site `{}` has `remote_site`/`key` but no `host`",
+                    "site `{}` has `remote_site`/`key`/`domain` but no `host`",
                     entry.slug
                 );
             }
@@ -362,6 +396,15 @@ impl Registry {
                         site.slug,
                         remote.slug
                     );
+                }
+                if let Some(domain) = &remote.domain {
+                    if !is_valid_domain(domain) {
+                        bail!(
+                            "site `{}`: `{domain}` is not a usable domain (a host name, or \
+                             https://host[:port])",
+                            site.slug
+                        );
+                    }
                 }
                 if !slugs.insert(site.slug.as_str()) {
                     bail!("site `{}` is listed twice", site.slug);
@@ -417,6 +460,7 @@ impl Registry {
                         host: None,
                         remote_site: None,
                         key: None,
+                        domain: None,
                     },
                     Some(r) => SiteEntry {
                         slug: s.slug.clone(),
@@ -426,6 +470,7 @@ impl Registry {
                         host: Some(r.host.clone()),
                         remote_site: Some(r.slug.clone()),
                         key: r.key.as_toml(),
+                        domain: r.domain.clone(),
                     },
                 })
                 .collect(),
@@ -717,7 +762,20 @@ fn legacy_candidate(registry: Option<&Registry>, user_home: &Path) -> Option<Sit
 /// adoption first, so an installed `~/.atelier`'s port counts as used even
 /// while it is stopped.
 pub fn next_free_port(used: &BTreeSet<u16>, mut is_free: impl FnMut(u16) -> bool) -> Option<u16> {
-    (DEFAULT_PORT..=u16::MAX).find(|port| !used.contains(port) && is_free(*port))
+    (DEFAULT_PORT..=u16::MAX)
+        .find(|port| !TUNNEL_PORTS.contains(port) && !used.contains(port) && is_free(*port))
+}
+
+/// The first port in [`TUNNEL_PORTS`] that `is_free` reports bindable, for an
+/// SSH tunnel to a remote console. `None` when the whole range is taken.
+pub fn next_tunnel_port(mut is_free: impl FnMut(u16) -> bool) -> Option<u16> {
+    TUNNEL_PORTS.into_iter().find(|port| is_free(*port))
+}
+
+/// Whether `port` can be bound on loopback right now — what a tunnel needs
+/// (it listens on 127.0.0.1 only).
+pub fn loopback_port_is_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 /// Whether `port` can be bound on this host right now — on all interfaces
@@ -926,6 +984,14 @@ pub fn add_site(
     };
     let chosen = match port {
         Some(p) => {
+            if TUNNEL_PORTS.contains(&p) {
+                bail!(
+                    "ports {}–{} are kept for SSH tunnels to remote sites — pick another \
+                     with --port",
+                    TUNNEL_PORTS.start(),
+                    TUNNEL_PORTS.end()
+                );
+            }
             if let Some(other) = claimed(p) {
                 bail!("port {p} is already the console port of site `{other}`");
             }
@@ -1626,13 +1692,13 @@ project = "atelier-blog"
         assert!(add_site(uh, "Bad Name", None, None, all_free).is_err());
         assert!(!default_home(uh).exists());
 
-        add_site(uh, "blog", None, Some(41300), all_free).unwrap();
+        add_site(uh, "blog", None, Some(41500), all_free).unwrap();
         let before = std::fs::read(registry_path(uh)).unwrap();
         // Same slug twice.
         assert!(add_site(uh, "blog", None, None, all_free).is_err());
         // An explicit port another site claims, or the host has taken.
-        assert!(add_site(uh, "shop", None, Some(41300), all_free).is_err());
-        assert!(add_site(uh, "shop", None, Some(41301), |_| false).is_err());
+        assert!(add_site(uh, "shop", None, Some(41500), all_free).is_err());
+        assert!(add_site(uh, "shop", None, Some(41501), |_| false).is_err());
         assert!(!site_home(uh, "shop").exists());
         // A non-empty directory that isn't a stack is left alone.
         let stray = site_home(uh, "notes");
@@ -1960,6 +2026,7 @@ host = "stage-alias"
                 host: "deploy@example.com".to_string(),
                 slug: "default".to_string(),
                 key: KeyMode::Guided,
+                domain: None,
             })
         );
         assert_eq!(prod.project, "");
@@ -2001,6 +2068,10 @@ host = "stage-alias"
             "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\n\n[[site]]\nslug = \"b\"\nlabel = \"B\"\nhost = \"h\"\nremote_site = \"a\"\n",
             // a local site still needs both
             "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhome = \"~/x\"\n",
+            // a domain on a local site, or one that is not a bare base
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhome = \"~/x\"\nproject = \"p\"\ndomain = \"x.com\"\n",
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\ndomain = \"x.com/atelier\"\n",
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\ndomain = \"https://u:p@x.com\"\n",
         ];
         for text in bad {
             assert!(Registry::parse(text, uh).is_err(), "accepted:\n{text}");
@@ -2009,6 +2080,58 @@ host = "stage-alias"
         let ok = "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h1\"\nremote_site = \"x\"\n\n\
                   [[site]]\nslug = \"b\"\nlabel = \"B\"\nhost = \"h2\"\nremote_site = \"x\"\n";
         Registry::parse(ok, uh).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_domain_round_trips() {
+        let uh = Path::new("/Users/someone");
+        let text = "[[site]]\nslug = \"prod\"\nlabel = \"Prod\"\nhost = \"h\"\n\
+                    domain = \"cms.example.com\"\n";
+        let r = Registry::parse(text, uh).unwrap();
+        let remote = r.get("prod").unwrap().remote.clone().unwrap();
+        assert_eq!(remote.domain.as_deref(), Some("cms.example.com"));
+        let out = r.to_toml(uh).unwrap();
+        assert!(out.contains("domain = \"cms.example.com\""), "{out}");
+        assert_eq!(Registry::parse(&out, uh).unwrap(), r);
+        for ok in [
+            "cms.example.com",
+            "https://cms.example.com",
+            "http://10.0.0.5:8080/",
+        ] {
+            assert!(is_valid_domain(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn tunnel_ports_never_go_to_a_local_site() {
+        // Every port below the tunnel range taken: the next local site skips
+        // the whole range rather than landing in it.
+        let used: BTreeSet<u16> = (DEFAULT_PORT..*TUNNEL_PORTS.start()).collect();
+        assert_eq!(
+            next_free_port(&used, |_| true),
+            Some(TUNNEL_PORTS.end() + 1)
+        );
+        // Nothing the local allocator can return is a tunnel port, whatever is busy.
+        for busy_below in [0u16, 10, 79] {
+            let used: BTreeSet<u16> = (DEFAULT_PORT..DEFAULT_PORT + busy_below).collect();
+            let port = next_free_port(&used, |p| p % 3 != 0).unwrap();
+            assert!(!TUNNEL_PORTS.contains(&port), "{port}");
+        }
+        // Tunnels pick the first free port of their own range.
+        assert_eq!(next_tunnel_port(|_| true), Some(*TUNNEL_PORTS.start()));
+        assert_eq!(
+            next_tunnel_port(|p| p > TUNNEL_PORTS.start() + 1),
+            Some(TUNNEL_PORTS.start() + 2)
+        );
+        assert_eq!(next_tunnel_port(|_| false), None);
+        assert!(!TUNNEL_PORTS.contains(&DEFAULT_PORT));
+    }
+
+    #[test]
+    fn sites_add_refuses_a_tunnel_port() {
+        let th = TempHome::new();
+        let err = add_site(th.path(), "blog", None, Some(41300), |_| true).unwrap_err();
+        assert!(err.to_string().contains("SSH tunnels"), "{err}");
     }
 
     #[test]
