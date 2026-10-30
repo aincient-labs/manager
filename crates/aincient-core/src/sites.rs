@@ -27,6 +27,12 @@
 //! remote_site = "default"       # its slug on the server
 //! key = "guided"                # omitted = the user's own ssh setup (D-05)
 //! domain = "cms.example.com"    # optional: where its console is public (D-02)
+//!
+//! [[site]]                   # a remote site PAIRED WITH ITS ENGINE (M4, E-02):
+//! slug = "vps"               # no SSH; EXPERIMENTAL (DECISIONS 0483)
+//! label = "VPS"
+//! engine = "https://cms.example.com"   # the site's https base; the token
+//!                                      # is in the OS keychain, never here
 //! ```
 //!
 //! A remote site is driven through the server's own `atelier` CLI over SSH
@@ -139,6 +145,20 @@ impl KeyMode {
     }
 }
 
+/// How the Manager reaches a remote site.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// SSH to the server, which runs its own `atelier` (M2, D-01).
+    #[default]
+    Ssh,
+    /// The site's engine over HTTPS with a pairing token (M4, E-02), no SSH:
+    /// only the verbs the engine has. `url` is the site's base
+    /// (`https://host[:port]`, or loopback `http://` for tests); the token
+    /// is in the OS keychain under [`crate::engine_client::token_account`].
+    /// EXPERIMENTAL (DECISIONS 0483).
+    Engine { url: String },
+}
+
 /// Where a remote site lives: the server and its slug there (D-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
@@ -152,6 +172,20 @@ pub struct Remote {
     /// (`cms.example.com`, https assumed) or an `http(s)://host[:port]` base.
     /// `None`: the console is reached through an SSH tunnel (D-02).
     pub domain: Option<String>,
+    /// SSH, or the engine. For [`Transport::Engine`], `host` is the URL's
+    /// host (for messages only: nothing runs `ssh` to it), `slug` is the
+    /// site's own slug, `key` is unused and `domain` is the URL.
+    pub transport: Transport,
+}
+
+impl Remote {
+    /// The engine URL of an engine-paired site, `None` for an SSH one.
+    pub fn engine_url(&self) -> Option<&str> {
+        match &self.transport {
+            Transport::Engine { url } => Some(url),
+            Transport::Ssh => None,
+        }
+    }
 }
 
 /// Whether `domain` is a usable public base for a remote console: a host name
@@ -206,6 +240,36 @@ impl Site {
         self.remote.is_some()
     }
 
+    /// The engine URL when this site is reached through its engine instead
+    /// of SSH (M4).
+    pub fn engine_url(&self) -> Option<&str> {
+        self.remote.as_ref().and_then(Remote::engine_url)
+    }
+
+    /// A remote site paired with its engine (M4, E-02): no SSH. `url` must
+    /// already be checked ([`engine_entry`] does).
+    pub fn new_engine(user_home: &Path, slug: &str, label: Option<&str>, url: &str) -> Site {
+        Site {
+            slug: slug.to_string(),
+            label: label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(slug)
+                .to_string(),
+            home: remote_placeholder_home(user_home, slug),
+            project: String::new(),
+            remote: Some(Remote {
+                host: url_host(url),
+                slug: slug.to_string(),
+                key: KeyMode::Ssh,
+                domain: Some(url.to_string()),
+                transport: Transport::Engine {
+                    url: url.to_string(),
+                },
+            }),
+        }
+    }
+
     /// A remote site's registry entry, pointing at `host`. Its slug on the
     /// server defaults to `slug`.
     pub fn new_remote(
@@ -230,6 +294,7 @@ impl Site {
                 slug: remote_slug.unwrap_or(slug).to_string(),
                 key,
                 domain: None,
+                transport: Transport::Ssh,
             }),
         }
     }
@@ -284,6 +349,29 @@ struct SiteEntry {
     key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     domain: Option<String>,
+    /// An engine-paired site's base URL (M4); absent for every other kind,
+    /// so files without one round-trip byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<String>,
+}
+
+/// The host of an engine URL, for messages (`https://cms.example.com:8443`
+/// → `cms.example.com:8443`).
+pub fn url_host(url: &str) -> String {
+    url.trim()
+        .trim_end_matches('/')
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .to_ascii_lowercase()
+}
+
+/// Whether `url` is a usable engine base: what the engine client accepts
+/// (`https://host[:port]`, or loopback `http://`) and spelt with its scheme,
+/// so the file says plainly where the token goes.
+pub fn is_valid_engine_url(url: &str) -> bool {
+    (url.starts_with("https://") || url.starts_with("http://"))
+        && crate::engine_client::EngineUrl::from_domain(url).is_ok()
 }
 
 /// Where a remote site's placeholder `home` points: `~/.atelier/remote/<slug>`.
@@ -318,6 +406,25 @@ impl Registry {
         let file: RegistryFile = toml::from_str(text).context("could not parse TOML")?;
         let mut sites = Vec::with_capacity(file.sites.len());
         for entry in file.sites {
+            if let Some(url) = entry.engine {
+                if entry.home.is_some()
+                    || entry.project.is_some()
+                    || entry.host.is_some()
+                    || entry.remote_site.is_some()
+                    || entry.key.is_some()
+                    || entry.domain.is_some()
+                {
+                    bail!(
+                        "site `{}` is paired with its engine ({url}): it has no `home`, \
+                         `project`, `host`, `remote_site`, `key` or `domain`",
+                        entry.slug
+                    );
+                }
+                let mut site = Site::new_engine(user_home, &entry.slug, None, &url);
+                site.label = entry.label;
+                sites.push(site);
+                continue;
+            }
             if let Some(host) = entry.host {
                 if entry.home.is_some() || entry.project.is_some() {
                     bail!(
@@ -381,6 +488,23 @@ impl Registry {
         for site in &self.sites {
             if !is_valid_slug(&site.slug) {
                 bail!("`{}` is not a valid site slug (a-z, 0-9, -)", site.slug);
+            }
+            if let Some(url) = site.engine_url() {
+                if !is_valid_engine_url(url) {
+                    bail!(
+                        "site `{}`: `{url}` is not a usable engine address (https://host[:port])",
+                        site.slug
+                    );
+                }
+                if !slugs.insert(site.slug.as_str()) {
+                    bail!("site `{}` is listed twice", site.slug);
+                }
+                // One pairing per site per Manager: two entries for one URL
+                // would share nothing but confusion.
+                if !targets.insert((url, "")) {
+                    bail!("two sites are paired with the engine at {url}");
+                }
+                continue;
             }
             if let Some(remote) = &site.remote {
                 if !is_valid_host(&remote.host) {
@@ -461,6 +585,21 @@ impl Registry {
                         remote_site: None,
                         key: None,
                         domain: None,
+                        engine: None,
+                    },
+                    Some(Remote {
+                        transport: Transport::Engine { url },
+                        ..
+                    }) => SiteEntry {
+                        slug: s.slug.clone(),
+                        label: s.label.clone(),
+                        home: None,
+                        project: None,
+                        host: None,
+                        remote_site: None,
+                        key: None,
+                        domain: None,
+                        engine: Some(url.clone()),
                     },
                     Some(r) => SiteEntry {
                         slug: s.slug.clone(),
@@ -471,6 +610,7 @@ impl Registry {
                         remote_site: Some(r.slug.clone()),
                         key: r.key.as_toml(),
                         domain: r.domain.clone(),
+                        engine: None,
                     },
                 })
                 .collect(),
@@ -856,6 +996,9 @@ pub struct SiteRow {
     /// A remote site's slug on its server; absent for a local one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_site: Option<String>,
+    /// An engine-paired site's URL (M4): reached without SSH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
 
 impl SiteRow {
@@ -900,6 +1043,7 @@ pub fn list_sites(user_home: &Path) -> Result<Vec<SiteRow>> {
                 active: registry.active.as_deref() == Some(site.slug.as_str()),
                 host: site.remote.as_ref().map(|r| r.host.clone()),
                 remote_site: site.remote.as_ref().map(|r| r.slug.clone()),
+                engine: site.engine_url().map(str::to_string),
             }
         })
         .collect())
@@ -1066,6 +1210,23 @@ pub fn remote_entry(
     Ok(site)
 }
 
+/// A checked entry for a site paired with its engine (M4): `url` must be
+/// what the engine client accepts, https unless loopback. Plain `http://` to
+/// anything else is refused here, before a code is ever sent.
+pub fn engine_entry(user_home: &Path, slug: &str, label: Option<&str>, url: &str) -> Result<Site> {
+    let url = url.trim().trim_end_matches('/');
+    let base = crate::engine_client::EngineUrl::from_domain(url).map_err(|e| anyhow::anyhow!(e))?;
+    // Recorded with its scheme, lower-cased, exactly as the client will use it.
+    let url = base.base();
+    if !is_valid_slug(slug) {
+        bail!(
+            "`{slug}` is not a valid site name — use lowercase letters, digits and `-` \
+             (starting with a letter or digit, at most 40 characters)"
+        );
+    }
+    Ok(Site::new_engine(user_home, slug, label, &url))
+}
+
 /// What [`add_remote_site`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedRemoteSite {
@@ -1173,6 +1334,9 @@ pub fn set_domain(user_home: &Path, slug: &str, domain: Option<&str>) -> Result<
              server (its console here is always its local address)"
         );
     };
+    if let Some(url) = remote.engine_url() {
+        bail!("`{slug}` is paired with its engine at {url}; that address is its domain");
+    }
     remote.domain = domain.map(str::to_string);
     let site = site.clone();
     registry.save(user_home)?;
@@ -2083,6 +2247,7 @@ host = "stage-alias"
                 slug: "default".to_string(),
                 key: KeyMode::Guided,
                 domain: None,
+                transport: Transport::Ssh,
             })
         );
         assert_eq!(prod.project, "");
@@ -2103,6 +2268,108 @@ host = "stage-alias"
             "no placeholder home is written: {out}"
         );
         assert_eq!(Registry::parse(&out, uh).unwrap(), r);
+    }
+
+    #[test]
+    fn an_m2_file_with_ssh_sites_round_trips_byte_for_byte() {
+        // What the M2 Manager writes, domain and guided key included: the
+        // engine field (M4) must not change a byte of it.
+        let th = TempHome::new();
+        let uh = th.path();
+        let text = format!(
+            "{FILE_HEADER}active = \"prod\"\n\n\
+             [[site]]\nslug = \"default\"\nlabel = \"My Site\"\nhome = \"~/.atelier\"\nproject = \"atelier\"\n\n\
+             [[site]]\nslug = \"prod\"\nlabel = \"Production\"\nhost = \"deploy@example.com\"\nremote_site = \"default\"\nkey = \"guided\"\ndomain = \"cms.example.com\"\n"
+        );
+        std::fs::create_dir_all(default_home(uh)).unwrap();
+        std::fs::write(registry_path(uh), &text).unwrap();
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.get("prod").unwrap().engine_url(), None);
+        r.save(uh).unwrap();
+        assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), text);
+    }
+
+    #[test]
+    fn an_engine_paired_site_round_trips_with_only_its_url() {
+        let uh = Path::new("/Users/someone");
+        let text =
+            "[[site]]\nslug = \"vps\"\nlabel = \"VPS\"\nengine = \"https://cms.example.com\"\n";
+        let r = Registry::parse(text, uh).unwrap();
+        let vps = r.get("vps").unwrap();
+        assert!(vps.is_remote());
+        assert_eq!(vps.engine_url(), Some("https://cms.example.com"));
+        let remote = vps.remote.as_ref().unwrap();
+        assert_eq!(remote.host, "cms.example.com", "for messages");
+        assert_eq!(
+            remote.transport,
+            Transport::Engine {
+                url: "https://cms.example.com".into()
+            }
+        );
+        let out = r.to_toml(uh).unwrap();
+        assert_eq!(
+            out,
+            format!("{FILE_HEADER}{text}"),
+            "no token, no host, no key"
+        );
+        assert_eq!(Registry::parse(&out, uh).unwrap(), r);
+        let rows_host = Site::new_engine(uh, "x", None, "https://a.example.com:8443");
+        assert_eq!(rows_host.remote.unwrap().host, "a.example.com:8443");
+    }
+
+    #[test]
+    fn engine_entries_refuse_plain_http_and_mixed_fields() {
+        let uh = Path::new("/Users/someone");
+        for bad in [
+            "engine = \"http://cms.example.com\"",
+            "engine = \"cms.example.com\"",
+            "engine = \"https://cms.example.com/path\"",
+            "engine = \"https://cms.example.com\"\nhost = \"x\"",
+            "engine = \"https://cms.example.com\"\ndomain = \"x.com\"",
+            "engine = \"https://cms.example.com\"\nhome = \"~/x\"\nproject = \"p\"",
+        ] {
+            let text = format!("[[site]]\nslug = \"vps\"\nlabel = \"VPS\"\n{bad}\n");
+            assert!(Registry::parse(&text, uh).is_err(), "{bad}");
+        }
+        // Loopback http is the client's test seam, and allowed.
+        let ok = "[[site]]\nslug = \"t\"\nlabel = \"T\"\nengine = \"http://127.0.0.1:8080\"\n";
+        assert!(Registry::parse(ok, uh).is_ok());
+        // Two entries for one engine.
+        let twice = "[[site]]\nslug = \"a\"\nlabel = \"A\"\nengine = \"https://x.com\"\n\n\
+                     [[site]]\nslug = \"b\"\nlabel = \"B\"\nengine = \"https://x.com\"\n";
+        assert!(Registry::parse(twice, uh).is_err());
+
+        assert!(engine_entry(uh, "vps", None, "http://cms.example.com").is_err());
+        assert!(engine_entry(uh, "Bad Slug", None, "https://cms.example.com").is_err());
+        assert!(engine_entry(uh, "vps", None, "ftp://cms.example.com").is_err());
+        let site = engine_entry(uh, "vps", Some("VPS"), "https://CMS.Example.com/").unwrap();
+        assert_eq!(site.engine_url(), Some("https://cms.example.com"));
+        assert_eq!(
+            engine_entry(uh, "vps", None, "cms.example.com")
+                .unwrap()
+                .engine_url(),
+            Some("https://cms.example.com")
+        );
+    }
+
+    #[test]
+    fn engine_sites_never_take_an_ssh_path_or_a_domain() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let site = engine_entry(uh, "vps", None, "https://cms.example.com").unwrap();
+        add_remote_site(uh, site.clone(), |_| Ok(())).unwrap();
+        assert!(set_domain(uh, "vps", Some("other.com")).is_err());
+        let e = crate::remote::Ssh::new(
+            site.remote.as_ref().unwrap(),
+            &crate::ssh_key::tests::Memory::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(e.to_string().contains("without SSH"), "{e}");
+        let rows = list_sites(uh).unwrap();
+        let row = rows.iter().find(|r| r.slug == "vps").unwrap();
+        assert_eq!(row.engine.as_deref(), Some("https://cms.example.com"));
+        assert!(!row.installed);
     }
 
     #[test]

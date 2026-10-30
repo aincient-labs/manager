@@ -229,6 +229,18 @@ impl EngineUrl {
         self.https
     }
 
+    /// `https://host[:port]` (or loopback `http://…`), no trailing slash:
+    /// how the registry records an engine-paired site.
+    pub fn base(&self) -> String {
+        let scheme = if self.https { "https" } else { "http" };
+        format!("{scheme}://{}", self.authority)
+    }
+
+    /// `host[:port]`, for messages.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
     /// The full URL of an API path (`version`, `pairings/self`).
     pub fn url(&self, path: &str) -> String {
         let scheme = if self.https { "https" } else { "http" };

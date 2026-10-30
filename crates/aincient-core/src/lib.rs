@@ -19,6 +19,7 @@ pub mod guard;
 pub mod mcp;
 pub mod ops;
 pub mod pack;
+pub mod pairing;
 pub mod remote;
 pub mod settings;
 pub mod sites;

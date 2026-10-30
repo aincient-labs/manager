@@ -119,6 +119,9 @@ impl Ssh {
     /// user's own setup, or the guided key from `store`, materialised to a
     /// private temp file for the lifetime of this value.
     pub fn new(remote: &Remote, store: &dyn SecretStore) -> Result<Self> {
+        if let Some(url) = remote.engine_url() {
+            bail!(no_ssh(&remote.slug, url));
+        }
         let identity = match remote.key {
             KeyMode::Ssh => None,
             KeyMode::Guided => Some(ssh_key::key_file(store, &remote.host)?),
@@ -2105,10 +2108,28 @@ fn server_skipped(host: &str, why: &str) -> Check {
         .on(HostTier::Remote(host.to_string()))
 }
 
+/// The refusal for an SSH path on a site paired with its engine (M4): no
+/// SSH means no host CLI, only the verbs the engine has.
+pub fn no_ssh(slug: &str, url: &str) -> String {
+    format!(
+        "site `{slug}` is paired with its engine at {url}, without SSH: only status, freeze, \
+         live, wake, lockdown and unlock (and the pairing commands) reach it. Everything else \
+         needs the server's own `atelier`: attach the site over SSH (`atelier sites add <SLUG> \
+         --host …`) or run it on the server"
+    )
+}
+
+/// A remote site reached over SSH; an engine-paired one is refused (M4), so
+/// no SSH path ever runs `ssh` to its URL's host.
 fn remote_of(site: &Site) -> Result<&Remote> {
-    site.remote
+    let remote = site
+        .remote
         .as_ref()
-        .with_context(|| format!("site `{}` is not a remote site", site.slug))
+        .with_context(|| format!("site `{}` is not a remote site", site.slug))?;
+    if let Some(url) = remote.engine_url() {
+        bail!(no_ssh(&site.slug, url));
+    }
+    Ok(remote)
 }
 
 #[cfg(all(test, unix))]
@@ -2984,6 +3005,7 @@ mod tests {
             slug: "prod".into(),
             key: KeyMode::Ssh,
             domain: domain.map(str::to_string),
+            transport: crate::sites::Transport::Ssh,
         }
     }
 
