@@ -158,6 +158,9 @@ pub enum AdminVerb {
     Lockdown,
     Unlock,
     Wake,
+    /// A one-time install code that pairs the primary Manager (E-02, m4-6).
+    /// Only SSH (or this computer's Docker) can make one.
+    InstallCode,
 }
 
 impl AdminVerb {
@@ -167,6 +170,7 @@ impl AdminVerb {
             AdminVerb::Lockdown => "lockdown",
             AdminVerb::Unlock => "unlock",
             AdminVerb::Wake => "wake",
+            AdminVerb::InstallCode => "install-code",
         }
     }
 }
@@ -351,16 +355,59 @@ pub fn compose_config_json(
 
 /// Turn the engine on for a stack on this computer and start it: the image
 /// must be there, pinned by its ID ([`local_image_id`]), then
-/// [`engine::enable`], then `compose up -d --remove-orphans`. The caller has
-/// the user's opt-in (the CLI's `--experimental`, the GUI's setting).
-pub fn enable_local(stack: &Stack) -> Result<()> {
+/// [`engine::enable`], then `compose up -d --remove-orphans`, then a first
+/// install code ([`install_code`], m4-6), returned to show next to the site's
+/// address: `None` when the engine wasn't ready to make one (the site is
+/// enabled anyway; `engine install-code` makes one later). The caller has the
+/// user's opt-in (the CLI's `--experimental`, the GUI's setting).
+pub fn enable_local(stack: &Stack) -> Result<Option<String>> {
     let id = local_image_id()?;
     engine::enable(stack, &id, &|files, env| {
         compose_config_json(stack, files, env)
     })?;
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
-    crate::docker::run_capture(c, "start the stack with the engine").map(|_| ())
+    crate::docker::run_capture(c, "start the stack with the engine")?;
+    Ok(install_code(&LocalDocker, probe(stack).as_ref()).ok())
+}
+
+/// Mint a one-time install code inside the engine (`admin install-code`,
+/// m4-6): it pairs the site's first (primary) Manager. Replaces any unused
+/// one. The code is returned once and never logged here.
+pub fn install_code<D: DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<&EngineInfo>,
+) -> Result<String> {
+    let out = EngineAdmin::new(docker, info, "install-code")?.run(AdminVerb::InstallCode)?;
+    install_code_in(&out).ok_or_else(|| {
+        anyhow!(
+            "the engine on {} made no install code the Manager can read",
+            docker.place()
+        )
+    })
+}
+
+/// The install code in `admin install-code`'s output: the last line shaped
+/// `XXXX-XXXX-XXXX-XXXX`.
+pub fn install_code_in(out: &str) -> Option<String> {
+    out.lines().map(str::trim).rev().find_map(|l| {
+        let w = l.rsplit(' ').next().unwrap_or(l);
+        let groups: Vec<&str> = w.split('-').collect();
+        (groups.len() == 4
+            && groups
+                .iter()
+                .all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_alphanumeric())))
+        .then(|| w.to_ascii_uppercase())
+    })
+}
+
+/// What a Manager prints next to the site's address after enabling (m4-6).
+pub fn install_code_notice(code: &str) -> String {
+    format!(
+        "Install code: {code}\nKeep this; it pairs your first Manager (`atelier sites add <SLUG> \
+         --url <the site's https address> --install-code …`). It works once. Lost it? Make a new \
+         one over SSH: `atelier --site <SLUG> engine install-code --experimental`."
+    )
 }
 
 /// The steps of [`remove`], so its order and failure handling are tested
@@ -708,6 +755,38 @@ mod tests {
         }
         assert!(EngineAdmin::new(&d, Some(&info(false)), "unlock").is_err());
         assert!(EngineAdmin::new(&d, None, "unlock").is_err());
+    }
+
+    #[test]
+    fn an_install_code_is_minted_inside_the_engine_after_the_version_check() {
+        let d = FakeDocker::default();
+        d.replies.borrow_mut().extend([
+            Ok(STATUS_V1.to_string()),
+            Ok("ab2c-defg-hjkm-npqr".to_string()),
+        ]);
+        let code = install_code(&d, Some(&info(true))).unwrap();
+        assert_eq!(code, "AB2C-DEFG-HJKM-NPQR");
+        assert_eq!(
+            d.calls.borrow()[1],
+            "exec atelier-blog-engine-1 atelier engine admin install-code"
+        );
+        // No engine, no code; junk output, no code.
+        assert!(install_code(&d, None).is_err());
+        let d = FakeDocker::default();
+        d.replies
+            .borrow_mut()
+            .extend([Ok(STATUS_V1.to_string()), Ok("Shown once.".to_string())]);
+        assert!(install_code(&d, Some(&info(true))).is_err());
+        assert_eq!(
+            install_code_in("x\nInstall code: WXYZ-2345-6789-ABCD\n").as_deref(),
+            Some("WXYZ-2345-6789-ABCD")
+        );
+        assert_eq!(
+            install_code_in("ABCD-EFGH"),
+            None,
+            "a request code isn't one"
+        );
+        assert!(install_code_notice("C").contains("pairs your first Manager"));
     }
 
     /// A scripted stack for [`remove`].

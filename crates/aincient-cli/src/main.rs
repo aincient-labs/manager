@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 
 #[cfg(unix)]
 mod engine;
+mod paired;
 mod style;
 
 #[derive(Parser)]
@@ -38,6 +39,11 @@ struct Cli {
     /// terminal; a wrong slug refuses the change.
     #[arg(long, global = true, value_name = "SLUG")]
     confirm_slug: Option<String>,
+    /// Say you mean to use an EXPERIMENTAL feature (DECISIONS 0483): the
+    /// engine sidecar and the sites paired with it. Required by every such
+    /// command; anywhere on the line.
+    #[arg(long, global = true, hide = true)]
+    experimental: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -126,7 +132,7 @@ enum SitesCommand {
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
         /// Console port (default: the first free one from 41221 up).
-        #[arg(long, value_name = "PORT", conflicts_with = "host")]
+        #[arg(long, value_name = "PORT", conflicts_with_all = ["host", "url"])]
         port: Option<u16>,
         /// Attach to a running site on this server: an SSH alias from
         /// ~/.ssh/config, `host` or `user@host`. Nothing is installed there;
@@ -151,6 +157,37 @@ enum SitesCommand {
         /// one it goes through an SSH tunnel.
         #[arg(long, value_name = "DOMAIN", requires = "host")]
         domain: Option<String>,
+        /// EXPERIMENTAL (with --experimental): pair with the site's engine
+        /// at this https address instead of SSH, using the install code its
+        /// installer printed. Makes this Manager the site's primary.
+        #[arg(long, value_name = "HTTPS-URL", conflicts_with = "host")]
+        url: Option<String>,
+        /// The one-time install code (`XXXX-XXXX-XXXX-XXXX`). Asked for when
+        /// left out in a terminal; on the command line it lands in your
+        /// shell history.
+        #[arg(long, value_name = "CODE", requires = "url")]
+        install_code: Option<String>,
+        /// What this Manager is called in the site's list (default: this
+        /// computer's name).
+        #[arg(long, value_name = "TEXT", requires = "url")]
+        name: Option<String>,
+    },
+    /// EXPERIMENTAL (with --experimental): ask to join a site that already
+    /// has a Manager. Shows a code to type into that first Manager, then
+    /// waits until it is approved (10 minutes at most; Ctrl-C cancels).
+    Join {
+        /// Short machine name for the site here, used with --site.
+        slug: String,
+        /// The site's https address.
+        #[arg(long, value_name = "HTTPS-URL")]
+        url: String,
+        /// Display name (defaults to the slug).
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+        /// What this Manager is called in the site's list (default: this
+        /// computer's name).
+        #[arg(long, value_name = "TEXT")]
+        name: Option<String>,
     },
     /// Make a site the active one — what commands use without --site.
     Use {
@@ -643,7 +680,7 @@ fn run() -> Result<()> {
                  (e.g. `atelier sites use blog`)"
             );
         }
-        return run_sites(command);
+        return run_sites(command, cli.experimental);
     }
     if let Command::App {
         command: AppCommand::Update { all: true, yes, .. },
@@ -667,7 +704,10 @@ fn run() -> Result<()> {
 
     let resolution = sites::locate(cli.site.as_deref())?;
     if let Some(site) = remote_site(&resolution) {
-        return run_remote(cli.command, site);
+        if site.engine_url().is_some() {
+            return paired::run(cli.command, site, cli.experimental);
+        }
+        return run_remote(cli.command, site, cli.experimental);
     }
     // A local site: exactly the path it took before remote sites existed.
     let stack = resolution.into_stack();
@@ -692,16 +732,38 @@ fn run() -> Result<()> {
             aincient_core::mcp::serve(&stack)
         }
         #[cfg(unix)]
-        Command::Engine { command } => engine::run_on_host(command, &stack, &confirm_change),
+        Command::Engine { command } => {
+            engine::run_on_host(command, &stack, cli.experimental, &confirm_change)
+        }
     }
 }
 
 /// `atelier sites …` — the multi-site registry. The logic lives in
 /// [`aincient_core::sites`]; this only prints.
-fn run_sites(command: SitesCommand) -> Result<()> {
+fn run_sites(command: SitesCommand, experimental: bool) -> Result<()> {
     let uh = sites::user_home()?;
     match command {
         SitesCommand::List { json } => sites_list(&uh, json),
+        SitesCommand::Add {
+            slug,
+            label,
+            url: Some(url),
+            install_code,
+            name,
+            ..
+        } => {
+            paired::require_experimental(experimental, "sites add --url")?;
+            paired::sites_add(&uh, &slug, label.as_deref(), &url, install_code, name)
+        }
+        SitesCommand::Join {
+            slug,
+            url,
+            label,
+            name,
+        } => {
+            paired::require_experimental(experimental, "sites join")?;
+            paired::sites_join(&uh, &slug, label.as_deref(), &url, name)
+        }
         SitesCommand::Add {
             slug,
             label,
@@ -831,6 +893,17 @@ fn run_sites(command: SitesCommand) -> Result<()> {
         }
         SitesCommand::Remove { slug } => {
             let removed = sites::remove_site(&uh, &slug)?;
+            if let Some(url) = removed.site.engine_url() {
+                println!(
+                    "{} {} is no longer in your sites. Its pairing with {url} still exists and \
+                     its token stays in your keychain; `sites join` or `sites add --url` with the \
+                     same name replaces it. To end the pairing too, add it back and run \
+                     `atelier --site {slug} engine forget --experimental`.",
+                    style::success("Removed."),
+                    removed.site.slug,
+                );
+                return Ok(());
+            }
             if let Some(remote) = &removed.site.remote {
                 println!(
                     "{} {} is no longer in your sites. Nothing on {} was touched.",
@@ -925,7 +998,11 @@ fn sites_list(uh: &std::path::Path, json: bool) -> Result<()> {
                 r.site.slug,
                 r.site.label,
                 "",
-                "remote",
+                if r.site.engine.is_some() {
+                    "engine-paired"
+                } else {
+                    "remote"
+                },
             );
             continue;
         }
@@ -2010,6 +2087,9 @@ enum Route {
         question: &'static str,
         detail: &'static str,
     },
+    /// `engine install-code`: a new one-time install code, minted inside
+    /// the server's engine through `docker exec` (m4-6).
+    InstallCode,
     /// Everything else: the same subcommand on the server, streamed.
     Run(remote::Action),
 }
@@ -2074,7 +2154,7 @@ fn engine_lifecycle<D: engine_admin::DockerExec + ?Sized>(
 
 /// Map a parsed command to its remote route, or refuse it with a message that
 /// names the host. Pure, so the whole table is unit-tested.
-fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
+fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) -> Result<Route> {
     use remote::Action;
     let on_server = |what: &str| {
         anyhow::anyhow!(
@@ -2218,21 +2298,22 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
         }
         #[cfg(unix)]
         Command::Engine { command } => {
-            engine::check_experimental(&command)?;
+            engine::check_experimental(&command, experimental)?;
             match command {
-                engine::EngineCommand::Enable { .. } => Route::EngineChange {
+                engine::EngineCommand::Enable => Route::EngineChange {
                     args: vec!["engine", "enable", "--experimental"],
                     yes: false,
                     question: ENABLE_QUESTION,
                     detail: ENABLE_DETAIL,
                 },
-                engine::EngineCommand::Remove { yes, .. } => Route::EngineChange {
+                engine::EngineCommand::Remove { yes } => Route::EngineChange {
                     args: vec!["engine", "remove", "--experimental", "--yes"],
                     yes,
                     question: engine::REMOVE_QUESTION,
                     detail: engine::REMOVE_DETAIL,
                 },
-                engine::EngineCommand::Disable { .. } => {
+                engine::EngineCommand::InstallCode => Route::InstallCode,
+                engine::EngineCommand::Disable => {
                     return Err(local_only(
                         "engine disable",
                         "skips the wake and the checks; use `engine remove --experimental`",
@@ -2246,6 +2327,16 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                 }
                 engine::EngineCommand::Probe { .. } => {
                     unreachable!("probe names its site by URL: no site lookup")
+                }
+                engine::EngineCommand::Requests
+                | engine::EngineCommand::Approve { .. }
+                | engine::EngineCommand::Managers
+                | engine::EngineCommand::Revoke { .. }
+                | engine::EngineCommand::Forget { .. } => {
+                    return Err(engine::not_token_paired(
+                        "requests/approve/managers/revoke/forget",
+                        &format!("over SSH ({host})"),
+                    ))
                 }
             }
         }
@@ -2263,10 +2354,10 @@ fn relay(pipe: aincient_core::docker::Pipe, line: &str) {
 
 /// A command on a remote site: run by the server's own `atelier` over SSH
 /// (D-01), non-interactively, after any confirmation was asked here.
-fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
+fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Result<()> {
     let remote = site.remote.as_ref().expect("caller checked");
     let host = remote.host.as_str();
-    let route = remote_route(command, host, &site.slug)?;
+    let route = remote_route(command, host, &site.slug, experimental)?;
     // Doctor opens its own session: a failed login is a finding, not an error.
     if let Route::Doctor { fix, json } = route {
         if !json {
@@ -2450,7 +2541,20 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                 println!("{}", style::warn("Aborted — nothing was changed."));
                 return Ok(());
             }
+            // The server's own `engine enable` prints the install code (m4-6)
+            // next to its address; it streams through here.
             session.run_streamed(&args, remote::LIFECYCLE_DEADLINE, &mut relay)
+        }
+        Route::InstallCode => {
+            let info = session.engine_info()?;
+            let code = engine_admin::install_code(&session, info.as_ref())?;
+            if let Some(d) = &remote.domain {
+                println!("Site:  {}", remote::domain_base(d));
+            } else {
+                println!("Site:  `{}` on {host}", remote.slug);
+            }
+            println!("{}", engine_admin::install_code_notice(&code));
+            Ok(())
         }
         Route::Run(action) => {
             session.run_action(&action, &mut relay)?;
@@ -2866,14 +2970,11 @@ mod tests {
 
     const HOST: &str = "deploy@example.com";
 
-    fn parse(args: &[&str]) -> Command {
+    fn route(args: &[&str]) -> Result<Route> {
         let mut argv = vec!["atelier", "--site", "prod"];
         argv.extend_from_slice(args);
-        Cli::try_parse_from(argv).unwrap().command
-    }
-
-    fn route(args: &[&str]) -> Result<Route> {
-        remote_route(parse(args), HOST, "prod")
+        let cli = Cli::try_parse_from(argv).unwrap();
+        remote_route(cli.command, HOST, "prod", cli.experimental)
     }
 
     /// The server argv a plain streamed route sends.

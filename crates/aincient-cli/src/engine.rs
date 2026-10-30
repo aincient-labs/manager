@@ -39,19 +39,12 @@ pub enum EngineCommand {
         command: AdminCommand,
     },
     /// Add the EXPERIMENTAL engine to this site. It holds the host's Docker
-    /// socket: root on this machine.
-    Enable {
-        /// Say you understand the engine is experimental and root on the host.
-        #[arg(long)]
-        experimental: bool,
-    },
+    /// socket: root on this machine. Prints the install code that pairs the
+    /// first Manager.
+    Enable,
     /// Remove the engine's files and restart the stack without it (no wake,
     /// no checks: `remove` is the Manager's action). Its volumes stay.
-    Disable {
-        /// Say you mean to change the experimental engine.
-        #[arg(long)]
-        experimental: bool,
-    },
+    Disable,
     /// Call a site's engine with the Manager's client: `GET version` and the
     /// API-major check, or with --ask an anonymous pairing request. Changes
     /// nothing on this computer. The client refuses plain http:// unless
@@ -68,11 +61,35 @@ pub enum EngineCommand {
     /// resting site, disable, restart, check edge, app and db run. Refused
     /// while locked down. Its volumes stay.
     Remove {
-        /// Say you mean to change the experimental engine.
-        #[arg(long)]
-        experimental: bool,
         /// Don't ask first. A live site on a server still needs its name:
         /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Make a new one-time install code (over SSH, or on this computer): it
+    /// pairs a site's first Manager as its primary. Replaces an unused one.
+    InstallCode,
+    /// On the site's PRIMARY Manager: Managers waiting to join (name,
+    /// address, age). Their codes are on their own screens, never here.
+    Requests,
+    /// On the PRIMARY: let a waiting Manager in. You type the code its
+    /// screen shows (asked for here; never one from a website or an email).
+    Approve {
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// The Managers paired with an engine-paired site: name, primary or
+    /// rank, last seen.
+    Managers,
+    /// Revoke a Manager junior to this one (its id from `engine managers`).
+    Revoke {
+        id: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// This Manager leaves an engine-paired site: revoke its own pairing,
+    /// delete its token from the keychain, drop the site from the list.
+    Forget {
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -87,21 +104,40 @@ pub fn needs_experimental(what: &str) -> anyhow::Error {
     )
 }
 
-/// Refuse an engine change without `--experimental`; `Ok` for the rest.
-pub fn check_experimental(cmd: &EngineCommand) -> Result<()> {
-    match cmd {
-        EngineCommand::Enable {
-            experimental: false,
-        } => Err(needs_experimental("enable")),
-        EngineCommand::Disable {
-            experimental: false,
-        } => Err(needs_experimental("disable")),
-        EngineCommand::Remove {
-            experimental: false,
-            ..
-        } => Err(needs_experimental("remove")),
-        _ => Ok(()),
+/// Refuse an engine command without `--experimental` (m7-3, M4); `Ok` for
+/// the ones that need none: inside the container (the container is the
+/// opt-in) and the read-only `probe`.
+pub fn check_experimental(cmd: &EngineCommand, experimental: bool) -> Result<()> {
+    let word = match cmd {
+        EngineCommand::Serve { .. } | EngineCommand::Admin { .. } | EngineCommand::Probe { .. } => {
+            return Ok(())
+        }
+        EngineCommand::Enable => "enable",
+        EngineCommand::Disable => "disable",
+        EngineCommand::Remove { .. } => "remove",
+        EngineCommand::InstallCode => "install-code",
+        EngineCommand::Requests => "requests",
+        EngineCommand::Approve { .. } => "approve",
+        EngineCommand::Managers => "managers",
+        EngineCommand::Revoke { .. } => "revoke",
+        EngineCommand::Forget { .. } => "forget",
+    };
+    if experimental {
+        Ok(())
+    } else {
+        Err(needs_experimental(word))
     }
+}
+
+/// The refusal for a pairing command on a site this Manager reaches without
+/// a token (on this computer, or over SSH).
+pub fn not_token_paired(what: &str, place: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`engine {what}` talks to a site this Manager is paired with by token (added with \
+         `atelier sites add <SLUG> --url … --install-code …` or `sites join`). This site is \
+         reached {place}, where whoever runs Docker is the owner: use `docker exec \
+         <project>-engine-1 atelier engine admin requests|approve <CODE>|pairings|revoke <ID>`."
+    )
 }
 
 /// The question `engine remove` asks, `{site}` naming the site and its host.
@@ -125,11 +161,7 @@ pub fn run_without_site(cmd: EngineCommand) -> Result<()> {
         }
         EngineCommand::Admin { command } => aincient_engine::admin(command),
         EngineCommand::Probe { domain, ask } => probe(&domain, ask.as_deref()),
-        EngineCommand::Enable { .. }
-        | EngineCommand::Disable { .. }
-        | EngineCommand::Remove { .. } => {
-            unreachable!("site commands go through run_on_host")
-        }
+        _ => unreachable!("site commands go through run_on_host"),
     }
 }
 
@@ -137,11 +169,30 @@ pub fn run_without_site(cmd: EngineCommand) -> Result<()> {
 /// `confirm_change`): `(guard, detail, question, yes)`.
 pub type Confirm<'a> = &'a dyn Fn(&ChangeGuard, &str, &str, bool) -> Result<bool>;
 
-pub fn run_on_host(cmd: EngineCommand, stack: &Stack, confirm: Confirm) -> Result<()> {
-    check_experimental(&cmd)?;
+pub fn run_on_host(
+    cmd: EngineCommand,
+    stack: &Stack,
+    experimental: bool,
+    confirm: Confirm,
+) -> Result<()> {
+    check_experimental(&cmd, experimental)?;
     match cmd {
-        EngineCommand::Enable { experimental } => enable(stack, experimental),
-        EngineCommand::Disable { .. } => disable(stack),
+        EngineCommand::Enable => enable(stack),
+        EngineCommand::Disable => disable(stack),
+        EngineCommand::InstallCode => {
+            let code = engine_admin::install_code(
+                &engine_admin::LocalDocker,
+                engine_admin::probe(stack).as_ref(),
+            )?;
+            println!("Site:  {}", stack.console_url());
+            println!("{}", engine_admin::install_code_notice(&code));
+            Ok(())
+        }
+        EngineCommand::Requests => Err(not_token_paired("requests", "on this computer")),
+        EngineCommand::Approve { .. } => Err(not_token_paired("approve", "on this computer")),
+        EngineCommand::Managers => Err(not_token_paired("managers", "on this computer")),
+        EngineCommand::Revoke { .. } => Err(not_token_paired("revoke", "on this computer")),
+        EngineCommand::Forget { .. } => Err(not_token_paired("forget", "on this computer")),
         EngineCommand::Remove { yes, .. } => {
             if optin::is_enabled(stack)
                 && !confirm(
@@ -163,10 +214,7 @@ pub fn run_on_host(cmd: EngineCommand, stack: &Stack, confirm: Confirm) -> Resul
     }
 }
 
-fn enable(stack: &Stack, experimental: bool) -> Result<()> {
-    if !experimental {
-        return Err(needs_experimental("enable"));
-    }
+fn enable(stack: &Stack) -> Result<()> {
     let id = engine_admin::local_image_id()?;
     optin::enable(stack, &id, &|files, env| {
         engine_admin::compose_config_json(stack, files, env)
@@ -179,10 +227,19 @@ fn enable(stack: &Stack, experimental: bool) -> Result<()> {
         "Engine enabled (EXPERIMENTAL). API: http://localhost:{}/_atelier/engine/v1/version",
         stack.http_port()
     );
-    println!(
-        "Pair the first Manager with: docker exec {}-engine-1 atelier engine admin install-code",
-        stack.project_name()
-    );
+    // m4-6: the code that pairs the first Manager, next to the site's address.
+    println!("Site:  {}", stack.console_url());
+    match engine_admin::install_code(
+        &engine_admin::LocalDocker,
+        engine_admin::probe(stack).as_ref(),
+    ) {
+        Ok(code) => println!("{}", engine_admin::install_code_notice(&code)),
+        Err(e) => println!(
+            "No install code yet ({e:#}). Make one with: atelier engine install-code \
+             --experimental (or docker exec {}-engine-1 atelier engine admin install-code)",
+            stack.project_name()
+        ),
+    }
     Ok(())
 }
 
@@ -242,10 +299,16 @@ mod tests {
     use clap::Parser;
 
     fn parse(args: &[&str]) -> EngineCommand {
+        parse_flag(args).0
+    }
+
+    /// The command and the global `--experimental`.
+    fn parse_flag(args: &[&str]) -> (EngineCommand, bool) {
         let mut all = vec!["atelier", "engine"];
         all.extend_from_slice(args);
-        match Cli::try_parse_from(all).unwrap().command {
-            Command::Engine { command } => command,
+        let cli = Cli::try_parse_from(all).unwrap();
+        match cli.command {
+            Command::Engine { command } => (command, cli.experimental),
             _ => panic!("not an engine command"),
         }
     }
@@ -259,6 +322,7 @@ mod tests {
         assert!(!needs_no_site(&parse(&["enable", "--experimental"])));
         assert!(!needs_no_site(&parse(&["disable", "--experimental"])));
         assert!(!needs_no_site(&parse(&["remove", "--experimental"])));
+        assert!(!needs_no_site(&parse(&["managers"])));
     }
 
     #[test]
@@ -268,8 +332,20 @@ mod tests {
         let never = |_: &ChangeGuard, _: &str, _: &str, _: bool| -> Result<bool> {
             panic!("nothing is confirmed without --experimental")
         };
-        for args in [&["enable"][..], &["disable"], &["remove", "--yes"]] {
-            let e = run_on_host(parse(args), &stack, &never)
+        for args in [
+            &["enable"][..],
+            &["disable"],
+            &["remove", "--yes"],
+            &["install-code"],
+            &["requests"],
+            &["approve"],
+            &["managers"],
+            &["revoke", "a00000000001"],
+            &["forget", "-y"],
+        ] {
+            let (cmd, flag) = parse_flag(args);
+            assert!(!flag);
+            let e = run_on_host(cmd, &stack, flag, &never)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -279,7 +355,41 @@ mod tests {
         }
         assert!(!dir.exists());
         // In-container commands need no flag: the container is the opt-in.
-        assert!(check_experimental(&parse(&["admin", "status"])).is_ok());
+        assert!(check_experimental(&parse(&["admin", "status"]), false).is_ok());
+        assert!(check_experimental(&parse(&["probe", "x.com"]), false).is_ok());
+        // The flag is global: before or after the subcommand.
+        assert!(parse_flag(&["managers", "--experimental"]).1);
+        let cli = Cli::try_parse_from(["atelier", "--experimental", "engine", "managers"]).unwrap();
+        assert!(cli.experimental);
+    }
+
+    #[test]
+    fn pairing_commands_on_a_site_reached_without_a_token_point_at_ssh_admin() {
+        let dir = std::env::temp_dir().join(format!("atelier-cli-pair-{}", std::process::id()));
+        let stack = Stack::at(&dir);
+        let never = |_: &ChangeGuard, _: &str, _: &str, _: bool| -> Result<bool> {
+            panic!("refused before any question")
+        };
+        for args in [
+            &["requests", "--experimental"][..],
+            &["approve", "--experimental"],
+            &["managers", "--experimental"],
+            &["revoke", "a00000000001", "--experimental"],
+            &["forget", "--experimental"],
+        ] {
+            let (cmd, flag) = parse_flag(args);
+            let e = run_on_host(cmd, &stack, flag, &never)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("by token") && e.contains("admin"),
+                "{args:?}: {e}"
+            );
+        }
+        assert!(!dir.exists());
+        // Approve takes no code argument: it is typed when asked.
+        let mut all = vec!["atelier", "engine", "approve", "ABCD-EFGH"];
+        assert!(Cli::try_parse_from(all.drain(..)).is_err());
     }
 
     #[test]
@@ -289,7 +399,8 @@ mod tests {
         let never = |_: &ChangeGuard, _: &str, _: &str, _: bool| -> Result<bool> {
             panic!("no engine, no question")
         };
-        run_on_host(parse(&["remove", "--experimental"]), &stack, &never).unwrap();
+        let (cmd, flag) = parse_flag(&["remove", "--experimental"]);
+        run_on_host(cmd, &stack, flag, &never).unwrap();
         assert!(!dir.exists());
     }
 }

@@ -827,21 +827,37 @@ async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
 
 /// Add the engine to the selected site (the window confirmed first): on this
 /// computer core's enable + `up`; on a server its own `atelier engine enable
-/// --experimental`, which runs `up` there.
+/// --experimental`, which runs `up` there. Returns the install code that
+/// pairs the first Manager (m4-6), when the engine made one, for the window
+/// to show once next to the site's address.
 #[tauri::command]
-async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<Option<String>, String> {
     require_experimental()?;
     match target(&sel)? {
         Target::Local(s) => blocking(move || engine_admin::enable_local(&s).map_err(err)).await,
         Target::Remote(site) => {
             blocking(move || {
+                let mut code = None;
+                let mut sink = feed(&app);
                 session(&site)?
                     .run_streamed(
                         &["engine", "enable", "--experimental"],
                         remote::LIFECYCLE_DEADLINE,
-                        &mut feed(&app),
+                        &mut |pipe, line| {
+                            let plain = remote::strip_ansi(line);
+                            if let Some(c) = plain
+                                .strip_prefix("Install code: ")
+                                .and_then(engine_admin::install_code_in)
+                            {
+                                // Shown in the dialog, not in the log feed.
+                                code = Some(c);
+                                return;
+                            }
+                            sink(pipe, line)
+                        },
                     )
-                    .map_err(err)
+                    .map_err(err)?;
+                Ok(code)
             })
             .await
         }
