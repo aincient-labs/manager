@@ -15,8 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and renames one. Every action runs against the site shown, and with more than one site each
   confirmation and progress panel names it. Switching also makes it the active site for the CLI;
   an `atelier sites use` in a terminal doesn't move an open window.
+- **Sites on a server, over SSH.** `atelier sites add <slug> --host <ssh target>` (or **Add a
+  site… → On a server** in the window) attaches a site that already runs on a server, using an
+  SSH alias you have or a per-server key the Manager makes and keeps in the OS keychain. The
+  Manager runs the server's own `atelier` CLI, copying a matching Linux build to
+  `~/.local/bin/atelier` when the server has none. Status, update, backup, restore, start/stop,
+  export, freeze/live, snapshots and doctor then work with `--site` or from the switcher; doctor
+  says which machine each check ran on. The console opens at the address set with `--domain` /
+  `atelier sites set-domain`, else through an SSH tunnel on 127.0.0.1 (ports 41300–41399).
+- **Server backups come home.** A backup made on a server is copied to
+  `~/.atelier/remote/<slug>/backups` and checked against the server's size and SHA-256
+  (`--no-copy` keeps it on the server). A backup on this computer restores onto the server by
+  upload; `--on-server` takes a path on the server.
+- **Backups know their site.** Every new backup records the site it came from, and restore
+  refuses another site's backup unless you pass `--other-site` (the window asks). Older backups
+  restore with a warning. `data backup --json` prints the archive's path, size and checksum.
 
 ### Changed
+
+- Every destructive confirmation names where it acts ("on this computer" or the server). On a
+  server site that is live, you type the site's short name; `--yes` alone doesn't skip it, so
+  scripts pass `--yes --confirm-slug <slug>`. `app stop` and `site freeze|use|live|prune` take
+  `--yes`.
 
 - The GUI's set-up screen installs a newly added site on the port it was registered with, the
   same rule as `atelier app install`, instead of always offering 41221.
