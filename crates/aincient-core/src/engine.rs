@@ -40,9 +40,22 @@ pub const CLIENT_API_MAJOR: u32 = 1;
 pub const ENGINE_COMPOSE_FILE: &str = "compose.engine.yaml";
 /// The edge config used instead of `edge.conf` while the engine is on.
 pub const ENGINE_EDGE_FILE: &str = "edge.engine.conf";
-/// The engine image: built locally by `engine/build.sh`, never pulled (slice C
-/// replaces this with a digest-pinned reference, m7-4).
+/// The tag `engine/build.sh` gives the engine image. Built locally, never
+/// pulled, and never run by this name: [`enable`] resolves it to the image ID
+/// once and pins that (m7-4).
 pub const ENGINE_IMAGE: &str = "atelier-engine:dev";
+/// The `.env` key holding the pinned engine image: its content-addressed ID,
+/// `sha256:<64 hex>`. A locally built image has no registry digest, and
+/// `name@sha256:<id>` doesn't resolve for one; the bare ID does, for both
+/// `docker run` and compose, and a rebuild or retag can't change what it
+/// names. [`ENGINE_COMPOSE_TEMPLATE`] runs exactly this; doctor flags a
+/// running engine whose image differs ([`pinned_image`]).
+pub const IMAGE_ENV: &str = "ATELIER_ENGINE_IMAGE";
+/// The `.env` key listing the TLS proxies in front of edge whose
+/// `X-Forwarded-For` edge believes (m7-4): IPs or CIDRs, separated by commas
+/// or spaces. The owner's key: unset or empty trusts nobody, so the client is
+/// the TCP peer. Edge then hands the engine that one address as `X-Real-IP`.
+pub const TRUSTED_PROXIES_ENV: &str = "ATELIER_TRUSTED_PROXIES";
 /// The engine refuses to start unless this is `1` (m7-2). Only
 /// [`ENGINE_COMPOSE_TEMPLATE`] sets it, so a copied compose file that drops the
 /// line can't start an engine by accident.
@@ -50,11 +63,12 @@ pub const EXPERIMENTAL_ENV: &str = "ATELIER_ENGINE_EXPERIMENTAL";
 /// The `.env` value of `COMPOSE_FILE` while the engine is on.
 pub const COMPOSE_FILE_VALUE: &str = "compose.yaml:compose.engine.yaml";
 /// The `.env` keys [`enable`] writes and [`disable`] removes.
-pub const ENV_KEYS: [&str; 4] = [
+pub const ENV_KEYS: [&str; 5] = [
     "COMPOSE_FILE",
     "COMPOSE_PATH_SEPARATOR",
     "ATELIER_STACK_DIR",
     "ATELIER_PROJECT",
+    IMAGE_ENV,
 ];
 
 /// The engine's routes under `/_atelier/engine/v1/`, as anchored regex
@@ -104,7 +118,9 @@ services:
     volumes:
       - ./edge.engine.conf:/etc/nginx/conf.d/default.conf:ro
   engine:
-    image: atelier-engine:dev
+    # The image ID `atelier engine enable` resolved from atelier-engine:dev:
+    # immutable, so a rebuild or retag changes nothing until enable runs again.
+    image: ${ATELIER_ENGINE_IMAGE:?run atelier engine enable}
     pull_policy: never
     environment:
       ATELIER_ENGINE_EXPERIMENTAL: "1"
@@ -266,11 +282,109 @@ fn insert_at(base: &str, anchor: &str, text: &str, before: bool) -> String {
     base.replacen(anchor, &with, 1)
 }
 
-/// [`EDGE_CONF_TEMPLATE`] with the engine added: derived, so it can't drift
-/// from the shipped rule silently (each insertion asserts its anchor).
-pub fn edge_conf() -> String {
+/// The client's address behind a TLS proxy (m7-4), server-wide so every
+/// limit and the `X-Real-IP` the engine gets already use it. nginx replaces
+/// `$remote_addr` with the right-most `X-Forwarded-For` entry that isn't a
+/// listed proxy, and only when the connection itself comes from one; from
+/// anyone else the header is ignored. No list, no `set_real_ip_from`: the
+/// client is the TCP peer, whatever it sends.
+fn edge_real_ip(trusted: &[String]) -> String {
+    let mut s = String::from(
+        "\n    # The client's address (m7-4): X-Forwarded-For is believed only from the\n\
+         \x20   # proxies ATELIER_TRUSTED_PROXIES in .env lists; then `atelier engine enable`.\n",
+    );
+    if trusted.is_empty() {
+        s.push_str("    # None listed: the client is the TCP peer.\n");
+        return s;
+    }
+    for t in trusted {
+        s.push_str(&format!("    set_real_ip_from {t};\n"));
+    }
+    s.push_str("    real_ip_header X-Forwarded-For;\n    real_ip_recursive on;\n");
+    s
+}
+
+/// [`EDGE_CONF_TEMPLATE`] with the engine added, for edge behind the
+/// `trusted` proxies ([`trusted_proxies`]): derived, so it can't drift from
+/// the shipped rule silently (each insertion asserts its anchor).
+pub fn edge_conf(trusted: &[String]) -> String {
     let s = insert_at(EDGE_CONF_TEMPLATE, "server {\n", EDGE_ZONES, true);
-    insert_at(&s, "    absolute_redirect off;\n", &edge_locations(), false)
+    let tail = format!("{}{}", edge_real_ip(trusted), edge_locations());
+    insert_at(&s, "    absolute_redirect off;\n", &tail, false)
+}
+
+/// Parse [`TRUSTED_PROXIES_ENV`]: IPs or CIDRs, separated by commas or
+/// spaces, each written back canonically (so nothing but an address reaches
+/// nginx's config). Refuses anything else, a prefix past the address's
+/// width, and a `/0`: "trust everyone" would let any client choose its own
+/// address, so it is never accepted.
+pub fn parse_trusted_proxies(value: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for item in value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+    {
+        let (ip, prefix) = match item.split_once('/') {
+            Some((ip, p)) => (ip, Some(p)),
+            None => (item, None),
+        };
+        let ip: std::net::IpAddr = ip.parse().with_context(|| {
+            format!("{TRUSTED_PROXIES_ENV}: {item:?} is not an IP address or CIDR")
+        })?;
+        let width = if ip.is_ipv4() { 32 } else { 128 };
+        let entry = match prefix {
+            None => ip.to_string(),
+            Some(p) => {
+                let n: u8 = p
+                    .parse()
+                    .ok()
+                    .filter(|n| p.bytes().all(|b| b.is_ascii_digit()) && *n <= width)
+                    .with_context(|| {
+                        format!("{TRUSTED_PROXIES_ENV}: {item:?} has a bad prefix length")
+                    })?;
+                if n == 0 {
+                    bail!(
+                        "{TRUSTED_PROXIES_ENV}: {item:?} trusts every address, so any client \
+                         could pick its own; list your proxy's address instead"
+                    );
+                }
+                format!("{ip}/{n}")
+            }
+        };
+        if ip.is_unspecified() {
+            bail!("{TRUSTED_PROXIES_ENV}: {item:?} is not a proxy's address");
+        }
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
+/// The stack's trusted proxies, from `.env`; none when the key is unset.
+pub fn trusted_proxies(stack: &Stack) -> Result<Vec<String>> {
+    parse_trusted_proxies(
+        stack
+            .read_env()
+            .get(TRUSTED_PROXIES_ENV)
+            .map(String::as_str)
+            .unwrap_or(""),
+    )
+}
+
+/// Whether `id` is a full image ID, `sha256:` and 64 lower-case hex digits.
+pub fn is_image_id(id: &str) -> bool {
+    id.strip_prefix("sha256:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The image ID `.env` pins the engine to, if it is a well-formed one.
+pub fn pinned_image(stack: &Stack) -> Option<String> {
+    stack
+        .read_env()
+        .get(IMAGE_ENV)
+        .filter(|v| is_image_id(v))
+        .cloned()
 }
 
 pub fn compose_path(stack: &Stack) -> PathBuf {
@@ -286,10 +400,17 @@ pub fn is_enabled(stack: &Stack) -> bool {
     stack.read_env().get("COMPOSE_FILE").map(String::as_str) == Some(COMPOSE_FILE_VALUE)
 }
 
-/// Whether both opt-in files are exactly what this Manager writes.
+/// Whether both opt-in files are exactly what this Manager writes for the
+/// stack's `.env` (its trusted proxies), and `.env` pins an image ID. False
+/// after a Manager update changed a template, or after the owner changed
+/// [`TRUSTED_PROXIES_ENV`]: `enable` again rewrites them (doctor says so).
 pub fn files_current(stack: &Stack) -> bool {
+    let Ok(trusted) = trusted_proxies(stack) else {
+        return false;
+    };
     read(&compose_path(stack)).as_deref() == Some(ENGINE_COMPOSE_TEMPLATE)
-        && read(&edge_path(stack)) == Some(edge_conf())
+        && read(&edge_path(stack)) == Some(edge_conf(&trusted))
+        && pinned_image(stack).is_some()
 }
 
 fn read(p: &Path) -> Option<String> {
@@ -317,7 +438,8 @@ fn refuse_unless_shipped(stack: &Stack) -> Result<()> {
 }
 
 /// Turn the engine on (m7-1): write [`ENGINE_EDGE_FILE`] and
-/// [`ENGINE_COMPOSE_FILE`], then name them in `.env`. Each file is written
+/// [`ENGINE_COMPOSE_FILE`], then name them in `.env` with the engine pinned
+/// to `image_id` (the ID the caller resolved from [`ENGINE_IMAGE`], m7-4). Each file is written
 /// atomically, and `.env` last, so `COMPOSE_FILE` never names a file that isn't
 /// there. Idempotent: running it again rewrites the files from this Manager's
 /// templates (after an update changed them). It starts nothing; the caller runs
@@ -327,8 +449,12 @@ fn refuse_unless_shipped(stack: &Stack) -> Result<()> {
 /// already sets `COMPOSE_FILE` to something else, and when a
 /// `compose.override.yaml` is present (`COMPOSE_FILE` would silently stop
 /// loading it).
-pub fn enable(stack: &Stack) -> Result<()> {
+pub fn enable(stack: &Stack, image_id: &str) -> Result<()> {
     refuse_unless_shipped(stack)?;
+    if !is_image_id(image_id) {
+        bail!("the engine image must be pinned by its full ID (sha256:<64 hex>), not {image_id:?}");
+    }
+    let trusted = trusted_proxies(stack)?;
     let env = stack.read_env();
     if let Some(v) = env.get("COMPOSE_FILE").filter(|v| *v != COMPOSE_FILE_VALUE) {
         bail!(
@@ -353,7 +479,7 @@ pub fn enable(stack: &Stack) -> Result<()> {
         .filter(|h| !h.contains(':') && !h.contains(char::is_whitespace))
         .context("the stack directory's path has a ':' or a space, which compose can't mount")?
         .to_string();
-    write_atomic(&edge_path(stack), &edge_conf(), 0o644)?;
+    write_atomic(&edge_path(stack), &edge_conf(&trusted), 0o644)?;
     write_atomic(&compose_path(stack), ENGINE_COMPOSE_TEMPLATE, 0o644)?;
     let mut text = env_without_ours(stack);
     if !text.is_empty() && !text.ends_with('\n') {
@@ -365,6 +491,7 @@ pub fn enable(stack: &Stack) -> Result<()> {
         ("COMPOSE_PATH_SEPARATOR", ":".to_string()),
         ("ATELIER_STACK_DIR", home),
         ("ATELIER_PROJECT", stack.project_name()),
+        (IMAGE_ENV, image_id.to_string()),
     ] {
         text.push_str(&format!("{k}={v}\n"));
     }
@@ -445,6 +572,8 @@ mod tests {
     use crate::stack::{InstallOptions, COMPOSE_TEMPLATE};
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    const ID: &str = "sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529";
+
     struct TempStack(Stack);
     impl TempStack {
         fn new() -> Self {
@@ -494,7 +623,7 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         let env_before = s.read_env();
-        enable(s).unwrap();
+        enable(s, ID).unwrap();
         assert!(is_enabled(s) && files_current(s));
         assert_eq!(
             std::fs::read_to_string(s.compose_path()).unwrap(),
@@ -517,7 +646,7 @@ mod tests {
         assert!(names.contains(&ENGINE_COMPOSE_FILE.to_string()));
         assert!(names.contains(&ENGINE_EDGE_FILE.to_string()));
         assert!(!names.iter().any(|n| n.contains(".tmp-")), "{names:?}");
-        enable(s).unwrap();
+        enable(s, ID).unwrap();
         assert!(files_current(s), "idempotent");
     }
 
@@ -526,7 +655,7 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         let before = snapshot(&s.home);
-        enable(s).unwrap();
+        enable(s, ID).unwrap();
         disable(s).unwrap();
         assert!(!is_enabled(s));
         assert_eq!(snapshot(&s.home), before);
@@ -539,11 +668,11 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         std::fs::write(s.edge_conf_path(), "# edited by hand\n").unwrap();
-        let e = enable(s).unwrap_err().to_string();
+        let e = enable(s, ID).unwrap_err().to_string();
         assert!(e.contains("doctor"), "{e}");
         assert!(!compose_path(s).exists() && !edge_path(s).exists());
         assert!(disable(s).is_err());
-        assert!(enable(&Stack::at(s.home.join("missing"))).is_err());
+        assert!(enable(&Stack::at(s.home.join("missing")), ID).is_err());
     }
 
     #[test]
@@ -551,12 +680,12 @@ mod tests {
         let t = TempStack::new();
         let s = &t.0;
         std::fs::write(s.home.join("compose.override.yaml"), "services: {}\n").unwrap();
-        assert!(enable(s).unwrap_err().to_string().contains("override"));
+        assert!(enable(s, ID).unwrap_err().to_string().contains("override"));
         std::fs::remove_file(s.home.join("compose.override.yaml")).unwrap();
         let mut text = std::fs::read_to_string(s.env_path()).unwrap();
         text.push_str("COMPOSE_FILE=mine.yaml\n");
         std::fs::write(s.env_path(), text).unwrap();
-        assert!(enable(s).is_err());
+        assert!(enable(s, ID).is_err());
         assert!(disable(s).is_err(), "not ours to remove");
         assert_eq!(s.read_env()["COMPOSE_FILE"], "mine.yaml");
         assert!(!compose_path(s).exists());
@@ -588,8 +717,12 @@ mod tests {
         );
         assert_eq!(c.matches("docker.sock").count(), 2, "one mount line");
         assert!(c.contains(&format!(
-            "    image: {ENGINE_IMAGE}\n    pull_policy: never\n"
+            "    image: ${{{IMAGE_ENV}:?run atelier engine enable}}\n    pull_policy: never\n"
         )));
+        assert!(
+            !c.contains(&format!("image: {ENGINE_IMAGE}")),
+            "never run by its mutable tag"
+        );
         assert!(c.contains(&format!("      {EXPERIMENTAL_ENV}: \"1\"\n")));
         assert!(c.contains(&format!(
             "./{ENGINE_EDGE_FILE}:/etc/nginx/conf.d/default.conf:ro"
@@ -598,7 +731,7 @@ mod tests {
 
     #[test]
     fn the_engine_edge_routes_only_named_paths_without_cookies() {
-        let e = edge_conf();
+        let e = edge_conf(&[]);
         assert!(e.starts_with(&EDGE_CONF_TEMPLATE[..200]));
         assert_eq!(e.matches("proxy_set_header Cookie \"\";").count(), 3);
         assert_eq!(e.matches("set $engine http://engine:8080;").count(), 3);
@@ -620,8 +753,120 @@ mod tests {
         assert_eq!(e.matches('{').count(), e.matches('}').count());
         // Removing the engine's additions gives back the shipped rule.
         assert_eq!(
-            e.replace(EDGE_ZONES, "").replace(&edge_locations(), ""),
+            e.replace(EDGE_ZONES, "")
+                .replace(&edge_real_ip(&[]), "")
+                .replace(&edge_locations(), ""),
             EDGE_CONF_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn enable_pins_the_image_by_id_and_refuses_a_tag() {
+        let t = TempStack::new();
+        let s = &t.0;
+        for bad in [
+            ENGINE_IMAGE,
+            "atelier-engine@sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529",
+            "sha256:700E4087B79A9F81777900A9862F395055D6F7B8CD1CA1A94EABAFC51BB17529",
+            "sha256:700e4087",
+            "",
+        ] {
+            assert!(enable(s, bad).is_err(), "{bad:?}");
+            assert!(!compose_path(s).exists(), "nothing written for {bad:?}");
+        }
+        enable(s, ID).unwrap();
+        assert_eq!(pinned_image(s).as_deref(), Some(ID));
+        assert_eq!(s.read_env()[IMAGE_ENV], ID);
+        // A pin edited into a tag no longer counts as current.
+        let text = std::fs::read_to_string(s.env_path())
+            .unwrap()
+            .replace(ID, ENGINE_IMAGE);
+        std::fs::write(s.env_path(), text).unwrap();
+        assert!(pinned_image(s).is_none() && !files_current(s));
+        disable(s).unwrap();
+        assert!(
+            !s.read_env().contains_key(IMAGE_ENV),
+            "disable takes the pin out"
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_parse_strictly_and_never_trust_everyone() {
+        assert_eq!(parse_trusted_proxies("").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_trusted_proxies(" 172.18.0.1, 10.0.0.0/8  2001:db8::/32,172.18.0.1").unwrap(),
+            ["172.18.0.1", "10.0.0.0/8", "2001:db8::/32"]
+        );
+        for bad in [
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.0/0",
+            "0.0.0.0",
+            "10.0.0.0/33",
+            "10.0.0.0/+8",
+            "10.0.0.0/",
+            "edge",
+            "10.0.0.1;real_ip_header X-Evil",
+            "10.0.0.1}",
+            "all",
+        ] {
+            assert!(parse_trusted_proxies(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn edge_believes_forwarded_addresses_only_from_listed_proxies() {
+        let none = edge_conf(&[]);
+        assert!(
+            !none.contains("set_real_ip_from"),
+            "empty list trusts nobody"
+        );
+        assert!(!none.contains("real_ip_header"));
+        let one = edge_conf(&["172.18.0.1".to_string()]);
+        let server = one.split("server {\n").nth(1).unwrap();
+        assert!(server.contains(
+            "    set_real_ip_from 172.18.0.1;\n    real_ip_header X-Forwarded-For;\n    real_ip_recursive on;\n"
+        ));
+        // Server-wide and before every location, so the limits' keys and the
+        // X-Real-IP edge sends the engine are the client's address.
+        assert!(one.find("set_real_ip_from").unwrap() < one.find("location ").unwrap());
+        assert_eq!(
+            one.matches("proxy_set_header X-Real-IP $remote_addr;")
+                .count(),
+            4
+        );
+        assert!(
+            !one.contains("$http_x_forwarded_for;"),
+            "the header is never passed raw"
+        );
+    }
+
+    #[test]
+    fn files_current_follows_the_trusted_proxies_in_env() {
+        let t = TempStack::new();
+        let s = &t.0;
+        enable(s, ID).unwrap();
+        assert!(files_current(s));
+        let mut text = std::fs::read_to_string(s.env_path()).unwrap();
+        text.push_str(&format!("{TRUSTED_PROXIES_ENV}=172.18.0.1\n"));
+        std::fs::write(s.env_path(), &text).unwrap();
+        assert!(!files_current(s), "a new proxy list needs enable again");
+        enable(s, ID).unwrap();
+        assert!(files_current(s));
+        assert!(std::fs::read_to_string(edge_path(s))
+            .unwrap()
+            .contains("set_real_ip_from 172.18.0.1;"));
+        std::fs::write(s.env_path(), text.replace("172.18.0.1", "0.0.0.0/0")).unwrap();
+        assert!(!files_current(s));
+        assert!(enable(s, ID)
+            .unwrap_err()
+            .to_string()
+            .contains("every address"));
+        disable(s).unwrap();
+        assert_eq!(
+            s.read_env().get(TRUSTED_PROXIES_ENV).map(String::as_str),
+            Some("0.0.0.0/0"),
+            "the owner's key stays"
         );
     }
 }

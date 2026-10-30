@@ -304,20 +304,39 @@ impl<'a, D: DockerExec + ?Sized> EngineAdmin<'a, D> {
     }
 }
 
-/// Turn the engine on for a stack on this computer and start it: the image
-/// must be there (built locally until slice C pins one), then
-/// [`engine::enable`], then `compose up -d --remove-orphans`. The caller has
-/// the user's opt-in (the CLI's `--experimental`, the GUI's setting).
-pub fn enable_local(stack: &Stack) -> Result<()> {
+/// The image ID [`engine::ENGINE_IMAGE`] names on this computer right now:
+/// what [`engine::enable`] pins (m7-4). Built locally, so there is no
+/// registry digest; the ID is content-addressed, which is what makes the pin
+/// immutable.
+pub fn local_image_id() -> Result<String> {
     let mut probe = docker();
-    probe.args(["image", "inspect", engine::ENGINE_IMAGE]);
-    if crate::docker::run_capture(probe, "find the engine image").is_err() {
+    probe.args([
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        engine::ENGINE_IMAGE,
+    ]);
+    let Ok(out) = crate::docker::run_capture(probe, "find the engine image") else {
         bail!(
             "no {} image on this computer — build it first with engine/build.sh",
             engine::ENGINE_IMAGE
         );
+    };
+    let id = out.trim().to_string();
+    if !engine::is_image_id(&id) {
+        bail!("docker gave {id:?} as the engine image's ID, not sha256:<64 hex>");
     }
-    engine::enable(stack)?;
+    Ok(id)
+}
+
+/// Turn the engine on for a stack on this computer and start it: the image
+/// must be there, pinned by its ID ([`local_image_id`]), then
+/// [`engine::enable`], then `compose up -d --remove-orphans`. The caller has
+/// the user's opt-in (the CLI's `--experimental`, the GUI's setting).
+pub fn enable_local(stack: &Stack) -> Result<()> {
+    let id = local_image_id()?;
+    engine::enable(stack, &id)?;
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
     crate::docker::run_capture(c, "start the stack with the engine").map(|_| ())

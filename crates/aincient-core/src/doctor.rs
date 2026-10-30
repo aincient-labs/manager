@@ -842,6 +842,10 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         .fixable(Repair::Scaffold)
     });
 
+    if crate::engine::is_enabled(stack) {
+        out.extend(check_engine(stack));
+    }
+
     out.push(check_container(
         stack,
         "db",
@@ -853,6 +857,88 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     let app_up = app.severity.is_ok();
     out.push(app);
     app_up
+}
+
+/// The EXPERIMENTAL engine (DECISIONS 0483), only on a stack that opted in:
+/// its two files are what this Manager writes for the stack's `.env`, and the
+/// engine container runs exactly the image ID `.env` pins (m7-4). Neither is
+/// repaired by `--fix`: the engine holds the Docker socket, so changing it
+/// takes `atelier engine enable --experimental`, which rewrites both files,
+/// re-pins the image from the local `atelier-engine:dev` and recreates it.
+fn check_engine(stack: &Stack) -> Vec<Check> {
+    use crate::engine;
+    const FILES: &str = "Engine files match this manager (EXPERIMENTAL)";
+    const IMAGE: &str = "Engine runs its pinned image (EXPERIMENTAL)";
+    let mut out = vec![if engine::files_current(stack) {
+        Check::ok("stack.engine_files", Tier::Stack, FILES)
+    } else {
+        let why = match engine::trusted_proxies(stack) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => format!(
+                "{} / {} / {} in .env differ from what this manager writes",
+                engine::ENGINE_COMPOSE_FILE,
+                engine::ENGINE_EDGE_FILE,
+                engine::IMAGE_ENV
+            ),
+        };
+        Check::bad(
+            "stack.engine_files",
+            Tier::Stack,
+            FILES,
+            Severity::Warn,
+            "The engine's files were written by another manager, edited, or predate a change \
+             to ATELIER_TRUSTED_PROXIES. Run `atelier engine enable --experimental` again: it \
+             rewrites them and restarts the engine and edge.",
+        )
+        .detail(why)
+    }];
+    let Some(pin) = engine::pinned_image(stack) else {
+        out.push(
+            Check::bad(
+                "stack.engine_image",
+                Tier::Stack,
+                IMAGE,
+                Severity::Fail,
+                "`.env` doesn't pin the engine image by its ID. Run `atelier engine enable \
+                 --experimental` again.",
+            )
+            .detail(format!(
+                "{} is missing or not sha256:<64 hex>",
+                engine::IMAGE_ENV
+            )),
+        );
+        return out;
+    };
+    let mut ps = compose(stack);
+    ps.args(["ps", "-aq", "engine"]);
+    let running = probe(ps).ok().and_then(|o| {
+        let id = o.trim().lines().next()?.to_string();
+        let mut inspect = docker::docker();
+        inspect.args(["inspect", "--format", "{{.Image}}", &id]);
+        probe(inspect).ok().map(|i| i.trim().to_string())
+    });
+    out.push(match running {
+        Some(image) if image == pin => Check::ok("stack.engine_image", Tier::Stack, IMAGE),
+        Some(image) => Check::bad(
+            "stack.engine_image",
+            Tier::Stack,
+            IMAGE,
+            Severity::Fail,
+            "The engine container runs another image than the one `.env` pins. Someone \
+             started it outside the Manager. Run `atelier engine enable --experimental` to \
+             recreate it from the pin, or `atelier engine remove --experimental`.",
+        )
+        .detail(format!("running {image}, pinned {pin}")),
+        None => Check::bad(
+            "stack.engine_image",
+            Tier::Stack,
+            IMAGE,
+            Severity::Warn,
+            "No engine container to compare. `docker compose up -d` starts it from the pin.",
+        )
+        .detail(format!("pinned {pin}")),
+    });
+    out
 }
 
 /// Inspect one compose service: is its container up, and (if it declares a
