@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use aincient_core::docker::Pipe;
 use aincient_core::{
-    doctor, ops, sites, update_cache, Backup, CacheStatus, Channel, InstallOptions, ModelRole,
-    Preflight, PullEvent, Reporter, SingleFlight, SiteRow, Stack, Stage, Status, UpdateCheck,
+    doctor, ops, remote, sites, ssh_key, update_cache, Backup, CacheStatus, ChangeGuard, Channel,
+    InstallOptions, ModelRole, Preflight, PullEvent, Reporter, SingleFlight, Site, SiteRow, Stack,
+    Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 /// The site this window operates on — its registry slug, or `None` when nothing
@@ -62,6 +64,80 @@ fn stack(sel: &Selected) -> Result<Stack, String> {
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
+
+// --- local or remote ---------------------------------------------------------
+
+/// What the selected site is: a stack on this computer, or a site on a server
+/// reached over SSH (M2). Every command that touches a site branches on this
+/// and calls the same core path the `atelier` CLI uses for that kind.
+enum Target {
+    Local(Stack),
+    Remote(Site),
+}
+
+/// Resolve the selected site. A registered remote site is [`Target::Remote`];
+/// everything else (a local site, an unregistered `~/.atelier`) is local.
+fn target(sel: &Selected) -> Result<Target, String> {
+    if let Some(slug) = sel.get() {
+        let resolution = sites::locate(Some(&slug)).map_err(err)?;
+        if let Some(site) = resolution.site.filter(Site::is_remote) {
+            return Ok(Target::Remote(site));
+        }
+    }
+    stack(sel).map(Target::Local)
+}
+
+/// The selected site's stack, for an action that only exists on this
+/// computer; a remote site gets a refusal that names its server and the
+/// command to run there.
+fn local_stack(sel: &Selected, what: &str) -> Result<Stack, String> {
+    match target(sel)? {
+        Target::Local(s) => Ok(s),
+        Target::Remote(site) => {
+            let r = site.remote.as_ref().expect("remote");
+            Err(format!(
+                "{what} isn't available here for a site on a server yet — {} is on {}. \
+                 Run it there: ssh {} atelier --site {} …",
+                site.label, r.host, r.host, r.slug
+            ))
+        }
+    }
+}
+
+/// The ssh target of a remote site.
+fn host_of(site: &Site) -> String {
+    site.remote
+        .as_ref()
+        .map(|r| r.host.clone())
+        .unwrap_or_default()
+}
+
+/// Open a session to a remote site's engine (copying a matching `atelier`
+/// to the server when it has none, exactly as the CLI does).
+fn session(site: &Site) -> Result<remote::Session<remote::Ssh>, String> {
+    remote::open(site, &remote::EngineOptions::from_env())
+        .map_err(|e| format!("Couldn't reach {} on {}: {e:#}", site.label, host_of(site)))
+}
+
+/// A remote command's output, line by line, into the progress feed.
+fn feed(app: &AppHandle) -> impl FnMut(Pipe, &str) + '_ {
+    move |_pipe, line| {
+        let _ = app.emit(
+            "op-progress",
+            ProgressEvent {
+                kind: "log",
+                stage: None,
+                message: remote::strip_ansi(line),
+                fraction: None,
+                pull: None,
+            },
+        );
+    }
+}
+
+/// How long a status read of a server may take before the window says it
+/// can't reach it.
+const REMOTE_STATUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// A progress update pushed to the webview as an `op-progress` event during a
 /// long lifecycle op. The frontend advances a progress bar from `fraction` and
@@ -175,15 +251,81 @@ async fn check_preflight() -> Result<Preflight, String> {
 /// readiness screen instead of letting an op fail with a raw Docker error.
 /// Off the main thread for the same reason as [`check_preflight`]: `refresh()`
 /// awaits this before anything renders.
+///
+/// A site on a server needs no Docker here: its engine is the server's.
 #[tauri::command]
-async fn preflight_problem() -> Result<Option<String>, String> {
+async fn preflight_problem(sel: State<'_, Selected>) -> Result<Option<String>, String> {
+    if let Target::Remote(_) = target(&sel)? {
+        return Ok(None);
+    }
     blocking(|| Ok(aincient_core::preflight().problem())).await
 }
 
+/// The selected site's status. For a site on a server: its own CLI's answer
+/// over SSH, bounded by [`REMOTE_STATUS_LIMIT`], with the URLs this machine
+/// can open (its recorded domain, or none — never the server's localhost).
 #[tauri::command]
 async fn get_status(sel: State<'_, Selected>) -> Result<Status, String> {
-    let s = stack(&sel)?;
-    blocking(move || Ok(ops::status(&s))).await
+    match target(&sel)? {
+        Target::Local(s) => blocking(move || Ok(ops::status(&s))).await,
+        Target::Remote(site) => {
+            blocking(move || {
+                let host = host_of(&site);
+                let remote = site.remote.clone().expect("remote");
+                remote::within(&host, REMOTE_STATUS_LIMIT, move || {
+                    let st = remote::open(
+                        &site,
+                        &remote::EngineOptions {
+                            no_install: true,
+                            ..remote::EngineOptions::from_env()
+                        },
+                    )?
+                    .status()?;
+                    Ok(remote::status_for_here(&remote, st).0)
+                })
+                .map_err(|e| format!("Can't reach {host}: {e:#}"))
+            })
+            .await
+        }
+    }
+}
+
+/// How a destructive change to the selected site is confirmed (m2-8, D-07):
+/// the dialog names where it runs, and a live site on a server keeps its
+/// confirm button disabled until the slug is typed. A server that can't be
+/// asked counts as live.
+#[tauri::command]
+async fn change_guard(sel: State<'_, Selected>) -> Result<ChangeGuard, String> {
+    match target(&sel)? {
+        Target::Local(s) => Ok(ChangeGuard::local(&s)),
+        Target::Remote(site) => {
+            blocking(move || {
+                let host = host_of(&site);
+                let probe = site.clone();
+                let live = remote::within(&host, REMOTE_STATUS_LIMIT, move || {
+                    Ok(session(&probe).map_err(anyhow::Error::msg)?.is_live())
+                })
+                .unwrap_or(true);
+                Ok(ChangeGuard::for_site(&site, live))
+            })
+            .await
+        }
+    }
+}
+
+/// A remote site's state for the switcher: one bounded read of its server
+/// (copies nothing there). Called per remote row, after the list painted.
+#[tauri::command]
+async fn probe_site(slug: String) -> Result<remote::SiteState, String> {
+    blocking(move || {
+        let resolution = sites::locate(Some(&slug)).map_err(err)?;
+        let site = resolution
+            .site
+            .filter(Site::is_remote)
+            .ok_or_else(|| format!("`{slug}` is not a site on a server"))?;
+        Ok(remote::probe_state(&site, remote::PROBE_STATE_LIMIT))
+    })
+    .await
 }
 
 /// The one registry check allowed in flight at a time **per site** (manager#6):
@@ -208,15 +350,23 @@ fn update_flight(stack: &Stack) -> Arc<SingleFlight<UpdateCheck>> {
 /// core, single-flight here, and its result refreshes the banner's cache.
 #[tauri::command]
 async fn get_update(sel: State<'_, Selected>) -> Result<UpdateCheck, String> {
-    let s = stack(&sel)?;
-    blocking(move || Ok(update_cache::live_check(&s, &update_flight(&s)))).await
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || Ok(update_cache::live_check(&s, &update_flight(&s)))).await
+        }
+        // The server's own check-update: its registry, its route.
+        Target::Remote(site) => blocking(move || session(&site)?.check_update().map_err(err)).await,
+    }
 }
 
 /// The cached update check, if any — a file read, never the network. What the
 /// Home banner (and the Home Update action, while it's fresh) reads.
 #[tauri::command]
 async fn get_cached_update(sel: State<'_, Selected>) -> Result<Option<CacheStatus>, String> {
-    let s = stack(&sel)?;
+    // No cache for a site on a server: its check is the server's to make.
+    let Target::Local(s) = target(&sel)? else {
+        return Ok(None);
+    };
     blocking(move || Ok(update_cache::status(&s))).await
 }
 
@@ -227,15 +377,23 @@ async fn refresh_update_cache(
     force: bool,
     sel: State<'_, Selected>,
 ) -> Result<Option<CacheStatus>, String> {
-    let s = stack(&sel)?;
+    let Target::Local(s) = target(&sel)? else {
+        return Ok(None);
+    };
     blocking(move || Ok(update_cache::refresh(&s, &update_flight(&s), force))).await
 }
 
 /// Off the main thread: a directory listing is quick, but a plain `fn` command
 /// runs on the main thread and nothing there may block (manager#6).
+///
+/// For a site on a server: the copies on this machine (D-03), which are what
+/// a restore here uploads.
 #[tauri::command]
 async fn list_backups(sel: State<'_, Selected>) -> Result<Vec<Backup>, String> {
-    let s = stack(&sel)?;
+    let s = match target(&sel)? {
+        Target::Local(s) => s,
+        Target::Remote(site) => site.stack(),
+    };
     blocking(move || Ok(ops::list_backups(&s))).await
 }
 
@@ -248,7 +406,7 @@ async fn set_admin_password(
     if password.trim().is_empty() {
         return Err("password cannot be empty".into());
     }
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "Setting the admin password")?;
     blocking(move || {
         ops::set_admin_password(&s, &password, &mut EventReporter { app }).map_err(err)
     })
@@ -262,7 +420,7 @@ async fn do_install(
     port: Option<u16>,
     sel: State<'_, Selected>,
 ) -> Result<(), String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "Setting up")?;
     blocking(move || {
         // A registered site without a `.env` gets a port no other site claims;
         // everything else keeps today's behaviour — the same rule as
@@ -290,14 +448,38 @@ async fn do_install(
     .await
 }
 
+/// The window has confirmed (a stepped route; a live remote site's slug).
+/// A site on a server walks its own route: the server's `app update --yes`,
+/// streamed — unless its check says there is nothing to do.
 #[tauri::command]
 async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    blocking(move || {
-        ops::update(&s, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
-    })
-    .await
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                ops::update(&s, &mut EventReporter { app }).map_err(err)?;
+                Ok(())
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let session = session(&site)?;
+                if session.check_update().map_err(err)?.update_available == Some(false) {
+                    return Ok(());
+                }
+                session
+                    .run_action(
+                        &remote::Action::Update {
+                            to: None,
+                            yes: true,
+                        },
+                        &mut feed(&app),
+                    )
+                    .map_err(err)
+            })
+            .await
+        }
+    }
 }
 
 /// Switch which images this install follows, then pull and converge onto the new
@@ -315,7 +497,7 @@ async fn set_channel(
     let target = Channel::parse(&channel)
         .filter(|c| *c != Channel::Pinned)
         .ok_or_else(|| format!("unknown channel {channel:?} — use \"stable\" or \"edge\""))?;
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "Switching the update channel")?;
     blocking(move || {
         ops::switch_channel(&s, target, true, &mut EventReporter { app })
             .map(|(image, _ready)| image)
@@ -324,28 +506,108 @@ async fn set_channel(
     .await
 }
 
+/// Back up the selected site. On a server: the server's `data backup`, then
+/// a copy home that is checked against the server's SHA-256 (D-03) — the
+/// returned path is that local copy.
 #[tauri::command]
 async fn do_backup(
     app: AppHandle,
     label: Option<String>,
     sel: State<'_, Selected>,
 ) -> Result<String, String> {
-    let s = stack(&sel)?;
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                ops::backup(&s, label.as_deref(), &mut EventReporter { app })
+                    .map(|p: PathBuf| p.to_string_lossy().into_owned())
+                    .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let home = remote::local_backups_dir(&site);
+                let got = session(&site)?
+                    .backup(label, Some(&home), &mut feed(&app))
+                    .map_err(err)?;
+                Ok(got
+                    .local
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(got.server.path))
+            })
+            .await
+        }
+    }
+}
+
+/// Whose backup `path` is, before anything is asked (m2-6, D-04): another
+/// site's comes back as `mismatch` so the window can name both sites and
+/// offer "Restore anyway"; an unlabelled one comes back with a `note`.
+#[derive(Serialize)]
+struct RestoreCheck {
+    note: Option<String>,
+    mismatch: Option<ops::IdentityMismatch>,
+}
+
+#[tauri::command]
+async fn check_restore(path: String, sel: State<'_, Selected>) -> Result<RestoreCheck, String> {
+    let target = target(&sel)?;
     blocking(move || {
-        ops::backup(&s, label.as_deref(), &mut EventReporter { app })
-            .map(|p: PathBuf| p.to_string_lossy().into_owned())
-            .map_err(err)
+        let file = std::path::Path::new(&path);
+        let checked = match &target {
+            Target::Local(s) => ops::restore_identity(s, file, false),
+            Target::Remote(site) => session(site)?.check_restore_identity(file, false),
+        };
+        match checked {
+            Ok(check) => Ok(RestoreCheck {
+                note: check.message().map(str::to_string),
+                mismatch: None,
+            }),
+            Err(e) => match e.downcast::<ops::IdentityMismatch>() {
+                Ok(mismatch) => Ok(RestoreCheck {
+                    note: None,
+                    mismatch: Some(mismatch),
+                }),
+                Err(e) => Err(err(e)),
+            },
+        }
     })
     .await
 }
 
+/// Restore `path` onto the selected site, behind the identity check
+/// (`ops::restore_with`; on a server, its own `data restore` after a
+/// verified upload). `other_site` is the explicit "Restore anyway".
 #[tauri::command]
-async fn do_restore(app: AppHandle, path: String, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    blocking(move || {
-        ops::restore(&s, std::path::Path::new(&path), &mut EventReporter { app }).map_err(err)
-    })
-    .await
+async fn do_restore(
+    app: AppHandle,
+    path: String,
+    other_site: Option<bool>,
+    sel: State<'_, Selected>,
+) -> Result<(), String> {
+    let other_site = other_site.unwrap_or(false);
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                ops::restore_with(
+                    &s,
+                    std::path::Path::new(&path),
+                    &ops::RestoreOptions { other_site },
+                    &mut EventReporter { app },
+                )
+                .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                session(&site)?
+                    .restore_upload(std::path::Path::new(&path), other_site, &mut feed(&app))
+                    .map_err(err)
+            })
+            .await
+        }
+    }
 }
 
 /// Open a native "open file" dialog and return the chosen backup's path (or
@@ -403,7 +665,7 @@ async fn export_backup(app: AppHandle, source: String) -> Result<bool, String> {
 
 #[tauri::command]
 async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "Reinstalling")?;
     blocking(move || {
         let opts = InstallOptions::default();
         ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
@@ -412,20 +674,38 @@ async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<(), St
     .await
 }
 
-#[tauri::command]
-async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
+/// Run one action on a remote site's server, streamed into the feed.
+async fn run_remote(app: AppHandle, site: Site, action: remote::Action) -> Result<(), String> {
     blocking(move || {
-        ops::start(&s, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
+        session(&site)?
+            .run_action(&action, &mut feed(&app))
+            .map_err(err)
     })
     .await
 }
 
 #[tauri::command]
+async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                ops::start(&s, &mut EventReporter { app }).map_err(err)?;
+                Ok(())
+            })
+            .await
+        }
+        Target::Remote(site) => run_remote(app, site, remote::Action::Start).await,
+    }
+}
+
+#[tauri::command]
 async fn do_stop(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
+        }
+        Target::Remote(site) => run_remote(app, site, remote::Action::Stop).await,
+    }
 }
 
 /// Remove the appliance's containers. With `wipe = true` this also deletes the
@@ -433,7 +713,7 @@ async fn do_stop(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String>
 /// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
 #[tauri::command]
 async fn do_down(wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "Removing the containers")?;
     blocking(move || ops::down(&s, wipe).map_err(err)).await
 }
 
@@ -445,7 +725,7 @@ async fn get_logs(
     lines: Option<usize>,
     sel: State<'_, Selected>,
 ) -> Result<String, String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "The activity log")?;
     let n = lines.unwrap_or(400);
     blocking(move || ops::tail_logs(&s, service.as_deref(), n).map_err(err)).await
 }
@@ -480,7 +760,40 @@ async fn site_export(
     skip_link_check: bool,
     sel: State<'_, Selected>,
 ) -> Result<String, String> {
-    let s = stack(&sel)?;
+    let s = match target(&sel)? {
+        Target::Local(s) => s,
+        // On a server the export is written there, where its own CLI puts
+        // it; the returned line says where (`host:path`).
+        Target::Remote(site) => {
+            return blocking(move || {
+                let host = host_of(&site);
+                let opts = ops::ExportOptions {
+                    out: None,
+                    base_url: base_url.filter(|u| !u.trim().is_empty()),
+                    zip,
+                    include_config,
+                    include_users,
+                    skip_link_check,
+                };
+                let mut written = None;
+                let mut sink = feed(&app);
+                session(&site)?
+                    .run_action(&remote::Action::Export(opts), &mut |pipe, line| {
+                        let plain = remote::strip_ansi(line);
+                        if let Some((_, path)) = plain.split_once("Static site at ") {
+                            written = Some(path.trim().to_string());
+                        }
+                        sink(pipe, line)
+                    })
+                    .map_err(err)?;
+                Ok(format!(
+                    "{host}:{}",
+                    written.unwrap_or_else(|| "(see the log)".to_string())
+                ))
+            })
+            .await;
+        }
+    };
     blocking(move || {
         // The picker asks "where to save it" — the answer is a *parent* folder.
         // The site goes into a named subfolder, so the engine's guard against
@@ -505,7 +818,7 @@ async fn site_export(
 /// AI view surfaces as "start your site first."
 #[tauri::command]
 async fn get_model_roles(sel: State<'_, Selected>) -> Result<Vec<ModelRole>, String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "AI model roles")?;
     blocking(move || ops::model_list(&s).map_err(err)).await
 }
 
@@ -517,7 +830,7 @@ async fn set_model_role(
     model: String,
     sel: State<'_, Selected>,
 ) -> Result<(), String> {
-    let s = stack(&sel)?;
+    let s = local_stack(&sel, "AI model roles")?;
     blocking(move || ops::model_set(&s, &role, &provider, &model).map_err(err)).await
 }
 
@@ -535,10 +848,17 @@ fn manager_version() -> &'static str {
 
 /// Diagnose the appliance — host, stack and site — without changing anything.
 /// Runs off the UI thread: it shells several docker/drush probes.
+///
+/// For a site on a server: the checks that run here (the key, the SSH login,
+/// the server's CLI), then the server's own report (m2-9).
 #[tauri::command]
-async fn run_doctor(sel: State<'_, Selected>) -> Result<doctor::Report, String> {
-    let s = stack(&sel)?;
-    blocking(move || Ok(doctor::diagnose(&s))).await
+async fn run_doctor(app: AppHandle, sel: State<'_, Selected>) -> Result<doctor::Report, String> {
+    match target(&sel)? {
+        Target::Local(s) => blocking(move || Ok(doctor::diagnose(&s))).await,
+        Target::Remote(site) => {
+            blocking(move || remote::doctor(&site, false, &mut feed(&app)).map_err(err)).await
+        }
+    }
 }
 
 /// Run the safe repair ladder, then re-diagnose. Progress (including a streamed
@@ -552,23 +872,68 @@ async fn run_doctor_fix(
     app: AppHandle,
     sel: State<'_, Selected>,
 ) -> Result<doctor::Report, String> {
-    let s = stack(&sel)?;
-    blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await
+    match target(&sel)? {
+        Target::Local(s) => blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await,
+        Target::Remote(site) => {
+            blocking(move || remote::doctor(&site, true, &mut feed(&app)).map_err(err)).await
+        }
+    }
+}
+
+/// The SSH tunnel to the console of the remote site this window shows, when
+/// it has none recorded (m2-4, D-02). Held until the window switches site or
+/// the Manager quits; dropping it closes the tunnel.
+#[derive(Default)]
+struct ConsoleTunnel(Mutex<Option<remote::Tunnel>>);
+
+impl ConsoleTunnel {
+    fn close(&self) {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+    }
+}
+
+/// A remote site's console: its recorded domain, or a tunnel kept in
+/// [`ConsoleTunnel`]. An open, live tunnel is reused rather than doubled.
+async fn open_remote_console(app: AppHandle, site: Site) -> Result<(), String> {
+    blocking(move || {
+        let held = app.state::<ConsoleTunnel>();
+        {
+            let mut guard = held.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(tunnel) = guard.as_mut() {
+                if tunnel.is_alive() {
+                    return ops::open_url(&tunnel.url).map_err(err);
+                }
+                guard.take();
+            }
+        }
+        let access = remote::console_access_in(&session(&site)?, &site).map_err(err)?;
+        ops::open_url(&access.url).map_err(err)?;
+        if let Some(tunnel) = access.tunnel {
+            *held.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(tunnel);
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-fn open_console(sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    ops::open_console(&s).map_err(err)
+async fn open_console(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    match target(&sel)? {
+        Target::Local(s) => ops::open_console(&s).map_err(err),
+        Target::Remote(site) => open_remote_console(app, site).await,
+    }
 }
 
 /// Open the console signed in — mints a one-time login link inside the
 /// container (a `drush` exec, so it runs off the UI thread) and opens it, so a
 /// fresh operator lands in `/atelier` authenticated instead of access-denied.
+/// A site on a server opens at its domain or through a tunnel (sign in there).
 #[tauri::command]
-async fn open_console_authed(sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    blocking(move || ops::open_console_authed(&s).map_err(err)).await
+async fn open_console_authed(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    match target(&sel)? {
+        Target::Local(s) => blocking(move || ops::open_console_authed(&s).map_err(err)).await,
+        Target::Remote(site) => open_remote_console(app, site).await,
+    }
 }
 
 /// Open a folder (the exported site) in the OS file manager. Shells out to the
@@ -589,9 +954,11 @@ fn reveal_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_login(sel: State<'_, Selected>) -> Result<(), String> {
-    let s = stack(&sel)?;
-    ops::open_login(&s).map_err(err)
+async fn open_login(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    match target(&sel)? {
+        Target::Local(s) => ops::open_login(&s).map_err(err),
+        Target::Remote(site) => open_remote_console(app, site).await,
+    }
 }
 
 /// Open an external URL (docs/guides) in the default browser. Plain
@@ -606,13 +973,13 @@ fn open_url(url: String) -> Result<(), String> {
 // --- sites -------------------------------------------------------------------
 
 /// One row of the header's site switcher: what the registry knows, plus whether
-/// the site is running. `host` is `None` for a site on this machine — the only
-/// kind there is until remote sites land.
+/// the site is running. A site on a server carries its `host` (in `row`) and
+/// is never probed here — the window asks [`probe_site`] for each one after
+/// the list painted, so a slow server can't hold the switcher up.
 #[derive(Serialize)]
 struct SiteView {
     #[serde(flatten)]
     row: SiteRow,
-    host: Option<String>,
     running: bool,
 }
 
@@ -643,11 +1010,7 @@ async fn list_sites(sel: State<'_, Selected>) -> Result<SitesView, String> {
             .into_iter()
             .map(|row| {
                 let running = docker_up && row.installed && ops::is_running(&row.stack());
-                SiteView {
-                    row,
-                    host: None,
-                    running,
-                }
+                SiteView { row, running }
             })
             .collect();
         Ok(SitesView { selected, sites })
@@ -658,7 +1021,11 @@ async fn list_sites(sel: State<'_, Selected>) -> Result<SitesView, String> {
 /// Switch this window to `slug`, and make it the registry's active site, so the
 /// Manager reopens on it and a bare `atelier` command in a terminal agrees.
 #[tauri::command]
-async fn select_site(slug: String, sel: State<'_, Selected>) -> Result<(), String> {
+async fn select_site(
+    slug: String,
+    sel: State<'_, Selected>,
+    tunnel: State<'_, ConsoleTunnel>,
+) -> Result<(), String> {
     let chosen = slug.clone();
     blocking(move || {
         let user_home = sites::user_home().map_err(err)?;
@@ -667,6 +1034,9 @@ async fn select_site(slug: String, sel: State<'_, Selected>) -> Result<(), Strin
             .map_err(err)
     })
     .await?;
+    if sel.get().as_deref() != Some(slug.as_str()) {
+        tunnel.close();
+    }
     sel.set(slug);
     Ok(())
 }
@@ -690,6 +1060,83 @@ async fn add_site(slug: String, label: String, sel: State<'_, Selected>) -> Resu
     Ok(())
 }
 
+/// The guided key for `host` (D-05): the one in the OS keychain, or a new one
+/// stored there — with the `authorized_keys` line and a command that adds it.
+#[derive(Serialize)]
+struct GuidedKeyView {
+    public_line: String,
+    command: String,
+    created: bool,
+}
+
+#[tauri::command]
+async fn guided_key(host: String) -> Result<GuidedKeyView, String> {
+    blocking(move || {
+        let host = host.trim().to_string();
+        if !sites::is_valid_host(&host) {
+            return Err(format!(
+                "`{host}` is not a usable SSH target (an alias, host or user@host)"
+            ));
+        }
+        let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, &host).map_err(err)?;
+        Ok(GuidedKeyView {
+            command: ssh_key::authorize_command(&key.public_line),
+            public_line: key.public_line,
+            created: key.created,
+        })
+    })
+    .await
+}
+
+/// Attach a site already running on a server (U-03) and switch to it — the
+/// same entry and check as `atelier sites add <SLUG> --host …`: the registry
+/// is written only after the server answered and reported the site running.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn add_remote_site(
+    slug: String,
+    label: String,
+    host: String,
+    remote_site: Option<String>,
+    domain: Option<String>,
+    guided: bool,
+    sel: State<'_, Selected>,
+    tunnel: State<'_, ConsoleTunnel>,
+) -> Result<(), String> {
+    let chosen = slug.clone();
+    blocking(move || {
+        let user_home = sites::user_home().map_err(err)?;
+        let label = Some(label.trim()).filter(|l| !l.is_empty());
+        let key = if guided {
+            sites::KeyMode::Guided
+        } else {
+            sites::KeyMode::Ssh
+        };
+        let site = sites::remote_entry(
+            &user_home,
+            &chosen,
+            label,
+            &host,
+            remote_site.as_deref(),
+            key,
+            domain.as_deref(),
+        )
+        .map_err(err)?;
+        sites::add_remote_site(&user_home, site, |site| {
+            remote::open(site, &remote::EngineOptions::from_env())?.attach_check()?;
+            Ok(())
+        })
+        .map_err(err)?;
+        sites::use_site(&user_home, &chosen)
+            .map(|_| ())
+            .map_err(err)
+    })
+    .await?;
+    tunnel.close();
+    sel.set(slug);
+    Ok(())
+}
+
 /// Change a site's display name. Its slug, folder and data stay as they are.
 #[tauri::command]
 async fn rename_site(slug: String, label: String) -> Result<(), String> {
@@ -707,10 +1154,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Selected::from_resolution())
+        .manage(ConsoleTunnel::default())
         .invoke_handler(tauri::generate_handler![
             check_preflight,
             preflight_problem,
             get_status,
+            change_guard,
+            probe_site,
             get_update,
             get_cached_update,
             refresh_update_cache,
@@ -719,6 +1169,7 @@ pub fn run() {
             do_install,
             do_update,
             do_backup,
+            check_restore,
             do_restore,
             pick_restore_file,
             export_backup,
@@ -743,8 +1194,16 @@ pub fn run() {
             list_sites,
             select_site,
             add_site,
+            add_remote_site,
+            guided_key,
             rename_site,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the Atelier Manager");
+        .build(tauri::generate_context!())
+        .expect("error while building the Atelier Manager")
+        .run(|app, event| {
+            // Quitting closes a console tunnel this window still holds.
+            if let tauri::RunEvent::Exit = event {
+                app.state::<ConsoleTunnel>().close();
+            }
+        });
 }

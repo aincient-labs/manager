@@ -1220,7 +1220,7 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// `line` without ANSI colour escapes.
-fn strip_ansi(line: &str) -> String {
+pub fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
