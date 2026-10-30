@@ -12,7 +12,8 @@ const $ = (id) => document.getElementById(id);
 
 // The four top-level "views" (what the whole window is showing) vs. the four
 // tab "panels" inside the installed app.
-const VIEWS = ["loading", "docker", "install", "app"];
+const SCREENS = ["loading", "docker", "unreachable", "install"];
+const VIEWS = [...SCREENS, "app"];
 const PANELS = ["home", "publish", "backups", "settings"];
 
 let lastStatus = null; // most recent get_status, so panels can adapt to it
@@ -23,6 +24,10 @@ let lastExportHadBaseUrl = false; // did that export get a real website address?
 let managerVersion = ""; // this app's own version, shown in the chrome
 let siteRows = []; // list_sites rows, for the header switcher
 let selectedSlug = null; // the site this window operates on (registry slug)
+// Sites on a server (M2): what each one's server last said (probe_site /
+// get_status), by slug — {state: running|frozen|stopped|unreachable, …}.
+const remoteStates = {};
+const probing = new Set();
 
 // Stamp the manager's version into the title bar once, before anything else can
 // fail. It's compile-time constant — no Docker, no stack — so it must still show
@@ -40,7 +45,7 @@ async function showManagerVersion() {
 // --- view + tab routing -----------------------------------------------------
 
 function setView(name) {
-  for (const v of VIEWS.slice(0, 3)) $(`screen-${v}`).classList.toggle("hidden", name !== v);
+  for (const v of SCREENS) $(`screen-${v}`).classList.toggle("hidden", name !== v);
   const app = name === "app";
   $("sidebar").classList.toggle("hidden", !app);
   for (const p of PANELS) $(`panel-${p}`).classList.toggle("hidden", !(app && p === currentTab));
@@ -69,21 +74,29 @@ function hideError() {
 }
 
 // In-page confirm (the webview blocks native confirm() without the dialog plugin).
-// Pass { requireText: "confirm" } to gate a destructive action behind a typed word.
+// Pass { requireText: "confirm" } to gate a destructive action behind a typed word;
+// { title } heads it (naming the site and where it runs — D-07), { exact } makes
+// the typed word case-sensitive (a site's slug), { lead } precedes "Type …".
 function confirmModal(msg, opts = {}) {
   return new Promise((resolve) => {
     const requireText = opts.requireText || null;
     const yes = $("confirm-yes");
     const input = $("confirm-input");
-    showSiteLine($("confirm-site"));
-    $("confirm-msg").textContent = msg;
+    if (opts.title) $("confirm-site").classList.add("hidden");
+    else showSiteLine($("confirm-site"));
+    $("confirm-title").textContent = opts.title || "";
+    $("confirm-title").classList.toggle("hidden", !opts.title);
+    $("confirm-msg").textContent = msg || "";
+    $("confirm-lead").textContent = opts.lead || "";
     if (requireText) {
       $("confirm-word").textContent = requireText;
       input.value = "";
       $("confirm-typecheck").classList.remove("hidden");
       yes.disabled = true;
       input.oninput = () => {
-        yes.disabled = input.value.trim().toLowerCase() !== requireText.toLowerCase();
+        yes.disabled = opts.exact
+          ? input.value.trim() !== requireText
+          : input.value.trim().toLowerCase() !== requireText.toLowerCase();
       };
     } else {
       $("confirm-typecheck").classList.add("hidden");
@@ -102,6 +115,84 @@ function confirmModal(msg, opts = {}) {
     yes.onclick = () => done(true);
     $("confirm-no").onclick = () => done(false);
   });
+}
+
+// THE confirmation before a site is changed (m2-8, D-07) — the window's half of
+// the CLI's confirm_change. `question` names the site with "{site}" ("Restore
+// {site}?" → "Restore Shop on vps.example.com?"). A live site on a server always
+// asks, with the confirm button disabled until its slug is typed; anything else
+// asks a plain confirm only when `always` (the actions that asked before remote
+// sites existed), with an optional `requireText` word as before.
+async function confirmChange(question, detail, opts = {}) {
+  const row = currentSite();
+  let guard = null;
+  document.body.classList.add("busy");
+  try {
+    guard = await invoke("change_guard");
+  } catch {
+    /* can't ask: a site on a server then counts as live (below) */
+  } finally {
+    document.body.classList.remove("busy");
+  }
+  const host = guard ? guard.host : row && row.host;
+  const label = guard ? guard.label : row ? row.label : "your site";
+  const slug = guard ? guard.slug : row && row.slug;
+  const place = host ? `on ${host}` : "on this computer";
+  const typed = guard ? guard.typed_slug : !!host;
+  if (!typed && !opts.always) return true;
+  const title = question.replace("{site}", `${label} ${place}`);
+  if (typed) {
+    return confirmModal(detail, {
+      title,
+      requireText: slug,
+      exact: true,
+      lead: `${label} is live ${place}. `,
+    });
+  }
+  return confirmModal(detail, { title, requireText: opts.requireText || null });
+}
+
+// Another site's backup (m2-6, D-04): name both, and make "Restore anyway" a
+// deliberate second button, never the default.
+function mismatchModal(m) {
+  return new Promise((resolve) => {
+    $("mismatch-archive").textContent = `${m.archive_site_name} (id ${m.archive_site_id})`;
+    $("mismatch-target").textContent =
+      `${m.target_site_name} (id ${m.target_site_id || "none yet"})`;
+    $("mismatch").classList.remove("hidden");
+    const done = (val) => {
+      $("mismatch").classList.add("hidden");
+      $("mismatch-yes").onclick = null;
+      $("mismatch-no").onclick = null;
+      resolve(val);
+    };
+    $("mismatch-yes").onclick = () => done(true);
+    $("mismatch-no").onclick = () => done(false);
+    setTimeout(() => $("mismatch-no").focus(), 0);
+  });
+}
+
+// Restore `path` onto the selected site: whose backup it is first (another
+// site's needs "Restore anyway"), then the D-07 confirm, then the restore —
+// identity-checked in the backend too.
+async function restoreFlow(path, what) {
+  let otherSite = false;
+  let note = null;
+  try {
+    const check = await invoke("check_restore", { path });
+    if (check.mismatch) {
+      if (!(await mismatchModal(check.mismatch))) return;
+      otherSite = true;
+    }
+    note = check.note;
+  } catch (e) {
+    return showError(String(e));
+  }
+  const detail =
+    `Restoring replaces the current pages, images, and settings with this ${what}.` +
+    (note ? `\n\n${note}` : "");
+  if (!(await confirmChange("Restore {site}?", detail, { always: true }))) return;
+  return runProgressOp("Restoring your backup", () => invoke("do_restore", { path, otherSite }));
 }
 
 // Whisper labels for each core Stage, shown in the progress sub-status / feed.
@@ -319,6 +410,8 @@ async function runProgressOp(title, fn) {
 
 async function refresh() {
   await refreshSites();
+  const row = currentSite();
+  const remote = !!(row && row.host);
   const problem = await invoke("preflight_problem");
   if (problem) {
     $("docker-msg").textContent = problem;
@@ -326,9 +419,33 @@ async function refresh() {
     return;
   }
 
-  const status = await invoke("get_status");
+  let status;
+  try {
+    status = await invoke("get_status");
+  } catch (e) {
+    if (!remote) throw e;
+    // A server that didn't answer: say which, and offer to try again.
+    remoteStates[row.slug] = { state: "unreachable", reason: String(e) };
+    renderSites();
+    $("unreachable-title").textContent = `Can't reach ${row.host}`;
+    $("unreachable-msg").textContent = String(e);
+    setView("unreachable");
+    return;
+  }
   lastStatus = status;
-  if (!status.installed) {
+  if (remote) {
+    const before = remoteStates[row.slug];
+    if (!(before && before.state === "frozen" && status.running)) {
+      remoteStates[row.slug] = {
+        state: status.running ? "running" : "stopped",
+        version: status.version,
+      };
+      renderSites();
+    }
+  }
+  // Nothing is ever set up on a server from here: a remote site is attached,
+  // so it always gets the app view.
+  if (!status.installed && !remote) {
     renderInstall();
     setView("install");
     return;
@@ -351,15 +468,63 @@ function currentSite() {
   return siteRows.find((r) => r.slug === selectedSlug) || null;
 }
 
-// Where a site runs, in words. Only this computer for now; remote sites add a
-// host name here.
+// Where a site runs, in words: this computer, or the server's ssh target.
 function siteHost(row) {
   return row && row.host ? row.host : "This computer";
 }
 
+// "on this computer" / "on deploy@vps…" — for sentences.
+function sitePlace(row) {
+  return row && row.host ? `on ${row.host}` : "on this computer";
+}
+
+const REMOTE_STATE_WORDS = {
+  running: "Running",
+  frozen: "Frozen",
+  stopped: "Stopped",
+};
+
 function siteState(row) {
+  if (row.host) {
+    const st = remoteStates[row.slug];
+    if (!st) return "Checking…";
+    if (st.state === "unreachable") return "Can't reach it";
+    return REMOTE_STATE_WORDS[st.state] || "—";
+  }
   if (!row.installed) return "Not set up yet";
   return row.running ? "Running" : "Stopped";
+}
+
+// The switcher line under a site's name. A server that didn't answer is
+// named outright: "Can't reach deploy@vps.example.com".
+function siteMeta(row) {
+  const st = row.host && remoteStates[row.slug];
+  if (st && st.state === "unreachable") return `Can't reach ${row.host}`;
+  return `${siteHost(row)} · ${siteState(row)}`;
+}
+
+function siteDot(row) {
+  if (!row.host) return row.running ? "up" : "down";
+  const st = remoteStates[row.slug];
+  if (!st) return "";
+  return { running: "up", frozen: "warn", stopped: "down", unreachable: "warn" }[st.state] || "";
+}
+
+// Ask each server for its site's state, after the list painted — one bounded
+// probe per site, never more than one in flight, so a slow server never holds
+// the switcher (or anything else) up.
+function probeRemoteSites() {
+  for (const r of siteRows) {
+    if (!r.host || probing.has(r.slug)) continue;
+    probing.add(r.slug);
+    invoke("probe_site", { slug: r.slug })
+      .then((st) => (remoteStates[r.slug] = st))
+      .catch((e) => (remoteStates[r.slug] = { state: "unreachable", reason: String(e) }))
+      .finally(() => {
+        probing.delete(r.slug);
+        renderSites();
+      });
+  }
 }
 
 // "Blog · This computer" above a confirm or a running op. Only once there is more
@@ -385,7 +550,10 @@ async function refreshSites() {
     // the selected site's screens working (they report the error themselves).
     siteRows = [];
   }
+  const row = currentSite();
+  document.body.classList.toggle("remote", !!(row && row.host));
   renderSites();
+  probeRemoteSites();
 }
 
 function renderSites() {
@@ -393,9 +561,11 @@ function renderSites() {
   $("site-switcher").classList.toggle("hidden", !row);
   if (!row) return;
   $("site-current-label").textContent = row.label;
-  $("site-current-host").textContent = `${siteHost(row)} · ${siteState(row)}`;
-  $("site-current-dot").className = `dot ${row.running ? "up" : "down"}`;
-  $("site-current").title = `${row.label} (${row.slug}) — ${row.home}`;
+  $("site-current-host").textContent = siteMeta(row);
+  $("site-current-dot").className = `dot ${siteDot(row)}`;
+  $("site-current").title = row.host
+    ? `${row.label} (${row.slug}) — ${row.remote_site || row.slug} on ${row.host}`
+    : `${row.label} (${row.slug}) — ${row.home}`;
 
   const list = $("site-list");
   const frag = document.createDocumentFragment();
@@ -407,11 +577,11 @@ function renderSites() {
     btn.setAttribute("aria-checked", String(r.slug === selectedSlug));
     btn.dataset.action = "select-site";
     btn.dataset.slug = r.slug;
-    btn.title = r.home;
+    btn.title = r.host ? `${r.remote_site || r.slug} on ${r.host}` : r.home;
     btn.innerHTML =
-      `<span class="dot ${r.running ? "up" : "down"}"></span>` +
+      `<span class="dot ${siteDot(r)}"></span>` +
       `<span class="site-option-text"><span class="site-option-label">${esc(r.label)}</span>` +
-      `<span class="site-option-meta">${esc(siteHost(r))} · ${esc(siteState(r))}</span></span>` +
+      `<span class="site-option-meta">${esc(siteMeta(r))}</span></span>` +
       `<svg class="ic tick" aria-hidden="true"><use href="#i-tick" /></svg>`;
     li.appendChild(btn);
     frag.appendChild(li);
@@ -476,11 +646,38 @@ function slugify(label) {
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 let slugEdited = false; // stop deriving the short name once someone types one
 
+let addMode = "local"; // "local" | "server"
+
+function setAddMode(mode) {
+  addMode = mode;
+  document.querySelectorAll("#add-site .seg-opt").forEach((el) =>
+    el.setAttribute("aria-checked", String(el.dataset.mode === mode))
+  );
+  document.querySelectorAll("#add-site .add-local").forEach((el) =>
+    el.classList.toggle("hidden", mode !== "local")
+  );
+  document.querySelectorAll("#add-site .add-server").forEach((el) =>
+    el.classList.toggle("hidden", mode !== "server")
+  );
+  $("add-site-submit").textContent = mode === "server" ? "Attach the site" : "Add the site";
+  $("add-site-error").classList.add("hidden");
+}
+
+function addKeyMode() {
+  const checked = document.querySelector('input[name="add-site-key"]:checked');
+  return checked ? checked.value : "ssh";
+}
+
 function openAddSite() {
   setSiteMenu(false);
   slugEdited = false;
   $("add-site-label").value = "";
   $("add-site-slug").value = "";
+  for (const id of ["add-site-host", "add-site-remote", "add-site-domain"]) $(id).value = "";
+  document.querySelector('input[name="add-site-key"][value="ssh"]').checked = true;
+  $("add-site-guided").classList.add("hidden");
+  $("add-site-key-out").classList.add("hidden");
+  setAddMode("local");
   $("add-site-error").classList.add("hidden");
   $("add-site").classList.remove("hidden");
   setTimeout(() => $("add-site-label").focus(), 0);
@@ -498,13 +695,31 @@ async function submitAddSite() {
   if (!SLUG_RE.test(slug))
     return fail("The short name needs lowercase letters, digits and dashes, starting with a letter or digit.");
   if (siteRows.some((r) => r.slug === slug)) return fail(`There's already a site called "${slug}".`);
-  $("add-site-submit").disabled = true;
+  const server = addMode === "server";
+  const host = $("add-site-host").value.trim();
+  if (server && !host) return fail("Name the server: an SSH alias, a host, or user@host.");
+  const submit = $("add-site-submit");
+  const idle = submit.textContent;
+  submit.disabled = true;
+  if (server) submit.textContent = `Connecting to ${host}…`;
   try {
-    await invoke("add_site", { slug, label });
+    if (server) {
+      await invoke("add_remote_site", {
+        slug,
+        label,
+        host,
+        remoteSite: $("add-site-remote").value.trim() || null,
+        domain: $("add-site-domain").value.trim() || null,
+        guided: addKeyMode() === "guided",
+      });
+    } else {
+      await invoke("add_site", { slug, label });
+    }
   } catch (e) {
     return fail(String(e));
   } finally {
-    $("add-site-submit").disabled = false;
+    submit.disabled = false;
+    submit.textContent = idle;
   }
   $("add-site").classList.add("hidden");
   selectedSlug = slug;
@@ -580,18 +795,21 @@ function renderStatus(status) {
   urlLink.textContent = url;
   urlLink.href = url;
   // Only present the address as a live link once the site actually answers.
-  urlLink.classList.toggle("hidden", !status.reachable);
+  urlLink.classList.toggle("hidden", !status.reachable || !url);
+  const place = sitePlace(currentSite());
 
   if (status.running && status.reachable) {
     dot.className = "dot up";
     headline.textContent = "Your website is running";
-    sub.textContent = "It's live on this computer and ready for you.";
+    sub.textContent = `It's live ${place} and ready for you.`;
     // "Edit my site" → console, signed in. "View my site" → public front page.
     primary.disabled = false;
     primary.dataset.action = "edit";
     primaryIcon.setAttribute("href", "#i-open");
     primaryLabel.textContent = "Edit my site";
-    view.classList.remove("hidden");
+    // A site on a server without a recorded address has no URL to view
+    // from here — "Edit my site" opens its console through a tunnel.
+    view.classList.toggle("hidden", !url);
     toggle.classList.remove("hidden");
     $("startstop-label").textContent = "Stop";
   } else if (status.running) {
@@ -758,6 +976,10 @@ function updatePublishGate() {
   $("publish-needs-running").classList.toggle("hidden", running);
   $("publish-form").classList.toggle("hidden", !running);
   $("export-btn").classList.toggle("hidden", !running);
+  // A server writes the export itself: no folder to choose here.
+  const row = currentSite();
+  if (row && row.host) $("export-btn").disabled = false;
+  else $("export-btn").disabled = !exportDir;
 }
 
 function revealExport() {
@@ -883,11 +1105,22 @@ async function refreshLogs() {
 // Tier headings, in the order the core reports them: outward-in, from the
 // machine to the site. Plain words — the core's tier ids are the stable handle,
 // these are just what a person reads.
-const DOCTOR_TIERS = [
-  ["host", "Your computer"],
-  ["stack", "Atelier itself"],
-  ["site", "Your website"],
-];
+function doctorTiers() {
+  const row = currentSite();
+  if (row && row.host) {
+    return [
+      ["connection", `Reaching ${row.host}`],
+      ["host", `The server (${row.host})`],
+      ["stack", "Atelier on the server"],
+      ["site", "Your website"],
+    ];
+  }
+  return [
+    ["host", "Your computer"],
+    ["stack", "Atelier itself"],
+    ["site", "Your website"],
+  ];
+}
 
 const DOCTOR_MARK = { ok: "✓", warn: "!", fail: "✕", skipped: "–" };
 
@@ -901,7 +1134,7 @@ function renderDoctor(report) {
   const warnings = report.checks.filter((c) => c.severity === "warn").length;
 
   let html = "";
-  for (const [tier, title] of DOCTOR_TIERS) {
+  for (const [tier, title] of doctorTiers()) {
     const checks = report.checks.filter((c) => c.tier === tier);
     if (!checks.length) continue;
     html += `<h4 class="doctor-tier">${esc(title)}</h4><ul class="doctor-list">`;
@@ -975,6 +1208,27 @@ const actions = {
   "select-site": (el) => switchSite(el.dataset.slug),
   "add-site-open": () => openAddSite(),
   "add-site-cancel": () => $("add-site").classList.add("hidden"),
+  "add-site-mode": (el) => setAddMode(el.dataset.mode),
+  "add-site-key": async () => {
+    const host = $("add-site-host").value.trim();
+    const errEl = $("add-site-error");
+    errEl.classList.add("hidden");
+    if (!host) {
+      errEl.textContent = "Name the server first: the key is made for it.";
+      errEl.classList.remove("hidden");
+      return;
+    }
+    try {
+      const key = await invoke("guided_key", { host });
+      $("add-site-pubkey").textContent = key.public_line;
+      $("add-site-keycmd").textContent = key.command;
+      $("add-site-key-out").classList.remove("hidden");
+    } catch (e) {
+      errEl.textContent = String(e);
+      errEl.classList.remove("hidden");
+    }
+  },
+  "add-site-copy-cmd": (el) => copyText($("add-site-keycmd").textContent, el),
   "rename-site-open": () => openRenameSite(),
   "rename-site-cancel": () => $("rename-site").classList.add("hidden"),
 
@@ -1050,24 +1304,32 @@ const actions = {
     } catch {
       /* couldn't plan — update anyway; the appliance is the real gate. */
     }
-    if (plan && plan.steps && plan.steps.length > 1) {
+    const stepped = !!(plan && plan.steps && plan.steps.length > 1);
+    let detail = "";
+    if (stepped) {
       const route = plan.steps
         .map((s, i) => `${i + 1}. ${s.version || s.image}`)
         .join("\n");
-      const ok = await confirmModal(
+      detail =
         `Getting to the newest version takes ${plan.steps.length} steps, because it ` +
-          `can't move a site this old there directly:\n\n${route}\n\n` +
-          `Each step updates and checks your site before the next one starts, and a ` +
-          `full backup is taken first. This will take a while — please leave it running.`
-      );
-      if (!ok) return;
+        `can't move a site this old there directly:\n\n${route}\n\n` +
+        `Each step updates and checks your site before the next one starts, and a ` +
+        `full backup is taken first. This will take a while — please leave it running.`;
     }
+    // A stepped route always asks; a live site on a server always asks for its slug.
+    if (!(await confirmChange("Update {site}?", detail, { always: stepped }))) return;
     return runProgressOp("Updating Atelier", () => invoke("do_update"));
   },
 
   // Start or stop, decided by the live status rather than a label.
-  startstop: () => {
+  startstop: async () => {
     const running = !!(lastStatus && lastStatus.running);
+    // Stopping a live site on a server takes its slug (D-07); locally it never asked.
+    if (
+      running &&
+      !(await confirmChange("Stop {site}?", "Visitors can't reach it until it's started again."))
+    )
+      return;
     return runProgressOp(running ? "Stopping your website" : "Starting your website", () =>
       invoke(running ? "do_stop" : "do_start")
     );
@@ -1091,13 +1353,14 @@ const actions = {
   },
 
   "export-site": async () => {
-    if (!exportDir) return;
+    const onServer = !!(currentSite() && currentSite().host);
+    if (!exportDir && !onServer) return;
     lastExportPath = null;
     $("publish-result").classList.add("hidden");
     const baseUrl = $("export-baseurl").value.trim() || null;
     const ok = await runProgressOp("Exporting your site", async () => {
       lastExportPath = await invoke("site_export", {
-        out: exportDir,
+        out: onServer ? null : exportDir,
         baseUrl,
         zip: $("export-zip").checked,
         includeConfig: $("export-config").checked,
@@ -1135,11 +1398,7 @@ const actions = {
   restore: async () => {
     const path = $("backup-select").value;
     if (!path) return;
-    const ok = await confirmModal(
-      "Restoring replaces your current site (pages, images, and settings) with this backup. Continue?"
-    );
-    if (!ok) return;
-    return runProgressOp("Restoring your backup", () => invoke("do_restore", { path }));
+    return restoreFlow(path, "backup");
   },
 
   export: async () => {
@@ -1160,11 +1419,7 @@ const actions = {
       return showError(String(e));
     }
     if (!path) return; // cancelled
-    const ok = await confirmModal(
-      "Restoring replaces your current site (pages, images, and settings) with this file. Continue?"
-    );
-    if (!ok) return;
-    return runProgressOp("Restoring your backup", () => invoke("do_restore", { path }));
+    return restoreFlow(path, "file");
   },
 
   // ---- Settings ----
@@ -1228,7 +1483,11 @@ const actions = {
     const msg = wipe
       ? "This removes Atelier AND erases all your data — pages, images, settings, and password. This cannot be undone."
       : "This removes the running containers. Your data is kept safe, and you can start again anytime.";
-    const ok = await confirmModal(msg, wipe ? { requireText: "erase" } : {});
+    const ok = await confirmChange(
+      wipe ? "Remove and erase {site}?" : "Remove the containers of {site}?",
+      msg,
+      { always: true, requireText: wipe ? "erase" : null }
+    );
     if (!ok) return;
     return runProgressOp(wipe ? "Removing and erasing" : "Removing containers", () =>
       invoke("do_down", { wipe })
@@ -1236,9 +1495,10 @@ const actions = {
   },
 
   reinstall: async () => {
-    const ok = await confirmModal(
+    const ok = await confirmChange(
+      "Reinstall {site} from scratch?",
       "Reinstalling erases everything — your pages, images, settings, and password — and sets up a fresh Atelier. This cannot be undone.",
-      { requireText: "confirm" }
+      { always: true, requireText: "confirm" }
     );
     if (!ok) return;
     return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"));
@@ -1290,7 +1550,7 @@ $("channel-select").addEventListener("change", async (e) => {
   }
   const msg =
     "Edge can be ahead of the newest release, and a site's database only migrates forward. Atelier snapshots first and rolls back if the switch fails. Switch to released versions?";
-  if (!(await confirmModal(msg))) {
+  if (!(await confirmChange("Switch {site} to released versions?", msg, { always: true }))) {
     renderChannel();
     return;
   }
@@ -1315,6 +1575,11 @@ $("add-site-label").addEventListener("input", (e) => {
 $("add-site-slug").addEventListener("input", () => {
   slugEdited = true;
 });
+document.querySelectorAll('input[name="add-site-key"]').forEach((el) =>
+  el.addEventListener("change", () =>
+    $("add-site-guided").classList.toggle("hidden", addKeyMode() !== "guided")
+  )
+);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (!$("site-menu").classList.contains("hidden")) {
@@ -1323,6 +1588,7 @@ document.addEventListener("keydown", (e) => {
   }
   $("add-site").classList.add("hidden");
   $("rename-site").classList.add("hidden");
+  if (!$("mismatch").classList.contains("hidden")) $("mismatch-no").click();
 });
 
 initPublishPrefs();

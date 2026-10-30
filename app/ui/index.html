@@ -96,6 +96,10 @@
         <path d="m15 5 4 4" />
       </symbol>
       <symbol id="i-tick" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5" /></symbol>
+      <symbol id="i-server" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="7" rx="1.5" /><rect x="3" y="13" width="18" height="7" rx="1.5" />
+        <path d="M7 7.5h.01" /><path d="M7 16.5h.01" />
+      </symbol>
     </svg>
 
     <header class="topbar">
@@ -214,6 +218,23 @@
       </section>
 
       <!-- First run — a warm welcome, not an "installer". -->
+      <!-- A site on a server that didn't answer (M2). Calm, like the Docker
+           screen: name the server, say what was tried, offer to try again. -->
+      <section id="screen-unreachable" class="screen center hidden">
+        <div class="card welcome">
+          <h2 id="unreachable-title">Can't reach the server</h2>
+          <p class="muted">
+            This site runs on a server, and the Manager reaches it over SSH. The
+            server didn't answer — it may be offline, or the connection may need
+            a moment. Nothing was changed.
+          </p>
+          <p id="unreachable-msg" class="hint"></p>
+        </div>
+        <button class="btn primary" data-action="recheck">
+          <svg class="ic"><use href="#i-refresh" /></svg>Try again
+        </button>
+      </section>
+
       <section id="screen-install" class="screen center hidden">
         <div class="card welcome">
           <h2 id="install-title">Welcome to Atelier</h2>
@@ -327,7 +348,11 @@
         </div>
 
         <div id="publish-form" class="card">
-          <label class="field">
+          <p class="hint remote-only">
+            This site runs on a server, so the export is written there — the
+            result names the folder.
+          </p>
+          <label class="field local-only">
             <span>Where to save it <em>— your site is written to a folder named <code>aincient-site-export</code> inside it; nothing else there is touched</em></span>
             <div class="picker">
               <input id="export-dir" type="text" placeholder="Choose a folder…" readonly />
@@ -363,7 +388,7 @@
             <h3 class="done-head"><svg class="ic"><use href="#i-check" /></svg>Your site is ready to publish</h3>
             <p class="muted">We saved it here:</p>
             <p id="export-path" class="path-line"></p>
-            <div class="inline-links">
+            <div class="inline-links local-only">
               <button class="btn small" data-action="reveal-export">
                 <svg class="ic"><use href="#i-folder" /></svg>Open the folder
               </button>
@@ -387,7 +412,7 @@
             </p>
           </div>
 
-          <section class="group">
+          <section class="group local-only">
             <h3 class="group-label"><svg class="ic"><use href="#i-upload" /></svg>Now put it online</h3>
             <div class="card">
               <p class="muted">
@@ -517,7 +542,7 @@
                  the CLI, never by picking a menu item. renderChannel() prepends a
                  self-describing option when the install is already on edge or
                  pinned, so the row never misreports where it is. -->
-            <div class="kv">
+            <div class="kv local-only">
               <span class="kv-label">Updates</span>
               <span class="kv-value">
                 <select id="channel-select">
@@ -525,13 +550,13 @@
                 </select>
               </span>
             </div>
-            <p id="channel-hint" class="hint">Released versions only — the supported choice.</p>
+            <p id="channel-hint" class="hint local-only">Released versions only — the supported choice.</p>
             <button class="btn small full" data-action="check-update">
               <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
             </button>
             <p id="update-status" class="hint hidden"></p>
 
-            <details class="advanced danger-zone">
+            <details class="advanced danger-zone local-only">
               <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Reset &amp; remove</summary>
               <p class="muted">
                 These change or remove your installation. The last one deletes
@@ -575,7 +600,7 @@
 
         <!-- Activity / logs — diagnostics, kept last: handy when something's off,
              ignorable the rest of the time. -->
-        <section class="group">
+        <section class="group local-only">
           <h3 class="group-label"><svg class="ic"><use href="#i-logs" /></svg>Activity</h3>
           <div class="card">
             <p class="muted">
@@ -631,14 +656,36 @@
     <div id="confirm" class="overlay hidden">
       <div class="modal">
         <p id="confirm-site" class="modal-site whisper hidden"></p>
+        <h3 id="confirm-title" class="modal-title hidden"></h3>
         <p id="confirm-msg"></p>
         <label id="confirm-typecheck" class="confirm-type hidden">
-          <span>Type <b id="confirm-word">confirm</b> to continue</span>
+          <span><span id="confirm-lead"></span>Type <b id="confirm-word">confirm</b> to continue</span>
           <input id="confirm-input" type="text" autocomplete="off" spellcheck="false" />
         </label>
         <div class="modal-actions">
           <button class="btn" id="confirm-no">Cancel</button>
           <button class="btn danger" id="confirm-yes">Confirm</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Another site's backup (m2-6, D-04). Names both sites and makes the
+         override an explicit choice, never the default button. -->
+    <div id="mismatch" class="overlay hidden">
+      <div class="modal" role="alertdialog" aria-labelledby="mismatch-title">
+        <h3 class="modal-title" id="mismatch-title">This backup is from another site</h3>
+        <p class="muted">Restoring it replaces this site's pages, images and settings with the other site's.</p>
+        <div class="kv">
+          <span class="kv-label">Backup of</span>
+          <span id="mismatch-archive" class="kv-value"></span>
+        </div>
+        <div class="kv">
+          <span class="kv-label">Would replace</span>
+          <span id="mismatch-target" class="kv-value"></span>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" id="mismatch-no">Cancel</button>
+          <button class="btn danger" id="mismatch-yes">Restore anyway</button>
         </div>
       </div>
     </div>
@@ -660,9 +707,21 @@
     <div id="add-site" class="overlay hidden">
       <form class="modal" id="add-site-form">
         <h3 class="modal-title">Add a site</h3>
-        <p class="muted">
+        <div class="seg" role="radiogroup" aria-label="Where the site runs">
+          <button type="button" class="seg-opt" role="radio" aria-checked="true" data-action="add-site-mode" data-mode="local">
+            <svg class="ic"><use href="#i-home" /></svg><span>On this computer</span>
+          </button>
+          <button type="button" class="seg-opt" role="radio" aria-checked="false" data-action="add-site-mode" data-mode="server">
+            <svg class="ic"><use href="#i-server" /></svg><span>On a server</span>
+          </button>
+        </div>
+        <p class="muted add-local">
           Each site is its own Atelier on this computer, with its own pages,
           backups and address. Nothing changes on your other sites.
+        </p>
+        <p class="muted add-server hidden">
+          Attach a site already running on a server you reach over SSH. Nothing
+          is installed on the server; its own <code>atelier</code> does the work.
         </p>
         <label class="field modal-field">
           <span>Name</span>
@@ -672,6 +731,36 @@
           <span>Short name <em>— lowercase letters, digits and dashes; used by the <code>atelier</code> command</em></span>
           <input id="add-site-slug" type="text" placeholder="my-blog" autocomplete="off" spellcheck="false" />
         </label>
+        <div class="add-server hidden">
+          <label class="field modal-field">
+            <span>Server <em>— an SSH alias from ~/.ssh/config, a host, or user@host</em></span>
+            <input id="add-site-host" type="text" placeholder="deploy@vps.example.com" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="field modal-field">
+            <span>Site on the server <em>— its short name there; blank means the same as above</em></span>
+            <input id="add-site-remote" type="text" placeholder="default" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="field modal-field">
+            <span>Public address <em>— optional; without one the console opens through an SSH tunnel</em></span>
+            <input id="add-site-domain" type="text" placeholder="cms.example.com" inputmode="url" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="check"><input type="radio" name="add-site-key" value="ssh" checked /><span>Use my SSH setup (an alias, or a key I already use)</span></label>
+          <label class="check"><input type="radio" name="add-site-key" value="guided" /><span>Make a key just for this server, kept in my keychain</span></label>
+          <div id="add-site-guided" class="guided hidden">
+            <button type="button" class="btn small" data-action="add-site-key">
+              <svg class="ic"><use href="#i-key" /></svg>Show the key to add
+            </button>
+            <div id="add-site-key-out" class="hidden">
+              <p class="hint">Add this line to <code>~/.ssh/authorized_keys</code> on the server:</p>
+              <p id="add-site-pubkey" class="path-line"></p>
+              <p class="hint">For example, logged in on the server, run:</p>
+              <p id="add-site-keycmd" class="path-line"></p>
+              <button type="button" class="btn small" data-action="add-site-copy-cmd">
+                <svg class="ic"><use href="#i-copy" /></svg><span>Copy the command</span>
+              </button>
+            </div>
+          </div>
+        </div>
         <p id="add-site-error" class="modal-error hidden" role="alert"></p>
         <div class="modal-actions">
           <button type="button" class="btn" data-action="add-site-cancel">Cancel</button>

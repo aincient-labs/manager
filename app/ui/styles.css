@@ -1608,3 +1608,101 @@ select:focus {
 .version-tag:empty {
   display: none;
 }
+
+/* --- Sites on a server (M2) -------------------------------------------------- */
+
+/* Ochre: a state worth a look, not a verdict — frozen, or a server that
+   didn't answer. Same grammar as up/down. */
+.dot.warn {
+  background: var(--accent-2);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent-2) 22%, transparent);
+}
+
+/* What only makes sense for one kind of site. `body.remote` is set while the
+   window shows a site on a server. */
+body.remote .local-only,
+body:not(.remote) .remote-only {
+  display: none !important;
+}
+
+/* Two-way choice in a modal: "On this computer" / "On a server". */
+.seg {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  margin: 0 0 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-control);
+}
+.seg-opt {
+  appearance: none;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: calc(var(--r-control) - 2px);
+  background: none;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.seg-opt[aria-checked="true"] {
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+.seg-opt:focus-visible {
+  outline: 3px solid color-mix(in oklch, var(--accent) 25%, transparent);
+}
+
+/* The add-site form grows with the server fields; it scrolls inside the
+   window rather than past it. */
+#add-site .modal {
+  width: min(440px, 90vw);
+  max-height: 88vh;
+  overflow-y: auto;
+}
+#add-site .check {
+  margin-top: 8px;
+}
+.guided {
+  margin: 12px 0 14px;
+}
+.guided .hint {
+  margin: 10px 0 0;
+}
+.guided .btn {
+  margin-top: 10px;
+}
+
+/* The identity-mismatch dialog names two sites side by side. */
+#mismatch .modal {
+  width: min(420px, 90vw);
+}
+#mismatch .kv-label {
+  white-space: nowrap;
+}
+#mismatch .kv-value {
+  font-family: inherit;
+  font-size: 13px;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+#mismatch .modal-actions {
+  margin-top: 18px;
+}
+#confirm-msg {
+  white-space: pre-line;
+}
+#confirm-msg:empty {
+  display: none;
+}
+body.busy, body.busy * {
+  cursor: progress !important;
+}
