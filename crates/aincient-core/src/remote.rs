@@ -208,14 +208,23 @@ fn control_path() -> Option<PathBuf> {
     let dir = dirs::home_dir()?
         .join(crate::sites::DEFAULT_DIR)
         .join("ssh");
-    std::fs::create_dir_all(&dir).ok()?;
+    // %C expands to a 40-hex-char hash of the connection.
+    if dir.as_os_str().len() + 1 + 40 >= 100 {
+        return None;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(&dir).ok()?;
+        // An existing directory keeps its mode; make sure it is private.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
-    // %C expands to a 40-hex-char hash of the connection.
-    (dir.as_os_str().len() + 1 + 40 < 100).then(|| dir.join("%C"))
+    #[cfg(not(unix))]
+    builder.create(&dir).ok()?;
+    Some(dir.join("%C"))
 }
 
 /// Quote `s` as one POSIX shell word.
@@ -568,8 +577,7 @@ fn checked<T: Transport>(
     let detail = stderr
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .last()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("no message")
         .to_string();
     match out.status.code() {
@@ -745,6 +753,7 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     type Reply = std::result::Result<Output, RunError>;
+    type Rule = (&'static str, Box<dyn Fn() -> Reply>);
 
     fn out(code: i32, stdout: &str, stderr: &str) -> Reply {
         Ok(Output {
@@ -757,7 +766,7 @@ mod tests {
     /// Answers each script with the reply of the first rule whose needle it
     /// contains, and records every call.
     struct Fake {
-        rules: Vec<(&'static str, Box<dyn Fn() -> Reply>)>,
+        rules: Vec<Rule>,
         calls: RefCell<Vec<(String, Option<PathBuf>)>>,
     }
 
