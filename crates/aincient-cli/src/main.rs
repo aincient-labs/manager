@@ -7,7 +7,9 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use aincient_core::{doctor, ops, remote, sites, ssh_key, Channel, InstallOptions, Stack};
+use aincient_core::{
+    doctor, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions, Stack,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -29,6 +31,11 @@ struct Cli {
     /// ATELIER_HOME and the active site.
     #[arg(long, global = true, value_name = "SLUG")]
     site: Option<String>,
+    /// Confirm a change to a live site on a server without typing its name:
+    /// with --yes, the site's slug here (D-07). Required when not in a
+    /// terminal; a wrong slug refuses the change.
+    #[arg(long, global = true, value_name = "SLUG")]
+    confirm_slug: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -147,6 +154,18 @@ enum SitesCommand {
         slug: String,
         /// The new display name.
         label: String,
+    },
+    /// Record where a site on a server is public, so `app open` goes there
+    /// instead of through an SSH tunnel — or forget it with --clear.
+    SetDomain {
+        /// The site's slug.
+        slug: String,
+        /// e.g. `cms.example.com` (https assumed) or `http://host:port`.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        domain: Option<String>,
+        /// Forget the domain: `app open` uses a tunnel again.
+        #[arg(long)]
+        clear: bool,
     },
     /// Stop a site and remove it from the list. Deletes nothing: its folder,
     /// database and files stay, and `sites add <SLUG>` brings it back.
@@ -270,7 +289,12 @@ enum AppCommand {
     /// Start the appliance.
     Start,
     /// Stop the appliance (keeps data).
-    Stop,
+    Stop {
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Remove the containers. With --wipe, also delete all data (destructive).
     Down {
         /// Also remove volumes — wipes the database, files, and admin password.
@@ -346,6 +370,10 @@ enum SiteCommand {
         /// Scheme + host to render absolute links against.
         #[arg(long, value_name = "URL")]
         base_url: Option<String>,
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// List snapshots and which one visitors see.
     Snapshots {
@@ -357,14 +385,27 @@ enum SiteCommand {
     Use {
         /// A snapshot id from `site snapshots`, or `live`.
         id: String,
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Back to live: Drupal renders every visit. Snapshots are kept.
-    Live,
+    Live {
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Delete old snapshots — keeps the newest N, every kept one, and the served one.
     Prune {
         /// How many recent unkept snapshots to retain.
         #[arg(long, default_value_t = 10, value_name = "N")]
         keep: u32,
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -564,6 +605,7 @@ impl ops::Reporter for CliReporter {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let _ = CONFIRM_SLUG.set(cli.confirm_slug.clone());
 
     // The registry commands name their site positionally and must keep working
     // whatever the active site is — so they never resolve a stack.
@@ -722,6 +764,30 @@ fn run_sites(command: SitesCommand) -> Result<()> {
                 site.slug,
                 site.label
             );
+            Ok(())
+        }
+        SitesCommand::SetDomain {
+            slug,
+            domain,
+            clear: _,
+        } => {
+            let site = sites::set_domain(&uh, &slug, domain.as_deref())?;
+            let remote = site
+                .remote
+                .as_ref()
+                .expect("set_domain only takes remote sites");
+            match &remote.domain {
+                Some(d) => println!(
+                    "{} `atelier --site {slug} app open` now opens {}.",
+                    style::success("Domain recorded."),
+                    style::url(&remote::domain_base(d))
+                ),
+                None => println!(
+                    "{} `atelier --site {slug} app open` goes through an SSH tunnel to {}.",
+                    style::success("Domain cleared."),
+                    remote.host
+                ),
+            }
             Ok(())
         }
         SitesCommand::Remove { slug } => {
@@ -1068,9 +1134,10 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
             if !confirm_change(
-                &Target::Local,
+                &ChangeGuard::local(stack),
                 "Reinstall will DELETE all data (database, files, admin password) and install \
-                 fresh. Continue?",
+                 fresh.",
+                "Reinstall {site}?",
                 yes,
             )? {
                 println!("{}", style::warn("Aborted."));
@@ -1100,7 +1167,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             }
             Ok(())
         }
-        AppCommand::Stop => {
+        AppCommand::Stop { .. } => {
             ops::stop(stack, &mut ops::Silent)?;
             println!("{}", style::success("Stopped."));
             Ok(())
@@ -1108,8 +1175,9 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
         AppCommand::Down { wipe, yes } => {
             if wipe
                 && !confirm_change(
-                    &Target::Local,
-                    "This will DELETE all data (database, files, admin password). Continue?",
+                    &ChangeGuard::local(stack),
+                    "This will DELETE all data (database, files, admin password).",
+                    "Remove and wipe {site}?",
                     yes,
                 )?
             {
@@ -1189,6 +1257,7 @@ fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
             no_serve,
             force,
             base_url,
+            ..
         } => {
             let opts = ops::FreezeOptions {
                 label,
@@ -1209,7 +1278,7 @@ fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
             print_snapshots(&list);
             Ok(())
         }
-        SiteCommand::Use { id } => {
+        SiteCommand::Use { id, .. } => {
             ops::use_snapshot(stack, &id, &mut ops::Silent)?;
             if id == "live" {
                 println!("{}", style::success("Live: Drupal renders every visit."));
@@ -1221,12 +1290,12 @@ fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
             }
             Ok(())
         }
-        SiteCommand::Live => {
+        SiteCommand::Live { .. } => {
             ops::use_snapshot(stack, "live", &mut ops::Silent)?;
             println!("{}", style::success("Live: Drupal renders every visit."));
             Ok(())
         }
-        SiteCommand::Prune { keep } => {
+        SiteCommand::Prune { keep, .. } => {
             let deleted = ops::prune_snapshots(stack, keep, &mut ops::Silent)?;
             if deleted.is_empty() {
                 println!("Nothing to prune.");
@@ -1297,8 +1366,9 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
                 println!("{}", style::warn(&skew));
             }
             if !confirm_change(
-                &Target::Local,
-                &restore_question(&file.display().to_string()),
+                &ChangeGuard::local(stack),
+                &restore_detail(&file.display().to_string()),
+                RESTORE_QUESTION,
                 yes,
             )? {
                 println!("{}", style::warn("Aborted."));
@@ -1629,7 +1699,12 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
         if let Some(problem) = &plan.problem {
             println!("\n{}", style::warn(problem));
         }
-        if !confirm_change(&Target::Local, "\nWalk the whole route now?", yes)? {
+        if !confirm_change(
+            &ChangeGuard::local(stack),
+            "",
+            "\nWalk the whole route for {site} now?",
+            yes,
+        )? {
             println!("{}", style::warn("Aborted — nothing was changed."));
             return Ok(());
         }
@@ -1722,7 +1797,12 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
                  migrates forward. Take a backup first: `atelier data backup`."
             )
         );
-        if !confirm_change(&Target::Local, "Follow unreleased edge builds anyway?", yes)? {
+        if !confirm_change(
+            &ChangeGuard::local(stack),
+            "",
+            "Switch {site} to unreleased edge builds anyway?",
+            yes,
+        )? {
             println!("{}", style::warn("Aborted."));
             return Ok(());
         }
@@ -1741,7 +1821,12 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
                  `atelier data backup`."
             )
         );
-        if !confirm_change(&Target::Local, "Switch to released versions anyway?", yes)? {
+        if !confirm_change(
+            &ChangeGuard::local(stack),
+            "",
+            "Switch {site} to released versions anyway?",
+            yes,
+        )? {
             println!("{}", style::warn("Aborted."));
             return Ok(());
         }
@@ -1842,6 +1927,14 @@ enum Route {
     Snapshots { json: bool },
     /// `doctor [--fix] [--json]`: Manager-side checks + the server's report.
     Doctor { fix: bool, json: bool },
+    /// A change to what the site serves (stop, freeze, use, live, prune): on
+    /// a live site it asks for the typed slug first (D-07), then streams.
+    Change {
+        action: remote::Action,
+        yes: bool,
+        /// The confirmation, `{site}` naming the site and its host.
+        question: &'static str,
+    },
     /// Everything else: the same subcommand on the server, streamed.
     Run(remote::Action),
 }
@@ -1867,7 +1960,11 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
             AppCommand::CheckUpdate { json } => Route::CheckUpdate { json },
             AppCommand::Update { to, yes, .. } => Route::Update { to, yes },
             AppCommand::Start => Route::Run(Action::Start),
-            AppCommand::Stop => Route::Run(Action::Stop),
+            AppCommand::Stop { yes } => Route::Change {
+                action: Action::Stop,
+                yes,
+                question: "Stop {site}?",
+            },
             AppCommand::Install { .. } => {
                 return Err(local_only(
                     "app install",
@@ -1910,17 +2007,34 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                 no_serve,
                 force,
                 base_url,
-            } => Route::Run(Action::Freeze(ops::FreezeOptions {
-                label,
-                keep,
-                no_serve,
-                force,
-                base_url,
-            })),
+                yes,
+            } => Route::Change {
+                action: Action::Freeze(ops::FreezeOptions {
+                    label,
+                    keep,
+                    no_serve,
+                    force,
+                    base_url,
+                }),
+                yes,
+                question: "Freeze {site}? Visitors get the snapshot instead of the live site.",
+            },
             SiteCommand::Snapshots { json } => Route::Snapshots { json },
-            SiteCommand::Use { id } => Route::Run(Action::UseSnapshot { id }),
-            SiteCommand::Live => Route::Run(Action::Live),
-            SiteCommand::Prune { keep } => Route::Run(Action::Prune { keep }),
+            SiteCommand::Use { id, yes } => Route::Change {
+                action: Action::UseSnapshot { id },
+                yes,
+                question: "Change what visitors of {site} see?",
+            },
+            SiteCommand::Live { yes } => Route::Change {
+                action: Action::Live,
+                yes,
+                question: "Switch {site} back to live?",
+            },
+            SiteCommand::Prune { keep, yes } => Route::Change {
+                action: Action::Prune { keep },
+                yes,
+                question: "Delete old snapshots of {site}?",
+            },
         },
         Command::Data { command } => match command {
             DataCommand::Backup {
@@ -1988,10 +2102,6 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
         let fix_cmd = format!("atelier --site {} doctor --fix", site.slug);
         return finish_doctor(&report, fix, json, &fix_cmd);
     }
-    let target = Target::Remote {
-        host,
-        slug: &site.slug,
-    };
     let session = remote_session(site, remote::EngineOptions::from_env())?;
     match route {
         Route::Doctor { .. } => unreachable!("handled above"),
@@ -2089,7 +2199,7 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
             }
             Ok(())
         }
-        Route::Update { to, yes } => remote_update(&session, &target, to, yes),
+        Route::Update { to, yes } => remote_update(&session, site, to, yes),
         Route::Restore {
             file,
             yes,
@@ -2109,7 +2219,8 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                 println!(
                     "{file} is on this machine — it is uploaded to {host} and restored there."
                 );
-                if !confirm_change(&target, &restore_question(&file), yes)? {
+                let guard = session.change_guard(site);
+                if !confirm_change(&guard, &restore_detail(&file), RESTORE_QUESTION, yes)? {
                     println!("{}", style::warn("Aborted."));
                     return Ok(());
                 }
@@ -2123,11 +2234,26 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                     "{file} is a path on {host} — the server restores its own copy."
                 ))
             );
-            if !confirm_change(&target, &restore_question(&file), yes)? {
+            let guard = session.change_guard(site);
+            if !confirm_change(&guard, &restore_detail(&file), RESTORE_QUESTION, yes)? {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
             session.run_action(&remote::Action::Restore { file, other_site }, &mut relay)
+        }
+        Route::Change {
+            action,
+            yes,
+            question,
+        } => {
+            // Only a live site asks: stopped or frozen, these change nothing
+            // visitors see, and locally they never ask at all.
+            let guard = session.change_guard(site);
+            if guard.typed_slug && !confirm_change(&guard, "", question, yes)? {
+                println!("{}", style::warn("Aborted — nothing was changed."));
+                return Ok(());
+            }
+            session.run_action(&action, &mut relay)
         }
         Route::Run(action) => {
             session.run_action(&action, &mut relay)?;
@@ -2144,13 +2270,15 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
 /// update run and a stepped route is shown and confirmed HERE. `--yes` goes
 /// to the server only when that confirmation happened (or the user gave it):
 /// otherwise a server that finds a stepped route declines it rather than wait.
+/// A live site is always confirmed, by its typed slug (D-07).
 fn remote_update(
     session: &remote::Session<remote::Ssh>,
-    target: &Target,
+    site: &sites::Site,
     to: Option<String>,
     yes: bool,
 ) -> Result<()> {
     let mut confirmed = yes;
+    let mut asked = false;
     if to.is_none() {
         let check = session.check_update()?;
         if check.update_available == Some(false) {
@@ -2167,7 +2295,19 @@ fn remote_update(
             if let Some(problem) = &plan.problem {
                 println!("\n{}", style::warn(problem));
             }
-            if !confirm_change(target, "\nWalk the whole route now?", yes)? {
+            let guard = session.change_guard(site);
+            if !confirm_change(&guard, "", "\nWalk the whole route for {site} now?", yes)? {
+                println!("{}", style::warn("Aborted — nothing was changed."));
+                return Ok(());
+            }
+            confirmed = true;
+            asked = true;
+        }
+    }
+    if !asked {
+        let guard = session.change_guard(site);
+        if guard.typed_slug {
+            if !confirm_change(&guard, "", "Update {site}?", yes)? {
                 println!("{}", style::warn("Aborted — nothing was changed."));
                 return Ok(());
             }
@@ -2237,6 +2377,7 @@ fn remote_session(
 /// `atelier sites add <SLUG> --host <TARGET>`: attach to a running site on a
 /// server (U-03). The registry is written only after the server answered and
 /// reported the site running.
+#[allow(clippy::too_many_arguments)]
 fn sites_add_remote(
     uh: &std::path::Path,
     slug: &str,
@@ -2416,32 +2557,101 @@ fn show_login(stack: &Stack) {
     }
 }
 
-/// Which machine a change is about to happen on.
-enum Target<'a> {
-    /// A site on this machine.
-    Local,
-    /// A site on a server: `host` is the ssh target, `slug` its name here.
-    #[allow(dead_code)] // read by the D-07 confirms (m2-8)
-    Remote { host: &'a str, slug: &'a str },
+/// What `--confirm-slug` said, set once in [`run`].
+static CONFIRM_SLUG: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// How a confirmation is given (m2-8, D-07).
+#[derive(Debug, PartialEq, Eq)]
+enum Ask {
+    /// Already confirmed: `--yes` (with the right `--confirm-slug` on a live
+    /// remote site).
+    Proceed,
+    /// A y/N question — every local site, and a remote one that isn't live.
+    YesNo,
+    /// The site's slug, typed in the terminal.
+    TypeSlug,
+    /// Can't be confirmed this way; the message says what would.
+    Refuse(String),
+}
+
+/// Decide how `guard`'s change is confirmed. Pure, so every branch is tested.
+/// On a live remote site `--yes` alone is never enough: in a terminal the
+/// slug is typed; elsewhere `--yes --confirm-slug <slug>` is required.
+fn decide(guard: &ChangeGuard, yes: bool, confirm_slug: Option<&str>, interactive: bool) -> Ask {
+    if !guard.typed_slug {
+        return if yes { Ask::Proceed } else { Ask::YesNo };
+    }
+    let place = guard.place();
+    match confirm_slug {
+        Some(given) if given != guard.slug => Ask::Refuse(format!(
+            "--confirm-slug `{given}` is not this site — it is `{}` {place}. Nothing was changed.",
+            guard.slug
+        )),
+        Some(_) if yes => Ask::Proceed,
+        _ if interactive => Ask::TypeSlug,
+        _ => Ask::Refuse(format!(
+            "`{slug}` is a live site {place}, so a change needs its name confirmed — and this \
+             isn't an interactive terminal. Pass --yes --confirm-slug {slug} to confirm it. \
+             Nothing was changed.",
+            slug = guard.slug
+        )),
+    }
 }
 
 /// THE confirmation before a site is changed — every destructive or
 /// route-walking action, local or remote, asks through here, always BEFORE the
 /// work starts (for a remote site: before the ssh call, so the server never
-/// waits on a prompt). Today both targets ask the same y/N; the next slice
-/// (m2-8, D-07) makes the remote one name the host and ask for the typed slug
-/// on a live site — here, and nowhere else.
-fn confirm_change(target: &Target, question: &str, assume_yes: bool) -> Result<bool> {
-    match target {
-        Target::Local | Target::Remote { .. } => confirm(question, assume_yes),
+/// waits on a prompt). `detail` (may be empty) is printed first; `question` is
+/// a template whose `{site}` names the site and where it runs ("Blog on
+/// vps.example.com", "Blog on this computer"). A live remote site asks for its
+/// slug instead of y/N (D-07).
+fn confirm_change(
+    guard: &ChangeGuard,
+    detail: &str,
+    question: &str,
+    assume_yes: bool,
+) -> Result<bool> {
+    use std::io::IsTerminal;
+    let given = CONFIRM_SLUG.get().and_then(|s| s.as_deref());
+    match decide(guard, assume_yes, given, std::io::stdin().is_terminal()) {
+        Ask::Proceed => Ok(true),
+        Ask::Refuse(why) => anyhow::bail!(why),
+        Ask::YesNo => {
+            if !detail.is_empty() {
+                println!("{detail}");
+            }
+            confirm(&guard.question(question), false)
+        }
+        Ask::TypeSlug => {
+            if !detail.is_empty() {
+                println!("{detail}");
+            }
+            println!("{}", style::heading(&guard.question(question)));
+            print!(
+                "{} is live {}. Type its name ({}) to continue: ",
+                guard.label,
+                guard.place(),
+                guard.slug
+            );
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if guard.accepts(&line) {
+                return Ok(true);
+            }
+            println!("{}", style::warn(&format!("That isn't `{}`.", guard.slug)));
+            Ok(false)
+        }
     }
 }
 
-/// The restore question, shared by the local and remote paths.
-fn restore_question(file: &str) -> String {
+/// The restore question and its detail, shared by the local and remote paths.
+const RESTORE_QUESTION: &str = "Restore {site}?";
+
+fn restore_detail(file: &str) -> String {
     format!(
         "Restore will REPLACE the current database (and files, for a .tar.gz snapshot) with \
-         {file}. Continue?"
+         {file}."
     )
 }
 
@@ -2480,7 +2690,7 @@ mod tests {
     /// The server argv a plain streamed route sends.
     fn argv(args: &[&str]) -> String {
         match route(args).unwrap() {
-            Route::Run(action) => action.argv().join(" "),
+            Route::Run(action) | Route::Change { action, .. } => action.argv().join(" "),
             other => panic!("{args:?} is not a plain run: {other:?}"),
         }
     }
@@ -2655,15 +2865,156 @@ mod tests {
         );
     }
 
+    fn remote_guard(live: bool) -> ChangeGuard {
+        let site = sites::Site::new_remote(
+            std::path::Path::new("/home/me"),
+            "prod",
+            Some("Shop"),
+            HOST,
+            None,
+            sites::KeyMode::Ssh,
+        );
+        ChangeGuard::for_site(&site, live)
+    }
+
+    fn local_guard() -> ChangeGuard {
+        ChangeGuard::local(&Stack {
+            home: "/home/me/.atelier/sites/blog".into(),
+            slug: Some("blog".into()),
+            label: Some("Blog".into()),
+            project: None,
+        })
+    }
+
     #[test]
-    fn one_confirmation_serves_both_targets() {
-        let remote = Target::Remote {
-            host: HOST,
-            slug: "prod",
+    fn local_sites_keep_their_yes_no_and_yes_skips_it() {
+        for interactive in [true, false] {
+            assert_eq!(decide(&local_guard(), false, None, interactive), Ask::YesNo);
+            assert_eq!(
+                decide(&local_guard(), true, None, interactive),
+                Ask::Proceed
+            );
+            // --confirm-slug means nothing to a local site.
+            assert_eq!(
+                decide(&local_guard(), true, Some("other"), interactive),
+                Ask::Proceed
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_site_that_is_not_live_asks_yes_no_naming_its_host() {
+        let g = remote_guard(false);
+        assert_eq!(decide(&g, false, None, true), Ask::YesNo);
+        assert_eq!(decide(&g, true, None, false), Ask::Proceed);
+        assert_eq!(
+            g.question(RESTORE_QUESTION),
+            format!("Restore Shop on {HOST}?")
+        );
+        assert_eq!(
+            local_guard().question(RESTORE_QUESTION),
+            "Restore Blog on this computer?"
+        );
+    }
+
+    #[test]
+    fn a_live_remote_site_needs_the_slug_typed_and_yes_alone_never_skips_it() {
+        let g = remote_guard(true);
+        // In a terminal: typed, with or without --yes.
+        assert_eq!(decide(&g, false, None, true), Ask::TypeSlug);
+        assert_eq!(decide(&g, true, None, true), Ask::TypeSlug);
+        // Matching --confirm-slug without --yes still types it.
+        assert_eq!(decide(&g, false, Some("prod"), true), Ask::TypeSlug);
+        // --yes --confirm-slug <slug> confirms, in a terminal or not.
+        assert_eq!(decide(&g, true, Some("prod"), true), Ask::Proceed);
+        assert_eq!(decide(&g, true, Some("prod"), false), Ask::Proceed);
+        assert!(g.accepts("prod\n") && !g.accepts("y") && !g.accepts("Shop"));
+    }
+
+    #[test]
+    fn a_live_remote_site_refuses_a_script_without_the_slug_or_with_a_wrong_one() {
+        let g = remote_guard(true);
+        for (yes, given) in [(true, None), (false, None), (false, Some("prod"))] {
+            match decide(&g, yes, given, false) {
+                Ask::Refuse(why) => assert!(
+                    why.contains("--yes --confirm-slug prod") && why.contains(HOST),
+                    "{why}"
+                ),
+                other => panic!("{yes} {given:?}: {other:?}"),
+            }
+        }
+        for interactive in [true, false] {
+            match decide(&g, true, Some("blog"), interactive) {
+                Ask::Refuse(why) => assert!(
+                    why.contains("`blog` is not this site") && why.contains("`prod`"),
+                    "{why}"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn changes_to_what_a_remote_site_serves_go_through_the_guard() {
+        for (args, want_yes) in [
+            (&["app", "stop"][..], false),
+            (&["site", "freeze", "-y"], true),
+            (&["site", "use", "s-1"], false),
+            (&["site", "live", "--yes"], true),
+            (&["site", "prune", "--keep", "3"], false),
+        ] {
+            match route(args).unwrap() {
+                Route::Change { yes, question, .. } => {
+                    assert_eq!(yes, want_yes, "{args:?}");
+                    assert!(question.contains("{site}"), "{args:?}: {question}");
+                }
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        // Start and export change nothing visitors rely on: no guard.
+        assert!(matches!(route(&["app", "start"]).unwrap(), Route::Run(_)));
+        assert!(matches!(route(&["site", "export"]).unwrap(), Route::Run(_)));
+        let cli = Cli::try_parse_from([
+            "atelier",
+            "--site",
+            "prod",
+            "data",
+            "restore",
+            "b.tar.gz",
+            "--yes",
+            "--confirm-slug",
+            "prod",
+        ])
+        .unwrap();
+        assert_eq!(cli.confirm_slug.as_deref(), Some("prod"));
+        assert!(restore_detail("/srv/b.tar.gz").contains("/srv/b.tar.gz"));
+    }
+
+    #[test]
+    fn sites_set_domain_takes_a_domain_or_clear() {
+        let parse_sites = |args: &[&str]| {
+            let mut argv = vec!["atelier", "sites", "set-domain"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
         };
-        assert!(confirm_change(&Target::Local, "q?", true).unwrap());
-        assert!(confirm_change(&remote, "q?", true).unwrap());
-        assert!(restore_question("/srv/b.tar.gz").contains("/srv/b.tar.gz"));
+        match parse_sites(&["prod", "cms.example.com"]).unwrap().command {
+            Command::Sites {
+                command:
+                    SitesCommand::SetDomain {
+                        slug,
+                        domain,
+                        clear,
+                    },
+            } => {
+                assert_eq!(slug, "prod");
+                assert_eq!(domain.as_deref(), Some("cms.example.com"));
+                assert!(!clear);
+            }
+            _ => panic!("not set-domain"),
+        }
+        assert!(parse_sites(&["prod", "--clear"]).is_ok());
+        assert!(parse_sites(&["prod"]).is_err(), "domain or --clear");
+        assert!(parse_sites(&["prod", "x.com", "--clear"]).is_err());
     }
 
     #[test]
