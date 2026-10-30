@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use aincient_core::{doctor, ops, sites, Channel, InstallOptions, Stack};
+use aincient_core::{doctor, ops, remote, sites, ssh_key, Channel, InstallOptions, Stack};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -99,7 +99,8 @@ enum SitesCommand {
         json: bool,
     },
     /// Create a new site under ~/.atelier/sites/<SLUG> on a free port, and
-    /// install it.
+    /// install it — or, with --host, attach to a site already running on a
+    /// server you reach over SSH.
     Add {
         /// Short machine name, used with --site (lowercase letters, digits, -).
         slug: String,
@@ -107,8 +108,26 @@ enum SitesCommand {
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
         /// Console port (default: the first free one from 41221 up).
-        #[arg(long, value_name = "PORT")]
+        #[arg(long, value_name = "PORT", conflicts_with = "host")]
         port: Option<u16>,
+        /// Attach to a running site on this server: an SSH alias from
+        /// ~/.ssh/config, `host` or `user@host`. Nothing is installed there;
+        /// the server's own `atelier` CLI does the work.
+        #[arg(long, value_name = "SSH-TARGET")]
+        host: Option<String>,
+        /// The site's slug on the server (default: SLUG).
+        #[arg(long, value_name = "SLUG", requires = "host")]
+        remote_site: Option<String>,
+        /// `guided`: generate a key for this server, keep it in your OS
+        /// keychain, and show the line to add on the server. Default: your own
+        /// SSH setup (agent, ~/.ssh/config).
+        #[arg(long, value_name = "MODE", value_parser = ["guided"], requires = "host")]
+        key: Option<String>,
+        /// A Linux `atelier` binary to copy to the server if it has none (or an
+        /// older one). Default: this version's release download. Also
+        /// ATELIER_REMOTE_BINARY.
+        #[arg(long, value_name = "PATH", requires = "host")]
+        engine_binary: Option<PathBuf>,
     },
     /// Make a site the active one — what commands use without --site.
     Use {
@@ -536,7 +555,11 @@ fn run() -> Result<()> {
         return update_all(yes);
     }
 
-    let stack = Stack::locate_site(cli.site.as_deref())?;
+    let resolution = sites::locate(cli.site.as_deref())?;
+    if let Some(site) = resolution.site.as_ref().filter(|s| s.is_remote()) {
+        return run_remote(cli.command, site);
+    }
+    let stack = resolution.into_stack();
 
     match cli.command {
         Command::Sites { .. } => unreachable!("handled above"),
@@ -566,7 +589,26 @@ fn run_sites(command: SitesCommand) -> Result<()> {
     let uh = sites::user_home()?;
     match command {
         SitesCommand::List { json } => sites_list(&uh, json),
-        SitesCommand::Add { slug, label, port } => {
+        SitesCommand::Add {
+            slug,
+            label,
+            host: Some(host),
+            remote_site,
+            key,
+            engine_binary,
+            ..
+        } => sites_add_remote(
+            &uh,
+            &slug,
+            label.as_deref(),
+            &host,
+            remote_site.as_deref(),
+            key.is_some(),
+            engine_binary,
+        ),
+        SitesCommand::Add {
+            slug, label, port, ..
+        } => {
             let added =
                 sites::add_site(&uh, &slug, label.as_deref(), port, sites::host_port_is_free)?;
             let stack = added.site.stack();
@@ -617,6 +659,17 @@ fn run_sites(command: SitesCommand) -> Result<()> {
         }
         SitesCommand::Use { slug } => {
             let site = sites::use_site(&uh, &slug)?;
+            if let Some(remote) = &site.remote {
+                println!(
+                    "{} {} ({}) — on {}",
+                    style::success("Active site:"),
+                    site.slug,
+                    site.label,
+                    remote.host
+                );
+                warn_atelier_home();
+                return Ok(());
+            }
             println!(
                 "{} {} ({}) — console {}",
                 style::success("Active site:"),
@@ -639,6 +692,23 @@ fn run_sites(command: SitesCommand) -> Result<()> {
         }
         SitesCommand::Remove { slug } => {
             let removed = sites::remove_site(&uh, &slug)?;
+            if let Some(remote) = &removed.site.remote {
+                println!(
+                    "{} {} is no longer in your sites. Nothing on {} was touched.",
+                    style::success("Removed."),
+                    removed.site.slug,
+                    remote.host
+                );
+                if remote.key == sites::KeyMode::Guided {
+                    println!(
+                        "Its SSH key for {} stays in your keychain (service `{}`) — re-adding \
+                         the site reuses it.",
+                        remote.host,
+                        aincient_core::ssh_key::KEYCHAIN_SERVICE
+                    );
+                }
+                return Ok(());
+            }
             let stack = removed.site.stack();
             // Stopping keeps containers and volumes (`compose stop`); it frees
             // the port so it can't collide with a site added later. Only a
@@ -680,6 +750,8 @@ fn sites_list(uh: &std::path::Path, json: bool) -> Result<()> {
         running: bool,
         version: Option<String>,
     }
+    // Remote sites are not contacted here: listing stays fast and offline-safe.
+    // `atelier --site <SLUG> app status` asks the server.
     let rows: Vec<Row> = sites::list_sites(uh)?
         .into_iter()
         .map(|site| {
@@ -707,6 +779,17 @@ fn sites_list(uh: &std::path::Path, json: bool) -> Result<()> {
         "SITE", "NAME", "PORT", "STATE"
     );
     for r in &rows {
+        if let Some(host) = &r.site.host {
+            println!(
+                "{} {:<14} {:<22} {:<6} {:<14} on {host}",
+                if r.site.active { "*" } else { " " },
+                r.site.slug,
+                r.site.label,
+                "",
+                "remote",
+            );
+            continue;
+        }
         let state = if !r.site.installed {
             "not installed"
         } else if r.running {
@@ -1609,6 +1692,12 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     if let (true, Some(slug), Some(label)) = (registry_exists, &stack.slug, &stack.label) {
         println!("  Site:     {label} ({slug})");
     }
+    print_status(&st);
+    Ok(())
+}
+
+/// The human rendering of a [`ops::Status`], local or remote.
+fn print_status(st: &ops::Status) {
     line("Installed", st.installed);
     line("Running", st.running);
     line("Console reachable", st.reachable);
@@ -1623,6 +1712,150 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
             "\n{}",
             style::warn("Not installed yet — run `atelier install`.")
         );
+    }
+}
+
+// --- remote sites (M2) -------------------------------------------------------
+
+/// A command on a remote site: run by the server's own `atelier` over SSH
+/// (D-01). This slice wires `app status`; the rest follow.
+fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
+    let remote = site.remote.as_ref().expect("caller checked");
+    match command {
+        Command::App {
+            command: AppCommand::Status { json },
+        } => {
+            let session = remote_session(site, remote::EngineOptions::from_env())?;
+            let st = session.status()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+                return Ok(());
+            }
+            println!(
+                "  Site:     {} ({}) — `{}` on {}",
+                site.label, site.slug, remote.slug, remote.host
+            );
+            print_status(&st);
+            Ok(())
+        }
+        _ => anyhow::bail!(
+            "site `{}` is on {} — only `atelier app status` works on remote sites so far. \
+             Run other commands on the server itself (`ssh {} atelier --site {} …`).",
+            site.slug,
+            remote.host,
+            remote.host,
+            remote.slug
+        ),
+    }
+}
+
+/// Connect to a remote site's engine. When the server's `atelier` is older
+/// than this one, offer (in a terminal) to copy ours to `~/.local/bin`.
+fn remote_session(
+    site: &sites::Site,
+    opts: remote::EngineOptions,
+) -> Result<remote::Session<remote::Ssh>> {
+    use std::io::IsTerminal;
+    match remote::open(site, &opts) {
+        Err(e) if e.downcast_ref::<remote::EngineTooOld>().is_some() => {
+            println!("{}", style::warn(&e.to_string()));
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "not copying it — this isn't an interactive terminal. Re-run in a terminal \
+                     to accept the copy."
+                );
+            }
+            if !confirm("Copy it now?", false)? {
+                anyhow::bail!("nothing changed on the server");
+            }
+            remote::open(
+                site,
+                &remote::EngineOptions {
+                    replace_older: true,
+                    ..opts
+                },
+            )
+        }
+        other => other,
+    }
+}
+
+/// `atelier sites add <SLUG> --host <TARGET>`: attach to a running site on a
+/// server (U-03). The registry is written only after the server answered and
+/// reported the site running.
+fn sites_add_remote(
+    uh: &std::path::Path,
+    slug: &str,
+    label: Option<&str>,
+    host: &str,
+    remote_site: Option<&str>,
+    guided: bool,
+    engine_binary: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    if !sites::is_valid_host(host) {
+        anyhow::bail!("`{host}` is not a usable SSH target (an alias, host or user@host)");
+    }
+    let key = if guided {
+        sites::KeyMode::Guided
+    } else {
+        sites::KeyMode::Ssh
+    };
+    let site = sites::Site::new_remote(uh, slug, label, host, remote_site, key);
+    if guided {
+        let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, host)?;
+        println!(
+            "{} the Manager's key for {host} {} in your OS keychain.",
+            style::success(if key.created { "Created" } else { "Found" }),
+            if key.created { "and stored it" } else { "is" },
+        );
+        println!("\nAdd this line to ~/.ssh/authorized_keys on {host}:\n");
+        println!("  {}\n", key.public_line);
+        println!("For example, logged in on the server, run:\n");
+        println!("  {}\n", ssh_key::authorize_command(&key.public_line));
+        if std::io::stdin().is_terminal() {
+            print!("Press Enter once it is added (Ctrl-C to stop)… ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+        } else if key.created {
+            anyhow::bail!(
+                "not an interactive terminal — add the key on the server, then run this \
+                 command again (the key stays in your keychain and is reused)"
+            );
+        }
+    }
+    let opts = remote::EngineOptions {
+        binary: engine_binary.or_else(|| remote::EngineOptions::from_env().binary),
+        replace_older: false,
+    };
+    println!("Checking {host}…");
+    let added = sites::add_remote_site(uh, site, |site| {
+        let session = remote_session(site, opts)?;
+        let st = session.attach_check()?;
+        println!(
+            "{} {host} runs site `{}`{} (engine {}).",
+            style::success("Reached"),
+            site.remote.as_ref().map(|r| r.slug.as_str()).unwrap_or(""),
+            st.version
+                .as_deref()
+                .map(|v| format!(", version {v}"))
+                .unwrap_or_default(),
+            session.engine()
+        );
+        Ok(())
+    })
+    .context("nothing was added")?;
+    println!(
+        "{} {} ({}) — on {host}",
+        style::success("Added site"),
+        added.site.slug,
+        added.site.label,
+    );
+    if added.activated {
+        println!("It is the active site: commands without --site use it.");
+    } else {
+        println!("Use it with `atelier --site {slug} app status`.");
     }
     Ok(())
 }
