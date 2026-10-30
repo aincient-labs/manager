@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "aincient-engine"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aincient-core",
  "anyhow",
