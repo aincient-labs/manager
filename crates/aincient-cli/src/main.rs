@@ -39,7 +39,9 @@ enum Command {
     ///
     /// Checks the host (Docker, ports, disk), the stack (compose files,
     /// containers) and the site inside it (Drupal boots, updates applied, files
-    /// writable). Read-only unless you pass --fix.
+    /// writable). Read-only unless you pass --fix. For a remote site the host
+    /// is the server: the server's own doctor runs, after the SSH login and
+    /// its atelier CLI are checked from here.
     Doctor {
         /// Apply the safe repairs: rebuild caches, run pending database
         /// updates, repair file ownership, restart containers, and re-run the
@@ -425,7 +427,11 @@ fn main() {
     }
     if let Err(err) = run() {
         eprintln!("{} {err:#}", style::error("error:"));
-        std::process::exit(1);
+        // A remote command's own exit code is the answer a script wants (m2-7).
+        let code = err
+            .downcast_ref::<remote::RemoteExit>()
+            .map_or(1, |exit| exit.code);
+        std::process::exit(code);
     }
 }
 
@@ -556,9 +562,10 @@ fn run() -> Result<()> {
     }
 
     let resolution = sites::locate(cli.site.as_deref())?;
-    if let Some(site) = resolution.site.as_ref().filter(|s| s.is_remote()) {
+    if let Some(site) = remote_site(&resolution) {
         return run_remote(cli.command, site);
     }
+    // A local site: exactly the path it took before remote sites existed.
     let stack = resolution.into_stack();
 
     match cli.command {
@@ -839,10 +846,23 @@ fn warn_atelier_home() {
 /// fails at the end if any did.
 fn update_all(yes: bool) -> Result<()> {
     let uh = sites::user_home()?;
-    let rows: Vec<_> = sites::list_sites(&uh)?
-        .into_iter()
-        .filter(|r| r.installed)
+    let all = sites::list_sites(&uh)?;
+    let remote: Vec<_> = all
+        .iter()
+        .filter(|r| r.host.is_some())
+        .map(|r| r.slug.clone())
         .collect();
+    if !remote.is_empty() {
+        println!(
+            "{}",
+            style::warn(&format!(
+                "--all updates the sites on this machine; remote sites are updated one at a \
+                 time (`atelier --site <SLUG> app update`): {}",
+                remote.join(", ")
+            ))
+        );
+    }
+    let rows: Vec<_> = all.into_iter().filter(|r| r.installed).collect();
     if rows.is_empty() {
         println!("{}", style::warn("No installed sites to update."));
         return Ok(());
@@ -1020,7 +1040,8 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
         AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
-            if !confirm(
+            if !confirm_change(
+                &Target::Local,
                 "Reinstall will DELETE all data (database, files, admin password) and install \
                  fresh. Continue?",
                 yes,
@@ -1059,7 +1080,8 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
         }
         AppCommand::Down { wipe, yes } => {
             if wipe
-                && !confirm(
+                && !confirm_change(
+                    &Target::Local,
                     "This will DELETE all data (database, files, admin password). Continue?",
                     yes,
                 )?
@@ -1228,12 +1250,9 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             if let Some(skew) = ops::restore_skew(stack, &file) {
                 println!("{}", style::warn(&skew));
             }
-            if !confirm(
-                &format!(
-                    "Restore will REPLACE the current database (and files, for a .tar.gz \
-                     snapshot) with {}. Continue?",
-                    file.display()
-                ),
+            if !confirm_change(
+                &Target::Local,
+                &restore_question(&file.display().to_string()),
                 yes,
             )? {
                 println!("{}", style::warn("Aborted."));
@@ -1308,13 +1327,15 @@ fn doctor(stack: &Stack, fix: bool, json: bool) -> Result<()> {
         doctor::diagnose(stack)
     };
 
+    finish_doctor(&report, fix, json, "atelier doctor --fix")
+}
+
+/// Print a doctor report (local or remote) and exit 1 when it is unhealthy.
+fn finish_doctor(report: &doctor::Report, fix: bool, json: bool, fix_cmd: &str) -> Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&JsonReport::of(&report))?
-        );
+        println!("{}", serde_json::to_string_pretty(&JsonReport::of(report))?);
     } else {
-        print_report(&report, fix);
+        print_report(report, fix, fix_cmd);
     }
 
     if !report.healthy() {
@@ -1358,17 +1379,18 @@ impl<'a> JsonReport<'a> {
 
 /// Render a report grouped by tier, with each failure's remedy indented under
 /// it — so the fix is never more than one line away from the problem.
-fn print_report(report: &doctor::Report, fixed: bool) {
-    for (tier, title) in [
-        (doctor::Tier::Host, "Your machine"),
-        (doctor::Tier::Stack, "The appliance"),
-        (doctor::Tier::Site, "Your site"),
+fn print_report(report: &doctor::Report, fixed: bool, fix_cmd: &str) {
+    for tier in [
+        doctor::Tier::Connection,
+        doctor::Tier::Host,
+        doctor::Tier::Stack,
+        doctor::Tier::Site,
     ] {
         let checks: Vec<_> = report.checks.iter().filter(|c| c.tier == tier).collect();
-        if checks.is_empty() {
+        let Some(first) = checks.first() else {
             continue;
-        }
-        println!("\n{}", style::heading(title));
+        };
+        println!("\n{}", style::heading(&tier_title(tier, &first.on)));
         for check in checks {
             print_check(check);
         }
@@ -1420,7 +1442,21 @@ fn print_report(report: &doctor::Report, fixed: bool) {
     // the user hasn't just run it — "run --fix" after --fix already failed is
     // noise, not advice.
     if !fixed && !report.available_repairs().is_empty() {
-        println!("Run `atelier doctor --fix` to repair what can be repaired automatically.");
+        println!("Run `{fix_cmd}` to repair what can be repaired automatically.");
+    }
+}
+
+/// A report section's heading, naming the machine its checks ran on (m2-9).
+fn tier_title(tier: doctor::Tier, on: &doctor::HostTier) -> String {
+    use doctor::{HostTier, Tier};
+    match (tier, on) {
+        (Tier::Connection, _) => "Reaching the server (from this machine)".to_string(),
+        (Tier::Host, HostTier::Local) => "Your machine".to_string(),
+        (Tier::Stack, HostTier::Local) => "The appliance".to_string(),
+        (Tier::Site, HostTier::Local) => "Your site".to_string(),
+        (Tier::Host, HostTier::Remote(host)) => format!("The server ({host})"),
+        (Tier::Stack, HostTier::Remote(host)) => format!("The appliance on {host}"),
+        (Tier::Site, HostTier::Remote(host)) => format!("Your site on {host}"),
     }
 }
 
@@ -1430,8 +1466,8 @@ fn print_check(check: &doctor::Check) {
     // `style::mark` convention), `!` advises, `-` was never reached.
     let (mark, styled_label) = match check.severity {
         doctor::Severity::Ok => (style::mark(true), check.label.to_string()),
-        doctor::Severity::Warn => ("[!]".to_string(), style::warn(check.label)),
-        doctor::Severity::Fail => (style::mark(false), style::danger(check.label)),
+        doctor::Severity::Warn => ("[!]".to_string(), style::warn(&check.label)),
+        doctor::Severity::Fail => (style::mark(false), style::danger(&check.label)),
         doctor::Severity::Skipped => ("[-]".to_string(), check.label.to_string()),
     };
     match &check.detail {
@@ -1542,7 +1578,7 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
         if let Some(problem) = &plan.problem {
             println!("\n{}", style::warn(problem));
         }
-        if !confirm("\nWalk the whole route now?", yes)? {
+        if !confirm_change(&Target::Local, "\nWalk the whole route now?", yes)? {
             println!("{}", style::warn("Aborted — nothing was changed."));
             return Ok(());
         }
@@ -1635,7 +1671,7 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
                  migrates forward. Take a backup first: `atelier data backup`."
             )
         );
-        if !confirm("Follow unreleased edge builds anyway?", yes)? {
+        if !confirm_change(&Target::Local, "Follow unreleased edge builds anyway?", yes)? {
             println!("{}", style::warn("Aborted."));
             return Ok(());
         }
@@ -1654,7 +1690,7 @@ fn channel_cmd(stack: &Stack, channel: Option<String>, now: bool, yes: bool) -> 
                  `atelier data backup`."
             )
         );
-        if !confirm("Switch to released versions anyway?", yes)? {
+        if !confirm_change(&Target::Local, "Switch to released versions anyway?", yes)? {
             println!("{}", style::warn("Aborted."));
             return Ok(());
         }
@@ -1717,15 +1753,172 @@ fn print_status(st: &ops::Status) {
 
 // --- remote sites (M2) -------------------------------------------------------
 
+/// The registered remote site a command resolved to, if any. `None` — a local
+/// site, a hand-rolled `ATELIER_HOME`, an unregistered `~/.atelier` — keeps
+/// the local code path untouched.
+fn remote_site(resolution: &sites::Resolution) -> Option<&sites::Site> {
+    resolution.site.as_ref().filter(|s| s.is_remote())
+}
+
+/// How a command runs on a remote site (m2-7, D-04).
+#[derive(Debug)]
+enum Route {
+    /// `app status [--json]`.
+    Status { json: bool },
+    /// `app check-update [--json]`.
+    CheckUpdate { json: bool },
+    /// `app update`: plan + confirm here, then the server walks it.
+    Update { to: Option<String>, yes: bool },
+    /// `data restore`: confirm here, then the server restores its own file.
+    Restore { file: String, yes: bool },
+    /// `site snapshots [--json]`.
+    Snapshots { json: bool },
+    /// `doctor [--fix] [--json]`: Manager-side checks + the server's report.
+    Doctor { fix: bool, json: bool },
+    /// Everything else: the same subcommand on the server, streamed.
+    Run(remote::Action),
+}
+
+/// Map a parsed command to its remote route, or refuse it with a message that
+/// names the host. Pure, so the whole table is unit-tested.
+fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
+    use remote::Action;
+    let on_server = |what: &str| {
+        anyhow::anyhow!(
+            "`atelier {what}` isn't available for remote sites yet — site `{slug}` is on {host}. \
+             Run it on the server: `ssh {host} atelier --site <SLUG> {what}`."
+        )
+    };
+    let local_only = |what: &str, why: &str| {
+        anyhow::anyhow!("`atelier {what}` {why}, and site `{slug}` is on {host}.")
+    };
+    Ok(match command {
+        Command::Sites { .. } => unreachable!("handled before resolving a site"),
+        Command::Doctor { fix, json } => Route::Doctor { fix, json },
+        Command::App { command } => match command {
+            AppCommand::Status { json } => Route::Status { json },
+            AppCommand::CheckUpdate { json } => Route::CheckUpdate { json },
+            AppCommand::Update { to, yes, .. } => Route::Update { to, yes },
+            AppCommand::Start => Route::Run(Action::Start),
+            AppCommand::Stop => Route::Run(Action::Stop),
+            AppCommand::Install { .. } => {
+                return Err(local_only(
+                    "app install",
+                    "installs on this machine — the Manager only attaches to a site already \
+                     running on a server",
+                ))
+            }
+            AppCommand::Open => {
+                return Err(local_only(
+                    "app open",
+                    "opens the console in a browser here, at the server's own local address",
+                ))
+            }
+            AppCommand::View => {
+                return Err(local_only(
+                    "app view",
+                    "opens the site in a browser here, at the server's own local address",
+                ))
+            }
+            AppCommand::Reinstall { .. } => return Err(on_server("app reinstall")),
+            AppCommand::Down { .. } => return Err(on_server("app down")),
+            AppCommand::Channel { .. } => return Err(on_server("app channel")),
+            AppCommand::Logs { .. } => return Err(on_server("app logs")),
+            AppCommand::Password { .. } => return Err(on_server("app password")),
+        },
+        Command::Site { command } => match command {
+            SiteCommand::Export {
+                out,
+                base_url,
+                zip,
+                include_config,
+                include_users,
+                skip_link_check,
+            } => Route::Run(Action::Export(ops::ExportOptions {
+                out,
+                base_url,
+                zip,
+                include_config,
+                include_users,
+                skip_link_check,
+            })),
+            SiteCommand::Freeze {
+                label,
+                keep,
+                no_serve,
+                force,
+                base_url,
+            } => Route::Run(Action::Freeze(ops::FreezeOptions {
+                label,
+                keep,
+                no_serve,
+                force,
+                base_url,
+            })),
+            SiteCommand::Snapshots { json } => Route::Snapshots { json },
+            SiteCommand::Use { id } => Route::Run(Action::UseSnapshot { id }),
+            SiteCommand::Live => Route::Run(Action::Live),
+            SiteCommand::Prune { keep } => Route::Run(Action::Prune { keep }),
+        },
+        Command::Data { command } => match command {
+            DataCommand::Backup { label } => Route::Run(Action::Backup { label }),
+            DataCommand::List => Route::Run(Action::BackupList),
+            DataCommand::Restore { file, yes } => Route::Restore {
+                file: file
+                    .to_str()
+                    .context("the backup path isn't valid UTF-8")?
+                    .to_string(),
+                yes,
+            },
+        },
+        Command::Ai { .. } => return Err(on_server("ai model")),
+        Command::Pack { .. } => {
+            return Err(local_only(
+                "pack",
+                "develops a pack against a dev stack on this machine",
+            ))
+        }
+        Command::Mcp => {
+            return Err(local_only(
+                "mcp",
+                "serves tools for a dev stack on this machine",
+            ))
+        }
+    })
+}
+
+/// Print a remote command's output as it arrives: stdout to stdout, stderr to
+/// stderr, so redirection behaves as it does for the local command.
+fn relay(pipe: aincient_core::docker::Pipe, line: &str) {
+    match pipe {
+        aincient_core::docker::Pipe::Stdout => println!("{line}"),
+        aincient_core::docker::Pipe::Stderr => eprintln!("{line}"),
+    }
+}
+
 /// A command on a remote site: run by the server's own `atelier` over SSH
-/// (D-01). This slice wires `app status`; the rest follow.
+/// (D-01), non-interactively, after any confirmation was asked here.
 fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
     let remote = site.remote.as_ref().expect("caller checked");
-    match command {
-        Command::App {
-            command: AppCommand::Status { json },
-        } => {
-            let session = remote_session(site, remote::EngineOptions::from_env())?;
+    let host = remote.host.as_str();
+    let route = remote_route(command, host, &site.slug)?;
+    // Doctor opens its own session: a failed login is a finding, not an error.
+    if let Route::Doctor { fix, json } = route {
+        if !json {
+            println!("Checking {} on {host}…", site.slug);
+        }
+        let report = remote::doctor(site, fix, &mut relay)?;
+        let fix_cmd = format!("atelier --site {} doctor --fix", site.slug);
+        return finish_doctor(&report, fix, json, &fix_cmd);
+    }
+    let target = Target::Remote {
+        host,
+        slug: &site.slug,
+    };
+    let session = remote_session(site, remote::EngineOptions::from_env())?;
+    match route {
+        Route::Doctor { .. } => unreachable!("handled above"),
+        Route::Status { json } => {
             let st = session.status()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&st)?);
@@ -1733,20 +1926,88 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
             }
             println!(
                 "  Site:     {} ({}) — `{}` on {}",
-                site.label, site.slug, remote.slug, remote.host
+                site.label, site.slug, remote.slug, host
             );
             print_status(&st);
             Ok(())
         }
-        _ => anyhow::bail!(
-            "site `{}` is on {} — only `atelier app status` works on remote sites so far. \
-             Run other commands on the server itself (`ssh {} atelier --site {} …`).",
-            site.slug,
-            remote.host,
-            remote.host,
-            remote.slug
-        ),
+        Route::CheckUpdate { json } => {
+            let check = session.check_update()?;
+            print_check_update(&check, Channel::of_image(&check.image), json)
+        }
+        Route::Snapshots { json } => {
+            let list = session.snapshots()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            } else {
+                print_snapshots(&list);
+            }
+            Ok(())
+        }
+        Route::Update { to, yes } => remote_update(&session, &target, to, yes),
+        Route::Restore { file, yes } => {
+            println!(
+                "{}",
+                style::warn(&format!(
+                    "{file} is a path on {host} — the server restores its own copy."
+                ))
+            );
+            if !confirm_change(&target, &restore_question(&file), yes)? {
+                println!("{}", style::warn("Aborted."));
+                return Ok(());
+            }
+            session.run_action(&remote::Action::Restore { file }, &mut relay)
+        }
+        Route::Run(action) => {
+            session.run_action(&action, &mut relay)?;
+            match action {
+                remote::Action::Backup { .. } => {
+                    println!("The backup is on {host}, in that site's backups folder.")
+                }
+                remote::Action::Export(_) => println!("The export is on {host}."),
+                _ => {}
+            }
+            Ok(())
+        }
     }
+}
+
+/// `app update` on a remote site. Without `--to`, the server's own
+/// `check-update` gives the route first, so "already up to date" costs no
+/// update run and a stepped route is shown and confirmed HERE. `--yes` goes
+/// to the server only when that confirmation happened (or the user gave it):
+/// otherwise a server that finds a stepped route declines it rather than wait.
+fn remote_update(
+    session: &remote::Session<remote::Ssh>,
+    target: &Target,
+    to: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let mut confirmed = yes;
+    if to.is_none() {
+        let check = session.check_update()?;
+        if check.update_available == Some(false) {
+            let at = check.current_version.as_deref().unwrap_or(&check.image);
+            println!("{}", style::success(&format!("Already up to date ({at}).")));
+            return Ok(());
+        }
+        if let Some(plan) = check.plan.as_ref().filter(|p| p.is_stepped()) {
+            println!(
+                "{}",
+                style::heading("This upgrade takes more than one step")
+            );
+            print_route(plan);
+            if let Some(problem) = &plan.problem {
+                println!("\n{}", style::warn(problem));
+            }
+            if !confirm_change(target, "\nWalk the whole route now?", yes)? {
+                println!("{}", style::warn("Aborted — nothing was changed."));
+                return Ok(());
+            }
+            confirmed = true;
+        }
+    }
+    session.run_action(&remote::Action::Update { to, yes: confirmed }, &mut relay)
 }
 
 /// Connect to a remote site's engine. When the server's `atelier` is older
@@ -1827,7 +2088,7 @@ fn sites_add_remote(
     }
     let opts = remote::EngineOptions {
         binary: engine_binary.or_else(|| remote::EngineOptions::from_env().binary),
-        replace_older: false,
+        ..Default::default()
     };
     println!("Checking {host}…");
     let added = sites::add_remote_site(uh, site, |site| {
@@ -1861,9 +2122,13 @@ fn sites_add_remote(
 }
 
 fn check_update(stack: &Stack, json: bool) -> Result<()> {
-    let check = ops::check_update(stack);
+    print_check_update(&ops::check_update(stack), stack.channel(), json)
+}
+
+/// Render an update check, local or remote.
+fn print_check_update(check: &ops::UpdateCheck, channel: Channel, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&check)?);
+        println!("{}", serde_json::to_string_pretty(check)?);
         return Ok(());
     }
     // Name the versions when the image says what it is (DECISIONS 0308) — on a
@@ -1898,7 +2163,7 @@ fn check_update(stack: &Stack, json: bool) -> Result<()> {
         }
         // On a pinned image "up to date" is true but useless — the tag can't move,
         // so no update will ever arrive through it. Say which it is.
-        Some(false) if stack.channel() == Channel::Pinned => println!(
+        Some(false) if channel == Channel::Pinned => println!(
             "{} {} ({}) — a pinned image, so updates never arrive here. \
              `atelier app channel stable` follows releases.",
             style::success("You're on"),
@@ -1951,6 +2216,35 @@ fn show_login(stack: &Stack) {
     }
 }
 
+/// Which machine a change is about to happen on.
+enum Target<'a> {
+    /// A site on this machine.
+    Local,
+    /// A site on a server: `host` is the ssh target, `slug` its name here.
+    #[allow(dead_code)] // read by the D-07 confirms (m2-8)
+    Remote { host: &'a str, slug: &'a str },
+}
+
+/// THE confirmation before a site is changed — every destructive or
+/// route-walking action, local or remote, asks through here, always BEFORE the
+/// work starts (for a remote site: before the ssh call, so the server never
+/// waits on a prompt). Today both targets ask the same y/N; the next slice
+/// (m2-8, D-07) makes the remote one name the host and ask for the typed slug
+/// on a live site — here, and nowhere else.
+fn confirm_change(target: &Target, question: &str, assume_yes: bool) -> Result<bool> {
+    match target {
+        Target::Local | Target::Remote { .. } => confirm(question, assume_yes),
+    }
+}
+
+/// The restore question, shared by the local and remote paths.
+fn restore_question(file: &str) -> String {
+    format!(
+        "Restore will REPLACE the current database (and files, for a .tar.gz snapshot) with \
+         {file}. Continue?"
+    )
+}
+
 fn confirm(prompt: &str, assume_yes: bool) -> Result<bool> {
     if assume_yes {
         return Ok(true);
@@ -1964,4 +2258,168 @@ fn confirm(prompt: &str, assume_yes: bool) -> Result<bool> {
 
 fn line(label: &str, ok: bool) {
     println!("  {} {label}", style::mark(ok));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aincient_core::doctor::{HostTier, Tier};
+
+    const HOST: &str = "deploy@example.com";
+
+    fn parse(args: &[&str]) -> Command {
+        let mut argv = vec!["atelier", "--site", "prod"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap().command
+    }
+
+    fn route(args: &[&str]) -> Result<Route> {
+        remote_route(parse(args), HOST, "prod")
+    }
+
+    /// The server argv a plain streamed route sends.
+    fn argv(args: &[&str]) -> String {
+        match route(args).unwrap() {
+            Route::Run(action) => action.argv().join(" "),
+            other => panic!("{args:?} is not a plain run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_site_action_routes_to_the_same_subcommand_on_the_server() {
+        assert_eq!(argv(&["app", "start"]), "app start");
+        assert_eq!(argv(&["app", "stop"]), "app stop");
+        assert_eq!(
+            argv(&["data", "backup", "--label", "before"]),
+            "data backup --label before"
+        );
+        assert_eq!(argv(&["data", "export"]), "data backup");
+        assert_eq!(argv(&["data", "list"]), "data list");
+        assert_eq!(
+            argv(&["site", "export", "--out", "/srv/x", "--zip"]),
+            "site export --out /srv/x --zip"
+        );
+        assert_eq!(
+            argv(&["site", "freeze", "--label", "v1", "--no-serve"]),
+            "site freeze --label v1 --no-serve"
+        );
+        assert_eq!(argv(&["site", "live"]), "site live");
+        assert_eq!(argv(&["site", "use", "s-1"]), "site use s-1");
+        assert_eq!(argv(&["site", "prune"]), "site prune --keep 10");
+
+        assert!(matches!(
+            route(&["app", "status", "--json"]).unwrap(),
+            Route::Status { json: true }
+        ));
+        assert!(matches!(
+            route(&["app", "check"]).unwrap(),
+            Route::CheckUpdate { json: false }
+        ));
+        assert!(matches!(
+            route(&["site", "snapshots", "--json"]).unwrap(),
+            Route::Snapshots { json: true }
+        ));
+        assert!(matches!(
+            route(&["doctor", "--fix"]).unwrap(),
+            Route::Doctor {
+                fix: true,
+                json: false
+            }
+        ));
+        match route(&["app", "update", "--to", "0.21.0"]).unwrap() {
+            Route::Update { to, yes } => {
+                assert_eq!(to.as_deref(), Some("0.21.0"));
+                assert!(!yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        match route(&["data", "restore", "/srv/b.tar.gz", "-y"]).unwrap() {
+            Route::Restore { file, yes } => {
+                assert_eq!(file, "/srv/b.tar.gz");
+                assert!(yes);
+                // What the server then runs: always non-interactive.
+                let sent = remote::Action::Restore { file }.argv().join(" ");
+                assert_eq!(sent, "data restore --yes -- /srv/b.tar.gz");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_only_and_not_yet_commands_are_refused_naming_the_host() {
+        for args in [
+            &["app", "install"][..],
+            &["app", "open"],
+            &["app", "view"],
+            &["pack", "dev"],
+            &["pack", "validate"],
+            &["mcp"],
+            &["app", "reinstall", "-y"],
+            &["app", "down", "--wipe"],
+            &["app", "channel", "edge"],
+            &["app", "logs"],
+            &["app", "password"],
+            &["ai", "model", "list"],
+        ] {
+            let err = route(args).unwrap_err().to_string();
+            assert!(
+                err.contains(HOST) && err.contains("`prod`"),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_sites_keep_the_local_path() {
+        let uh = std::path::Path::new("/home/me");
+        let local = sites::Site {
+            slug: "blog".into(),
+            label: "Blog".into(),
+            home: uh.join(".atelier/sites/blog"),
+            project: "atelier-blog".into(),
+            remote: None,
+        };
+        let resolution = |site: Option<sites::Site>| sites::Resolution {
+            home: uh.join(".atelier/sites/blog"),
+            site,
+            source: sites::Source::Flag,
+        };
+        assert!(remote_site(&resolution(Some(local))).is_none());
+        assert!(
+            remote_site(&resolution(None)).is_none(),
+            "unregistered home"
+        );
+        let remote = sites::Site::new_remote(uh, "prod", None, HOST, None, sites::KeyMode::Ssh);
+        assert_eq!(
+            remote_site(&resolution(Some(remote))).map(|s| s.slug.as_str()),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn one_confirmation_serves_both_targets() {
+        let remote = Target::Remote {
+            host: HOST,
+            slug: "prod",
+        };
+        assert!(confirm_change(&Target::Local, "q?", true).unwrap());
+        assert!(confirm_change(&remote, "q?", true).unwrap());
+        assert!(restore_question("/srv/b.tar.gz").contains("/srv/b.tar.gz"));
+    }
+
+    #[test]
+    fn doctor_sections_name_the_machine_they_ran_on() {
+        let server = HostTier::Remote(HOST.into());
+        assert_eq!(tier_title(Tier::Host, &HostTier::Local), "Your machine");
+        assert_eq!(tier_title(Tier::Site, &HostTier::Local), "Your site");
+        assert_eq!(
+            tier_title(Tier::Host, &server),
+            "The server (deploy@example.com)"
+        );
+        assert_eq!(
+            tier_title(Tier::Stack, &server),
+            "The appliance on deploy@example.com"
+        );
+        assert!(tier_title(Tier::Connection, &HostTier::Local).contains("this machine"));
+    }
 }
