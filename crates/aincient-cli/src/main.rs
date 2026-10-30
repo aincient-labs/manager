@@ -1637,12 +1637,16 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     // A channel update (no explicit target) can be conclusively "nothing new" — and
     // an update that always claims success can never tell the operator so. On a
     // definite answer, short-circuit; fall through when the check is inconclusive.
-    // A pinned `--to` always proceeds — the operator named a specific image.
+    // A pinned `--to` always proceeds — the operator named a specific image. So does a
+    // pending edge-image move: "no new Atelier" must not keep an unpatched web server
+    // (the same image re-pulls; only `edge` is recreated).
     let plan = match &to {
         Some(target) => ops::plan_upgrade(stack, Some(target)),
         None => {
             let check = ops::check_update(stack);
-            if check.update_available == Some(false) {
+            if check.update_available == Some(false)
+                && stack.pending_edge_image_migration().is_none()
+            {
                 let at = check.current_version.unwrap_or_else(|| stack.image());
                 println!("{}", style::success(&format!("Already up to date ({at}).")));
                 return Ok(());

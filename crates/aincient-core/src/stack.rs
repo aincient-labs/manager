@@ -159,6 +159,32 @@ pub fn rename_legacy_repo(image: &str) -> Option<String> {
     Some(format!("{IMAGE_REPO}{rest}"))
 }
 
+/// The nginx image the `edge` service runs — the tag in [`COMPOSE_TEMPLATE`].
+///
+/// A *maintained* nginx line, not merely a recent one: nginx patches only its
+/// current stable and mainline branches, and the old stable stops receiving fixes
+/// the day the next one ships. Moving this means moving installs too — see
+/// [`edge_nginx_upgrade`].
+pub const EDGE_IMAGE: &str = "nginx:1.30-alpine";
+
+/// The `nginx:1.N-alpine` minor below which an edge image is on an nginx line that
+/// no longer receives security fixes, and is moved onto [`EDGE_IMAGE`].
+const EDGE_NGINX_FLOOR_MINOR: u32 = 30;
+
+/// Move an edge image on an unmaintained nginx line onto [`EDGE_IMAGE`]. `None`
+/// for anything that isn't one of the `nginx:1.N-alpine` tags a manager or
+/// `install.sh` ever wrote below the floor — a newer line, a digest or another
+/// image is the operator's choice and stays.
+///
+/// Like [`rename_legacy_repo`] this is a dead pointer rather than a preference: the
+/// tag was baked into `compose.yaml` at install time and `compose pull` on it only
+/// ever fetches the last build of a line nginx no longer fixes (ATELIER-SA-2026-002).
+pub fn edge_nginx_upgrade(image: &str) -> Option<String> {
+    let (minor, suffix) = image.strip_prefix("nginx:1.")?.split_once('-')?;
+    let minor: u32 = minor.parse().ok()?;
+    (suffix == "alpine" && minor < EDGE_NGINX_FLOOR_MINOR).then(|| EDGE_IMAGE.to_string())
+}
+
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
 /// step with the `cat > compose.yaml` heredoc in `docker/install.sh`: the slim
 /// runtime topology (edge + app + db, no build context, no updater sidecar).
@@ -196,7 +222,7 @@ services:
       - private:/opt/drupal/private
     restart: unless-stopped
   edge:
-    image: nginx:1.28-alpine
+    image: nginx:1.30-alpine
     depends_on:
       - app
     ports:
@@ -665,6 +691,42 @@ impl Stack {
         }
         let from = self.env_get("AINCIENT_IMAGE")?;
         rename_legacy_repo(&from).map(|to| (from, to))
+    }
+
+    /// Move the `edge` service off an nginx line that no longer receives security
+    /// fixes, onto [`EDGE_IMAGE`]. Returns `Some((from, to))` if it rewrote anything.
+    ///
+    /// Rewrites that one `image:` line in place rather than re-scaffolding, so a
+    /// hand-edited `compose.yaml` keeps its edits. Unguarded for the same reason as
+    /// [`migrate_image_repo`](Self::migrate_image_repo): nobody chose an unpatched
+    /// web server. Idempotent: once rewritten the line no longer matches.
+    pub fn migrate_edge_image(&self) -> Result<Option<(String, String)>> {
+        let Some((from, to)) = self.pending_edge_image_migration() else {
+            return Ok(None);
+        };
+        let path = self.compose_path();
+        let compose = std::fs::read_to_string(&path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        let rewritten: String = compose
+            .split_inclusive('\n')
+            .map(|line| match line.trim_start().strip_prefix("image:") {
+                Some(value) if value.trim() == from => line.replacen(&from, &to, 1),
+                _ => line.to_string(),
+            })
+            .collect();
+        std::fs::write(&path, rewritten)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(Some((from, to)))
+    }
+
+    /// Whether [`migrate_edge_image`](Self::migrate_edge_image) would rewrite this
+    /// install, and to what.
+    pub fn pending_edge_image_migration(&self) -> Option<(String, String)> {
+        let compose = std::fs::read_to_string(self.compose_path()).ok()?;
+        compose.lines().find_map(|line| {
+            let from = line.trim_start().strip_prefix("image:")?.trim();
+            edge_nginx_upgrade(from).map(|to| (from.to_string(), to))
+        })
     }
 
     /// The image this install will be configured to run once the legacy repairs have
@@ -1387,18 +1449,75 @@ mod tests {
     }
 
     #[test]
+    fn the_template_runs_the_maintained_edge_image() {
+        assert!(COMPOSE_TEMPLATE.contains(&format!("    image: {EDGE_IMAGE}\n")));
+        assert_eq!(edge_nginx_upgrade(EDGE_IMAGE), None);
+    }
+
+    #[test]
+    fn only_unmaintained_nginx_lines_are_moved() {
+        assert_eq!(
+            edge_nginx_upgrade("nginx:1.28-alpine").as_deref(),
+            Some(EDGE_IMAGE)
+        );
+        assert_eq!(
+            edge_nginx_upgrade("nginx:1.27-alpine").as_deref(),
+            Some(EDGE_IMAGE)
+        );
+        // A newer line, an unpinned tag, another flavour or another image is a choice.
+        assert_eq!(edge_nginx_upgrade("nginx:1.31-alpine"), None);
+        assert_eq!(edge_nginx_upgrade("nginx:alpine"), None);
+        assert_eq!(edge_nginx_upgrade("nginx:1.28"), None);
+        assert_eq!(edge_nginx_upgrade("nginx:1.28-bookworm"), None);
+        assert_eq!(
+            edge_nginx_upgrade("ghcr.io/aincient-labs/atelier-cms:v0.19.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_old_edge_is_moved_and_hand_edits_survive() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        // An install from before the move, with an operator's own line added.
+        let old = COMPOSE_TEMPLATE
+            .replace(EDGE_IMAGE, "nginx:1.28-alpine")
+            .replace(
+                "    restart: unless-stopped\nvolumes:",
+                "    restart: unless-stopped\n    # mine\nvolumes:",
+            );
+        std::fs::write(stack.compose_path(), &old).unwrap();
+
+        assert_eq!(
+            stack.pending_edge_image_migration(),
+            Some(("nginx:1.28-alpine".to_string(), EDGE_IMAGE.to_string()))
+        );
+        assert!(stack.migrate_edge_image().unwrap().is_some());
+
+        let now = std::fs::read_to_string(stack.compose_path()).unwrap();
+        assert_eq!(now, old.replace("nginx:1.28-alpine", EDGE_IMAGE));
+        assert!(now.contains("    # mine\n"), "hand edits survive");
+        // Once only.
+        assert_eq!(stack.migrate_edge_image().unwrap(), None);
+    }
+
+    #[test]
     fn a_current_install_has_nothing_to_repair() {
         let ts = TempStack::new();
         ts.0.ensure_scaffold(&InstallOptions::default()).unwrap();
 
         assert_eq!(ts.0.pending_image_repo_migration(), None);
         assert_eq!(ts.0.migrate_image_repo().unwrap(), None);
+        assert_eq!(ts.0.pending_edge_image_migration(), None);
+        assert_eq!(ts.0.migrate_edge_image().unwrap(), None);
         assert_eq!(ts.0.prospective_image(), DEFAULT_IMAGE);
         assert_eq!(ts.0.image(), DEFAULT_IMAGE);
 
         // And with no stack at all there is nothing to repair either.
         let empty = TempStack::new();
         assert_eq!(empty.0.pending_image_repo_migration(), None);
+        assert_eq!(empty.0.migrate_edge_image().unwrap(), None);
         assert_eq!(empty.0.migrate_image_repo().unwrap(), None);
     }
 
