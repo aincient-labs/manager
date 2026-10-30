@@ -1423,6 +1423,45 @@ impl Tunnel {
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// Close the tunnel when this process is told to stop (SIGTERM, SIGHUP),
+    /// not only on Ctrl-C. Drop never runs on those signals, and ssh isn't
+    /// always in the foreground group that gets them, so without this a
+    /// `kill <pid>` left the forward listening. For a process that only waits
+    /// on the tunnel (the CLI's `app open`): the handler exits the process.
+    #[cfg(unix)]
+    pub fn close_on_termination(&self) {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static TUNNEL_PID: AtomicI32 = AtomicI32::new(0);
+        extern "C" {
+            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+            fn kill(pid: i32, sig: i32) -> i32;
+            fn _exit(status: i32) -> !;
+        }
+        extern "C" fn on_signal(sig: i32) {
+            let pid = TUNNEL_PID.load(Ordering::SeqCst);
+            // SAFETY: kill(2) and _exit(2) are async-signal-safe and take
+            // plain integers; the pid is our own ssh child.
+            unsafe {
+                if pid > 0 {
+                    kill(pid, 15);
+                }
+                _exit(128 + sig);
+            }
+        }
+        if let Ok(pid) = i32::try_from(self.child.id()) {
+            TUNNEL_PID.store(pid, Ordering::SeqCst);
+            // SAFETY: installs a handler that only calls async-signal-safe
+            // functions; SIGHUP = 1 and SIGTERM = 15 on Linux and macOS.
+            unsafe {
+                signal(1, on_signal);
+                signal(15, on_signal);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn close_on_termination(&self) {}
 }
 
 impl Drop for Tunnel {

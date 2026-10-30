@@ -1873,7 +1873,11 @@ fn print_status(st: &ops::Status) {
     line("Installed", st.installed);
     line("Running", st.running);
     line("Console reachable", st.reachable);
-    println!("  Console:  {}", style::url(&st.console_url));
+    // Empty for a remote site without a recorded domain: the caller says
+    // how to reach it (a tunnel) instead.
+    if !st.console_url.is_empty() {
+        println!("  Console:  {}", style::url(&st.console_url));
+    }
     if let Some(version) = &st.version {
         println!("  Version:  {version}");
     }
@@ -2224,8 +2228,8 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                     println!("{}", style::warn("Aborted."));
                     return Ok(());
                 }
+                // The server's restore prints its own "Restore complete.".
                 session.restore_upload(&local, other_site, &mut relay)?;
-                println!("{}", style::success("Restore complete."));
                 return Ok(());
             }
             println!(
@@ -2338,6 +2342,7 @@ fn remote_open(session: &remote::Session<remote::Ssh>, site: &sites::Site) -> Re
             if let Err(e) = ops::open_url(&access.url) {
                 println!("{} {e:#}", style::warn("Couldn't open a browser:"));
             }
+            tunnel.close_on_termination();
             tunnel.wait()
         }
     }
