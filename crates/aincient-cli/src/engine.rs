@@ -5,10 +5,18 @@
 //!   `aincient-engine` crate).
 //! - `enable`, `disable`: on the host, for a local stack: write or remove the
 //!   opt-in files ([`aincient_core::engine`]) and apply them with compose.
+//! - `remove`: the Manager's one action that takes the engine off and puts
+//!   today's stack back (m3-6, C-09): wake, disable, `up --remove-orphans`,
+//!   verify ([`aincient_core::engine_admin::remove`]). For a remote site the
+//!   Manager confirms here, then the server runs its own `engine remove`.
+//!
+//! Every subcommand that changes the stack takes `--experimental` (m7-3), so
+//! no one adds or takes away the root-holding sidecar by a stray command.
 
 use aincient_core::docker::{compose, docker, run_capture, run_inherited};
 use aincient_core::engine::{self as optin, ENGINE_IMAGE};
-use aincient_core::Stack;
+use aincient_core::engine_admin::{self, LocalRemove};
+use aincient_core::{ChangeGuard, Stack};
 use aincient_engine::admin::AdminCommand;
 use anyhow::{bail, Result};
 use clap::Subcommand;
@@ -33,9 +41,57 @@ pub enum EngineCommand {
         #[arg(long)]
         experimental: bool,
     },
-    /// Remove the engine and put the stack back as it was. Its volumes stay.
-    Disable,
+    /// Remove the engine's files and restart the stack without it (no wake,
+    /// no checks: `remove` is the Manager's action). Its volumes stay.
+    Disable {
+        /// Say you mean to change the experimental engine.
+        #[arg(long)]
+        experimental: bool,
+    },
+    /// Take the engine off this site and put today's stack back: wake a
+    /// resting site, disable, restart, check edge, app and db run. Refused
+    /// while locked down. Its volumes stay.
+    Remove {
+        /// Say you mean to change the experimental engine.
+        #[arg(long)]
+        experimental: bool,
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
+
+/// The refusal for an engine change without `--experimental` (m7-3).
+pub fn needs_experimental(what: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the engine is EXPERIMENTAL (DECISIONS 0483): it holds the host's Docker socket, which \
+         is root on that machine. `engine {what}` changes it; re-run with --experimental if \
+         that is what you want."
+    )
+}
+
+/// Refuse an engine change without `--experimental`; `Ok` for the rest.
+pub fn check_experimental(cmd: &EngineCommand) -> Result<()> {
+    match cmd {
+        EngineCommand::Enable {
+            experimental: false,
+        } => Err(needs_experimental("enable")),
+        EngineCommand::Disable {
+            experimental: false,
+        } => Err(needs_experimental("disable")),
+        EngineCommand::Remove {
+            experimental: false,
+            ..
+        } => Err(needs_experimental("remove")),
+        _ => Ok(()),
+    }
+}
+
+/// The question `engine remove` asks, `{site}` naming the site and its host.
+pub const REMOVE_QUESTION: &str = "Remove the engine from {site}?";
+pub const REMOVE_DETAIL: &str = "The engine is taken off and the stack restarted as edge, app \
+     and db (a resting site is woken first). Paired Managers stop working; its volumes are kept.";
 
 /// Whether the command runs inside the container, before any site lookup.
 pub fn is_in_container(cmd: &EngineCommand) -> bool {
@@ -51,16 +107,38 @@ pub fn run_in_container(cmd: EngineCommand) -> Result<()> {
             aincient_engine::serve(&listen, |k| std::env::var(k).ok())
         }
         EngineCommand::Admin { command } => aincient_engine::admin(command),
-        EngineCommand::Enable { .. } | EngineCommand::Disable => {
+        EngineCommand::Enable { .. }
+        | EngineCommand::Disable { .. }
+        | EngineCommand::Remove { .. } => {
             unreachable!("host commands go through run_on_host")
         }
     }
 }
 
-pub fn run_on_host(cmd: EngineCommand, stack: &Stack) -> Result<()> {
+/// `confirm` asks the D-07 question through [`ChangeGuard`] (the CLI's
+/// `confirm_change`): `(guard, detail, question, yes)`.
+pub type Confirm<'a> = &'a dyn Fn(&ChangeGuard, &str, &str, bool) -> Result<bool>;
+
+pub fn run_on_host(cmd: EngineCommand, stack: &Stack, confirm: Confirm) -> Result<()> {
+    check_experimental(&cmd)?;
     match cmd {
         EngineCommand::Enable { experimental } => enable(stack, experimental),
-        EngineCommand::Disable => disable(stack),
+        EngineCommand::Disable { .. } => disable(stack),
+        EngineCommand::Remove { yes, .. } => {
+            if optin::is_enabled(stack)
+                && !confirm(
+                    &ChangeGuard::local(stack),
+                    REMOVE_DETAIL,
+                    REMOVE_QUESTION,
+                    yes,
+                )?
+            {
+                println!("Aborted — nothing was changed.");
+                return Ok(());
+            }
+            engine_admin::remove(&mut LocalRemove::new(stack), &mut |line| println!("{line}"))?;
+            Ok(())
+        }
         EngineCommand::Serve { .. } | EngineCommand::Admin { .. } => {
             unreachable!("container commands go through run_in_container")
         }
@@ -69,11 +147,7 @@ pub fn run_on_host(cmd: EngineCommand, stack: &Stack) -> Result<()> {
 
 fn enable(stack: &Stack, experimental: bool) -> Result<()> {
     if !experimental {
-        bail!(
-            "the engine is EXPERIMENTAL (DECISIONS 0483): it holds this host's Docker socket, \
-             which is root here, and is reachable through edge at /_atelier/engine/. \
-             Re-run with --experimental if that is what you want."
-        );
+        return Err(needs_experimental("enable"));
     }
     let mut probe = docker();
     probe.args(["image", "inspect", ENGINE_IMAGE]);
@@ -130,22 +204,39 @@ mod tests {
         assert!(is_in_container(&parse(&["admin", "install-code"])));
         assert!(is_in_container(&parse(&["admin", "approve", "ABCD-EFGH"])));
         assert!(!is_in_container(&parse(&["enable", "--experimental"])));
-        assert!(!is_in_container(&parse(&["disable"])));
+        assert!(!is_in_container(&parse(&["disable", "--experimental"])));
+        assert!(!is_in_container(&parse(&["remove", "--experimental"])));
     }
 
     #[test]
     fn enable_needs_the_experimental_flag_and_touches_nothing_without_it() {
         let dir = std::env::temp_dir().join(format!("atelier-cli-engine-{}", std::process::id()));
         let stack = Stack::at(&dir);
-        let e = run_on_host(
-            EngineCommand::Enable {
-                experimental: false,
-            },
-            &stack,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("EXPERIMENTAL") && e.contains("root"), "{e}");
+        let never = |_: &ChangeGuard, _: &str, _: &str, _: bool| -> Result<bool> {
+            panic!("nothing is confirmed without --experimental")
+        };
+        for args in [&["enable"][..], &["disable"], &["remove", "--yes"]] {
+            let e = run_on_host(parse(args), &stack, &never)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains("EXPERIMENTAL") && e.contains("root") && e.contains("--experimental"),
+                "{args:?}: {e}"
+            );
+        }
+        assert!(!dir.exists());
+        // In-container commands need no flag: the container is the opt-in.
+        assert!(check_experimental(&parse(&["admin", "status"])).is_ok());
+    }
+
+    #[test]
+    fn remove_on_a_stack_without_the_engine_asks_nothing_and_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("atelier-cli-rm-{}", std::process::id()));
+        let stack = Stack::at(&dir);
+        let never = |_: &ChangeGuard, _: &str, _: &str, _: bool| -> Result<bool> {
+            panic!("no engine, no question")
+        };
+        run_on_host(parse(&["remove", "--experimental"]), &stack, &never).unwrap();
         assert!(!dir.exists());
     }
 }

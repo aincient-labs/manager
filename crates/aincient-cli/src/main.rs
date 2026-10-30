@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions, Stack,
+    doctor, engine_admin, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions, Stack,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -406,6 +406,24 @@ enum SiteCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Lock the site down through its engine (EXPERIMENTAL, 0483): stop app
+    /// and db at once, close wake and pairing, revoke every pairing but the
+    /// primary. Needs the engine; only SSH or a senior Manager can unlock.
+    #[command(hide = true)]
+    Lockdown {
+        /// Don't ask first. A live site on a server still needs its name:
+        /// typed, or given with --confirm-slug.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Leave lockdown (EXPERIMENTAL, needs the engine). The site stays stopped
+    /// until it is started.
+    #[command(hide = true)]
+    Unlock {
+        /// Don't ask first.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Delete old snapshots — keeps the newest N, every kept one, and the served one.
     Prune {
         /// How many recent unkept snapshots to retain.
@@ -673,7 +691,7 @@ fn run() -> Result<()> {
             aincient_core::mcp::serve(&stack)
         }
         #[cfg(unix)]
-        Command::Engine { command } => engine::run_on_host(command, &stack),
+        Command::Engine { command } => engine::run_on_host(command, &stack, &confirm_change),
     }
 }
 
@@ -1251,6 +1269,20 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
 /// `atelier site …` — publish the site you built.
 fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
     match command {
+        SiteCommand::Lockdown { yes } => engine_lifecycle(
+            &engine_admin::LocalDocker,
+            engine_admin::probe(stack).as_ref(),
+            engine_admin::Lifecycle::Lockdown,
+            &ChangeGuard::local(stack),
+            yes,
+        ),
+        SiteCommand::Unlock { yes } => engine_lifecycle(
+            &engine_admin::LocalDocker,
+            engine_admin::probe(stack).as_ref(),
+            engine_admin::Lifecycle::Unlock,
+            &ChangeGuard::local(stack),
+            yes,
+        ),
         SiteCommand::Export {
             out,
             base_url,
@@ -1959,8 +1991,80 @@ enum Route {
         /// The confirmation, `{site}` naming the site and its host.
         question: &'static str,
     },
+    /// `site lockdown|unlock`: the site's engine through `docker exec` over
+    /// SSH (m3-7), confirmed here first.
+    EngineVerb {
+        verb: engine_admin::Lifecycle,
+        yes: bool,
+    },
+    /// `engine enable|remove --experimental`: confirmed here, then the
+    /// server's own `atelier engine …` runs it (m3-6, m7-3).
+    EngineChange {
+        args: Vec<&'static str>,
+        yes: bool,
+        question: &'static str,
+        detail: &'static str,
+    },
     /// Everything else: the same subcommand on the server, streamed.
     Run(remote::Action),
+}
+
+/// What `engine enable` says before it changes anything.
+const ENABLE_QUESTION: &str = "Add the EXPERIMENTAL engine to {site}?";
+const ENABLE_DETAIL: &str = "The engine holds the server's Docker socket, which is root on that \
+     server. It is for testers (DECISIONS 0483): it publishes no port and answers only at \
+     /_atelier/engine/ on the site's domain.";
+
+/// The confirmation for lockdown and unlock: `(question, detail)`.
+fn lifecycle_words(verb: engine_admin::Lifecycle) -> (&'static str, &'static str) {
+    match verb {
+        engine_admin::Lifecycle::Lockdown => (
+            "Lock down {site}?",
+            "The site stops at once: app and db are stopped, wake and pairing close, and every \
+             pairing but the primary is revoked. Only SSH or a senior Manager can unlock it.",
+        ),
+        _ => (
+            "Unlock {site}?",
+            "Wake and pairing open again. The site stays stopped until it is started.",
+        ),
+    }
+}
+
+/// `site lockdown|unlock` (m3-7): only through the engine, else refused.
+/// The engine's version is read before anything is asked (m3-3), the change
+/// is confirmed through the guard (D-07), then the admin verb runs.
+fn engine_lifecycle<D: engine_admin::DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<&engine_admin::EngineInfo>,
+    verb: engine_admin::Lifecycle,
+    guard: &ChangeGuard,
+    yes: bool,
+) -> Result<()> {
+    use engine_admin::{AdminVerb, EngineAdmin, Lifecycle, Via};
+    let (admin_verb, word) = match verb {
+        Lifecycle::Lockdown => (AdminVerb::Lockdown, "lockdown"),
+        Lifecycle::Unlock => (AdminVerb::Unlock, "unlock"),
+        other => unreachable!("{other:?} is not an engine-only verb"),
+    };
+    if let Via::Refuse(why) = engine_admin::route(verb, info) {
+        anyhow::bail!(why);
+    }
+    let admin = EngineAdmin::new(docker, info, word)?;
+    let state = admin.status()?;
+    if verb == Lifecycle::Unlock && !state.lockdown {
+        println!("{} isn't locked down; nothing to do.", guard.site_words());
+        return Ok(());
+    }
+    let (question, detail) = lifecycle_words(verb);
+    if !confirm_change(guard, detail, question, yes)? {
+        println!("{}", style::warn("Aborted — nothing was changed."));
+        return Ok(());
+    }
+    let out = admin.run(admin_verb)?;
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    Ok(())
 }
 
 /// Map a parsed command to its remote route, or refuse it with a message that
@@ -2054,6 +2158,14 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                 yes,
                 question: "Switch {site} back to live?",
             },
+            SiteCommand::Lockdown { yes } => Route::EngineVerb {
+                verb: engine_admin::Lifecycle::Lockdown,
+                yes,
+            },
+            SiteCommand::Unlock { yes } => Route::EngineVerb {
+                verb: engine_admin::Lifecycle::Unlock,
+                yes,
+            },
             SiteCommand::Prune { keep, yes } => Route::Change {
                 action: Action::Prune { keep },
                 yes,
@@ -2100,7 +2212,35 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
             ))
         }
         #[cfg(unix)]
-        Command::Engine { .. } => return Err(on_server("engine enable")),
+        Command::Engine { command } => {
+            engine::check_experimental(&command)?;
+            match command {
+                engine::EngineCommand::Enable { .. } => Route::EngineChange {
+                    args: vec!["engine", "enable", "--experimental"],
+                    yes: false,
+                    question: ENABLE_QUESTION,
+                    detail: ENABLE_DETAIL,
+                },
+                engine::EngineCommand::Remove { yes, .. } => Route::EngineChange {
+                    args: vec!["engine", "remove", "--experimental", "--yes"],
+                    yes,
+                    question: engine::REMOVE_QUESTION,
+                    detail: engine::REMOVE_DETAIL,
+                },
+                engine::EngineCommand::Disable { .. } => {
+                    return Err(local_only(
+                        "engine disable",
+                        "skips the wake and the checks; use `engine remove --experimental`",
+                    ))
+                }
+                engine::EngineCommand::Serve { .. } | engine::EngineCommand::Admin { .. } => {
+                    return Err(local_only(
+                        "engine serve/admin",
+                        "runs inside the engine container",
+                    ))
+                }
+            }
+        }
     })
 }
 
@@ -2280,6 +2420,29 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                 return Ok(());
             }
             session.run_action(&action, &mut relay)
+        }
+        Route::EngineVerb { verb, yes } => {
+            let info = session.engine_info()?;
+            engine_lifecycle(
+                &session,
+                info.as_ref(),
+                verb,
+                &session.change_guard(site),
+                yes,
+            )
+        }
+        Route::EngineChange {
+            args,
+            yes,
+            question,
+            detail,
+        } => {
+            // Always asked: the engine is root on that server.
+            if !confirm_change(&session.change_guard(site), detail, question, yes)? {
+                println!("{}", style::warn("Aborted — nothing was changed."));
+                return Ok(());
+            }
+            session.run_streamed(&args, remote::LIFECYCLE_DEADLINE, &mut relay)
         }
         Route::Run(action) => {
             session.run_action(&action, &mut relay)?;
@@ -2772,6 +2935,122 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn lockdown_and_unlock_go_to_the_engine_and_engine_changes_need_the_flag() {
+        use engine_admin::Lifecycle;
+        assert!(matches!(
+            route(&["site", "lockdown"]).unwrap(),
+            Route::EngineVerb {
+                verb: Lifecycle::Lockdown,
+                yes: false
+            }
+        ));
+        assert!(matches!(
+            route(&["site", "unlock", "-y"]).unwrap(),
+            Route::EngineVerb {
+                verb: Lifecycle::Unlock,
+                yes: true
+            }
+        ));
+        for args in [&["engine", "enable"][..], &["engine", "remove", "-y"]] {
+            let e = route(args).unwrap_err().to_string();
+            assert!(e.contains("--experimental") && e.contains("root"), "{e}");
+        }
+        match route(&["engine", "enable", "--experimental"]).unwrap() {
+            Route::EngineChange { args, yes, .. } => {
+                assert_eq!(args.join(" "), "engine enable --experimental");
+                assert!(!yes, "enabling is always asked here");
+            }
+            other => panic!("{other:?}"),
+        }
+        match route(&["engine", "remove", "--experimental"]).unwrap() {
+            Route::EngineChange { args, yes, .. } => {
+                // Confirmed here, so the server never waits on a prompt.
+                assert_eq!(args.join(" "), "engine remove --experimental --yes");
+                assert!(!yes);
+            }
+            other => panic!("{other:?}"),
+        }
+        let e = route(&["engine", "disable", "--experimental"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("engine remove"), "{e}");
+    }
+
+    /// `docker` answered from a script; records the calls.
+    struct FakeDocker {
+        status: &'static str,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl engine_admin::DockerExec for FakeDocker {
+        fn place(&self) -> String {
+            "test".into()
+        }
+        fn docker(&self, args: &[String], _: std::time::Duration) -> Result<std::process::Output> {
+            use std::os::unix::process::ExitStatusExt;
+            let line = args.join(" ");
+            self.calls.borrow_mut().push(line.clone());
+            let stdout = if line.ends_with("admin status") {
+                self.status.to_string()
+            } else {
+                "done".to_string()
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.into_bytes(),
+                stderr: vec![],
+            })
+        }
+    }
+
+    #[test]
+    fn site_lockdown_reads_the_version_then_execs_into_the_engine() {
+        use engine_admin::{EngineInfo, Lifecycle};
+        let info = EngineInfo {
+            enabled: true,
+            container: Some("atelier-engine-1".into()),
+            running: true,
+        };
+        let guard = local_guard();
+        let d = FakeDocker {
+            status: r#"{"api":"1.2.0","app":"running","db":"running","lockdown":false}"#,
+            calls: Default::default(),
+        };
+        engine_lifecycle(&d, Some(&info), Lifecycle::Lockdown, &guard, true).unwrap();
+        assert_eq!(
+            d.calls.borrow().last().unwrap(),
+            "exec atelier-engine-1 atelier engine admin lockdown"
+        );
+        assert!(d.calls.borrow()[0].ends_with("admin status"));
+
+        // Unlock on a site that isn't locked down runs nothing.
+        let d = FakeDocker {
+            status: r#"{"api":"1.0.0","app":"running","db":"running","lockdown":false}"#,
+            calls: Default::default(),
+        };
+        engine_lifecycle(&d, Some(&info), Lifecycle::Unlock, &guard, true).unwrap();
+        assert!(d.calls.borrow().iter().all(|c| c.ends_with("admin status")));
+
+        // A newer engine: refused before anything is asked or run.
+        let d = FakeDocker {
+            status: r#"{"api":"2.0.0","app":"running","db":"running","lockdown":true}"#,
+            calls: Default::default(),
+        };
+        let e = engine_lifecycle(&d, Some(&info), Lifecycle::Unlock, &guard, true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Update the Manager"), "{e}");
+        assert_eq!(d.calls.borrow().len(), 1);
+
+        // No engine: refused, nothing run.
+        let e = engine_lifecycle(&d, None, Lifecycle::Lockdown, &guard, true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Enable the engine (experimental)"), "{e}");
+        assert_eq!(d.calls.borrow().len(), 1);
     }
 
     #[test]
