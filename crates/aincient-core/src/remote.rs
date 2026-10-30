@@ -31,6 +31,7 @@ use crate::docker::{
     output_within, output_within_input, output_within_io, stream_lines_within, Pipe, RunError,
 };
 use crate::doctor::{Check, HostTier, Report, Severity, Tier};
+use crate::guard::ChangeGuard;
 use crate::ops::{
     check_identity, sha256_file, snapshot_manifest, BackupInfo, ExportOptions, FreezeOptions,
     IdentityCheck, SnapshotList, Status, UpdateCheck,
@@ -889,6 +890,23 @@ impl<T: Transport> Session<T> {
                 self.transport.target()
             )
         })
+    }
+
+    /// Whether the site is live (m2-8, D-07) — see [`crate::guard::is_live`]:
+    /// running and serving its live site. The snapshot list is only asked of
+    /// a running site; whatever can't be read counts as live.
+    pub fn is_live(&self) -> bool {
+        let status = self.status().ok();
+        let snapshots = match &status {
+            Some(st) if st.running => self.snapshots().ok(),
+            _ => None,
+        };
+        crate::guard::is_live(status.as_ref(), snapshots.as_ref())
+    }
+
+    /// The [`ChangeGuard`] for a change to `site` over this session.
+    pub fn change_guard(&self, site: &Site) -> ChangeGuard {
+        ChangeGuard::for_site(site, self.is_live())
     }
 
     /// Prove the site can be attached (U-03): the server answers and the site
@@ -1772,6 +1790,92 @@ pub fn status(site: &Site) -> Result<Status> {
     open(site, &EngineOptions::from_env())?.status()
 }
 
+/// A remote site's state as a site list shows it (m2-8): one short read of
+/// the server, bounded so a dead link can't hold a list up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum SiteState {
+    /// Running and serving its live site.
+    Running { version: Option<String> },
+    /// Running, but visitors get the frozen snapshot `snapshot`.
+    Frozen {
+        snapshot: String,
+        version: Option<String>,
+    },
+    /// Reachable, not running.
+    Stopped,
+    /// The server didn't answer in time, or answered with an error.
+    Unreachable { reason: String },
+}
+
+impl SiteState {
+    /// Whether changing it needs the typed slug (D-07) — see
+    /// [`crate::guard::is_live`]: unreachable counts as live.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            SiteState::Running { .. } | SiteState::Unreachable { .. }
+        )
+    }
+}
+
+/// How long [`probe_state`] waits for a server by default.
+pub const PROBE_STATE_LIMIT: Duration = Duration::from_secs(20);
+
+/// The [`SiteState`] for what a server answered.
+pub fn state_of(status: Result<Status>, snapshots: Option<SnapshotList>) -> SiteState {
+    match status {
+        Err(e) => SiteState::Unreachable {
+            reason: format!("{e:#}"),
+        },
+        Ok(st) if !st.running => SiteState::Stopped,
+        Ok(st) => match snapshots {
+            Some(l) if l.serving != "live" => SiteState::Frozen {
+                snapshot: l.serving,
+                version: st.version,
+            },
+            _ => SiteState::Running {
+                version: st.version,
+            },
+        },
+    }
+}
+
+/// Ask `site`'s server for its state, giving up after `limit`. Copies no
+/// engine (a list must never install anything). The ssh process of a probe
+/// that ran out of time ends by its own deadlines, in the background.
+pub fn probe_state(site: &Site, limit: Duration) -> SiteState {
+    let site = site.clone();
+    let host = site
+        .remote
+        .as_ref()
+        .map(|r| r.host.clone())
+        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let opts = EngineOptions {
+            no_install: true,
+            ..EngineOptions::from_env()
+        };
+        let state = match open(&site, &opts) {
+            Err(e) => state_of(Err(e), None),
+            Ok(session) => {
+                let status = session.status();
+                let snapshots = match &status {
+                    Ok(st) if st.running => session.snapshots().ok(),
+                    _ => None,
+                };
+                state_of(status, snapshots)
+            }
+        };
+        let _ = tx.send(state);
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| SiteState::Unreachable {
+            reason: format!("{host} didn't answer within {} s", limit.as_secs()),
+        })
+}
+
 /// `doctor` for a remote site (m2-9): the checks that genuinely run on this
 /// machine — the Manager's key, the SSH login, the server's `atelier` CLI —
 /// under [`Tier::Connection`], then the server's own report with every check
@@ -2523,6 +2627,62 @@ mod tests {
                    {"image":"ghcr.io/aincient-labs/atelier:latest","version":"0.21.0",
                     "is_target":true,"reason":null}],
           "problem":null,"explicit_target":false}}"#;
+
+    #[test]
+    fn liveness_reads_status_then_snapshots_and_fails_safe() {
+        let live = with_cli(Fake::new())
+            .on("app status --json", || out(0, STATUS_JSON, ""))
+            .on("snapshots --json", || {
+                out(0, r#"{"serving":"live","snapshots":[]}"#, "")
+            });
+        assert!(session(&live).is_live());
+
+        let frozen = with_cli(Fake::new())
+            .on("app status --json", || out(0, STATUS_JSON, ""))
+            .on("snapshots --json", || {
+                out(0, r#"{"serving":"s-2","snapshots":[]}"#, "")
+            });
+        assert!(!session(&frozen).is_live());
+
+        let stopped_json = STATUS_JSON.replace(r#""running":true"#, r#""running":false"#);
+        let stopped =
+            with_cli(Fake::new()).on("app status --json", move || out(0, &stopped_json, ""));
+        assert!(!session(&stopped).is_live());
+        assert!(
+            !stopped.ran("snapshots"),
+            "a stopped site isn't asked for snapshots"
+        );
+
+        let mute = with_cli(Fake::new()).on("app status --json", || out(255, "", "ssh: timeout"));
+        assert!(session(&mute).is_live(), "unknown counts as live");
+    }
+
+    #[test]
+    fn site_state_maps_the_servers_answers() {
+        let st: Status = serde_json::from_str(STATUS_JSON).unwrap();
+        let list = |id: &str| SnapshotList {
+            serving: id.into(),
+            snapshots: Vec::new(),
+        };
+        let running = state_of(Ok(st.clone()), Some(list("live")));
+        assert_eq!(
+            running,
+            SiteState::Running {
+                version: Some("v0.20.0".into())
+            }
+        );
+        assert!(running.is_live());
+        let frozen = state_of(Ok(st.clone()), Some(list("s-2")));
+        assert!(matches!(&frozen, SiteState::Frozen { snapshot, .. } if snapshot == "s-2"));
+        assert!(!frozen.is_live());
+        let mut off = st;
+        off.running = false;
+        assert_eq!(state_of(Ok(off), None), SiteState::Stopped);
+        let gone = state_of(Err(anyhow!("ssh: connect timed out")), None);
+        assert!(gone.is_live(), "unknown counts as live");
+        let json = serde_json::to_value(&gone).unwrap();
+        assert_eq!(json["state"], "unreachable");
+    }
 
     #[test]
     fn json_actions_parse_into_the_local_structs() {

@@ -769,7 +769,7 @@ pub fn next_free_port(used: &BTreeSet<u16>, mut is_free: impl FnMut(u16) -> bool
 /// The first port in [`TUNNEL_PORTS`] that `is_free` reports bindable, for an
 /// SSH tunnel to a remote console. `None` when the whole range is taken.
 pub fn next_tunnel_port(mut is_free: impl FnMut(u16) -> bool) -> Option<u16> {
-    TUNNEL_PORTS.into_iter().find(|port| is_free(*port))
+    TUNNEL_PORTS.clone().find(|port| is_free(*port))
 }
 
 /// Whether `port` can be bound on loopback right now — what a tunnel needs
@@ -1118,6 +1118,34 @@ pub fn rename_site(user_home: &Path, slug: &str, label: &str) -> Result<Site> {
         .find(|s| s.slug == slug)
         .expect("checked above");
     site.label = label.to_string();
+    let site = site.clone();
+    registry.save(user_home)?;
+    Ok(site)
+}
+
+/// Record (or with `None`, clear) where a remote site is public — its
+/// [`Remote::domain`]. Only a remote site has one; a domain is validated with
+/// [`is_valid_domain`] and stored as given.
+pub fn set_domain(user_home: &Path, slug: &str, domain: Option<&str>) -> Result<Site> {
+    let domain = domain.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(d) = domain.filter(|d| !is_valid_domain(d)) {
+        bail!("`{d}` is not a usable domain — a host name, or https://host[:port]");
+    }
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    registered(&registry, slug)?;
+    let site = registry
+        .sites
+        .iter_mut()
+        .find(|s| s.slug == slug)
+        .expect("checked above");
+    let Some(remote) = site.remote.as_mut() else {
+        bail!(
+            "`{slug}` is a site on this computer — a domain is only recorded for a site on a \
+             server (its console here is always its local address)"
+        );
+    };
+    remote.domain = domain.map(str::to_string);
     let site = site.clone();
     registry.save(user_home)?;
     Ok(site)
@@ -2202,5 +2230,33 @@ host = "stage-alias"
         // Removing it touches nothing on disk but sites.toml.
         remove_site(uh, "prod").unwrap();
         assert!(Registry::load(uh).unwrap().unwrap().get("prod").is_none());
+    }
+
+    #[test]
+    fn set_domain_records_and_clears_a_remote_sites_domain_only() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        add_remote_site(uh, remote(uh, "prod", "example.com"), |_| Ok(())).unwrap();
+
+        let site = set_domain(uh, "prod", Some("cms.example.com")).unwrap();
+        assert_eq!(
+            site.remote.unwrap().domain.as_deref(),
+            Some("cms.example.com")
+        );
+        let saved = Registry::load(uh).unwrap().unwrap();
+        let remote = saved.get("prod").unwrap().remote.clone().unwrap();
+        assert_eq!(remote.domain.as_deref(), Some("cms.example.com"));
+
+        assert!(set_domain(uh, "prod", Some("not a domain")).is_err());
+        assert!(set_domain(uh, DEFAULT_SLUG, Some("x.example.com")).is_err());
+        assert!(set_domain(uh, "nope", None).is_err());
+
+        set_domain(uh, "prod", None).unwrap();
+        let saved = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(
+            saved.get("prod").unwrap().remote.as_ref().unwrap().domain,
+            None
+        );
     }
 }

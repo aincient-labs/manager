@@ -1995,7 +1995,7 @@ impl SnapshotManifest {
 
 /// A restore was refused: the archive belongs to another site (m2-6, D-04).
 /// Typed so a front-end can offer the override instead of only showing it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IdentityMismatch {
     pub archive_site_id: String,
     pub archive_site_name: String,
