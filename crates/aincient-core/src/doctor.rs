@@ -781,6 +781,37 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         ));
     }
 
+    // The edge's nginx tag was baked into compose.yaml at install time, so an old
+    // install keeps pulling the last build of a line nginx no longer patches. The
+    // site runs fine, which is why it's a warning — and why it goes unnoticed.
+    if scaffolded {
+        out.push(match stack.pending_edge_image_migration() {
+            Some((from, to)) => Check::bad(
+                "stack.edge_image",
+                Tier::Stack,
+                "Web server receives security fixes",
+                Severity::Warn,
+                "The edge web server runs an nginx line that no longer receives security \
+                 fixes (ATELIER-SA-2026-002). `atelier app update` moves it and keeps your \
+                 compose.yaml edits; doctor can instead rewrite the stack files.",
+            )
+            .detail(format!("{from} → {to}"))
+            .fixable(Repair::Scaffold),
+            None => Check::ok(
+                "stack.edge_image",
+                Tier::Stack,
+                "Web server receives security fixes",
+            ),
+        });
+    } else {
+        out.push(Check::skipped(
+            "stack.edge_image",
+            Tier::Stack,
+            "Web server receives security fixes",
+            "No stack yet.",
+        ));
+    }
+
     if !host_ok || !scaffolded {
         // Say which prerequisite is actually missing. "Docker isn't ready" on a
         // machine with perfectly good Docker sends the user to fix the wrong
