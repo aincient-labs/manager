@@ -311,6 +311,37 @@ server {
 }
 "#;
 
+/// The file in a stack directory holding the site's identity (m2-6, D-04).
+pub const SITE_ID_FILE: &str = "site-id";
+
+/// Whether `id` looks like an identity [`new_site_id`] makes: a lowercase
+/// 8-4-4-4-12 hex UUID.
+pub fn is_site_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
+}
+
+/// A fresh random (v4) UUID.
+pub fn new_site_id() -> Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("OS RNG unavailable: {e}"))?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
 /// A located appliance stack directory.
 ///
 /// `slug` / `label` / `project` are set when the directory is a registered site
@@ -432,6 +463,51 @@ impl Stack {
 
     pub fn backups_dir(&self) -> PathBuf {
         self.home.join("backups")
+    }
+
+    /// Where this site's identity lives: `<home>/site-id` (m2-6, D-04).
+    pub fn site_id_path(&self) -> PathBuf {
+        self.home.join(SITE_ID_FILE)
+    }
+
+    /// This site's identity, if it has one yet: a random UUID minted on its
+    /// first backup and kept beside its `.env`. Not Drupal's `system.site`
+    /// uuid — every appliance installs from the same `config/sync`, so they
+    /// all share that one.
+    pub fn site_id(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.site_id_path()).ok()?;
+        let id = raw.trim();
+        is_site_id(id).then(|| id.to_string())
+    }
+
+    /// [`site_id`](Self::site_id), minting and saving one when there is none.
+    pub fn ensure_site_id(&self) -> Result<String> {
+        if let Some(id) = self.site_id() {
+            return Ok(id);
+        }
+        let id = new_site_id()?;
+        std::fs::create_dir_all(&self.home)
+            .with_context(|| format!("could not create {}", self.home.display()))?;
+        let path = self.site_id_path();
+        let tmp = self
+            .home
+            .join(format!(".{SITE_ID_FILE}.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, format!("{id}\n"))
+            .with_context(|| format!("could not write {}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("could not write {}", path.display()));
+        }
+        Ok(id)
+    }
+
+    /// How to name this site in a message: `Label (slug)`, else its folder.
+    pub fn display_name(&self) -> String {
+        match (&self.label, &self.slug) {
+            (Some(label), Some(slug)) if label != slug => format!("{label} ({slug})"),
+            (_, Some(slug)) => slug.clone(),
+            _ => self.home.display().to_string(),
+        }
     }
 
     /// True once a `compose.yaml` exists — i.e. the stack has been laid down.

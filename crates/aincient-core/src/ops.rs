@@ -121,6 +121,10 @@ pub struct Status {
     /// nothing is running, or the image predates the stamp. Read off the container,
     /// so it's the version genuinely serving, not whatever the tag now points at.
     pub version: Option<String>,
+    /// The site's identity (m2-6, D-04) — see [`Stack::site_id`]. `None` until
+    /// its first backup, and from a server whose CLI predates it.
+    #[serde(default)]
+    pub site_id: Option<String>,
 }
 
 /// The result of comparing the local image against the registry.
@@ -298,6 +302,25 @@ impl UpgradePlan {
     }
 }
 
+/// What `data backup --json` reports about the archive it wrote — what a
+/// Manager driving this CLI over SSH needs to fetch and verify it (m2-5, D-03).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupInfo {
+    /// Absolute path of the archive on the machine that wrote it.
+    pub path: String,
+    /// Its file name.
+    pub name: String,
+    pub size: u64,
+    /// Lowercase hex SHA-256 of the whole file.
+    pub sha256: String,
+    /// The identity of the site it was taken from (m2-6, D-04).
+    #[serde(default)]
+    pub site_id: Option<String>,
+    /// That site's name there (`Label (slug)`).
+    #[serde(default)]
+    pub site_name: Option<String>,
+}
+
 /// A backup file on the host.
 #[derive(Debug, Clone, Serialize)]
 pub struct Backup {
@@ -351,6 +374,7 @@ pub fn status(stack: &Stack) -> Status {
         channel: stack.channel(),
         image_digest: local_digest(&stack.image()),
         version: running.then(|| running_image_version(stack)).flatten(),
+        site_id: stack.site_id(),
     }
 }
 
@@ -1374,6 +1398,8 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     r.stage(Stage::Working, "Backing up the database and files…", None);
     ensure_running(stack)?;
     std::fs::create_dir_all(stack.backups_dir())?;
+    // Which site this is (m2-6, D-04): restore refuses another site's archive.
+    let site_id = stack.ensure_site_id()?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let stem = match label {
@@ -1397,15 +1423,22 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     //
     // Both extra fields are best-effort: an image that isn't inspectable (locally
     // built, or already gone) records what we do know rather than failing a backup
-    // over provenance. JSON has no single quotes, so it's safe inside the printf's
-    // single-quoted arg, and every value here is docker-shaped (no quotes/escapes).
+    // over provenance. Version 3 adds the site's identity (m2-6, D-04); the
+    // label is free text, so the JSON is built by serde and quoted for the shell
+    // by `backup_script`.
     let probe = local_probe(&stack.image()).unwrap_or_default();
-    let manifest = format!(
-        r#"{{"format":"aincient-snapshot","version":2,"created":"{ts}","image":"{image}","digest":"{digest}","atelier_version":"{version}"}}"#,
-        image = stack.image(),
-        digest = probe.digest.clone().unwrap_or_default(),
-        version = probe.version.clone().unwrap_or_default(),
-    );
+    let manifest = serde_json::json!({
+        "format": "aincient-snapshot",
+        "version": 3,
+        "created": ts,
+        "image": stack.image(),
+        "digest": probe.digest.clone().unwrap_or_default(),
+        "atelier_version": probe.version.clone().unwrap_or_default(),
+        "site_id": site_id,
+        "site_slug": stack.slug.clone().unwrap_or_default(),
+        "site_label": stack.label.clone().unwrap_or_default(),
+    })
+    .to_string();
 
     // Build the bundle inside the container, then copy it out (mirrors the
     // dump→cp→rm pattern).
@@ -1938,6 +1971,191 @@ pub struct SnapshotManifest {
     pub atelier_version: String,
     #[serde(default)]
     pub created: String,
+    /// The identity of the site it was taken from (v3, m2-6). Empty in older
+    /// archives: their origin is unknown.
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_slug: String,
+    #[serde(default)]
+    pub site_label: String,
+}
+
+impl SnapshotManifest {
+    /// `Label (slug)` of the site it came from, as far as it says.
+    pub fn site_name(&self) -> String {
+        match (self.site_label.as_str(), self.site_slug.as_str()) {
+            ("", "") => "an unnamed site".to_string(),
+            (label, slug) if label.is_empty() || label == slug => slug.to_string(),
+            (label, "") => label.to_string(),
+            (label, slug) => format!("{label} ({slug})"),
+        }
+    }
+}
+
+/// A restore was refused: the archive belongs to another site (m2-6, D-04).
+/// Typed so a front-end can offer the override instead of only showing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityMismatch {
+    pub archive_site_id: String,
+    pub archive_site_name: String,
+    /// `None`: the target has no identity yet (it never made a backup).
+    pub target_site_id: Option<String>,
+    pub target_site_name: String,
+}
+
+impl std::fmt::Display for IdentityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this backup is from another site — {} (id {}) — and would replace {} (id {}). \
+             Nothing was changed. To restore it here anyway, pass --other-site.",
+            self.archive_site_name,
+            self.archive_site_id,
+            self.target_site_name,
+            self.target_site_id.as_deref().unwrap_or("none yet"),
+        )
+    }
+}
+
+impl std::error::Error for IdentityMismatch {}
+
+/// What the identity check found for an allowed restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityCheck {
+    /// The archive was taken from this very site.
+    Same,
+    /// The archive records no site (taken before identities existed, a legacy
+    /// `.sql` dump, or an unreadable manifest): allowed, with this warning.
+    Unknown(String),
+    /// Another site's archive, allowed by `--other-site`: this note.
+    OtherAllowed(String),
+}
+
+impl IdentityCheck {
+    /// The line to show the user, if any.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            IdentityCheck::Same => None,
+            IdentityCheck::Unknown(m) | IdentityCheck::OtherAllowed(m) => Some(m),
+        }
+    }
+}
+
+/// Decide whether an archive with `manifest` may be restored onto the site
+/// identified by `target_id`/`target_name` (m2-6, D-04). Pure: the local and
+/// remote paths feed it what they read. A mismatch is an [`IdentityMismatch`]
+/// unless `other_site`.
+pub fn check_identity(
+    manifest: Option<&SnapshotManifest>,
+    target_id: Option<&str>,
+    target_name: &str,
+    other_site: bool,
+) -> Result<IdentityCheck> {
+    let Some(m) = manifest.filter(|m| !m.site_id.is_empty()) else {
+        return Ok(IdentityCheck::Unknown(
+            "WARNING: this backup doesn't say which site it was taken from (it predates \
+             site identities) — make sure it is one of this site's own."
+                .to_string(),
+        ));
+    };
+    if target_id == Some(m.site_id.as_str()) {
+        return Ok(IdentityCheck::Same);
+    }
+    if other_site {
+        return Ok(IdentityCheck::OtherAllowed(format!(
+            "Restoring a backup of another site — {} (id {}) — onto {target_name}, as \
+             --other-site asked.",
+            m.site_name(),
+            m.site_id
+        )));
+    }
+    Err(anyhow::anyhow!(IdentityMismatch {
+        archive_site_id: m.site_id.clone(),
+        archive_site_name: m.site_name(),
+        target_site_id: target_id.map(str::to_string),
+        target_site_name: target_name.to_string(),
+    }))
+}
+
+/// [`check_identity`] for restoring `file` onto `stack`.
+pub fn restore_identity(stack: &Stack, file: &Path, other_site: bool) -> Result<IdentityCheck> {
+    check_identity(
+        snapshot_manifest(file).as_ref(),
+        stack.site_id().as_deref(),
+        &stack.display_name(),
+        other_site,
+    )
+}
+
+/// How [`restore_with`] treats an archive from another site.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOptions {
+    /// Restore another site's archive anyway (`--other-site`).
+    pub other_site: bool,
+}
+
+/// [`restore`] behind the site-identity check (m2-6, D-04): another site's
+/// archive is refused with an [`IdentityMismatch`] unless `opts.other_site`;
+/// one that records no site is restored with a warning through `r`.
+pub fn restore_with(
+    stack: &Stack,
+    file: &Path,
+    opts: &RestoreOptions,
+    r: &mut dyn Reporter,
+) -> Result<()> {
+    if !file.is_file() {
+        bail!("backup file not found: {}", file.display());
+    }
+    if let Some(note) = restore_identity(stack, file, opts.other_site)?.message() {
+        r.log(note);
+    }
+    restore(stack, file, r)
+}
+
+/// Describe a backup archive the way `data backup --json` reports it: size and
+/// SHA-256 of the file, and the site it came from per its manifest.
+pub fn describe_backup(file: &Path) -> Result<BackupInfo> {
+    let (size, sha256) = sha256_file(file)?;
+    let manifest = snapshot_manifest(file).filter(|m| !m.site_id.is_empty());
+    Ok(BackupInfo {
+        path: file.to_string_lossy().into_owned(),
+        name: file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        size,
+        sha256,
+        site_id: manifest.as_ref().map(|m| m.site_id.clone()),
+        site_name: manifest.as_ref().map(SnapshotManifest::site_name),
+    })
+}
+
+/// Size and lowercase hex SHA-256 of `file`, read in chunks (archives can be
+/// gigabytes).
+pub fn sha256_file(file: &Path) -> Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    let mut f =
+        std::fs::File::open(file).with_context(|| format!("could not read {}", file.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut size = 0u64;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("could not read {}", file.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    let hex = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Ok((size, hex))
 }
 
 /// Read `manifest.json` out of a snapshot bundle without unpacking it. `tar -O`
@@ -2018,8 +2236,7 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
 /// The in-container shell that builds a snapshot bundle. `drush --gzip` appends
 /// `.gz` to --result-file (see converge.sh). One `tar` with two `-C` changes
 /// packs the staged DB dump + manifest, then the live files tree, so `files/`
-/// lands at the archive root. `manifest` is JSON (no single quotes), so it's
-/// safe inside the single-quoted `printf` argument.
+/// lands at the archive root. `manifest` is JSON, shell-quoted here as one word.
 /// The in-container script that builds the snapshot bundle: DB dump + manifest +
 /// the uploaded files tree + frozen snapshots.
 ///
@@ -2032,6 +2249,7 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
 /// carry their own derivatives and are NOT affected by the exclude (the pattern
 /// is anchored to the `files` member).
 fn backup_script(drush: &str, manifest: &str) -> String {
+    let manifest = crate::remote::sh_quote(manifest);
     format!(
         "set -e\n\
          STAGE=/tmp/aincient-snapshot\n\
@@ -2039,7 +2257,7 @@ fn backup_script(drush: &str, manifest: &str) -> String {
          rm -rf \"$STAGE\" \"$ARCHIVE\"\n\
          mkdir -p \"$STAGE\"\n\
          {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
-         printf '%s\\n' '{manifest}' > \"$STAGE/manifest.json\"\n\
+         printf '%s\\n' {manifest} > \"$STAGE/manifest.json\"\n\
          mkdir -p /opt/drupal/private/frozen\n\
          tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
          -C /opt/drupal/web/sites/default files \
@@ -2553,7 +2771,12 @@ mod tests {
         remote_probe_with, restore_bundle_script, start_action, waypoint_image, ContainerState,
         ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
     };
+    use super::{
+        check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
+        IdentityMismatch, RestoreOptions, Silent,
+    };
     use crate::stack::Stack;
+    use std::path::{Path, PathBuf};
 
     /// A reporter that answers the migration question however the test wants, and
     /// remembers whether it was asked at all.
@@ -2939,6 +3162,217 @@ mod tests {
             exclude_at < files_at,
             "exclude comes before the files member"
         );
+    }
+
+    /// A unique scratch directory, removed on drop.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir =
+                std::env::temp_dir().join(format!("aincient-ops-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A snapshot bundle holding just `manifest` — enough for every
+    /// manifest reader.
+    fn bundle_with(dir: &Path, name: &str, manifest: &str) -> PathBuf {
+        let stage = dir.join(format!("stage-{name}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("manifest.json"), manifest).unwrap();
+        let file = dir.join(name);
+        let ok = std::process::Command::new("tar")
+            .arg("czf")
+            .arg(&file)
+            .arg("-C")
+            .arg(&stage)
+            .arg("manifest.json")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "tar");
+        file
+    }
+
+    const ID_A: &str = "11111111-1111-4111-8111-111111111111";
+    const ID_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn manifest_of(id: &str) -> SnapshotManifest {
+        SnapshotManifest {
+            site_id: id.to_string(),
+            site_slug: "blog".to_string(),
+            site_label: "Blog".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn identity_matching_restore_is_allowed_quietly() {
+        let m = manifest_of(ID_A);
+        assert_eq!(
+            check_identity(Some(&m), Some(ID_A), "Blog (blog)", false).unwrap(),
+            IdentityCheck::Same
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_is_refused_naming_both_sites_and_the_override() {
+        let m = manifest_of(ID_A);
+        let err = check_identity(Some(&m), Some(ID_B), "Shop (shop)", false).unwrap_err();
+        let mismatch = err.downcast_ref::<IdentityMismatch>().expect("typed");
+        assert_eq!(mismatch.archive_site_id, ID_A);
+        assert_eq!(mismatch.target_site_id.as_deref(), Some(ID_B));
+        let text = err.to_string();
+        for needle in ["Blog (blog)", ID_A, "Shop (shop)", ID_B, "--other-site"] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        // A target that never made a backup has no identity: still another site.
+        let err = check_identity(Some(&m), None, "Shop (shop)", false).unwrap_err();
+        assert!(err.to_string().contains("none yet"), "{err}");
+    }
+
+    #[test]
+    fn other_site_overrides_the_identity_check() {
+        let m = manifest_of(ID_A);
+        let got = check_identity(Some(&m), Some(ID_B), "Shop (shop)", true).unwrap();
+        assert!(matches!(got, IdentityCheck::OtherAllowed(ref n) if n.contains("Blog (blog)")));
+    }
+
+    #[test]
+    fn a_legacy_archive_restores_with_a_warning() {
+        let v2 = SnapshotManifest {
+            digest: "sha256:x".into(),
+            ..Default::default()
+        };
+        for manifest in [None, Some(&v2)] {
+            let got = check_identity(manifest, Some(ID_B), "Shop", false).unwrap();
+            assert!(
+                matches!(got, IdentityCheck::Unknown(ref w) if w.contains("WARNING")),
+                "{got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_v3_carries_the_site_identity() {
+        let m: SnapshotManifest = serde_json::from_str(&format!(
+            r#"{{"format":"aincient-snapshot","version":3,"created":"x","image":"y",
+                "digest":"","atelier_version":"","site_id":"{ID_A}",
+                "site_slug":"blog","site_label":"Bob's \"blog\""}}"#
+        ))
+        .unwrap();
+        assert_eq!(m.site_id, ID_A);
+        assert_eq!(m.site_name(), "Bob's \"blog\" (blog)");
+    }
+
+    #[test]
+    fn a_label_with_quotes_keeps_the_backup_script_valid() {
+        let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
+        let manifest =
+            serde_json::json!({ "site_label": "Bob's \"blog\" $(rm -rf /)" }).to_string();
+        let script = backup_script(drush, &manifest);
+        assert_valid_sh(&script);
+        // What the printf writes is the manifest, byte for byte.
+        let printf = script
+            .lines()
+            .find(|l| l.starts_with("printf"))
+            .unwrap()
+            .replace(" > \"$STAGE/manifest.json\"", "");
+        let out = std::process::Command::new("sh")
+            .args(["-c", &printf])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), manifest);
+    }
+
+    #[test]
+    fn site_identity_is_minted_once_and_kept() {
+        let dir = Scratch::new("site-id");
+        let stack = Stack::at(dir.0.clone());
+        assert_eq!(stack.site_id(), None);
+        let id = stack.ensure_site_id().unwrap();
+        assert!(crate::stack::is_site_id(&id), "{id}");
+        assert_eq!(stack.site_id().as_deref(), Some(id.as_str()));
+        assert_eq!(stack.ensure_site_id().unwrap(), id, "stable");
+        // A garbled file is no identity, never a match for anything.
+        std::fs::write(stack.site_id_path(), "not-an-id\n").unwrap();
+        assert_eq!(stack.site_id(), None);
+    }
+
+    #[test]
+    fn local_restore_refuses_another_sites_archive_before_touching_anything() {
+        let dir = Scratch::new("restore-identity");
+        let stack = Stack::at(dir.0.join("site"));
+        std::fs::create_dir_all(&stack.home).unwrap();
+        std::fs::write(stack.site_id_path(), format!("{ID_B}\n")).unwrap();
+        let ours = bundle_with(
+            &dir.0,
+            "ours.tar.gz",
+            &format!(r#"{{"format":"aincient-snapshot","version":3,"site_id":"{ID_B}"}}"#),
+        );
+        let theirs = bundle_with(
+            &dir.0,
+            "theirs.tar.gz",
+            &format!(
+                r#"{{"format":"aincient-snapshot","version":3,"site_id":"{ID_A}","site_slug":"blog"}}"#
+            ),
+        );
+        let legacy = bundle_with(
+            &dir.0,
+            "legacy.tar.gz",
+            r#"{"format":"aincient-snapshot","version":2,"image":"y"}"#,
+        );
+        assert_eq!(
+            restore_identity(&stack, &ours, false).unwrap(),
+            IdentityCheck::Same
+        );
+        assert!(matches!(
+            restore_identity(&stack, &legacy, false).unwrap(),
+            IdentityCheck::Unknown(_)
+        ));
+        assert!(matches!(
+            restore_identity(&stack, &theirs, true).unwrap(),
+            IdentityCheck::OtherAllowed(_)
+        ));
+        // The checked restore refuses before Docker is ever asked anything.
+        let err =
+            restore_with(&stack, &theirs, &RestoreOptions::default(), &mut Silent).unwrap_err();
+        assert!(err.downcast_ref::<IdentityMismatch>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn describe_backup_reports_size_sha_and_origin() {
+        let dir = Scratch::new("describe");
+        let file = bundle_with(
+            &dir.0,
+            "aincient-x.tar.gz",
+            &format!(r#"{{"site_id":"{ID_A}","site_slug":"blog","site_label":"Blog"}}"#),
+        );
+        let info = describe_backup(&file).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert_eq!(info.size, bytes.len() as u64);
+        use sha2::Digest;
+        let want: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(info.sha256, want);
+        assert_eq!(info.name, "aincient-x.tar.gz");
+        assert_eq!(info.site_id.as_deref(), Some(ID_A));
+        assert_eq!(info.site_name.as_deref(), Some("Blog (blog)"));
+        // Round-trips as the JSON a Manager reads back.
+        let back: BackupInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(back, info);
     }
 
     #[test]
