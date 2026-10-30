@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod ops;
 pub mod pack;
 pub mod remote;
+pub mod settings;
 pub mod sites;
 pub mod ssh_key;
 pub mod stack;

@@ -959,6 +959,18 @@ function loadPublishPrefs() {
   $("export-btn").disabled = !exportDir;
 }
 
+function initExperimental() {
+  $("experimental-toggle").addEventListener("change", async (e) => {
+    const on = e.target.checked;
+    try {
+      experimental = !!(await invoke("set_experimental", { on })).experimental;
+    } catch (err) {
+      showError(String(err));
+    }
+    renderExperimental();
+  });
+}
+
 function initPublishPrefs() {
   loadPublishPrefs();
   // Remember the address as it's typed, not only on export.
@@ -1055,6 +1067,86 @@ function loadSettings() {
   $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
   $("manager-version-row").textContent = managerVersion || "—";
   renderChannel();
+  loadExperimental();
+}
+
+// --- experimental features (m7-3, DECISIONS 0483) ---------------------------
+// Off by default and kept per user by the Rust side (~/.atelier/manager.json).
+// While off, everything engine-related stays hidden — except a plain note when
+// the site already runs the engine, so a root-holding helper is never invisible.
+
+let experimental = false;
+
+async function loadExperimental() {
+  try {
+    experimental = !!(await invoke("get_settings")).experimental;
+  } catch {
+    experimental = false;
+  }
+  renderExperimental();
+}
+
+function renderExperimental() {
+  $("experimental-toggle").checked = experimental;
+  $("experimental-body").classList.toggle("hidden", !experimental);
+  const hasEngine = !!(lastStatus && lastStatus.engine && lastStatus.engine.enabled);
+  $("engine-hidden-note").classList.toggle("hidden", experimental || !hasEngine);
+  if (experimental) refreshEngine();
+}
+
+const ENGINE_BUTTONS = [
+  "engine-enable",
+  "engine-lockdown",
+  "engine-unlock",
+  "engine-remove",
+  "engine-update-manager",
+];
+
+function showEngineButtons(shown) {
+  for (const id of ENGINE_BUTTONS) $(id).classList.toggle("hidden", !shown.includes(id));
+}
+
+async function refreshEngine() {
+  const state = $("engine-state");
+  const problem = $("engine-problem");
+  state.textContent = "Checking…";
+  problem.classList.add("hidden");
+  showEngineButtons([]);
+  let v;
+  try {
+    v = await invoke("engine_state");
+  } catch (e) {
+    state.textContent = "Unknown";
+    problem.textContent = String(e);
+    problem.classList.remove("hidden");
+    return;
+  }
+  if (!v.enabled) {
+    state.textContent = "Not on this site";
+    showEngineButtons(["engine-enable"]);
+    return;
+  }
+  if (!v.running) {
+    state.textContent = "Added, but not running";
+    showEngineButtons(["engine-remove"]);
+    return;
+  }
+  if (v.problem) {
+    state.textContent = v.api ? `Running (API ${v.api})` : "Running";
+    problem.textContent = v.problem;
+    problem.classList.remove("hidden");
+    // A newer engine than this Manager understands (C-08): update the Manager
+    // first; nothing else is offered until then.
+    showEngineButtons(v.manager_too_old ? ["engine-update-manager"] : ["engine-remove"]);
+    return;
+  }
+  if (v.lockdown) {
+    state.textContent = "Locked down";
+    showEngineButtons(["engine-unlock"]);
+    return;
+  }
+  state.textContent = `Running (API ${v.api})`;
+  showEngineButtons(["engine-lockdown", "engine-remove"]);
 }
 
 // Which images this install follows. The menu offers released versions and
@@ -1494,6 +1586,59 @@ const actions = {
     );
   },
 
+  // ---- Experimental: the engine (m3-6, m3-7, m7-3) ----
+  "engine-enable": async () => {
+    const ok = await confirmChange(
+      "Add the experimental engine to {site}?",
+      "The engine holds the server's Docker socket, which is full control (root) of that " +
+        "server. It is for testers. You can remove it again from here.",
+      { always: true }
+    );
+    if (!ok) return;
+    await runProgressOp("Adding the engine", () => invoke("engine_enable"));
+    refreshEngine();
+  },
+
+  "engine-lockdown": async () => {
+    const ok = await confirmChange(
+      "Lock down {site}?",
+      "The site stops at once. Waking it and pairing close, and every paired Manager but " +
+        "the first is removed. Only this Manager over SSH, or the first paired Manager, " +
+        "can unlock it.",
+      { always: true }
+    );
+    if (!ok) return;
+    await runProgressOp("Locking the site down", () => invoke("engine_lockdown", { lock: true }));
+    refreshEngine();
+  },
+
+  "engine-unlock": async () => {
+    const ok = await confirmChange(
+      "Unlock {site}?",
+      "Waking and pairing open again. The site stays stopped until you start it.",
+      { always: true }
+    );
+    if (!ok) return;
+    await runProgressOp("Unlocking", () => invoke("engine_lockdown", { lock: false }));
+    refreshEngine();
+  },
+
+  "engine-remove": async () => {
+    const ok = await confirmChange(
+      "Remove the engine from {site}?",
+      "The engine is taken off and the site restarts as before (a resting site is woken " +
+        "first). Its saved data is kept.",
+      { always: true }
+    );
+    if (!ok) return;
+    await runProgressOp("Removing the engine", () => invoke("engine_remove"));
+    refreshEngine();
+  },
+
+  // The Manager has no updater of its own: its update is the releases page.
+  "engine-update-manager": () =>
+    invoke("open_url", { url: MANAGER_RELEASES_PAGE }).catch((e) => showError(String(e))),
+
   reinstall: async () => {
     const ok = await confirmChange(
       "Reinstall {site} from scratch?",
@@ -1592,6 +1737,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 initPublishPrefs();
+initExperimental();
 // The nudge needs managerVersion to compare against, so it chains off the
 // version stamp — still fire-and-forget, nothing here delays first paint.
 showManagerVersion().then(checkManagerUpdate);

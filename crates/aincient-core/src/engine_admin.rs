@@ -304,6 +304,25 @@ impl<'a, D: DockerExec + ?Sized> EngineAdmin<'a, D> {
     }
 }
 
+/// Turn the engine on for a stack on this computer and start it: the image
+/// must be there (built locally until slice C pins one), then
+/// [`engine::enable`], then `compose up -d --remove-orphans`. The caller has
+/// the user's opt-in (the CLI's `--experimental`, the GUI's setting).
+pub fn enable_local(stack: &Stack) -> Result<()> {
+    let mut probe = docker();
+    probe.args(["image", "inspect", engine::ENGINE_IMAGE]);
+    if crate::docker::run_capture(probe, "find the engine image").is_err() {
+        bail!(
+            "no {} image on this computer — build it first with engine/build.sh",
+            engine::ENGINE_IMAGE
+        );
+    }
+    engine::enable(stack)?;
+    let mut c = compose(stack);
+    c.args(["up", "-d", "--remove-orphans"]);
+    crate::docker::run_capture(c, "start the stack with the engine").map(|_| ())
+}
+
 /// The steps of [`remove`], so its order and failure handling are tested
 /// against a fake. [`LocalRemove`] is the real one; a server runs it through
 /// its own `atelier engine remove`.

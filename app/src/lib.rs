@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use aincient_core::docker::Pipe;
+use aincient_core::engine_admin::{self, AdminVerb, EngineAdmin, EngineInfo};
+use aincient_core::engine_client::EngineError;
+use aincient_core::settings::{self, Settings};
 use aincient_core::{
     doctor, ops, remote, sites, ssh_key, update_cache, Backup, CacheStatus, ChangeGuard, Channel,
     InstallOptions, ModelRole, Preflight, PullEvent, Reporter, SingleFlight, Site, SiteRow, Stack,
@@ -708,6 +711,217 @@ async fn do_stop(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String>
     }
 }
 
+// --- experimental features (m7-3, DECISIONS 0483) ----------------------------
+
+/// The Manager's per-user settings (`~/.atelier/manager.json`).
+#[tauri::command]
+fn get_settings() -> Result<Settings, String> {
+    Ok(settings::load(&sites::user_home().map_err(err)?))
+}
+
+/// Turn experimental features on or off. Off hides everything engine-related
+/// and makes every engine command below refuse.
+#[tauri::command]
+fn set_experimental(on: bool) -> Result<Settings, String> {
+    let home = sites::user_home().map_err(err)?;
+    let mut s = settings::load(&home);
+    s.experimental = on;
+    settings::save(&home, &s).map_err(err)?;
+    Ok(s)
+}
+
+/// Refuse unless the user turned experimental features on: the window hides
+/// the engine then, and the commands don't trust the window alone.
+fn require_experimental() -> Result<(), String> {
+    let home = sites::user_home().map_err(err)?;
+    if settings::load(&home).experimental {
+        Ok(())
+    } else {
+        Err(
+            "The engine is an experimental feature. Turn on Experimental features in \
+             System first."
+                .into(),
+        )
+    }
+}
+
+/// The selected site's engine, as the window shows it.
+#[derive(Serialize, Default)]
+struct EngineView {
+    /// The stack uses the engine (`.env` names it).
+    enabled: bool,
+    running: bool,
+    /// From the engine's `admin status`, when it answered.
+    lockdown: Option<bool>,
+    api: Option<String>,
+    /// The engine speaks a newer API major: offer the Manager's update (C-08).
+    manager_too_old: bool,
+    /// Why the engine couldn't be read, in words.
+    problem: Option<String>,
+}
+
+fn engine_view<D: engine_admin::DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<EngineInfo>,
+) -> EngineView {
+    let Some(info) = info else {
+        return EngineView::default();
+    };
+    let mut view = EngineView {
+        enabled: info.enabled,
+        running: info.running,
+        ..EngineView::default()
+    };
+    if info.ready().is_none() {
+        return view;
+    }
+    let read = EngineAdmin::new(docker, Some(&info), "status").and_then(|a| {
+        let raw = a.status_unchecked()?;
+        view.api = Some(raw.api.clone());
+        view.lockdown = Some(raw.lockdown);
+        a.status()
+    });
+    if let Err(e) = read {
+        view.manager_too_old = matches!(
+            e.downcast_ref::<EngineError>(),
+            Some(EngineError::ManagerTooOld { .. })
+        );
+        view.problem = Some(format!("{e:#}"));
+    }
+    view
+}
+
+#[tauri::command]
+async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
+    require_experimental()?;
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                Ok(engine_view(
+                    &engine_admin::LocalDocker,
+                    engine_admin::probe(&s),
+                ))
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let host = host_of(&site);
+                remote::within(&host, REMOTE_STATUS_LIMIT, move || {
+                    let s = remote::open(
+                        &site,
+                        &remote::EngineOptions {
+                            no_install: true,
+                            ..remote::EngineOptions::from_env()
+                        },
+                    )?;
+                    let info = s.engine_info()?;
+                    Ok(engine_view(&s, info))
+                })
+                .map_err(|e| format!("Can't reach {host}: {e:#}"))
+            })
+            .await
+        }
+    }
+}
+
+/// Add the engine to the selected site (the window confirmed first): on this
+/// computer core's enable + `up`; on a server its own `atelier engine enable
+/// --experimental`, which runs `up` there.
+#[tauri::command]
+async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    require_experimental()?;
+    match target(&sel)? {
+        Target::Local(s) => blocking(move || engine_admin::enable_local(&s).map_err(err)).await,
+        Target::Remote(site) => {
+            blocking(move || {
+                session(&site)?
+                    .run_streamed(
+                        &["engine", "enable", "--experimental"],
+                        remote::LIFECYCLE_DEADLINE,
+                        &mut feed(&app),
+                    )
+                    .map_err(err)
+            })
+            .await
+        }
+    }
+}
+
+/// Remove the engine and restore edge + app + db (m3-6, C-09; confirmed in
+/// the window first). Allowed with experimental features off too: taking the
+/// root-holding sidecar away must never be hidden behind the opt-in.
+#[tauri::command]
+async fn engine_remove(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                let mut say = |line: &str| {
+                    let _ = app.emit(
+                        "op-progress",
+                        ProgressEvent {
+                            kind: "log",
+                            stage: None,
+                            message: line.to_string(),
+                            fraction: None,
+                            pull: None,
+                        },
+                    );
+                };
+                engine_admin::remove(&mut engine_admin::LocalRemove::new(&s), &mut say)
+                    .map(|_| ())
+                    .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                session(&site)?
+                    .run_streamed(
+                        &["engine", "remove", "--experimental", "--yes"],
+                        remote::LIFECYCLE_DEADLINE,
+                        &mut feed(&app),
+                    )
+                    .map_err(err)
+            })
+            .await
+        }
+    }
+}
+
+/// Lock down or unlock through the engine (m3-7; confirmed in the window
+/// first): `docker exec` here or over SSH, the version read first.
+#[tauri::command]
+async fn engine_lockdown(lock: bool, sel: State<'_, Selected>) -> Result<String, String> {
+    require_experimental()?;
+    let verb = if lock {
+        AdminVerb::Lockdown
+    } else {
+        AdminVerb::Unlock
+    };
+    match target(&sel)? {
+        Target::Local(s) => {
+            blocking(move || {
+                let info = engine_admin::probe(&s);
+                EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), verb.word())
+                    .and_then(|a| a.run(verb))
+                    .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let s = session(&site)?;
+                let info = s.engine_info().map_err(err)?;
+                EngineAdmin::new(&s, info.as_ref(), verb.word())
+                    .and_then(|a| a.run(verb))
+                    .map_err(err)
+            })
+            .await
+        }
+    }
+}
+
 /// Remove the appliance's containers. With `wipe = true` this also deletes the
 /// data volumes (database, files, admin password) — a harder teardown than a
 /// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
@@ -1197,6 +1411,12 @@ pub fn run() {
             add_remote_site,
             guided_key,
             rename_site,
+            get_settings,
+            set_experimental,
+            engine_state,
+            engine_enable,
+            engine_remove,
+            engine_lockdown,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Atelier Manager")
