@@ -22,7 +22,7 @@ pub mod stack;
 pub mod update_cache;
 
 pub use docker::{preflight, Preflight, PullEvent};
-pub use doctor::{Check, Repair, Report, Severity, Tier};
+pub use doctor::{Check, HostTier, Repair, Report, Severity, Tier};
 pub use ops::{
     admin_password, backup, check_update, down, export_static, install, list_backups, logs_command,
     model_list, model_set, open_console, open_console_authed, open_login, open_url, reinstall,

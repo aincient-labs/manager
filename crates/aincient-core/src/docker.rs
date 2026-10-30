@@ -354,6 +354,114 @@ pub fn output_within_input(
     })
 }
 
+/// Which pipe a streamed line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pipe {
+    Stdout,
+    Stderr,
+}
+
+/// Spawn `cmd` with stdin closed, hand each line it prints to `sink` as it
+/// arrives, and wait at most `deadline` for it to exit — then kill it.
+///
+/// For long, user-visible work run over SSH (a remote update, backup,
+/// restore): the user sees progress live, and a dead link can't hang the
+/// Manager forever. Unlike [`output_within`] the child stays in our process
+/// group, so a Ctrl-C at the terminal reaches it too.
+pub fn stream_lines_within(
+    cmd: &mut Command,
+    deadline: Duration,
+    sink: &mut dyn FnMut(Pipe, &str),
+) -> Result<std::process::ExitStatus, RunError> {
+    let started = Instant::now();
+    let command = describe(cmd);
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|source| RunError::Io {
+        program: program.clone(),
+        source,
+    })?;
+    let (tx, rx) = mpsc::channel::<(Pipe, String)>();
+    for (which, pipe) in [
+        (
+            Pipe::Stdout,
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+        (
+            Pipe::Stderr,
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ),
+    ] {
+        if let Some(pipe) = pipe {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut reader = BufReader::new(pipe);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&buf);
+                            let line = line.trim_end_matches(['\n', '\r']).to_string();
+                            if tx.send((which, line)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    drop(tx);
+
+    let timed_out = |child: &mut Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        RunError::TimedOut {
+            command: command.clone(),
+            after: deadline,
+        }
+    };
+    // Relay lines until both pipes close (the child exited, or closed them).
+    loop {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(timed_out(&mut child));
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(200))) {
+            Ok((which, line)) => sink(which, &line),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    return Err(timed_out(&mut child));
+                }
+                thread::sleep(POLL_INTERVAL.min(deadline - elapsed));
+            }
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunError::Io { program, source });
+            }
+        }
+    }
+}
+
 /// Kill a timed-out child (and, on Unix, its process group) and wait for it, so
 /// it never lingers as a zombie.
 fn kill_and_reap(child: &mut Child) {
@@ -623,7 +731,9 @@ pub fn try_capture(mut cmd: Command) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_reach, output_within, registry_endpoint, PullEvent, RunError};
+    use super::{
+        can_reach, output_within, registry_endpoint, stream_lines_within, Pipe, PullEvent, RunError,
+    };
     use std::net::{Ipv4Addr, TcpListener};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -673,6 +783,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!alive(grandchild), "grandchild {grandchild} left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_lines_arrive_per_pipe_with_the_exit_code() {
+        let mut seen = Vec::new();
+        let status = stream_lines_within(
+            Command::new("sh").args(["-c", "echo one; echo two >&2; printf three; exit 3"]),
+            Duration::from_secs(10),
+            &mut |pipe, line| seen.push((pipe, line.to_string())),
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        seen.sort_by_key(|(p, _)| *p == Pipe::Stderr);
+        assert_eq!(
+            seen,
+            [
+                (Pipe::Stdout, "one".to_string()),
+                (Pipe::Stdout, "three".to_string()),
+                (Pipe::Stderr, "two".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_streamed_command_past_its_deadline_is_killed() {
+        let started = Instant::now();
+        let err = stream_lines_within(
+            Command::new("sleep").arg("30"),
+            Duration::from_millis(300),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(err, RunError::TimedOut { .. }), "{err}");
     }
 
     #[cfg(unix)]

@@ -21,14 +21,15 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use crate::docker::{output_within, output_within_input, RunError};
-use crate::ops::Status;
+use crate::docker::{output_within, output_within_input, stream_lines_within, Pipe, RunError};
+use crate::doctor::{Check, HostTier, Report, Severity, Tier};
+use crate::ops::{ExportOptions, FreezeOptions, SnapshotList, Status, UpdateCheck};
 use crate::sites::{KeyMode, Remote, Site};
 use crate::ssh_key::{self, KeyFile, SecretStore};
 
@@ -40,6 +41,23 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 pub const CLI_DEADLINE: Duration = Duration::from_secs(120);
 /// Deadline for streaming the engine binary to the server.
 pub const UPLOAD_DEADLINE: Duration = Duration::from_secs(600);
+/// `app check-update`: a registry probe per hop of the route (each bounded
+/// by the server's own 10 s probe deadline), so more than a plain read.
+pub const CHECK_UPDATE_DEADLINE: Duration = Duration::from_secs(300);
+/// `app start` / `app stop`: the server waits up to `START_READY_TIMEOUT`
+/// (120 s) for the console, after Compose has done its part.
+pub const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(600);
+/// `doctor` read-only: Docker probes (15 s each) plus drush calls.
+pub const DOCTOR_DEADLINE: Duration = Duration::from_secs(300);
+/// `doctor --fix`, `site freeze`, `site export`: a converge run or a full
+/// static render. Locally unbounded; over SSH half an hour is the ceiling.
+pub const WORK_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// `data backup` / `data restore`: a database dump plus the files tree.
+/// Locally unbounded (`run_inherited`); a link dead that long has failed.
+pub const DATA_DEADLINE: Duration = Duration::from_secs(60 * 60);
+/// `app update`: every hop pulls an image, migrates and waits up to
+/// `READY_TIMEOUT` (240 s) — a stepped route can take several of those.
+pub const UPDATE_DEADLINE: Duration = Duration::from_secs(90 * 60);
 /// How long the multiplexed master outlives its last client.
 pub const CONTROL_PERSIST_SECS: u64 = 60;
 /// Env override for the Linux engine binary to copy (same as `--engine-binary`).
@@ -61,6 +79,15 @@ pub trait Transport {
         input: Option<&Path>,
         deadline: Duration,
     ) -> std::result::Result<Output, RunError>;
+
+    /// Run `script` with stdin closed, handing each output line to `sink` as
+    /// it arrives (for long actions the user watches), bounded by `deadline`.
+    fn exec_streaming(
+        &self,
+        script: &str,
+        deadline: Duration,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> std::result::Result<ExitStatus, RunError>;
 }
 
 /// The real transport: the system `ssh`.
@@ -196,6 +223,16 @@ impl Transport for Ssh {
             }
         }
     }
+
+    fn exec_streaming(
+        &self,
+        script: &str,
+        deadline: Duration,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> std::result::Result<ExitStatus, RunError> {
+        self.start_master();
+        stream_lines_within(&mut self.command(script), deadline, sink)
+    }
 }
 
 /// `~/.atelier/ssh/%C`: the multiplexing socket, in a 0700 directory. `None`
@@ -315,6 +352,9 @@ pub struct EngineOptions {
     pub binary: Option<PathBuf>,
     /// Copy ours to `~/.local/bin` even when an older `atelier` exists.
     pub replace_older: bool,
+    /// Copy nothing at all: a server without a usable `atelier` is an error
+    /// ([`NoEngine`] / [`EngineTooOld`]). For `doctor`, which only looks.
+    pub no_install: bool,
 }
 
 impl EngineOptions {
@@ -325,6 +365,186 @@ impl EngineOptions {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             replace_older: false,
+            no_install: false,
+        }
+    }
+}
+
+/// The server has no `atelier` CLI and the caller said not to copy one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoEngine {
+    pub host: String,
+}
+
+impl std::fmt::Display for NoEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} has no atelier CLI on its PATH or in ~/.local/bin",
+            self.host
+        )
+    }
+}
+
+impl std::error::Error for NoEngine {}
+
+/// A remote `atelier` command ran and exited non-zero. Its own output (and
+/// error message) already reached the user; front-ends exit with `code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteExit {
+    pub host: String,
+    /// `` `atelier data backup` ``.
+    pub what: String,
+    pub code: i32,
+}
+
+impl std::fmt::Display for RemoteExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} failed on {} (exit {})",
+            self.what, self.host, self.code
+        )
+    }
+}
+
+impl std::error::Error for RemoteExit {}
+
+/// One site action, as it runs on a remote site (m2-7, D-04): the same
+/// `atelier` subcommand the server would run locally. The front-end confirms
+/// anything destructive BEFORE building one, so the server is always run
+/// non-interactively (`--yes`, stdin closed) and never waits on a prompt.
+#[derive(Debug, Clone)]
+pub enum Action {
+    /// `app status --json` — see [`Session::status`].
+    Status,
+    /// `app check-update --json` — see [`Session::check_update`].
+    CheckUpdate,
+    /// `app update [--to V] [--yes]`. `yes` only when the route was confirmed
+    /// here first (or there was nothing to confirm).
+    Update { to: Option<String>, yes: bool },
+    /// `app start`.
+    Start,
+    /// `app stop`.
+    Stop,
+    /// `data backup [--label L]` — the backup stays on the server (m2-5 moves it).
+    Backup { label: Option<String> },
+    /// `data list` — the server's backups.
+    BackupList,
+    /// `data restore <FILE> --yes`, FILE being a path on the server.
+    Restore { file: String },
+    /// `site export …` — written on the server.
+    Export(ExportOptions),
+    /// `site freeze …`.
+    Freeze(FreezeOptions),
+    /// `site snapshots --json` — see [`Session::snapshots`].
+    Snapshots,
+    /// `site use <ID>`.
+    UseSnapshot { id: String },
+    /// `site live`.
+    Live,
+    /// `site prune --keep N`.
+    Prune { keep: u32 },
+    /// `doctor --json [--fix]` — see [`Session::doctor`].
+    Doctor { fix: bool },
+}
+
+impl Action {
+    /// The `atelier` arguments after `--site <slug>`.
+    pub fn argv(&self) -> Vec<String> {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut v = match self {
+            Action::Status => words(&["app", "status", "--json"]),
+            Action::CheckUpdate => words(&["app", "check-update", "--json"]),
+            Action::Update { .. } => words(&["app", "update"]),
+            Action::Start => words(&["app", "start"]),
+            Action::Stop => words(&["app", "stop"]),
+            Action::Backup { .. } => words(&["data", "backup"]),
+            Action::BackupList => words(&["data", "list"]),
+            Action::Restore { .. } => words(&["data", "restore"]),
+            Action::Export(_) => words(&["site", "export"]),
+            Action::Freeze(_) => words(&["site", "freeze"]),
+            Action::Snapshots => words(&["site", "snapshots", "--json"]),
+            Action::UseSnapshot { id } => words(&["site", "use", id]),
+            Action::Live => words(&["site", "live"]),
+            Action::Prune { keep } => vec![
+                "site".into(),
+                "prune".into(),
+                "--keep".into(),
+                keep.to_string(),
+            ],
+            Action::Doctor { .. } => words(&["doctor", "--json"]),
+        };
+        let mut opt = |flag: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                v.push(flag.to_string());
+                v.push(value.clone());
+            }
+        };
+        match self {
+            Action::Update { to, yes } => {
+                opt("--to", to);
+                if *yes {
+                    v.push("--yes".into());
+                }
+            }
+            Action::Backup { label } => opt("--label", label),
+            Action::Restore { file } => {
+                // `--` so a file named like a flag stays a file.
+                v.extend(["--yes".into(), "--".into(), file.clone()]);
+            }
+            Action::Export(o) => {
+                opt(
+                    "--out",
+                    &o.out.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                );
+                opt("--base-url", &o.base_url);
+                for (on, flag) in [
+                    (o.zip, "--zip"),
+                    (o.include_config, "--include-config"),
+                    (o.include_users, "--include-users"),
+                    (o.skip_link_check, "--skip-link-check"),
+                ] {
+                    if on {
+                        v.push(flag.into());
+                    }
+                }
+            }
+            Action::Freeze(o) => {
+                opt("--label", &o.label);
+                opt("--base-url", &o.base_url);
+                for (on, flag) in [
+                    (o.keep, "--keep"),
+                    (o.no_serve, "--no-serve"),
+                    (o.force, "--force"),
+                ] {
+                    if on {
+                        v.push(flag.into());
+                    }
+                }
+            }
+            Action::Doctor { fix: true } => v.push("--fix".into()),
+            _ => {}
+        }
+        v
+    }
+
+    /// How long the server may take. Local equivalents of the long ones run
+    /// unbounded; over SSH each gets a ceiling that fits its slowest honest run.
+    pub fn deadline(&self) -> Duration {
+        match self {
+            Action::Status
+            | Action::BackupList
+            | Action::Snapshots
+            | Action::UseSnapshot { .. }
+            | Action::Live
+            | Action::Prune { .. } => CLI_DEADLINE,
+            Action::CheckUpdate => CHECK_UPDATE_DEADLINE,
+            Action::Start | Action::Stop => LIFECYCLE_DEADLINE,
+            Action::Doctor { fix: false } => DOCTOR_DEADLINE,
+            Action::Doctor { fix: true } | Action::Export(_) | Action::Freeze(_) => WORK_DEADLINE,
+            Action::Backup { .. } | Action::Restore { .. } => DATA_DEADLINE,
+            Action::Update { .. } => UPDATE_DEADLINE,
         }
     }
 }
@@ -404,6 +624,8 @@ pub struct Session<T: Transport> {
     transport: T,
     remote_slug: String,
     engine: String,
+    /// What the engine's `--version` said (`atelier 0.12.0`).
+    engine_reported: String,
 }
 
 impl<T: Transport> Session<T> {
@@ -422,9 +644,9 @@ impl<T: Transport> Session<T> {
             .clis
             .iter()
             .find(|c| Version::find(&c.reported).is_some_and(|v| v.satisfies(wanted)));
-        let engine = match (usable, probe.clis.first()) {
-            (Some(cli), _) => cli.path.clone(),
-            (None, Some(old)) if !opts.replace_older => {
+        let (engine, engine_reported) = match (usable, probe.clis.first()) {
+            (Some(cli), _) => (cli.path.clone(), cli.reported.clone()),
+            (None, Some(old)) if !opts.replace_older || opts.no_install => {
                 return Err(anyhow!(EngineTooOld {
                     host: transport.target().to_string(),
                     path: old.path.clone(),
@@ -436,13 +658,153 @@ impl<T: Transport> Session<T> {
                     wanted,
                 }));
             }
-            _ => install_engine(&transport, &probe, opts, wanted)?,
+            (None, None) if opts.no_install => {
+                return Err(anyhow!(NoEngine {
+                    host: transport.target().to_string(),
+                }));
+            }
+            _ => (
+                install_engine(&transport, &probe, opts, wanted)?,
+                format!("atelier {wanted}"),
+            ),
         };
         Ok(Session {
             transport,
             remote_slug: remote_slug.to_string(),
             engine,
+            engine_reported,
         })
+    }
+
+    /// The ssh target this session reaches.
+    pub fn host(&self) -> &str {
+        self.transport.target()
+    }
+
+    /// What the engine reported as its version (`atelier 0.12.0`).
+    pub fn engine_version(&self) -> &str {
+        &self.engine_reported
+    }
+
+    /// The shell line that runs `atelier --site <slug> <args…>` on the server.
+    fn script(&self, args: &[&str]) -> String {
+        let mut words = vec![
+            sh_quote(&self.engine),
+            "--site".into(),
+            sh_quote(&self.remote_slug),
+        ];
+        words.extend(args.iter().map(|a| sh_quote(a)));
+        words.join(" ")
+    }
+
+    /// Run `atelier --site <slug> <args…>` on the server, its output streamed
+    /// line by line to `sink` as it arrives. A non-zero exit is a
+    /// [`RemoteExit`] carrying the server's exit code; the CLI's own message
+    /// has already gone through `sink`.
+    pub fn run_streamed(
+        &self,
+        args: &[&str],
+        deadline: Duration,
+        sink: &mut dyn FnMut(Pipe, &str),
+    ) -> Result<()> {
+        let host = self.transport.target();
+        let what = format!("`atelier {}`", args.join(" "));
+        let mut last_err = String::new();
+        let outcome =
+            self.transport
+                .exec_streaming(&self.script(args), deadline, &mut |pipe, line| {
+                    if pipe == Pipe::Stderr && !line.trim().is_empty() {
+                        last_err = line.trim().to_string();
+                    }
+                    sink(pipe, line)
+                });
+        let status = match outcome {
+            Ok(status) => status,
+            Err(RunError::TimedOut { after, .. }) => bail!(
+                "{what} on {host} didn't finish within {} min and the Manager stopped waiting                  — it may still be running on the server; check there before retrying",
+                after.as_secs() / 60
+            ),
+            Err(RunError::Io { source, .. }) => {
+                bail!("couldn't run ssh to reach {host}: {source} — is OpenSSH installed?")
+            }
+        };
+        match status.code() {
+            Some(0) => Ok(()),
+            Some(255) => bail!("lost the connection to {host} during {what}: {last_err}"),
+            Some(code) => Err(anyhow!(RemoteExit {
+                host: host.to_string(),
+                what,
+                code,
+            })),
+            None => bail!("{what} on {host} was killed"),
+        }
+    }
+
+    /// Run one [`Action`] with its own deadline, streaming its output.
+    pub fn run_action(&self, action: &Action, sink: &mut dyn FnMut(Pipe, &str)) -> Result<()> {
+        let argv = action.argv();
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.run_streamed(&args, action.deadline(), sink)
+    }
+
+    /// Run a `--json` action and parse what it printed into `J`.
+    fn json<J: serde::de::DeserializeOwned>(&self, action: &Action) -> Result<J> {
+        let argv = action.argv();
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.run(&args, action.deadline())?;
+        serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "{} answered `{}` with something the Manager can't read",
+                self.transport.target(),
+                argv.join(" ")
+            )
+        })
+    }
+
+    /// The server's `app check-update --json`.
+    pub fn check_update(&self) -> Result<UpdateCheck> {
+        self.json(&Action::CheckUpdate)
+    }
+
+    /// The server's `site snapshots --json`.
+    pub fn snapshots(&self) -> Result<SnapshotList> {
+        self.json(&Action::Snapshots)
+    }
+
+    /// The server's own `doctor --json [--fix]`, every check marked as run on
+    /// the server (m2-9). With `fix` the repair ladder's progress — everything
+    /// the server prints before its JSON — goes to `sink` as it happens. The
+    /// server exits 1 for an unhealthy report; that is still a report.
+    pub fn doctor(&self, fix: bool, sink: &mut dyn FnMut(Pipe, &str)) -> Result<Report> {
+        let action = Action::Doctor { fix };
+        let mut json = String::new();
+        let mut in_json = false;
+        let result = self.run_action(&action, &mut |pipe, line| {
+            // The pretty-printed report starts with a lone `{` on stdout.
+            if pipe == Pipe::Stdout && (in_json || line == "{") {
+                in_json = true;
+                json.push_str(line);
+                json.push('\n');
+            } else {
+                sink(pipe, line);
+            }
+        });
+        match result {
+            Ok(()) => {}
+            Err(e) if e.downcast_ref::<RemoteExit>().is_some_and(|x| x.code == 1) && in_json => {}
+            Err(e) => return Err(e),
+        }
+        let mut report: Report = serde_json::from_str(&json).with_context(|| {
+            format!(
+                "{} answered `atelier doctor --json` with something that isn't a report",
+                self.transport.target()
+            )
+        })?;
+        let on = HostTier::Remote(self.transport.target().to_string());
+        for check in &mut report.checks {
+            check.on = on.clone();
+        }
+        Ok(report)
     }
 
     /// The `atelier` path this session drives on the server.
@@ -453,17 +815,11 @@ impl<T: Transport> Session<T> {
     /// Run `atelier --site <remote slug> <args…>` on the server. A non-zero
     /// exit is an error naming the host and carrying the CLI's own message.
     pub fn run(&self, args: &[&str], deadline: Duration) -> Result<Output> {
-        let mut words = vec![
-            sh_quote(&self.engine),
-            "--site".into(),
-            sh_quote(&self.remote_slug),
-        ];
-        words.extend(args.iter().map(|a| sh_quote(a)));
         let what = format!("`atelier {}`", args.join(" "));
         checked(
             &self.transport,
             &what,
-            self.transport.exec(&words.join(" "), None, deadline),
+            self.transport.exec(&self.script(args), None, deadline),
         )
     }
 
@@ -740,6 +1096,162 @@ pub fn status(site: &Site) -> Result<Status> {
     open(site, &EngineOptions::from_env())?.status()
 }
 
+/// `doctor` for a remote site (m2-9): the checks that genuinely run on this
+/// machine — the Manager's key, the SSH login, the server's `atelier` CLI —
+/// under [`Tier::Connection`], then the server's own report with every check
+/// marked [`HostTier::Remote`]. This machine's Docker, ports and disk are never
+/// looked at: they say nothing about the server. Copies no engine.
+pub fn doctor(site: &Site, fix: bool, sink: &mut dyn FnMut(Pipe, &str)) -> Result<Report> {
+    let remote = remote_of(site)?;
+    let mut checks = Vec::new();
+    let transport = match remote.key {
+        KeyMode::Ssh => Ssh::new(remote, &ssh_key::Keychain),
+        KeyMode::Guided => {
+            let made = Ssh::new(remote, &ssh_key::Keychain);
+            checks.push(match &made {
+                Ok(_) => Check::ok("remote.key", Tier::Connection, "The Manager's key for this server")
+                    .detail("in your OS keychain"),
+                Err(e) => Check::bad(
+                    "remote.key",
+                    Tier::Connection,
+                    "The Manager's key for this server",
+                    Severity::Fail,
+                    format!(
+                        "Re-create it with `atelier sites remove {0}` then                          `atelier sites add {0} --host {1} --key guided`, or use an SSH alias",
+                        site.slug, remote.host
+                    ),
+                )
+                .detail(format!("{e:#}")),
+            });
+            made
+        }
+    };
+    Ok(match transport {
+        Ok(t) => doctor_over(t, &remote.slug, fix, checks, sink),
+        Err(_) => {
+            checks.push(server_skipped(
+                &remote.host,
+                "the Manager has no key to log in with",
+            ));
+            Report {
+                checks,
+                actions: Vec::new(),
+            }
+        }
+    })
+}
+
+/// [`doctor`] over any transport: `checks` so far, plus the login and engine
+/// checks, plus the server's own report.
+pub fn doctor_over<T: Transport>(
+    transport: T,
+    remote_slug: &str,
+    fix: bool,
+    mut checks: Vec<Check>,
+    sink: &mut dyn FnMut(Pipe, &str),
+) -> Report {
+    const SSH: (&str, &str) = ("remote.ssh", "SSH login to the server");
+    const CLI: (&str, &str) = ("remote.cli", "atelier CLI on the server");
+    let host = transport.target().to_string();
+    let opts = EngineOptions {
+        no_install: true,
+        ..EngineOptions::from_env()
+    };
+    let session = match Session::connect(transport, remote_slug, &opts) {
+        Ok(session) => session,
+        Err(e) => {
+            let detail = format!("{e:#}");
+            let engine_problem = e.downcast_ref::<EngineTooOld>().is_some()
+                || e.downcast_ref::<NoEngine>().is_some();
+            if engine_problem {
+                checks.push(Check::ok(SSH.0, Tier::Connection, SSH.1).detail(host.clone()));
+                checks.push(
+                    Check::bad(
+                        CLI.0,
+                        Tier::Connection,
+                        CLI.1,
+                        Severity::Fail,
+                        format!(
+                            "Run `atelier --site <SLUG> app status` in a terminal: the Manager \
+                             offers to copy atelier {} to ~/.local/bin on {host}",
+                            manager_version()
+                        ),
+                    )
+                    .detail(detail),
+                );
+                checks.push(server_skipped(
+                    &host,
+                    "the server has no usable atelier CLI",
+                ));
+            } else {
+                checks.push(
+                    Check::bad(
+                        SSH.0,
+                        Tier::Connection,
+                        SSH.1,
+                        Severity::Fail,
+                        format!(
+                            "Check that `ssh {host}` works from a terminal (host up, key \
+                             accepted, host key known)"
+                        ),
+                    )
+                    .detail(detail),
+                );
+                checks.push(Check::skipped(
+                    CLI.0,
+                    Tier::Connection,
+                    CLI.1,
+                    "couldn't log in",
+                ));
+                checks.push(server_skipped(&host, "couldn't log in"));
+            }
+            return Report {
+                checks,
+                actions: Vec::new(),
+            };
+        }
+    };
+    checks.push(Check::ok(SSH.0, Tier::Connection, SSH.1).detail(host.clone()));
+    checks.push(Check::ok(CLI.0, Tier::Connection, CLI.1).detail(format!(
+        "{} — {}, works with this Manager ({})",
+        session.engine(),
+        session.engine_version(),
+        manager_version()
+    )));
+    match session.doctor(fix, sink) {
+        Ok(server) => {
+            checks.extend(server.checks);
+            Report {
+                checks,
+                actions: server.actions,
+            }
+        }
+        Err(e) => {
+            checks.push(
+                Check::bad(
+                    "remote.doctor",
+                    Tier::Host,
+                    "The server's own checks",
+                    Severity::Fail,
+                    format!("Run `atelier --site {remote_slug} doctor` on {host} to see why"),
+                )
+                .detail(format!("{e:#}"))
+                .on(HostTier::Remote(host)),
+            );
+            Report {
+                checks,
+                actions: Vec::new(),
+            }
+        }
+    }
+}
+
+/// The placeholder for the server's own checks when they couldn't run.
+fn server_skipped(host: &str, why: &str) -> Check {
+    Check::skipped("remote.doctor", Tier::Host, "The server's own checks", why)
+        .on(HostTier::Remote(host.to_string()))
+}
+
 fn remote_of(site: &Site) -> Result<&Remote> {
     site.remote
         .as_ref()
@@ -800,6 +1312,21 @@ mod tests {
                 }
             }
             panic!("unexpected script: {script}");
+        }
+        fn exec_streaming(
+            &self,
+            script: &str,
+            deadline: Duration,
+            sink: &mut dyn FnMut(Pipe, &str),
+        ) -> std::result::Result<ExitStatus, RunError> {
+            let out = self.exec(script, None, deadline)?;
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                sink(Pipe::Stdout, line);
+            }
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                sink(Pipe::Stderr, line);
+            }
+            Ok(out.status)
         }
     }
 
@@ -878,7 +1405,7 @@ mod tests {
             .on("mv -f", || out(0, "", ""));
         let opts = EngineOptions {
             binary: Some(bin.clone()),
-            replace_older: false,
+            ..Default::default()
         };
         let s = Session::connect(&fake, "default", &opts).unwrap();
         assert_eq!(s.engine(), "/home/deploy/.local/bin/atelier");
@@ -903,7 +1430,7 @@ mod tests {
             .on("rm -f", || out(0, "", ""));
         let opts = EngineOptions {
             binary: Some(bin),
-            replace_older: false,
+            ..Default::default()
         };
         let err = Session::connect(&fake, "default", &opts).err().unwrap();
         assert!(format!("{err:#}").contains("cannot execute"), "{err:#}");
@@ -935,6 +1462,7 @@ mod tests {
         let opts = EngineOptions {
             binary: Some(bin),
             replace_older: true,
+            ..Default::default()
         };
         let s = Session::connect(&fake, "prod", &opts).unwrap();
         assert_eq!(s.engine(), "/home/deploy/.local/bin/atelier");
@@ -1107,5 +1635,340 @@ mod tests {
         assert_eq!(p.home, "/root");
         assert_eq!(p.clis.len(), 2);
         assert_eq!(p.clis[1].reported, "");
+    }
+
+    fn session(fake: &Fake) -> Session<&Fake> {
+        Session::connect(fake, "prod", &EngineOptions::default()).unwrap()
+    }
+
+    fn with_cli(fake: Fake) -> Fake {
+        let cli = format!("cli\t/usr/local/bin/atelier\t{}\n", current());
+        fake.on("uname -m", move || probe_reply(&cli))
+    }
+
+    /// The streamed script of the last call.
+    fn last(fake: &Fake) -> String {
+        fake.calls.borrow().last().unwrap().0.clone()
+    }
+
+    #[test]
+    fn every_action_sends_the_matching_local_subcommand() {
+        let export = ExportOptions {
+            out: Some("/srv/out dir".into()),
+            base_url: Some("https://example.com".into()),
+            zip: true,
+            include_config: false,
+            include_users: true,
+            skip_link_check: true,
+        };
+        let freeze = FreezeOptions {
+            label: Some("spring".into()),
+            keep: true,
+            no_serve: false,
+            force: true,
+            base_url: None,
+        };
+        let cases: Vec<(Action, &str, Duration)> = vec![
+            (Action::Status, "app status --json", CLI_DEADLINE),
+            (
+                Action::CheckUpdate,
+                "app check-update --json",
+                CHECK_UPDATE_DEADLINE,
+            ),
+            (
+                Action::Update {
+                    to: None,
+                    yes: true,
+                },
+                "app update --yes",
+                UPDATE_DEADLINE,
+            ),
+            (
+                Action::Update {
+                    to: Some("0.21.0".into()),
+                    yes: false,
+                },
+                "app update --to 0.21.0",
+                UPDATE_DEADLINE,
+            ),
+            (Action::Start, "app start", LIFECYCLE_DEADLINE),
+            (Action::Stop, "app stop", LIFECYCLE_DEADLINE),
+            (
+                Action::Backup {
+                    label: Some("pre move".into()),
+                },
+                "data backup --label 'pre move'",
+                DATA_DEADLINE,
+            ),
+            (Action::Backup { label: None }, "data backup", DATA_DEADLINE),
+            (Action::BackupList, "data list", CLI_DEADLINE),
+            (
+                Action::Restore {
+                    file: "/home/deploy/.atelier/backups/a b.tar.gz".into(),
+                },
+                "data restore --yes -- '/home/deploy/.atelier/backups/a b.tar.gz'",
+                DATA_DEADLINE,
+            ),
+            (
+                Action::Export(export),
+                "site export --out '/srv/out dir' --base-url https://example.com --zip \
+                 --include-users --skip-link-check",
+                WORK_DEADLINE,
+            ),
+            (
+                Action::Freeze(freeze),
+                "site freeze --label spring --keep --force",
+                WORK_DEADLINE,
+            ),
+            (Action::Snapshots, "site snapshots --json", CLI_DEADLINE),
+            (
+                Action::UseSnapshot { id: "s-1".into() },
+                "site use s-1",
+                CLI_DEADLINE,
+            ),
+            (Action::Live, "site live", CLI_DEADLINE),
+            (
+                Action::Prune { keep: 3 },
+                "site prune --keep 3",
+                CLI_DEADLINE,
+            ),
+            (
+                Action::Doctor { fix: false },
+                "doctor --json",
+                DOCTOR_DEADLINE,
+            ),
+            (
+                Action::Doctor { fix: true },
+                "doctor --json --fix",
+                WORK_DEADLINE,
+            ),
+        ];
+        for (action, args, deadline) in cases {
+            let fake = with_cli(Fake::new()).on("--site prod", || out(0, "done\n", ""));
+            let s = session(&fake);
+            let mut lines = Vec::new();
+            s.run_action(&action, &mut |_, l| lines.push(l.to_string()))
+                .unwrap();
+            assert_eq!(
+                last(&fake),
+                format!("/usr/local/bin/atelier --site prod {args}"),
+                "{action:?}"
+            );
+            assert_eq!(action.deadline(), deadline, "{action:?}");
+            assert_eq!(lines, ["done"], "output streamed through");
+        }
+    }
+
+    #[test]
+    fn a_failing_remote_command_carries_its_exit_code_and_streams_its_message() {
+        let fake = with_cli(Fake::new()).on("data backup", || {
+            out(
+                3,
+                "Backing up…\n",
+                "error: the database container is down\n",
+            )
+        });
+        let s = session(&fake);
+        let mut seen = Vec::new();
+        let err = s
+            .run_action(&Action::Backup { label: None }, &mut |p, l| {
+                seen.push((p, l.to_string()))
+            })
+            .unwrap_err();
+        let exit = err.downcast_ref::<RemoteExit>().expect("typed exit");
+        assert_eq!(exit.code, 3);
+        assert_eq!(exit.host, "deploy@example.com");
+        assert_eq!(
+            err.to_string(),
+            "`atelier data backup` failed on deploy@example.com (exit 3)"
+        );
+        assert!(seen.contains(&(
+            Pipe::Stderr,
+            "error: the database container is down".to_string()
+        )));
+
+        // ssh's own 255 is a lost connection, not the CLI's verdict.
+        let fake = with_cli(Fake::new()).on("app update", || {
+            out(
+                255,
+                "",
+                "Connection to example.com closed by remote host.\n",
+            )
+        });
+        let err = session(&fake)
+            .run_action(
+                &Action::Update {
+                    to: None,
+                    yes: true,
+                },
+                &mut |_, _| {},
+            )
+            .unwrap_err();
+        assert!(err.downcast_ref::<RemoteExit>().is_none());
+        assert!(
+            err.to_string()
+                .contains("lost the connection to deploy@example.com"),
+            "{err}"
+        );
+    }
+
+    const CHECK_JSON: &str = r#"{"image":"ghcr.io/aincient-labs/atelier:latest",
+        "current":"sha256:a","latest":"sha256:b","current_version":"v0.20.0",
+        "latest_version":"v0.21.0","update_available":true,"problem":null,
+        "plan":{"from":"0.20.0","target_image":"ghcr.io/aincient-labs/atelier:latest",
+          "steps":[{"image":"ghcr.io/aincient-labs/atelier:v0.20.5","version":"0.20.5",
+                    "is_target":false,"reason":"0.21 migrates from 0.20.5 on"},
+                   {"image":"ghcr.io/aincient-labs/atelier:latest","version":"0.21.0",
+                    "is_target":true,"reason":null}],
+          "problem":null,"explicit_target":false}}"#;
+
+    #[test]
+    fn json_actions_parse_into_the_local_structs() {
+        let fake = with_cli(Fake::new())
+            .on("check-update --json", || out(0, CHECK_JSON, ""))
+            .on("snapshots --json", || {
+                out(
+                    0,
+                    r#"{"serving":"s-2","snapshots":[{"id":"s-2","pages":12,"keep":true}]}"#,
+                    "",
+                )
+            });
+        let s = session(&fake);
+        let check = s.check_update().unwrap();
+        assert_eq!(check.update_available, Some(true));
+        assert!(check.plan.as_ref().unwrap().is_stepped());
+        let snaps = s.snapshots().unwrap();
+        assert_eq!(snaps.serving, "s-2");
+        assert_eq!(snaps.snapshots[0].pages, 12);
+
+        let fake = with_cli(Fake::new()).on("check-update", || out(0, "not json", ""));
+        let err = format!("{:#}", session(&fake).check_update().unwrap_err());
+        assert!(err.contains("can't read"), "{err}");
+    }
+
+    const DOCTOR_JSON: &str = r#"{
+  "manager_version": "0.12.0",
+  "healthy": false,
+  "failures": 1,
+  "checks": [
+    {"id": "docker.installed", "tier": "host", "label": "Docker installed",
+     "severity": "ok", "detail": "27.3.1"},
+    {"id": "host.disk", "tier": "host", "label": "Free disk space",
+     "severity": "ok", "detail": "41.0 GB free"},
+    {"id": "site.pending_updates", "tier": "site", "label": "Database updates applied",
+     "severity": "fail", "remedy": "Run doctor --fix", "fix": "run_updates"}
+  ],
+  "actions": []
+}"#;
+
+    #[test]
+    fn remote_doctor_labels_every_check_with_the_machine_it_ran_on() {
+        // Exit 1 = unhealthy report: still a report.
+        let fake = with_cli(Fake::new()).on("doctor --json", || out(1, DOCTOR_JSON, ""));
+        let report = doctor_over(&fake, "prod", false, Vec::new(), &mut |_, _| {});
+        let by_id = |id: &str| report.checks.iter().find(|c| c.id == id).unwrap();
+
+        for id in ["remote.ssh", "remote.cli"] {
+            let c = by_id(id);
+            assert_eq!(c.tier, Tier::Connection, "{id}");
+            assert_eq!(c.on, HostTier::Local, "{id} ran here");
+            assert_eq!(c.severity, Severity::Ok, "{id}");
+        }
+        assert!(by_id("remote.cli")
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("/usr/local/bin/atelier"));
+        let server = HostTier::Remote("deploy@example.com".into());
+        for id in ["docker.installed", "host.disk", "site.pending_updates"] {
+            assert_eq!(by_id(id).on, server, "{id} ran on the server");
+        }
+        assert_eq!(by_id("host.disk").detail.as_deref(), Some("41.0 GB free"));
+        assert!(!report.healthy());
+        assert!(fake.ran("/usr/local/bin/atelier --site prod doctor --json"));
+        // Nothing of this machine's host tier sneaks in.
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(|c| c.tier == Tier::Host && c.on == HostTier::Local)
+                .count(),
+            0
+        );
+        // The marker survives a JSON round trip; local checks omit it.
+        let json = serde_json::to_value(by_id("host.disk")).unwrap();
+        assert_eq!(json["on"]["remote"], "deploy@example.com");
+        let json = serde_json::to_value(by_id("remote.ssh")).unwrap();
+        assert!(json.get("on").is_none());
+    }
+
+    #[test]
+    fn remote_doctor_fix_streams_progress_and_parses_the_final_report() {
+        let fake = with_cli(Fake::new()).on("doctor --json --fix", || {
+            out(
+                0,
+                &format!("Run the pending database updates\n[converge] ok\n{DOCTOR_JSON}"),
+                "",
+            )
+        });
+        let mut progress = Vec::new();
+        let report = doctor_over(&fake, "prod", true, Vec::new(), &mut |_, l| {
+            progress.push(l.to_string())
+        });
+        assert_eq!(
+            progress,
+            ["Run the pending database updates", "[converge] ok"]
+        );
+        assert!(report.checks.iter().any(|c| c.id == "site.pending_updates"));
+    }
+
+    #[test]
+    fn remote_doctor_reports_login_and_engine_failures_without_copying() {
+        let fake = Fake::new().on("uname -m", || {
+            out(
+                255,
+                "",
+                "deploy@example.com: Permission denied (publickey).\n",
+            )
+        });
+        let report = doctor_over(&fake, "prod", false, Vec::new(), &mut |_, _| {});
+        let sev: Vec<_> = report
+            .checks
+            .iter()
+            .map(|c| (c.id.to_string(), c.severity))
+            .collect();
+        assert_eq!(
+            sev,
+            [
+                ("remote.ssh".to_string(), Severity::Fail),
+                ("remote.cli".to_string(), Severity::Skipped),
+                ("remote.doctor".to_string(), Severity::Skipped),
+            ]
+        );
+        assert_eq!(
+            report.checks[2].on,
+            HostTier::Remote("deploy@example.com".into())
+        );
+
+        // No CLI on the server: doctor copies nothing, it says so.
+        let fake = Fake::new().on("uname -m", || probe_reply(""));
+        let report = doctor_over(&fake, "prod", false, Vec::new(), &mut |_, _| {});
+        assert_eq!(report.checks[0].severity, Severity::Ok);
+        assert_eq!(report.checks[1].id, "remote.cli");
+        assert_eq!(report.checks[1].severity, Severity::Fail);
+        assert!(!fake.ran("cat >"), "nothing uploaded");
+        assert_eq!(fake.calls.borrow().len(), 1);
+
+        // An older CLI: also a failed engine check, not a copy.
+        let fake = Fake::new().on("uname -m", || {
+            probe_reply("cli\t/usr/bin/atelier\tatelier 0.0.9\n")
+        });
+        let report = doctor_over(&fake, "prod", false, Vec::new(), &mut |_, _| {});
+        assert_eq!(report.checks[1].severity, Severity::Fail);
+        assert!(report.checks[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("older than this Manager"));
     }
 }

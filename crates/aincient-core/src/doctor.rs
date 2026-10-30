@@ -24,14 +24,16 @@
 
 use std::process::Command;
 
-use serde::Serialize;
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 
 use crate::docker::{self, compose, preflight, probe};
 use crate::ops::{self, Reporter, Stage, DRUSH, FILES_DIR};
 use crate::stack::Stack;
 
 /// How a single check came out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// Verified good.
@@ -52,10 +54,14 @@ impl Severity {
 }
 
 /// Which tier a check belongs to — the grouping a report renders under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// The machine: Docker, ports, disk.
+    /// A remote site only: this machine reaching the server (SSH login, the
+    /// Manager's key, the server's `atelier` CLI). Always runs here.
+    Connection,
+    /// The machine the site runs on: Docker, ports, disk. That is the server,
+    /// not this machine, for a remote site — see [`HostTier`].
     Host,
     /// `~/.atelier` and the containers it describes.
     Stack,
@@ -63,13 +69,39 @@ pub enum Tier {
     Site,
 }
 
+/// Which machine a check ran on (m2-9). Every check of a local site runs here;
+/// a remote site's own Host/Stack/Site checks run on the server, by the
+/// server's `atelier doctor`, and only its [`Tier::Connection`] checks run here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostTier {
+    /// This machine.
+    #[default]
+    Local,
+    /// The server behind this SSH target.
+    Remote(String),
+}
+
+impl HostTier {
+    pub fn is_local(&self) -> bool {
+        matches!(self, HostTier::Local)
+    }
+}
+
 /// One diagnosis. `id` is stable and greppable (`site.pending_updates`) so a
 /// pasted `--json` report can be reasoned about without parsing prose.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` because a remote site's report is the server's own
+/// `atelier doctor --json`, read back over SSH (m2-9).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Check {
-    pub id: &'static str,
+    pub id: Cow<'static, str>,
     pub tier: Tier,
-    pub label: &'static str,
+    pub label: Cow<'static, str>,
+    /// The machine it ran on. Omitted from JSON for this machine, so a local
+    /// report reads exactly as before.
+    #[serde(default, skip_serializing_if = "HostTier::is_local")]
+    pub on: HostTier,
     pub severity: Severity,
     /// What we actually observed. Present whenever it adds anything beyond the
     /// label — the error text, the port number, the pending update count.
@@ -85,11 +117,16 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(id: &'static str, tier: Tier, label: &'static str) -> Self {
+    pub(crate) fn ok(
+        id: impl Into<Cow<'static, str>>,
+        tier: Tier,
+        label: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Check {
-            id,
+            id: id.into(),
             tier,
-            label,
+            label: label.into(),
+            on: HostTier::Local,
             severity: Severity::Ok,
             detail: None,
             remedy: None,
@@ -97,17 +134,18 @@ impl Check {
         }
     }
 
-    fn bad(
-        id: &'static str,
+    pub(crate) fn bad(
+        id: impl Into<Cow<'static, str>>,
         tier: Tier,
-        label: &'static str,
+        label: impl Into<Cow<'static, str>>,
         severity: Severity,
         remedy: impl Into<String>,
     ) -> Self {
         Check {
-            id,
+            id: id.into(),
             tier,
-            label,
+            label: label.into(),
+            on: HostTier::Local,
             severity,
             detail: None,
             remedy: Some(remedy.into()),
@@ -115,11 +153,17 @@ impl Check {
         }
     }
 
-    fn skipped(id: &'static str, tier: Tier, label: &'static str, why: impl Into<String>) -> Self {
+    pub(crate) fn skipped(
+        id: impl Into<Cow<'static, str>>,
+        tier: Tier,
+        label: impl Into<Cow<'static, str>>,
+        why: impl Into<String>,
+    ) -> Self {
         Check {
-            id,
+            id: id.into(),
             tier,
-            label,
+            label: label.into(),
+            on: HostTier::Local,
             severity: Severity::Skipped,
             detail: Some(why.into()),
             remedy: None,
@@ -127,7 +171,7 @@ impl Check {
         }
     }
 
-    fn detail(mut self, d: impl Into<String>) -> Self {
+    pub(crate) fn detail(mut self, d: impl Into<String>) -> Self {
         self.detail = Some(d.into());
         self
     }
@@ -136,12 +180,18 @@ impl Check {
         self.fix = Some(repair);
         self
     }
+
+    /// Mark the machine this check ran on.
+    pub(crate) fn on(mut self, on: HostTier) -> Self {
+        self.on = on;
+        self
+    }
 }
 
 /// A repair doctor knows how to perform. Ordered as the ladder runs: cheapest
 /// and most local first, so a site that only needed a cache rebuild never gets
 /// a converge run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Repair {
     /// Write back a missing `compose.yaml` / `.env` key.
@@ -175,20 +225,21 @@ impl Repair {
 }
 
 /// What happened when a repair ran.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
     pub repair: Repair,
-    pub description: &'static str,
+    pub description: Cow<'static, str>,
     pub succeeded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
 /// The full result of a doctor run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub checks: Vec<Check>,
     /// Repairs attempted this run. Empty for a plain diagnosis.
+    #[serde(default)]
     pub actions: Vec<Action>,
 }
 
@@ -262,13 +313,13 @@ pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> Report {
         actions.push(match apply(stack, repair, r) {
             Ok(detail) => Action {
                 repair,
-                description: repair.describe(),
+                description: repair.describe().into(),
                 succeeded: true,
                 detail,
             },
             Err(e) => Action {
                 repair,
-                description: repair.describe(),
+                description: repair.describe().into(),
                 succeeded: false,
                 detail: Some(e),
             },
