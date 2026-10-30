@@ -19,7 +19,18 @@
 //! label = "Blog"
 //! home = "~/.atelier/sites/blog"
 //! project = "atelier-blog"
+//!
+//! [[site]]                   # a REMOTE site (M2, D-06): no home, no project
+//! slug = "prod"
+//! label = "Production"
+//! host = "deploy@example.com"   # an ssh target or ~/.ssh/config alias
+//! remote_site = "default"       # its slug on the server
+//! key = "guided"                # omitted = the user's own ssh setup (D-05)
 //! ```
+//!
+//! A remote site is driven through the server's own `atelier` CLI over SSH
+//! (D-01, see [`crate::remote`]). It has no stack directory here and claims no
+//! port; every home/project/port rule below applies to local sites only.
 //!
 //! **No code path here moves, renames or deletes a stack directory.** A stack's
 //! Compose project is derived from its directory name, so relocating one orphans
@@ -94,6 +105,57 @@ pub fn is_valid_slug(slug: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// How the Manager authenticates to a remote site's server (D-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyMode {
+    /// The user's own SSH setup: `~/.ssh/config` alias, agent, default keys.
+    #[default]
+    Ssh,
+    /// A per-server ed25519 key the Manager generated, held in the OS keychain.
+    Guided,
+}
+
+impl KeyMode {
+    fn as_toml(self) -> Option<String> {
+        match self {
+            KeyMode::Ssh => None,
+            KeyMode::Guided => Some("guided".to_string()),
+        }
+    }
+
+    fn from_toml(raw: Option<&str>) -> Result<Self> {
+        match raw {
+            None | Some("ssh") => Ok(KeyMode::Ssh),
+            Some("guided") => Ok(KeyMode::Guided),
+            Some(other) => bail!("unknown key mode `{other}` (expected `guided` or `ssh`)"),
+        }
+    }
+}
+
+/// Where a remote site lives: the server and its slug there (D-06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// The ssh target: an alias from `~/.ssh/config`, `host` or `user@host`.
+    pub host: String,
+    /// The site's slug in the **server's** registry (what `--site` gets there).
+    pub slug: String,
+    /// How to authenticate.
+    pub key: KeyMode,
+}
+
+/// Whether `host` is an ssh target we are willing to pass to `ssh`: printable,
+/// no whitespace or shell metacharacters, and never starting with `-` (which
+/// `ssh` would read as an option).
+pub fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.starts_with('-')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-@:[]%/".contains(c))
+}
+
 /// One registered site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
@@ -105,9 +167,45 @@ pub struct Site {
     pub home: PathBuf,
     /// The Compose project, **pinned** at registration — never re-derived.
     pub project: String,
+    /// `Some` for a site on another machine (M2): then `home` is only a
+    /// Manager-side placeholder (`~/.atelier/remote/<slug>`, never a stack and
+    /// never written by this module) and `project` is empty.
+    pub remote: Option<Remote>,
 }
 
 impl Site {
+    /// Whether this site lives on another machine.
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// A remote site's registry entry, pointing at `host`. Its slug on the
+    /// server defaults to `slug`.
+    pub fn new_remote(
+        user_home: &Path,
+        slug: &str,
+        label: Option<&str>,
+        host: &str,
+        remote_slug: Option<&str>,
+        key: KeyMode,
+    ) -> Site {
+        Site {
+            slug: slug.to_string(),
+            label: label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .unwrap_or(slug)
+                .to_string(),
+            home: remote_placeholder_home(user_home, slug),
+            project: String::new(),
+            remote: Some(Remote {
+                host: host.to_string(),
+                slug: remote_slug.unwrap_or(slug).to_string(),
+                key,
+            }),
+        }
+    }
+
     /// This site's [`Stack`], carrying its slug, label and pinned project.
     pub fn stack(&self) -> Stack {
         Stack {
@@ -138,13 +236,31 @@ struct RegistryFile {
     sites: Vec<SiteEntry>,
 }
 
+/// A site entry. `home`/`project` are required for a local site and absent for
+/// a remote one; the remote fields are absent for a local one, so a local-only
+/// file round-trips byte for byte (D-06).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SiteEntry {
     slug: String,
     label: String,
-    home: String,
-    project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+}
+
+/// Where a remote site's placeholder `home` points: `~/.atelier/remote/<slug>`.
+/// Nothing in this module creates it; it only keeps `Site::home` meaningful
+/// (and away from any real stack) for a site that has none here.
+pub fn remote_placeholder_home(user_home: &Path, slug: &str) -> PathBuf {
+    default_home(user_home).join("remote").join(slug)
 }
 
 const FILE_HEADER: &str = "# Atelier sites — managed by the atelier CLI and the manager app.\n\
@@ -172,17 +288,46 @@ impl Registry {
         let file: RegistryFile = toml::from_str(text).context("could not parse TOML")?;
         let mut sites = Vec::with_capacity(file.sites.len());
         for entry in file.sites {
-            let home = expand_home(&entry.home, user_home).with_context(|| {
-                format!(
-                    "site `{}`: home `{}` is not absolute",
-                    entry.slug, entry.home
-                )
+            if let Some(host) = entry.host {
+                if entry.home.is_some() || entry.project.is_some() {
+                    bail!(
+                        "site `{}` is remote (host `{host}`): it has no local `home` or `project`",
+                        entry.slug
+                    );
+                }
+                let key = KeyMode::from_toml(entry.key.as_deref())
+                    .with_context(|| format!("site `{}`", entry.slug))?;
+                sites.push(Site::new_remote(
+                    user_home,
+                    &entry.slug,
+                    Some(&entry.label),
+                    &host,
+                    entry.remote_site.as_deref(),
+                    key,
+                ));
+                // `new_remote` falls back to the slug for an empty label; keep
+                // the file's label verbatim.
+                sites.last_mut().expect("just pushed").label = entry.label;
+                continue;
+            }
+            if entry.remote_site.is_some() || entry.key.is_some() {
+                bail!(
+                    "site `{}` has `remote_site`/`key` but no `host`",
+                    entry.slug
+                );
+            }
+            let (Some(raw_home), Some(project)) = (entry.home, entry.project) else {
+                bail!("site `{}` needs a `home` and a `project`", entry.slug);
+            };
+            let home = expand_home(&raw_home, user_home).with_context(|| {
+                format!("site `{}`: home `{raw_home}` is not absolute", entry.slug)
             })?;
             sites.push(Site {
                 slug: entry.slug,
                 label: entry.label,
                 home,
-                project: entry.project,
+                project,
+                remote: None,
             });
         }
         let registry = Registry {
@@ -198,9 +343,38 @@ impl Registry {
         let mut slugs = HashSet::new();
         let mut projects = HashSet::new();
         let mut homes = HashSet::new();
+        let mut targets = HashSet::new();
         for site in &self.sites {
             if !is_valid_slug(&site.slug) {
                 bail!("`{}` is not a valid site slug (a-z, 0-9, -)", site.slug);
+            }
+            if let Some(remote) = &site.remote {
+                if !is_valid_host(&remote.host) {
+                    bail!(
+                        "site `{}`: `{}` is not a usable ssh target",
+                        site.slug,
+                        remote.host
+                    );
+                }
+                if !is_valid_slug(&remote.slug) {
+                    bail!(
+                        "site `{}`: `{}` is not a valid site slug on the server",
+                        site.slug,
+                        remote.slug
+                    );
+                }
+                if !slugs.insert(site.slug.as_str()) {
+                    bail!("site `{}` is listed twice", site.slug);
+                }
+                if !targets.insert((remote.host.as_str(), remote.slug.as_str())) {
+                    bail!(
+                        "two sites point at site `{}` on {}",
+                        remote.slug,
+                        remote.host
+                    );
+                }
+                // No home, project or port: nothing local to collide on.
+                continue;
             }
             if site.project.trim().is_empty() {
                 bail!("site `{}` has no Compose project", site.slug);
@@ -234,11 +408,25 @@ impl Registry {
             sites: self
                 .sites
                 .iter()
-                .map(|s| SiteEntry {
-                    slug: s.slug.clone(),
-                    label: s.label.clone(),
-                    home: contract_home(&s.home, user_home),
-                    project: s.project.clone(),
+                .map(|s| match &s.remote {
+                    None => SiteEntry {
+                        slug: s.slug.clone(),
+                        label: s.label.clone(),
+                        home: Some(contract_home(&s.home, user_home)),
+                        project: Some(s.project.clone()),
+                        host: None,
+                        remote_site: None,
+                        key: None,
+                    },
+                    Some(r) => SiteEntry {
+                        slug: s.slug.clone(),
+                        label: s.label.clone(),
+                        home: None,
+                        project: None,
+                        host: Some(r.host.clone()),
+                        remote_site: Some(r.slug.clone()),
+                        key: r.key.as_toml(),
+                    },
                 })
                 .collect(),
         };
@@ -275,7 +463,13 @@ impl Registry {
     /// the filesystem), if any.
     pub fn find_by_home(&self, home: &Path) -> Option<&Site> {
         let want = normalize(home);
-        self.sites.iter().find(|s| normalize(&s.home) == want)
+        self.local_sites().find(|s| normalize(&s.home) == want)
+    }
+
+    /// The sites with a stack on this machine — the only ones home, project
+    /// and port rules apply to.
+    pub fn local_sites(&self) -> impl Iterator<Item = &Site> {
+        self.sites.iter().filter(|s| !s.is_remote())
     }
 
     /// The active site, if one is set.
@@ -287,7 +481,7 @@ impl Registry {
     /// `port` in its `.env` — i.e. a site that cannot run at the same time.
     pub fn port_claimant(&self, port: u16, except_home: &Path) -> Option<&Site> {
         let except = normalize(except_home);
-        self.sites.iter().find(|s| {
+        self.local_sites().find(|s| {
             normalize(&s.home) != except && {
                 let stack = s.stack();
                 stack.env_path().is_file() && stack.http_port() == port
@@ -299,8 +493,7 @@ impl Registry {
     /// with no `.env` yet (never installed) claims nothing; one whose `.env`
     /// lacks `HTTP_PORT` runs on — and so claims — [`DEFAULT_PORT`].
     pub fn used_ports(&self) -> BTreeSet<u16> {
-        self.sites
-            .iter()
+        self.local_sites()
             .map(Site::stack)
             .filter(|stack| stack.env_path().is_file())
             .map(|stack| stack.http_port())
@@ -512,6 +705,7 @@ fn legacy_candidate(registry: Option<&Registry>, user_home: &Path) -> Option<Sit
         label: DEFAULT_LABEL.to_string(),
         home,
         project: DEFAULT_PROJECT.to_string(),
+        remote: None,
     })
 }
 
@@ -564,6 +758,7 @@ pub fn adopt_legacy(user_home: &Path) -> Result<Option<Site>> {
         label: DEFAULT_LABEL.to_string(),
         home,
         project: DEFAULT_PROJECT.to_string(),
+        remote: None,
     };
     registry.sites.insert(0, site.clone());
     if registry.active.is_none() {
@@ -597,6 +792,12 @@ pub struct SiteRow {
     pub image: Option<String>,
     /// This is the registry's active site.
     pub active: bool,
+    /// The ssh target of a remote site (M2); absent for a local one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// A remote site's slug on its server; absent for a local one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_site: Option<String>,
 }
 
 impl SiteRow {
@@ -627,16 +828,20 @@ pub fn list_sites(user_home: &Path) -> Result<Vec<SiteRow>> {
         .iter()
         .map(|site| {
             let stack = site.stack();
-            let configured = stack.env_path().is_file();
+            // A remote site's state is the server's to answer; nothing here is
+            // read for it (its placeholder home holds no stack).
+            let configured = !site.is_remote() && stack.env_path().is_file();
             SiteRow {
                 slug: site.slug.clone(),
                 label: site.label.clone(),
                 home: site.home.clone(),
                 project: site.project.clone(),
                 port: configured.then(|| stack.http_port()),
-                installed: stack.exists(),
+                installed: !site.is_remote() && stack.exists(),
                 image: configured.then(|| stack.image()),
                 active: registry.active.as_deref() == Some(site.slug.as_str()),
+                host: site.remote.as_ref().map(|r| r.host.clone()),
+                remote_site: site.remote.as_ref().map(|r| r.slug.clone()),
             }
         })
         .collect())
@@ -696,6 +901,7 @@ pub fn add_site(
             .to_string(),
         home: site_home(user_home, slug),
         project: project_for_slug(slug),
+        remote: None,
     };
     // Every collision the registry can name (project, directory) is refused
     // before anything is written to disk.
@@ -764,6 +970,59 @@ pub fn add_site(
         reregistered,
         activated,
     })
+}
+
+/// What [`add_remote_site`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedRemoteSite {
+    pub site: Site,
+    /// It became the active site (there was none).
+    pub activated: bool,
+}
+
+/// Register `site` (built with [`Site::new_remote`]) — a site that already runs
+/// on another machine (U-03: attach only, no remote install).
+///
+/// `verify` is the caller's proof that the server answers and runs that site
+/// (in production: [`crate::remote`] over SSH). It runs after every local check
+/// and **before** anything is written; when it fails, `sites.toml` is left
+/// exactly as it was — not even legacy adoption has happened.
+pub fn add_remote_site(
+    user_home: &Path,
+    site: Site,
+    verify: impl FnOnce(&Site) -> Result<()>,
+) -> Result<AddedRemoteSite> {
+    if !is_valid_slug(&site.slug) {
+        bail!(
+            "`{}` is not a valid site name — use lowercase letters, digits and `-` \
+             (starting with a letter or digit, at most 40 characters)",
+            site.slug
+        );
+    }
+    if !site.is_remote() {
+        bail!("internal: add_remote_site called with a local site");
+    }
+    // Check against the registry as commands see it (incl. an unadopted
+    // ~/.atelier) without writing anything yet.
+    let effective = load_effective(user_home)?.unwrap_or_default();
+    if effective.get(&site.slug).is_some() {
+        bail!("a site named `{}` is already registered", site.slug);
+    }
+    let mut candidate = effective;
+    candidate.sites.push(site.clone());
+    candidate.validate()?;
+
+    verify(&site)?;
+
+    adopt_legacy(user_home)?;
+    let mut registry = Registry::load(user_home)?.unwrap_or_default();
+    registry.sites.push(site.clone());
+    let activated = registry.active.is_none();
+    if activated {
+        registry.active = Some(site.slug.clone());
+    }
+    registry.save(user_home)?;
+    Ok(AddedRemoteSite { site, activated })
 }
 
 /// Make `slug` the active site — what `atelier` operates on when neither
@@ -921,6 +1180,7 @@ mod tests {
             label: slug.to_uppercase(),
             home: site_home(user_home, slug),
             project: project_for_slug(slug),
+            remote: None,
         }
     }
 
@@ -930,6 +1190,7 @@ mod tests {
             label: DEFAULT_LABEL.to_string(),
             home: default_home(user_home),
             project: DEFAULT_PROJECT.to_string(),
+            remote: None,
         }
     }
 
@@ -976,6 +1237,7 @@ mod tests {
                     label: "Off home".to_string(),
                     home: PathBuf::from("/srv/atelier-elsewhere"),
                     project: "atelier-elsewhere".to_string(),
+                    remote: None,
                 },
             ],
         };
@@ -1642,5 +1904,180 @@ project = "atelier-blog"
         );
         assert_eq!(r.port_claimant(41260, &blog.site.home), None, "not itself");
         assert_eq!(r.port_claimant(41261, &shop), None);
+    }
+
+    fn remote(uh: &Path, slug: &str, host: &str) -> Site {
+        Site::new_remote(uh, slug, None, host, None, KeyMode::Ssh)
+    }
+
+    #[test]
+    fn a_local_only_file_round_trips_byte_for_byte() {
+        // What the M1 CLI writes: no `host` anywhere. Adding the remote fields
+        // must not change a single byte of it (D-06).
+        let th = TempHome::new();
+        let uh = th.path();
+        let text = format!(
+            "{FILE_HEADER}active = \"blog\"\n\n\
+             [[site]]\nslug = \"default\"\nlabel = \"My Site\"\nhome = \"~/.atelier\"\nproject = \"atelier\"\n\n\
+             [[site]]\nslug = \"blog\"\nlabel = \"Blog\"\nhome = \"~/.atelier/sites/blog\"\nproject = \"atelier-blog\"\n"
+        );
+        std::fs::create_dir_all(default_home(uh)).unwrap();
+        std::fs::write(registry_path(uh), &text).unwrap();
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert!(r.sites.iter().all(|s| s.remote.is_none()));
+        assert_eq!(r.to_toml(uh).unwrap(), text);
+        r.save(uh).unwrap();
+        assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), text);
+    }
+
+    #[test]
+    fn a_remote_site_round_trips_without_home_or_project() {
+        let uh = Path::new("/Users/someone");
+        let text = r#"
+[[site]]
+slug = "default"
+label = "My Site"
+home = "~/.atelier"
+project = "atelier"
+
+[[site]]
+slug = "prod"
+label = "Production"
+host = "deploy@example.com"
+remote_site = "default"
+key = "guided"
+
+[[site]]
+slug = "stage"
+label = "Stage"
+host = "stage-alias"
+"#;
+        let r = Registry::parse(text, uh).unwrap();
+        let prod = r.get("prod").unwrap();
+        assert_eq!(
+            prod.remote,
+            Some(Remote {
+                host: "deploy@example.com".to_string(),
+                slug: "default".to_string(),
+                key: KeyMode::Guided,
+            })
+        );
+        assert_eq!(prod.project, "");
+        assert_eq!(prod.home, remote_placeholder_home(uh, "prod"));
+        // remote_site defaults to the local slug, key to the user's ssh setup.
+        let stage = r.get("stage").unwrap().remote.clone().unwrap();
+        assert_eq!((stage.slug.as_str(), stage.key), ("stage", KeyMode::Ssh));
+
+        let out = r.to_toml(uh).unwrap();
+        assert!(
+            out.contains(
+                "host = \"deploy@example.com\"\nremote_site = \"default\"\nkey = \"guided\""
+            ),
+            "{out}"
+        );
+        assert!(
+            !out.contains("remote/prod"),
+            "no placeholder home is written: {out}"
+        );
+        assert_eq!(Registry::parse(&out, uh).unwrap(), r);
+    }
+
+    #[test]
+    fn remote_entries_are_validated() {
+        let uh = Path::new("/Users/someone");
+        let bad = [
+            // remote with a local home
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\nhome = \"~/x\"\n",
+            // remote fields without a host
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhome = \"~/x\"\nproject = \"p\"\nremote_site = \"b\"\n",
+            // a host ssh would read as an option
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"-oProxyCommand=evil\"\n",
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h; rm -rf /\"\n",
+            // bad slug on the server
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\nremote_site = \"No Way\"\n",
+            // unknown key mode
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\nkey = \"password\"\n",
+            // two entries for the same site on the same server
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\n\n[[site]]\nslug = \"b\"\nlabel = \"B\"\nhost = \"h\"\nremote_site = \"a\"\n",
+            // a local site still needs both
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhome = \"~/x\"\n",
+        ];
+        for text in bad {
+            assert!(Registry::parse(text, uh).is_err(), "accepted:\n{text}");
+        }
+        // The same remote slug on two servers is fine.
+        let ok = "[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h1\"\nremote_site = \"x\"\n\n\
+                  [[site]]\nslug = \"b\"\nlabel = \"B\"\nhost = \"h2\"\nremote_site = \"x\"\n";
+        Registry::parse(ok, uh).unwrap();
+    }
+
+    #[test]
+    fn remote_sites_claim_no_home_or_port() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let r = Registry {
+            active: None,
+            sites: vec![remote(uh, "prod", "example.com")],
+        };
+        assert!(r.used_ports().is_empty());
+        assert_eq!(r.port_claimant(DEFAULT_PORT, &default_home(uh)), None);
+        assert_eq!(r.find_by_home(&remote_placeholder_home(uh, "prod")), None);
+        assert_eq!(r.local_sites().count(), 0);
+    }
+
+    #[test]
+    fn add_remote_writes_nothing_when_verification_fails() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        let before = snapshot(uh);
+        let err = add_remote_site(uh, remote(uh, "prod", "example.com"), |_| {
+            bail!("example.com did not answer")
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("did not answer"));
+        assert_eq!(snapshot(uh), before, "not even legacy adoption happened");
+        assert!(!registry_path(uh).exists());
+    }
+
+    #[test]
+    fn add_remote_registers_after_verification_and_adopts_legacy() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        let mut seen = None;
+        let added = add_remote_site(uh, remote(uh, "prod", "example.com"), |s| {
+            seen = Some(s.slug.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some("prod"));
+        assert!(
+            !added.activated,
+            "legacy was adopted first and stays active"
+        );
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.active.as_deref(), Some(DEFAULT_SLUG));
+        assert_eq!(r.sites.len(), 2);
+        assert!(r.get("prod").unwrap().is_remote());
+        assert!(!remote_placeholder_home(uh, "prod").exists());
+
+        let rows = list_sites(uh).unwrap();
+        let prod = rows.iter().find(|r| r.slug == "prod").unwrap();
+        assert_eq!(prod.host.as_deref(), Some("example.com"));
+        assert_eq!(prod.remote_site.as_deref(), Some("prod"));
+        assert!(!prod.installed);
+        assert_eq!(prod.port, None);
+
+        // Taken slug, and a duplicate server target, are refused before verify.
+        let dup = add_remote_site(uh, remote(uh, "prod", "other"), |_| unreachable!());
+        assert!(dup.is_err());
+        let same_target =
+            Site::new_remote(uh, "prod2", None, "example.com", Some("prod"), KeyMode::Ssh);
+        assert!(add_remote_site(uh, same_target, |_| unreachable!()).is_err());
+
+        // Removing it touches nothing on disk but sites.toml.
+        remove_site(uh, "prod").unwrap();
+        assert!(Registry::load(uh).unwrap().unwrap().get("prod").is_none());
     }
 }
