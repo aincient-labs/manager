@@ -130,6 +130,11 @@ enum SitesCommand {
         /// ATELIER_REMOTE_BINARY.
         #[arg(long, value_name = "PATH", requires = "host")]
         engine_binary: Option<PathBuf>,
+        /// Where the site is public, e.g. `cms.example.com` (https assumed) or
+        /// `http://host:port`. `app open` opens the console there; without
+        /// one it goes through an SSH tunnel.
+        #[arg(long, value_name = "DOMAIN", requires = "host")]
+        domain: Option<String>,
     },
     /// Make a site the active one — what commands use without --site.
     Use {
@@ -283,6 +288,8 @@ enum AppCommand {
         service: Option<String>,
     },
     /// Open the console in your browser, signed in (one-time login link).
+    /// For a remote site: at its recorded domain, else through an SSH tunnel
+    /// that stays open until you press Ctrl-C.
     Open,
     /// Open your public site (the front page visitors see) in your browser.
     View,
@@ -372,16 +379,34 @@ enum DataCommand {
         /// A label folded into the filename.
         #[arg(long)]
         label: Option<String>,
+        /// Print the archive's path, size, sha256 and site as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Remote sites: keep the backup on the server only. By default it is
+        /// also copied to this machine (~/.atelier/remote/<SLUG>/backups) and
+        /// verified.
+        #[arg(long)]
+        no_copy: bool,
     },
     /// Restore from a backup file (destructive). A .tar.gz snapshot restores the
     /// database and files; a legacy .sql/.sql.gz dump restores the database only.
     #[command(visible_alias = "import")]
     Restore {
         /// Path to a `.tar.gz` snapshot (or a legacy `.sql`/`.sql.gz` dump).
+        /// For a remote site: a file on this machine is uploaded and restored
+        /// there; any other path is one on the server.
         file: PathBuf,
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Restore a backup taken from a different site. Without it, such a
+        /// backup is refused.
+        #[arg(long)]
+        other_site: bool,
+        /// Remote sites: FILE is a path on the server, even if a file by that
+        /// name exists here.
+        #[arg(long)]
+        on_server: bool,
     },
     /// List snapshots taken on this host.
     #[command(visible_alias = "backups")]
@@ -603,6 +628,7 @@ fn run_sites(command: SitesCommand) -> Result<()> {
             remote_site,
             key,
             engine_binary,
+            domain,
             ..
         } => sites_add_remote(
             &uh,
@@ -612,6 +638,7 @@ fn run_sites(command: SitesCommand) -> Result<()> {
             remote_site.as_deref(),
             key.is_some(),
             engine_binary,
+            domain,
         ),
         SitesCommand::Add {
             slug, label, port, ..
@@ -1238,12 +1265,31 @@ fn print_snapshots(list: &ops::SnapshotList) {
 /// `atelier data …` — portable db + files snapshots.
 fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
     match command {
-        DataCommand::Backup { label } => {
+        DataCommand::Backup { label, json, .. } => {
             let path = ops::backup(stack, label.as_deref(), &mut ops::Silent)?;
+            if json {
+                // What a Manager driving this CLI over SSH reads (m2-5).
+                let info = ops::describe_backup(&path)?;
+                println!("{}", serde_json::to_string_pretty(&info)?);
+                return Ok(());
+            }
             println!("{} {}", style::success("Backup written to"), path.display());
             Ok(())
         }
-        DataCommand::Restore { file, yes } => {
+        DataCommand::Restore {
+            file,
+            yes,
+            other_site,
+            ..
+        } => {
+            if !file.is_file() {
+                anyhow::bail!("backup file not found: {}", file.display());
+            }
+            // Whose backup this is (m2-6, D-04): another site's is refused
+            // before anything is asked.
+            if let Some(note) = ops::restore_identity(stack, &file, other_site)?.message() {
+                println!("{}", style::warn(note));
+            }
             // Provenance BEFORE the confirmation: which image this data came from
             // is exactly what the operator needs to decide, and after the prompt
             // it would be advice about something already done.
@@ -1258,7 +1304,12 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            ops::restore(stack, &file, &mut ops::Silent)?;
+            ops::restore_with(
+                stack,
+                &file,
+                &ops::RestoreOptions { other_site },
+                &mut ops::Silent,
+            )?;
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
@@ -1769,8 +1820,24 @@ enum Route {
     CheckUpdate { json: bool },
     /// `app update`: plan + confirm here, then the server walks it.
     Update { to: Option<String>, yes: bool },
-    /// `data restore`: confirm here, then the server restores its own file.
-    Restore { file: String, yes: bool },
+    /// `data restore`: confirm here, then the server restores its own file,
+    /// or one uploaded from here.
+    Restore {
+        file: String,
+        yes: bool,
+        other_site: bool,
+        on_server: bool,
+    },
+    /// `data backup`: on the server, then (unless `copy` is off) home.
+    Backup {
+        label: Option<String>,
+        copy: bool,
+        json: bool,
+    },
+    /// `data list`: the server's backups and the copies on this machine.
+    BackupList,
+    /// `app open`: the recorded domain, else an SSH tunnel.
+    Open,
     /// `site snapshots [--json]`.
     Snapshots { json: bool },
     /// `doctor [--fix] [--json]`: Manager-side checks + the server's report.
@@ -1808,12 +1875,7 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
                      running on a server",
                 ))
             }
-            AppCommand::Open => {
-                return Err(local_only(
-                    "app open",
-                    "opens the console in a browser here, at the server's own local address",
-                ))
-            }
+            AppCommand::Open => Route::Open,
             AppCommand::View => {
                 return Err(local_only(
                     "app view",
@@ -1861,14 +1923,29 @@ fn remote_route(command: Command, host: &str, slug: &str) -> Result<Route> {
             SiteCommand::Prune { keep } => Route::Run(Action::Prune { keep }),
         },
         Command::Data { command } => match command {
-            DataCommand::Backup { label } => Route::Run(Action::Backup { label }),
-            DataCommand::List => Route::Run(Action::BackupList),
-            DataCommand::Restore { file, yes } => Route::Restore {
+            DataCommand::Backup {
+                label,
+                json,
+                no_copy,
+            } => Route::Backup {
+                label,
+                copy: !no_copy,
+                json,
+            },
+            DataCommand::List => Route::BackupList,
+            DataCommand::Restore {
+                file,
+                yes,
+                other_site,
+                on_server,
+            } => Route::Restore {
                 file: file
                     .to_str()
                     .context("the backup path isn't valid UTF-8")?
                     .to_string(),
                 yes,
+                other_site,
+                on_server,
             },
         },
         Command::Ai { .. } => return Err(on_server("ai model")),
@@ -1919,9 +1996,17 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
     match route {
         Route::Doctor { .. } => unreachable!("handled above"),
         Route::Status { json } => {
-            let st = session.status()?;
+            // The URLs the user can open from HERE (m2-4): the recorded
+            // domain, or none — never the server's own localhost.
+            let (st, route) = remote::status_for_here(remote, session.status()?);
+            let via = match route {
+                remote::ConsoleRoute::Domain { .. } => "domain",
+                remote::ConsoleRoute::Tunnel { .. } => "tunnel",
+            };
             if json {
-                println!("{}", serde_json::to_string_pretty(&st)?);
+                let mut value = serde_json::to_value(&st)?;
+                value["console_via"] = via.into();
+                println!("{}", serde_json::to_string_pretty(&value)?);
                 return Ok(());
             }
             println!(
@@ -1929,6 +2014,66 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                 site.label, site.slug, remote.slug, host
             );
             print_status(&st);
+            if via == "tunnel" {
+                println!(
+                    "  Console:  via an SSH tunnel — `atelier --site {} app open`",
+                    site.slug
+                );
+            }
+            Ok(())
+        }
+        Route::Open => remote_open(&session, site),
+        Route::Backup { label, copy, json } => {
+            let home = copy.then(|| remote::local_backups_dir(site));
+            let got = session.backup(label, home.as_deref(), &mut relay)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "server": got.server,
+                        "local": got.local,
+                    }))?
+                );
+                return Ok(());
+            }
+            println!(
+                "{} {} on {host} ({:.1} MB)",
+                style::success("Backup written to"),
+                got.server.path,
+                got.server.size as f64 / 1_048_576.0
+            );
+            match got.local {
+                Some(local) => println!(
+                    "{} {} (size and sha256 match the server's)",
+                    style::success("Copied to"),
+                    local.display()
+                ),
+                None => println!("Kept on {host} only (--no-copy)."),
+            }
+            Ok(())
+        }
+        Route::BackupList => {
+            println!("{}", style::heading(&format!("On {host}:")));
+            session.run_action(&remote::Action::BackupList, &mut relay)?;
+            let dir = remote::local_backups_dir(site);
+            println!(
+                "\n{}",
+                style::heading(&format!("On this machine ({}):", dir.display()))
+            );
+            let here = ops::list_backups(&site.stack());
+            if here.is_empty() {
+                println!(
+                    "  none yet — `atelier --site {} data backup` copies one here",
+                    site.slug
+                );
+            }
+            for b in here {
+                println!(
+                    "  {}  ({:.1} MB)",
+                    b.name,
+                    b.size_bytes as f64 / 1_048_576.0
+                );
+            }
             Ok(())
         }
         Route::CheckUpdate { json } => {
@@ -1945,7 +2090,33 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
             Ok(())
         }
         Route::Update { to, yes } => remote_update(&session, &target, to, yes),
-        Route::Restore { file, yes } => {
+        Route::Restore {
+            file,
+            yes,
+            other_site,
+            on_server,
+        } => {
+            let local = PathBuf::from(&file);
+            if !on_server && local.is_file() {
+                // A backup on this machine (m2-6): refused before a byte moves
+                // if it is another site's; then uploaded, verified, restored.
+                if let Some(note) = session
+                    .check_restore_identity(&local, other_site)?
+                    .message()
+                {
+                    println!("{}", style::warn(note));
+                }
+                println!(
+                    "{file} is on this machine — it is uploaded to {host} and restored there."
+                );
+                if !confirm_change(&target, &restore_question(&file), yes)? {
+                    println!("{}", style::warn("Aborted."));
+                    return Ok(());
+                }
+                session.restore_upload(&local, other_site, &mut relay)?;
+                println!("{}", style::success("Restore complete."));
+                return Ok(());
+            }
             println!(
                 "{}",
                 style::warn(&format!(
@@ -1956,16 +2127,12 @@ fn run_remote(command: Command, site: &sites::Site) -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            session.run_action(&remote::Action::Restore { file }, &mut relay)
+            session.run_action(&remote::Action::Restore { file, other_site }, &mut relay)
         }
         Route::Run(action) => {
             session.run_action(&action, &mut relay)?;
-            match action {
-                remote::Action::Backup { .. } => {
-                    println!("The backup is on {host}, in that site's backups folder.")
-                }
-                remote::Action::Export(_) => println!("The export is on {host}."),
-                _ => {}
+            if let remote::Action::Export(_) = action {
+                println!("The export is on {host}.");
             }
             Ok(())
         }
@@ -2010,6 +2177,32 @@ fn remote_update(
     session.run_action(&remote::Action::Update { to, yes: confirmed }, &mut relay)
 }
 
+/// `app open` on a remote site (m2-4, D-02): the recorded domain, or an SSH
+/// tunnel held open until Ctrl-C (which ends ssh along with us).
+fn remote_open(session: &remote::Session<remote::Ssh>, site: &sites::Site) -> Result<()> {
+    let access = remote::console_access_in(session, site)?;
+    match access.tunnel {
+        None => {
+            println!("Opening {}", style::url(&access.url));
+            ops::open_url(&access.url)
+        }
+        Some(mut tunnel) => {
+            println!(
+                "{} {} → {} on {}",
+                style::success("Tunnel open:"),
+                style::url(&access.url),
+                site.slug,
+                session.host()
+            );
+            println!("Sign in there. Keep this running while you use it; Ctrl-C closes it.");
+            if let Err(e) = ops::open_url(&access.url) {
+                println!("{} {e:#}", style::warn("Couldn't open a browser:"));
+            }
+            tunnel.wait()
+        }
+    }
+}
+
 /// Connect to a remote site's engine. When the server's `atelier` is older
 /// than this one, offer (in a terminal) to copy ours to `~/.local/bin`.
 fn remote_session(
@@ -2052,17 +2245,24 @@ fn sites_add_remote(
     remote_site: Option<&str>,
     guided: bool,
     engine_binary: Option<PathBuf>,
+    domain: Option<String>,
 ) -> Result<()> {
     use std::io::IsTerminal;
     if !sites::is_valid_host(host) {
         anyhow::bail!("`{host}` is not a usable SSH target (an alias, host or user@host)");
+    }
+    if let Some(d) = domain.as_deref().filter(|d| !sites::is_valid_domain(d)) {
+        anyhow::bail!("`{d}` is not a usable domain — a host name, or https://host[:port]");
     }
     let key = if guided {
         sites::KeyMode::Guided
     } else {
         sites::KeyMode::Ssh
     };
-    let site = sites::Site::new_remote(uh, slug, label, host, remote_site, key);
+    let mut site = sites::Site::new_remote(uh, slug, label, host, remote_site, key);
+    if let Some(remote) = site.remote.as_mut() {
+        remote.domain = domain;
+    }
     if guided {
         let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, host)?;
         println!(
@@ -2290,12 +2490,6 @@ mod tests {
         assert_eq!(argv(&["app", "start"]), "app start");
         assert_eq!(argv(&["app", "stop"]), "app stop");
         assert_eq!(
-            argv(&["data", "backup", "--label", "before"]),
-            "data backup --label before"
-        );
-        assert_eq!(argv(&["data", "export"]), "data backup");
-        assert_eq!(argv(&["data", "list"]), "data list");
-        assert_eq!(
             argv(&["site", "export", "--out", "/srv/x", "--zip"]),
             "site export --out /srv/x --zip"
         );
@@ -2334,11 +2528,18 @@ mod tests {
             other => panic!("{other:?}"),
         }
         match route(&["data", "restore", "/srv/b.tar.gz", "-y"]).unwrap() {
-            Route::Restore { file, yes } => {
+            Route::Restore {
+                file,
+                yes,
+                other_site,
+                on_server,
+            } => {
                 assert_eq!(file, "/srv/b.tar.gz");
-                assert!(yes);
+                assert!(yes && !other_site && !on_server);
                 // What the server then runs: always non-interactive.
-                let sent = remote::Action::Restore { file }.argv().join(" ");
+                let sent = remote::Action::Restore { file, other_site }
+                    .argv()
+                    .join(" ");
                 assert_eq!(sent, "data restore --yes -- /srv/b.tar.gz");
             }
             other => panic!("{other:?}"),
@@ -2346,10 +2547,68 @@ mod tests {
     }
 
     #[test]
+    fn backups_come_home_unless_no_copy_and_restore_carries_its_flags() {
+        for (args, want_copy, want_json) in [
+            (&["data", "backup", "--label", "before"][..], true, false),
+            (&["data", "export"], true, false),
+            (&["data", "backup", "--no-copy", "--json"], false, true),
+        ] {
+            match route(args).unwrap() {
+                Route::Backup { copy, json, .. } => {
+                    assert_eq!((copy, json), (want_copy, want_json), "{args:?}")
+                }
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        // What the Manager then asks the server for: always the JSON answer.
+        let sent = remote::Action::Backup {
+            label: Some("before".into()),
+            json: true,
+        };
+        assert_eq!(sent.argv().join(" "), "data backup --label before --json");
+        assert!(matches!(
+            route(&["data", "list"]).unwrap(),
+            Route::BackupList
+        ));
+        match route(&["data", "restore", "b.tar.gz", "--other-site", "--on-server"]).unwrap() {
+            Route::Restore {
+                other_site,
+                on_server,
+                ..
+            } => assert!(other_site && on_server),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(route(&["app", "open"]).unwrap(), Route::Open));
+    }
+
+    #[test]
+    fn sites_add_takes_a_domain_only_with_a_host() {
+        let cli = Cli::try_parse_from([
+            "atelier",
+            "sites",
+            "add",
+            "prod",
+            "--host",
+            "h",
+            "--domain",
+            "cms.example.com",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Sites {
+                command: SitesCommand::Add { domain, .. },
+            } => assert_eq!(domain.as_deref(), Some("cms.example.com")),
+            _ => panic!("not sites add"),
+        }
+        assert!(
+            Cli::try_parse_from(["atelier", "sites", "add", "blog", "--domain", "x.com"]).is_err()
+        );
+    }
+
+    #[test]
     fn local_only_and_not_yet_commands_are_refused_naming_the_host() {
         for args in [
             &["app", "install"][..],
-            &["app", "open"],
             &["app", "view"],
             &["pack", "dev"],
             &["pack", "validate"],

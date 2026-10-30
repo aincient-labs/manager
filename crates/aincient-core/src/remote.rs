@@ -1507,8 +1507,13 @@ pub struct ConsoleAccess {
 /// Reach `site`'s console (m2-4, D-02): its recorded domain, else a tunnel.
 /// The server's status supplies the console path and its port.
 pub fn console_access(site: &Site) -> Result<ConsoleAccess> {
-    let remote = remote_of(site)?;
     let session = open(site, &EngineOptions::from_env())?;
+    console_access_in(&session, site)
+}
+
+/// [`console_access`] over a session the caller already holds.
+pub fn console_access_in<T: Transport>(session: &Session<T>, site: &Site) -> Result<ConsoleAccess> {
+    let remote = remote_of(site)?;
     let status = session.status()?;
     match console_route(remote, &status)? {
         ConsoleRoute::Domain { console_url, .. } => Ok(ConsoleAccess {
