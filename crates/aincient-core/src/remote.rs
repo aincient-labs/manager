@@ -1851,29 +1851,36 @@ pub fn probe_state(site: &Site, limit: Duration) -> SiteState {
         .as_ref()
         .map(|r| r.host.clone())
         .unwrap_or_default();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let probed = within(&host, limit, move || {
         let opts = EngineOptions {
             no_install: true,
             ..EngineOptions::from_env()
         };
-        let state = match open(&site, &opts) {
-            Err(e) => state_of(Err(e), None),
-            Ok(session) => {
-                let status = session.status();
-                let snapshots = match &status {
-                    Ok(st) if st.running => session.snapshots().ok(),
-                    _ => None,
-                };
-                state_of(status, snapshots)
-            }
+        let session = open(&site, &opts)?;
+        let status = session.status();
+        let snapshots = match &status {
+            Ok(st) if st.running => session.snapshots().ok(),
+            _ => None,
         };
-        let _ = tx.send(state);
+        Ok(state_of(status, snapshots))
+    });
+    probed.unwrap_or_else(|e| state_of(Err(e), None))
+}
+
+/// Run `work` (talking to `host`) on its own thread and give up waiting after
+/// `limit` — for a front-end that must answer even when a server doesn't.
+/// The abandoned thread ends by the ssh deadlines inside `work`.
+pub fn within<T: Send + 'static>(
+    host: &str,
+    limit: Duration,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
     });
     rx.recv_timeout(limit)
-        .unwrap_or_else(|_| SiteState::Unreachable {
-            reason: format!("{host} didn't answer within {} s", limit.as_secs()),
-        })
+        .unwrap_or_else(|_| bail!("{host} didn't answer within {} s", limit.as_secs()))
 }
 
 /// `doctor` for a remote site (m2-9): the checks that genuinely run on this
@@ -2682,6 +2689,17 @@ mod tests {
         assert!(gone.is_live(), "unknown counts as live");
         let json = serde_json::to_value(&gone).unwrap();
         assert_eq!(json["state"], "unreachable");
+    }
+
+    #[test]
+    fn within_gives_up_on_a_server_that_does_not_answer() {
+        assert_eq!(within("h", Duration::from_secs(5), || Ok(7)).unwrap(), 7);
+        let slow = within("deploy@example.com", Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        });
+        let err = format!("{:#}", slow.unwrap_err());
+        assert!(err.contains("deploy@example.com didn't answer"), "{err}");
     }
 
     #[test]

@@ -1038,6 +1038,34 @@ pub fn add_site(
     })
 }
 
+/// A checked remote entry for [`add_remote_site`]: the ssh target and the
+/// optional public domain validated, the domain recorded. What both
+/// front-ends build before attaching.
+pub fn remote_entry(
+    user_home: &Path,
+    slug: &str,
+    label: Option<&str>,
+    host: &str,
+    remote_slug: Option<&str>,
+    key: KeyMode,
+    domain: Option<&str>,
+) -> Result<Site> {
+    let host = host.trim();
+    if !is_valid_host(host) {
+        bail!("`{host}` is not a usable SSH target (an alias, host or user@host)");
+    }
+    let domain = domain.map(str::trim).filter(|d| !d.is_empty());
+    if let Some(d) = domain.filter(|d| !is_valid_domain(d)) {
+        bail!("`{d}` is not a usable domain — a host name, or https://host[:port]");
+    }
+    let remote_slug = remote_slug.map(str::trim).filter(|s| !s.is_empty());
+    let mut site = Site::new_remote(user_home, slug, label, host, remote_slug, key);
+    if let Some(remote) = site.remote.as_mut() {
+        remote.domain = domain.map(str::to_string);
+    }
+    Ok(site)
+}
+
 /// What [`add_remote_site`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedRemoteSite {
@@ -2258,5 +2286,28 @@ host = "stage-alias"
             saved.get("prod").unwrap().remote.as_ref().unwrap().domain,
             None
         );
+    }
+
+    #[test]
+    fn remote_entry_checks_the_target_and_domain() {
+        let uh = Path::new("/home/u");
+        let site = remote_entry(
+            uh,
+            "prod",
+            None,
+            " vps ",
+            Some(""),
+            KeyMode::Guided,
+            Some("cms.example.com"),
+        )
+        .unwrap();
+        let remote = site.remote.unwrap();
+        assert_eq!(
+            (remote.host.as_str(), remote.slug.as_str(), remote.key),
+            ("vps", "prod", KeyMode::Guided)
+        );
+        assert_eq!(remote.domain.as_deref(), Some("cms.example.com"));
+        assert!(remote_entry(uh, "prod", None, "-oProxy", None, KeyMode::Ssh, None).is_err());
+        assert!(remote_entry(uh, "prod", None, "vps", None, KeyMode::Ssh, Some("a b")).is_err());
     }
 }

@@ -2389,21 +2389,12 @@ fn sites_add_remote(
     domain: Option<String>,
 ) -> Result<()> {
     use std::io::IsTerminal;
-    if !sites::is_valid_host(host) {
-        anyhow::bail!("`{host}` is not a usable SSH target (an alias, host or user@host)");
-    }
-    if let Some(d) = domain.as_deref().filter(|d| !sites::is_valid_domain(d)) {
-        anyhow::bail!("`{d}` is not a usable domain — a host name, or https://host[:port]");
-    }
     let key = if guided {
         sites::KeyMode::Guided
     } else {
         sites::KeyMode::Ssh
     };
-    let mut site = sites::Site::new_remote(uh, slug, label, host, remote_site, key);
-    if let Some(remote) = site.remote.as_mut() {
-        remote.domain = domain;
-    }
+    let site = sites::remote_entry(uh, slug, label, host, remote_site, key, domain.as_deref())?;
     if guided {
         let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, host)?;
         println!(
