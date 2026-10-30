@@ -106,14 +106,30 @@ pub fn serve(listen: &str, get: impl Fn(&str) -> Option<String>) -> Result<()> {
     Arc::new(engine).serve(listener)
 }
 
-/// `atelier engine admin …`.
+/// `atelier engine admin …`, inside the engine container: `docker exec`
+/// inherits the container's environment, so the site is the one it serves.
 pub fn admin(cmd: admin::AdminCommand) -> Result<()> {
     let state_dir = std::env::var("ATELIER_ENGINE_STATE").unwrap_or_else(|_| STATE_DIR.into());
     let store = state::Store::at(state_dir)?;
+    let site: Box<dyn site::Site> = match (
+        std::env::var("ATELIER_STACK_DIR"),
+        std::env::var("ATELIER_PROJECT"),
+    ) {
+        (Ok(home), Ok(project)) => {
+            let mut stack = Stack::at(&home);
+            stack.project = Some(project);
+            Box::new(site::ComposeSite {
+                stack,
+                edge: EDGE.into(),
+            })
+        }
+        _ => Box::new(site::NoSite),
+    };
     admin::run(
         cmd,
         &store,
         &inbox::Inbox::at(INBOX_DIR, OUTBOX_DIR),
+        site.as_ref(),
         &mut std::io::stdin(),
         &mut std::io::stdout(),
     )
@@ -124,6 +140,11 @@ mod tests {
     use super::*;
     use aincient_core::engine::ENGINE_COMPOSE_TEMPLATE;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_engine_and_the_managers_client_agree_on_the_major() {
+        assert_eq!(API_MAJOR, aincient_core::engine::CLIENT_API_MAJOR);
+    }
 
     #[test]
     fn the_api_version_is_semver_and_its_major_is_the_path() {

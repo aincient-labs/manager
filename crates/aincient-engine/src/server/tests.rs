@@ -135,6 +135,7 @@ impl T {
             cmd,
             &self.e.store,
             &self.e.inbox,
+            &Shared(self.fake.clone()),
             &mut stdin.as_bytes(),
             &mut out,
         )

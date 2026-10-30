@@ -126,6 +126,30 @@ impl Site for ComposeSite {
     }
 }
 
+/// Outside the engine container (no `ATELIER_STACK_DIR`): every site call
+/// fails, so an admin verb that needs the site says why.
+pub struct NoSite;
+
+impl Site for NoSite {
+    fn states(&self) -> Result<Value> {
+        anyhow::bail!(
+            "ATELIER_STACK_DIR / ATELIER_PROJECT are not set: run this in the engine container"
+        )
+    }
+    fn stop_app_and_db(&self, _: Cut) -> Result<()> {
+        self.states().map(|_| ())
+    }
+    fn start_db_and_app(&self, _: Cut) -> Result<()> {
+        self.states().map(|_| ())
+    }
+    fn drush(&self, _: Drush, _: Cut) -> Result<()> {
+        self.states().map(|_| ())
+    }
+    fn answers(&self) -> bool {
+        false
+    }
+}
+
 /// The status code of a plain GET, or `None`.
 fn http_status(addr: &str, path: &str) -> Option<u16> {
     use std::net::ToSocketAddrs;
