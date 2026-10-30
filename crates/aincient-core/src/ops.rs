@@ -125,6 +125,11 @@ pub struct Status {
     /// its first backup, and from a server whose CLI predates it.
     #[serde(default)]
     pub site_id: Option<String>,
+    /// The engine sidecar (EXPERIMENTAL, 0483), when `.env` enables it: its
+    /// container and whether it runs. `None` without it, and from a server
+    /// whose CLI predates it (the Manager then uses the host CLI, m3-7).
+    #[serde(default)]
+    pub engine: Option<crate::engine_admin::EngineInfo>,
 }
 
 /// The result of comparing the local image against the registry.
@@ -375,6 +380,9 @@ pub fn status(stack: &Stack) -> Status {
         image_digest: local_digest(&stack.image()),
         version: running.then(|| running_image_version(stack)).flatten(),
         site_id: stack.site_id(),
+        engine: installed
+            .then(|| crate::engine_admin::probe(stack))
+            .flatten(),
     }
 }
 

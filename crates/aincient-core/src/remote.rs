@@ -933,6 +933,33 @@ impl<T: Transport> Session<T> {
     }
 }
 
+/// `docker` on the server, over this session (m3-7): how the Manager reaches
+/// a server's engine with `docker exec` (no token, no HTTP).
+impl<T: Transport> crate::engine_admin::DockerExec for Session<T> {
+    fn place(&self) -> String {
+        self.transport.target().to_string()
+    }
+
+    fn docker(&self, args: &[String], deadline: Duration) -> Result<Output> {
+        let mut words = vec!["docker".to_string()];
+        words.extend(args.iter().map(|a| sh_quote(a)));
+        let what = format!("`docker {}`", args.join(" "));
+        checked(
+            &self.transport,
+            &what,
+            self.transport.exec(&words.join(" "), None, deadline),
+        )
+    }
+}
+
+impl<T: Transport> Session<T> {
+    /// The server's engine for this site, per its `app status --json`; `None`
+    /// when there is none (or its CLI predates the field).
+    pub fn engine_info(&self) -> Result<Option<crate::engine_admin::EngineInfo>> {
+        Ok(self.status()?.engine)
+    }
+}
+
 /// What [`Session::backup`] produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBackup {
@@ -2480,6 +2507,57 @@ mod tests {
     /// The streamed script of the last call.
     fn last(fake: &Fake) -> String {
         fake.calls.borrow().last().unwrap().0.clone()
+    }
+
+    #[test]
+    fn an_engine_on_the_server_is_driven_with_docker_exec_over_the_session() {
+        use crate::engine_admin::{route, AdminVerb, EngineAdmin, Lifecycle, Via};
+        let with_engine = STATUS_JSON.replace(
+            r#""version":"v0.20.0"}"#,
+            r#""version":"v0.20.0","engine":{"enabled":true,"container":"atelier-blog-engine-1","running":true}}"#,
+        );
+        let fake = with_cli(Fake::new())
+            .on("app status --json", move || out(0, &with_engine, ""))
+            .on("engine admin status", || {
+                out(
+                    0,
+                    r#"{"api":"1.0.0","app":"running","db":"running","lockdown":false}"#,
+                    "",
+                )
+            })
+            .on("engine admin lockdown", || out(0, "Locked down.", ""));
+        let s = session(&fake);
+        let info = s.engine_info().unwrap();
+        assert_eq!(
+            route(Lifecycle::Lockdown, info.as_ref()),
+            Via::Engine("atelier-blog-engine-1".into())
+        );
+        let admin = EngineAdmin::new(&s, info.as_ref(), "lockdown").unwrap();
+        admin.run(AdminVerb::Lockdown).unwrap();
+        assert_eq!(
+            last(&fake),
+            "docker exec atelier-blog-engine-1 atelier engine admin lockdown"
+        );
+        assert!(fake.ran("admin status"), "the version is read first");
+        assert!(
+            !fake.ran("site lockdown"),
+            "the host CLI isn't asked to lock down"
+        );
+    }
+
+    #[test]
+    fn a_server_cli_without_the_engine_field_means_the_host_cli_path() {
+        use crate::engine_admin::{route, Lifecycle, Via};
+        let fake = with_cli(Fake::new()).on("app status --json", || out(0, STATUS_JSON, ""));
+        let s = session(&fake);
+        let info = s.engine_info().unwrap();
+        assert_eq!(info, None);
+        assert_eq!(route(Lifecycle::Status, info.as_ref()), Via::HostCli);
+        assert!(matches!(
+            route(Lifecycle::Lockdown, info.as_ref()),
+            Via::Refuse(_)
+        ));
+        assert!(!fake.ran("docker"));
     }
 
     #[test]

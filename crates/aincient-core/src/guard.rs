@@ -112,6 +112,7 @@ mod tests {
             image_digest: None,
             version: None,
             site_id: None,
+            engine: None,
         }
     }
 
