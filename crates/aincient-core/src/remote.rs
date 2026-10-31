@@ -893,15 +893,9 @@ impl<T: Transport> Session<T> {
     }
 
     /// Whether the site is live (m2-8, D-07) — see [`crate::guard::is_live`]:
-    /// running and serving its live site. The snapshot list is only asked of
-    /// a running site; whatever can't be read counts as live.
+    /// running, frozen or not; a status that can't be read counts as live.
     pub fn is_live(&self) -> bool {
-        let status = self.status().ok();
-        let snapshots = match &status {
-            Some(st) if st.running => self.snapshots().ok(),
-            _ => None,
-        };
-        crate::guard::is_live(status.as_ref(), snapshots.as_ref())
+        crate::guard::is_live(self.status().ok().as_ref())
     }
 
     /// The [`ChangeGuard`] for a change to `site` over this session.
@@ -1879,12 +1873,9 @@ pub enum SiteState {
 
 impl SiteState {
     /// Whether changing it needs the typed slug (D-07) — see
-    /// [`crate::guard::is_live`]: unreachable counts as live.
+    /// [`crate::guard::is_live`]: frozen and unreachable count as live.
     pub fn is_live(&self) -> bool {
-        matches!(
-            self,
-            SiteState::Running { .. } | SiteState::Unreachable { .. }
-        )
+        !matches!(self, SiteState::Stopped)
     }
 }
 
@@ -2718,7 +2709,7 @@ mod tests {
             .on("snapshots --json", || {
                 out(0, r#"{"serving":"s-2","snapshots":[]}"#, "")
             });
-        assert!(!session(&frozen).is_live());
+        assert!(session(&frozen).is_live(), "a frozen site is live");
 
         let stopped_json = STATUS_JSON.replace(r#""running":true"#, r#""running":false"#);
         let stopped =
@@ -2750,7 +2741,7 @@ mod tests {
         assert!(running.is_live());
         let frozen = state_of(Ok(st.clone()), Some(list("s-2")));
         assert!(matches!(&frozen, SiteState::Frozen { snapshot, .. } if snapshot == "s-2"));
-        assert!(!frozen.is_live());
+        assert!(frozen.is_live(), "a frozen site is live");
         let mut off = st;
         off.running = false;
         assert_eq!(state_of(Ok(off), None), SiteState::Stopped);

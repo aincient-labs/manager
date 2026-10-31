@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 
-use crate::ops::{SnapshotList, Status};
+use crate::ops::Status;
 use crate::sites::Site;
 use crate::Stack;
 
@@ -81,16 +81,14 @@ impl ChangeGuard {
     }
 }
 
-/// Whether a remote site is live — running and serving its live site, so a
-/// change reaches visitors as it happens. `status`/`snapshots` are what the
-/// server answered, `None` when it couldn't be asked. **Unknown counts as
-/// live**: a guard that relaxes because a probe failed guards nothing.
-pub fn is_live(status: Option<&Status>, snapshots: Option<&SnapshotList>) -> bool {
-    match status {
-        None => true,
-        Some(st) if !st.running => false,
-        Some(_) => snapshots.is_none_or(|l| l.serving == "live"),
-    }
+/// Whether a remote site is live: running, whatever visitors are served. A
+/// frozen site counts too: a restore there wipes what editors did, the next
+/// freeze publishes it, and after a rest every engine site is frozen. `status`
+/// is what the server answered, `None` when it couldn't be asked. **Unknown
+/// counts as live**: a guard that relaxes because a probe failed guards
+/// nothing.
+pub fn is_live(status: Option<&Status>) -> bool {
+    status.is_none_or(|st| st.running)
 }
 
 #[cfg(test)]
@@ -115,27 +113,15 @@ mod tests {
         }
     }
 
-    fn serving(id: &str) -> SnapshotList {
-        SnapshotList {
-            serving: id.to_string(),
-            snapshots: Vec::new(),
-        }
+    #[test]
+    fn a_running_site_is_live_and_unknown_counts_as_live() {
+        assert!(is_live(Some(&status(true))));
+        assert!(is_live(None), "server unreachable");
     }
 
     #[test]
-    fn a_running_live_site_is_live_and_unknown_counts_as_live() {
-        assert!(is_live(Some(&status(true)), Some(&serving("live"))));
-        assert!(is_live(Some(&status(true)), None), "snapshots unreadable");
-        assert!(is_live(None, None), "server unreachable");
-    }
-
-    #[test]
-    fn a_stopped_or_frozen_site_is_not_live() {
-        assert!(!is_live(Some(&status(false)), None));
-        assert!(!is_live(
-            Some(&status(true)),
-            Some(&serving("20261030-1200"))
-        ));
+    fn a_stopped_site_is_not_live() {
+        assert!(!is_live(Some(&status(false))));
     }
 
     #[test]
