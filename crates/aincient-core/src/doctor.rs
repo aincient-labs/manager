@@ -892,10 +892,13 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
 
 /// The EXPERIMENTAL engine (DECISIONS 0483), only on a stack that opted in:
 /// its two files are what this Manager writes for the stack's `.env`, and the
-/// engine container runs exactly the image ID `.env` pins (m7-4). Neither is
-/// repaired by `--fix`: the engine holds the Docker socket, so changing it
-/// takes `atelier engine enable --experimental`, which rewrites both files,
-/// re-pins the image from the local `atelier-engine:dev` and recreates it.
+/// engine container runs exactly the image `.env` pins (m7-4): the released
+/// image by digest (0487) or a developer build's image ID, compared by the
+/// image ID the pin resolves to here. Neither is repaired by `--fix`: the
+/// engine holds the Docker socket, so changing it takes `atelier engine
+/// enable --experimental`, which rewrites both files, re-pins the image (the
+/// one this Manager build carries, or a developer build's local
+/// `atelier-engine:dev`) and recreates it.
 fn check_engine(stack: &Stack) -> Vec<Check> {
     use crate::engine;
     const FILES: &str = "Engine files match this manager (EXPERIMENTAL)";
@@ -933,12 +936,13 @@ fn check_engine(stack: &Stack) -> Vec<Check> {
                 Tier::Stack,
                 IMAGE,
                 Severity::Fail,
-                "`.env` doesn't pin the engine image by its ID. Run `atelier engine enable \
-                 --experimental` again.",
+                "`.env` doesn't pin the engine image by its digest or ID. Run `atelier engine \
+                 enable --experimental` again.",
             )
             .detail(format!(
-                "{} is missing or not sha256:<64 hex>",
-                engine::IMAGE_ENV
+                "{} is missing, a tag, or not {}@sha256:<64 hex> / sha256:<64 hex>",
+                engine::IMAGE_ENV,
+                engine::ENGINE_IMAGE_REPO
             )),
         );
         return out;
@@ -951,8 +955,19 @@ fn check_engine(stack: &Stack) -> Vec<Check> {
         inspect.args(["inspect", "--format", "{{.Image}}", &id]);
         probe(inspect).ok().map(|i| i.trim().to_string())
     });
+    // A container records the image ID it runs; a digest pin names the
+    // image by its registry digest, so resolve it to the ID here.
+    let want = if engine::is_image_id(&pin) {
+        Some(pin.clone())
+    } else {
+        let mut inspect = docker::docker();
+        inspect.args(["image", "inspect", "--format", "{{.Id}}", &pin]);
+        probe(inspect).ok().map(|i| i.trim().to_string())
+    };
     out.push(match running {
-        Some(image) if image == pin => Check::ok("stack.engine_image", Tier::Stack, IMAGE),
+        Some(image) if Some(&image) == want.as_ref() => {
+            Check::ok("stack.engine_image", Tier::Stack, IMAGE)
+        }
         Some(image) => Check::bad(
             "stack.engine_image",
             Tier::Stack,
@@ -962,7 +977,11 @@ fn check_engine(stack: &Stack) -> Vec<Check> {
              started it outside the Manager. Run `atelier engine enable --experimental` to \
              recreate it from the pin, or `atelier engine remove --experimental`.",
         )
-        .detail(format!("running {image}, pinned {pin}")),
+        .detail(match &want {
+            Some(id) if *id != pin => format!("running {image}, pinned {pin} ({id})"),
+            Some(_) => format!("running {image}, pinned {pin}"),
+            None => format!("running {image}, pinned {pin} (not on this computer)"),
+        }),
         None => Check::bad(
             "stack.engine_image",
             Tier::Stack,

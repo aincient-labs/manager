@@ -43,16 +43,29 @@ pub const CLIENT_API_MAJOR: u32 = 1;
 pub const ENGINE_COMPOSE_FILE: &str = "compose.engine.yaml";
 /// The edge config used instead of `edge.conf` while the engine is on.
 pub const ENGINE_EDGE_FILE: &str = "edge.engine.conf";
-/// The tag `engine/build.sh` gives the engine image. Built locally, never
-/// pulled, and never run by this name: [`enable`] resolves it to the image ID
-/// once and pins that (m7-4).
+/// The tag `engine/build.sh` gives a locally built engine image: the
+/// developer path, used only by a Manager build that carries no released
+/// image ([`released_engine_image`]). Never pulled, and never run by this
+/// name: [`enable`]'s caller resolves it to the image ID once and pins that
+/// (m7-4).
 pub const ENGINE_IMAGE: &str = "atelier-engine:dev";
-/// The `.env` key holding the pinned engine image: its content-addressed ID,
-/// `sha256:<64 hex>`. A locally built image has no registry digest, and
-/// `name@sha256:<id>` doesn't resolve for one; the bare ID does, for both
-/// `docker run` and compose, and a rebuild or retag can't change what it
-/// names. [`ENGINE_COMPOSE_TEMPLATE`] runs exactly this; doctor flags a
-/// running engine whose image differs ([`pinned_image`]).
+/// Where the Manager's release workflow publishes the engine image, built
+/// from the same tag as the Manager (DECISIONS 0487). Only ever run by
+/// digest ([`released_engine_image`]), never by a tag.
+pub const ENGINE_IMAGE_REPO: &str = "ghcr.io/aincient-labs/atelier-engine";
+/// The build-time environment variable carrying the released engine image's
+/// digest (`sha256:<64 hex>`, of its multi-arch index), which the release
+/// workflow sets for every Manager build (0487).
+pub const ENGINE_DIGEST_ENV: &str = "ATELIER_ENGINE_DIGEST";
+/// The `.env` key holding the pinned engine image, in one of two immutable
+/// forms ([`is_pinned_image`]): the released image by digest,
+/// `ghcr.io/aincient-labs/atelier-engine@sha256:<64 hex>` (0487), or, on a
+/// developer build, a locally built image's content-addressed ID,
+/// `sha256:<64 hex>` (a local build has no registry digest, and
+/// `name@sha256:<id>` doesn't resolve for one; the bare ID does). Never a
+/// tag: no pull, rebuild or retag can change what either form names.
+/// [`ENGINE_COMPOSE_TEMPLATE`] runs exactly this; doctor flags a running
+/// engine whose image differs ([`pinned_image`]).
 pub const IMAGE_ENV: &str = "ATELIER_ENGINE_IMAGE";
 /// The `.env` key listing the TLS proxies in front of edge whose
 /// `X-Forwarded-For` edge believes (m7-4): IPs or CIDRs, separated by commas
@@ -159,8 +172,9 @@ services:
       - engine-signal:/run/atelier-engine:ro
       - engine-activity:/var/log/atelier-activity
   engine:
-    # The image ID `atelier engine enable` resolved from atelier-engine:dev:
-    # immutable, so a rebuild or retag changes nothing until enable runs again.
+    # The image `atelier engine enable` pinned: the released image by digest
+    # (enable pulls it) or, on a developer build, a local build's image ID.
+    # Never a tag, so nothing changes what runs until enable runs again.
     image: ${ATELIER_ENGINE_IMAGE:?run atelier engine enable}
     pull_policy: never
     environment:
@@ -644,18 +658,54 @@ pub fn trusted_proxies(stack: &Stack) -> Result<Vec<String>> {
     )
 }
 
-/// Whether `id` is a full image ID, `sha256:` and 64 lower-case hex digits.
+/// Whether `id` is a full image ID (or digest): `sha256:` and 64 lower-case
+/// hex digits.
 pub fn is_image_id(id: &str) -> bool {
     id.strip_prefix("sha256:")
         .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// The image ID `.env` pins the engine to, if it is a well-formed one.
+/// Whether `image` is a pin [`enable`] accepts (0487): the released
+/// [`ENGINE_IMAGE_REPO`] by digest (`<repo>@sha256:<64 hex>`), or a bare
+/// image ID (the developer path). Never a tag, and no other repository: the
+/// engine holds the Docker socket, so only the image this project publishes,
+/// or one the owner built, may run as it.
+pub fn is_pinned_image(image: &str) -> bool {
+    is_image_id(image)
+        || image
+            .strip_prefix(ENGINE_IMAGE_REPO)
+            .and_then(|r| r.strip_prefix('@'))
+            .is_some_and(is_image_id)
+}
+
+/// The released engine image this Manager build pins (0487):
+/// `ghcr.io/aincient-labs/atelier-engine@sha256:…`, from the digest the
+/// release workflow passed at compile time as [`ENGINE_DIGEST_ENV`]. `None`
+/// for a developer build (unset, empty or malformed), which falls back to a
+/// local [`ENGINE_IMAGE`] build.
+///
+/// No `build.rs` is needed for a change of the variable to rebuild this
+/// crate: rustc records every `option_env!` it reads in the dep-info file
+/// (`# env-dep:ATELIER_ENGINE_DIGEST`), and Cargo rebuilds when a recorded
+/// variable changes (checked with Cargo 1.88: set, changed and unset each
+/// recompile).
+pub fn released_engine_image() -> Option<String> {
+    released_image_from(option_env!("ATELIER_ENGINE_DIGEST"))
+}
+
+/// [`released_engine_image`]'s parsing, apart from the environment.
+fn released_image_from(digest: Option<&str>) -> Option<String> {
+    let d = digest?.trim();
+    is_image_id(d).then(|| format!("{ENGINE_IMAGE_REPO}@{d}"))
+}
+
+/// The image `.env` pins the engine to, if it is a well-formed pin
+/// ([`is_pinned_image`]).
 pub fn pinned_image(stack: &Stack) -> Option<String> {
     stack
         .read_env()
         .get(IMAGE_ENV)
-        .filter(|v| is_image_id(v))
+        .filter(|v| is_pinned_image(v))
         .cloned()
 }
 
@@ -673,7 +723,8 @@ pub fn is_enabled(stack: &Stack) -> bool {
 }
 
 /// Whether both opt-in files are exactly what this Manager writes for the
-/// stack's `.env` (its trusted proxies), and `.env` pins an image ID. False
+/// stack's `.env` (its trusted proxies), and `.env` pins an image
+/// ([`is_pinned_image`]: by digest or by ID). False
 /// after a Manager update changed a template, or after the owner changed
 /// [`TRUSTED_PROXIES_ENV`]: `enable` again rewrites them (doctor says so).
 pub fn files_current(stack: &Stack) -> bool {
@@ -711,7 +762,9 @@ fn refuse_unless_shipped(stack: &Stack) -> Result<()> {
 
 /// Turn the engine on (m7-1): write [`ENGINE_EDGE_FILE`] and
 /// [`ENGINE_COMPOSE_FILE`], then name them in `.env` with the engine pinned
-/// to `image_id` (the ID the caller resolved from [`ENGINE_IMAGE`], m7-4). Each file is written
+/// to `image` ([`is_pinned_image`]: the released image by digest, 0487, or
+/// on a developer build the ID the caller resolved from [`ENGINE_IMAGE`],
+/// m7-4; the caller has made sure it is on this computer). Each file is written
 /// atomically, and `.env` last, so `COMPOSE_FILE` never names a file that isn't
 /// there. Idempotent: running it again rewrites the files from this Manager's
 /// templates (after an update changed them). It starts nothing; the caller runs
@@ -728,10 +781,13 @@ fn refuse_unless_shipped(stack: &Stack) -> Result<()> {
 /// publishes must be on a loopback address. A Compose too old for
 /// `!override` (it appends, or fails) is refused here, before any file is
 /// written.
-pub fn enable(stack: &Stack, image_id: &str, config: ComposeConfig) -> Result<()> {
+pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     refuse_unless_shipped(stack)?;
-    if !is_image_id(image_id) {
-        bail!("the engine image must be pinned by its full ID (sha256:<64 hex>), not {image_id:?}");
+    if !is_pinned_image(image) {
+        bail!(
+            "the engine image must be pinned as {ENGINE_IMAGE_REPO}@sha256:<64 hex> or by a \
+             local image's full ID (sha256:<64 hex>), never a tag: not {image:?}"
+        );
     }
     let trusted = trusted_proxies(stack)?;
     let env = stack.read_env();
@@ -760,7 +816,7 @@ pub fn enable(stack: &Stack, image_id: &str, config: ComposeConfig) -> Result<()
         .to_string();
     let compose_text = engine_compose(&trusted);
     if !trusted.is_empty() {
-        refuse_unless_loopback_only(stack, &compose_text, &home, image_id, config)?;
+        refuse_unless_loopback_only(stack, &compose_text, &home, image, config)?;
     }
     write_atomic(&edge_path(stack), &edge_conf(&trusted), 0o644)?;
     write_atomic(&compose_path(stack), &compose_text, 0o644)?;
@@ -774,7 +830,7 @@ pub fn enable(stack: &Stack, image_id: &str, config: ComposeConfig) -> Result<()
         ("COMPOSE_PATH_SEPARATOR", ":".to_string()),
         ("ATELIER_STACK_DIR", home),
         ("ATELIER_PROJECT", stack.project_name()),
-        (IMAGE_ENV, image_id.to_string()),
+        (IMAGE_ENV, image.to_string()),
     ] {
         text.push_str(&format!("{k}={v}\n"));
     }
@@ -793,7 +849,7 @@ fn refuse_unless_loopback_only(
     stack: &Stack,
     compose_text: &str,
     home: &str,
-    image_id: &str,
+    image: &str,
     config: ComposeConfig,
 ) -> Result<()> {
     let candidate = stack.home.join(format!(
@@ -804,7 +860,7 @@ fn refuse_unless_loopback_only(
     let merged = config(
         &[stack.compose_path(), candidate.clone()],
         &[
-            (IMAGE_ENV, image_id.to_string()),
+            (IMAGE_ENV, image.to_string()),
             ("ATELIER_STACK_DIR", home.to_string()),
             ("ATELIER_PROJECT", stack.project_name()),
         ],
@@ -1254,6 +1310,8 @@ mod tests {
             "sha256:700E4087B79A9F81777900A9862F395055D6F7B8CD1CA1A94EABAFC51BB17529",
             "sha256:700e4087",
             "",
+            "ghcr.io/aincient-labs/atelier-engine:0.13.0",
+            "ghcr.io/aincient-labs/atelier-engine:0.13.0@sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529",
         ] {
             assert!(enable(s, bad, &fake).is_err(), "{bad:?}");
             assert!(!compose_path(s).exists(), "nothing written for {bad:?}");
@@ -1272,6 +1330,78 @@ mod tests {
             !s.read_env().contains_key(IMAGE_ENV),
             "disable takes the pin out"
         );
+    }
+
+    /// 0487: a released Manager pins the published image by digest, and that
+    /// counts as current exactly like a local build's ID.
+    #[test]
+    fn enable_pins_the_released_image_by_digest() {
+        let t = TempStack::new();
+        let s = &t.0;
+        let pin = format!("{ENGINE_IMAGE_REPO}@{ID}");
+        enable(s, &pin, &fake).unwrap();
+        assert_eq!(s.read_env()[IMAGE_ENV], pin);
+        assert_eq!(pinned_image(s).as_deref(), Some(pin.as_str()));
+        assert!(files_current(s));
+        // Edited into the version tag, the pin no longer counts.
+        let text = std::fs::read_to_string(s.env_path())
+            .unwrap()
+            .replace(&pin, &format!("{ENGINE_IMAGE_REPO}:0.13.0"));
+        std::fs::write(s.env_path(), text).unwrap();
+        assert!(pinned_image(s).is_none() && !files_current(s));
+    }
+
+    #[test]
+    fn a_pin_is_the_released_repo_by_digest_or_a_bare_id_never_a_tag() {
+        let hex = &ID["sha256:".len()..];
+        assert!(is_pinned_image(ID));
+        assert!(is_pinned_image(&format!(
+            "{ENGINE_IMAGE_REPO}@sha256:{hex}"
+        )));
+        for bad in [
+            format!("{ENGINE_IMAGE_REPO}:0.13.0"),
+            format!("{ENGINE_IMAGE_REPO}:latest"),
+            ENGINE_IMAGE_REPO.to_string(),
+            format!("{ENGINE_IMAGE_REPO}@sha256:{}", &hex[..12]),
+            format!("{ENGINE_IMAGE_REPO}@sha256:{}", hex.to_uppercase()),
+            format!("{ENGINE_IMAGE_REPO}@sha512:{hex}"),
+            format!("{ENGINE_IMAGE_REPO}:0.13.0@sha256:{hex}"),
+            format!("{ENGINE_IMAGE_REPO}-fork@sha256:{hex}"),
+            format!("ghcr.io/someone-else/atelier-engine@sha256:{hex}"),
+            format!("docker.io/library/alpine@sha256:{hex}"),
+            format!("atelier-engine@sha256:{hex}"),
+            format!(" {ID}"),
+            ENGINE_IMAGE.to_string(),
+            String::new(),
+        ] {
+            assert!(!is_pinned_image(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_released_image_comes_only_from_a_full_digest() {
+        let hex = &ID["sha256:".len()..];
+        assert_eq!(
+            released_image_from(Some(ID)).as_deref(),
+            Some(format!("ghcr.io/aincient-labs/atelier-engine@sha256:{hex}").as_str())
+        );
+        assert_eq!(
+            released_image_from(Some(&format!("{ID}\n"))).as_deref(),
+            Some(format!("{ENGINE_IMAGE_REPO}@{ID}").as_str()),
+            "a trailing newline from the workflow is trimmed"
+        );
+        for dev in [
+            None,
+            Some(""),
+            Some("sha256:700e4087"),
+            Some(hex),
+            Some("0.13.0"),
+            Some("ghcr.io/aincient-labs/atelier-engine@sha256:700e4087b79a9f81777900a9862f395055d6f7b8cd1ca1a94eabafc51bb17529"),
+        ] {
+            assert_eq!(released_image_from(dev), None, "{dev:?}");
+        }
+        // Whatever this test binary was built with, it is one of the two.
+        assert!(released_engine_image().is_none_or(|r| is_pinned_image(&r) && !is_image_id(&r)));
     }
 
     #[test]

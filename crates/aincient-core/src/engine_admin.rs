@@ -347,10 +347,51 @@ impl<'a, D: DockerExec + ?Sized> EngineAdmin<'a, D> {
     }
 }
 
+/// The engine image [`engine::enable`] pins, made ready on this computer
+/// (0487). A released Manager pulls the image its build carries,
+/// [`engine::released_engine_image`] (`<repo>@sha256:…`); a developer build
+/// carries none and uses the local [`engine::ENGINE_IMAGE`] build's ID
+/// ([`local_image_id`]).
+pub struct EngineImage {
+    /// The value for [`engine::IMAGE_ENV`].
+    pub pin: String,
+    /// Whether `pin` is the released image (false: a developer build's
+    /// local image).
+    pub released: bool,
+}
+
+/// See [`EngineImage`]. Pulling by digest is a no-op when the image is
+/// already here, and can't fetch anything but that exact image.
+pub fn engine_image() -> Result<EngineImage> {
+    match engine::released_engine_image() {
+        Some(pin) => {
+            pull_image(&pin)?;
+            Ok(EngineImage {
+                pin,
+                released: true,
+            })
+        }
+        None => Ok(EngineImage {
+            pin: local_image_id()?,
+            released: false,
+        }),
+    }
+}
+
+/// `docker pull <image>` on this computer, for the released engine image
+/// pinned by digest.
+pub fn pull_image(image: &str) -> Result<()> {
+    let mut pull = docker();
+    pull.args(["pull", "--quiet", image]);
+    crate::docker::run_capture(pull, "pull the engine image")
+        .with_context(|| format!("pull {image}"))?;
+    Ok(())
+}
+
 /// The image ID [`engine::ENGINE_IMAGE`] names on this computer right now:
-/// what [`engine::enable`] pins (m7-4). Built locally, so there is no
-/// registry digest; the ID is content-addressed, which is what makes the pin
-/// immutable.
+/// what [`engine::enable`] pins on a developer build (m7-4). Built locally,
+/// so there is no registry digest; the ID is content-addressed, which is
+/// what makes the pin immutable.
 pub fn local_image_id() -> Result<String> {
     let mut probe = docker();
     probe.args([
@@ -362,8 +403,11 @@ pub fn local_image_id() -> Result<String> {
     ]);
     let Ok(out) = crate::docker::run_capture(probe, "find the engine image") else {
         bail!(
-            "no {} image on this computer — build it first with engine/build.sh",
-            engine::ENGINE_IMAGE
+            "this Manager is a developer build: it carries no released engine image, so it \
+             pins a local {} build, and there is none on this computer. Build it first with \
+             engine/build.sh, or use a released Manager, which pulls {} by digest",
+            engine::ENGINE_IMAGE,
+            engine::ENGINE_IMAGE_REPO
         );
     };
     let id = out.trim().to_string();
@@ -393,15 +437,16 @@ pub fn compose_config_json(
 }
 
 /// Turn the engine on for a stack on this computer and start it: the image
-/// must be there, pinned by its ID ([`local_image_id`]), then
+/// made ready and pinned ([`engine_image`]: the released one pulled by
+/// digest, or a developer build's local ID), then
 /// [`engine::enable`], then `compose up -d --remove-orphans`, then a first
 /// install code ([`install_code`], m4-6), returned to show next to the site's
 /// address: `None` when the engine wasn't ready to make one (the site is
 /// enabled anyway; `engine install-code` makes one later). The caller has the
 /// user's opt-in (the CLI's `--experimental`, the GUI's setting).
 pub fn enable_local(stack: &Stack) -> Result<Option<String>> {
-    let id = local_image_id()?;
-    engine::enable(stack, &id, &|files, env| {
+    let image = engine_image()?;
+    engine::enable(stack, &image.pin, &|files, env| {
         compose_config_json(stack, files, env)
     })?;
     let mut c = compose(stack);
