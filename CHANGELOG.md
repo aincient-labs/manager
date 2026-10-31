@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-11-01
+
 ### Fixed
 
 - `atelier sites list` says **resting** or **locked down** for a site the experimental engine
@@ -640,7 +642,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/aincient-labs/manager/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/aincient-labs/manager/compare/v0.12.1...v0.13.0
 [0.11.0]: https://github.com/aincient-labs/manager/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/aincient-labs/manager/compare/v0.9.1...v0.10.0
