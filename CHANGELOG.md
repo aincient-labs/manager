@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the CLI and the desktop app carry its digest: `atelier engine enable --experimental` pulls
   the image and pins it by that digest, never by a tag. Building the image on the server
   (`engine/build.sh`) remains for developer builds of the Manager, which say so when they enable.
+- **On a site with the experimental engine, Start wakes it and Stop puts it to rest.** Resting
+  saves a fresh snapshot first and visitors keep reading it; the window's button reads **Rest** and
+  asks first, and the site list says Resting or Locked down instead of Stopped. A locked-down site
+  can't be started until it is unlocked. Update, backup, restore and freeze work as before; sites
+  without the engine are unchanged.
 
 ### Changed
 
