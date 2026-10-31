@@ -975,7 +975,8 @@ function renderStatus(status) {
   } else if (engineWord(status) === "resting" || engineWord(status) === "locked") {
     // Resting mode (M5): visitors still read the snapshot.
     const locked = engineWord(status) === "locked";
-    dot.className = "dot down";
+    // The switcher's dots: amber resting, grey locked down.
+    dot.className = locked ? "dot down" : "dot warn";
     headline.textContent = locked ? "Your website is locked down" : "Your website is resting";
     sub.textContent = locked
       ? "Visitors read its saved pages; nothing else runs. Unlock it under System → Experimental features."
@@ -1304,21 +1305,29 @@ function showEngineButtons(shown) {
   for (const id of ENGINE_BUTTONS) $(id).classList.toggle("hidden", !shown.includes(id));
 }
 
+// Bumped on every refresh: an answer for a site switched away from is dropped.
+let engineAsked = 0;
+
 async function refreshEngine() {
   const state = $("engine-state");
   const problem = $("engine-problem");
+  const asked = ++engineAsked;
   state.textContent = "Checking…";
   problem.classList.add("hidden");
   showEngineButtons([]);
+  // Nothing of the previous site's engine stays up while this one is asked.
+  $("managers-panel").classList.add("hidden");
   let v;
   try {
     v = await invoke("engine_state");
   } catch (e) {
+    if (asked !== engineAsked) return;
     state.textContent = "Unknown";
     problem.textContent = String(e);
     problem.classList.remove("hidden");
     return;
   }
+  if (asked !== engineAsked) return;
   $("managers-panel").classList.toggle("hidden", !v.paired);
   if (v.paired) {
     // Paired by token, without SSH: lock down / unlock and the Managers;
