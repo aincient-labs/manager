@@ -787,6 +787,10 @@ struct EngineView {
     running: bool,
     /// From the engine's `admin status`, when it answered.
     lockdown: Option<bool>,
+    /// The site's state as the engine sees it (M5): resting, waking, awake,
+    /// locked or stopped.
+    state: Option<String>,
+    wake_code_set: Option<bool>,
     api: Option<String>,
     /// The engine speaks a newer API major: offer the Manager's update (C-08).
     manager_too_old: bool,
@@ -816,6 +820,8 @@ fn engine_view<D: engine_admin::DockerExec + ?Sized>(
         let raw = a.status_unchecked()?;
         view.api = Some(raw.api.clone());
         view.lockdown = Some(raw.lockdown);
+        view.state = Some(raw.state.clone()).filter(|s| !s.is_empty());
+        view.wake_code_set = Some(raw.wake_code_set);
         a.status()
     });
     if let Err(e) = read {
@@ -840,6 +846,8 @@ async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
                     running: true,
                     lockdown: Some(e.lockdown),
                     api: Some(e.api),
+                    state: Some(e.state).filter(|s| !s.is_empty()),
+                    wake_code_set: Some(e.wake_code_set),
                     paired: true,
                     ..EngineView::default()
                 })
@@ -991,6 +999,79 @@ async fn engine_lockdown(lock: bool, sel: State<'_, Selected>) -> Result<String,
                 EngineAdmin::new(&s, info.as_ref(), verb.word())
                     .and_then(|a| a.run(verb))
                     .map_err(err)
+            })
+            .await
+        }
+    }
+}
+
+/// Rest or wake the selected site through its engine (M5, m5-1, m5-3;
+/// rest is confirmed in the window first, D-07). Resting needs the engine:
+/// `docker exec` here or over SSH, the API for a paired site. A failed
+/// freeze keeps the site awake, and the error says why.
+#[tauri::command]
+async fn engine_rest(rest: bool, sel: State<'_, Selected>) -> Result<String, String> {
+    require_experimental()?;
+    let (verb, word) = if rest {
+        (AdminVerb::Rest, "rest")
+    } else {
+        (AdminVerb::Wake, "wake")
+    };
+    match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => {
+            let v = if rest { Verb::Rest } else { Verb::Wake };
+            blocking(move || paired::act(&site, v)).await
+        }
+        Target::Local(s) => {
+            blocking(move || {
+                let info = engine_admin::probe(&s);
+                EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), word)
+                    .and_then(|a| a.run(verb))
+                    .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let s = session(&site)?;
+                let info = s.engine_info().map_err(err)?;
+                EngineAdmin::new(&s, info.as_ref(), word)
+                    .and_then(|a| a.run(verb))
+                    .map_err(err)
+            })
+            .await
+        }
+    }
+}
+
+/// A new wake code for the selected site (shown once in the window), or
+/// none with `revoke` (m5-3, D-10).
+#[tauri::command]
+async fn engine_wake_code(
+    revoke: bool,
+    sel: State<'_, Selected>,
+) -> Result<Option<String>, String> {
+    require_experimental()?;
+    match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => {
+            blocking(move || paired::wake_code(&site, revoke)).await
+        }
+        Target::Local(s) => {
+            blocking(move || {
+                engine_admin::wake_code(
+                    &engine_admin::LocalDocker,
+                    engine_admin::probe(&s).as_ref(),
+                    revoke,
+                )
+                .map_err(err)
+            })
+            .await
+        }
+        Target::Remote(site) => {
+            blocking(move || {
+                let s = session(&site)?;
+                let info = s.engine_info().map_err(err)?;
+                engine_admin::wake_code(&s, info.as_ref(), revoke).map_err(err)
             })
             .await
         }
@@ -1618,6 +1699,8 @@ pub fn run() {
             engine_enable,
             engine_remove,
             engine_lockdown,
+            engine_rest,
+            engine_wake_code,
             manager_name,
             pair_with_install_code,
             join_start,

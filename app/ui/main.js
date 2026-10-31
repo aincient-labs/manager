@@ -912,6 +912,11 @@ function renderInstall() {
 
 // Paint the Home hero from the current status — and adapt the one primary action
 // to whatever the person most likely wants to do next.
+// The engine's word for the site (M5), when it runs one and answered.
+function engineWord(status) {
+  return (status && status.engine && status.engine.state) || null;
+}
+
 function renderStatus(status) {
   const dot = $("status-dot");
   const headline = $("status-headline");
@@ -957,6 +962,20 @@ function renderStatus(status) {
     view.classList.add("hidden");
     toggle.classList.remove("hidden");
     $("startstop-label").textContent = "Stop";
+  } else if (engineWord(status) === "resting" || engineWord(status) === "locked") {
+    // Resting mode (M5): visitors still read the snapshot.
+    const locked = engineWord(status) === "locked";
+    dot.className = "dot down";
+    headline.textContent = locked ? "Your website is locked down" : "Your website is resting";
+    sub.textContent = locked
+      ? "Visitors read its saved pages; nothing else runs. Unlock it under System → Experimental features."
+      : "Visitors read its saved pages; sign-in and forms are paused. Wake it to work on it.";
+    primary.disabled = locked;
+    primary.dataset.action = experimental ? "engine-wake" : "startstop";
+    primaryIcon.setAttribute("href", "#i-play");
+    primaryLabel.textContent = "Wake my website";
+    view.classList.add("hidden");
+    toggle.classList.add("hidden");
   } else {
     dot.className = "dot down";
     headline.textContent = "Your website is stopped";
@@ -1232,9 +1251,34 @@ const ENGINE_BUTTONS = [
   "engine-enable",
   "engine-lockdown",
   "engine-unlock",
+  "engine-rest",
+  "engine-wake",
+  "engine-wake-code",
+  "engine-wake-code-revoke",
   "engine-remove",
   "engine-update-manager",
 ];
+
+// Resting mode (M5): the engine's word for the site, in the window's words.
+const ENGINE_STATES = {
+  resting: "Resting",
+  waking: "Waking",
+  awake: "Awake",
+  locked: "Locked down",
+  stopped: "Stopped",
+};
+
+// Rest or wake (whichever applies), and the wake code, for an unlocked site.
+function restingButtons(v) {
+  const shown = [v.state === "resting" ? "engine-wake" : "engine-rest", "engine-wake-code"];
+  if (v.wake_code_set) shown.push("engine-wake-code-revoke");
+  return v.state === "waking" ? ["engine-wake-code"] : shown;
+}
+
+function engineStateText(v) {
+  const word = ENGINE_STATES[v.state] || (v.lockdown ? "Locked down" : "Running");
+  return v.api ? `${word} (API ${v.api})` : word;
+}
 
 function showEngineButtons(shown) {
   for (const id of ENGINE_BUTTONS) $(id).classList.toggle("hidden", !shown.includes(id));
@@ -1259,8 +1303,10 @@ async function refreshEngine() {
   if (v.paired) {
     // Paired by token, without SSH: lock down / unlock and the Managers;
     // adding or removing the engine needs SSH.
-    state.textContent = v.lockdown ? "Locked down" : `Paired (API ${v.api})`;
-    showEngineButtons(v.lockdown ? ["engine-unlock"] : ["engine-lockdown"]);
+    state.textContent = `Paired · ${engineStateText(v)}`;
+    showEngineButtons(
+      v.lockdown ? ["engine-unlock"] : [...restingButtons(v), "engine-lockdown"]
+    );
     refreshManagers();
     return;
   }
@@ -1288,8 +1334,8 @@ async function refreshEngine() {
     showEngineButtons(["engine-unlock"]);
     return;
   }
-  state.textContent = `Running (API ${v.api})`;
-  showEngineButtons(["engine-lockdown", "engine-remove"]);
+  state.textContent = engineStateText(v);
+  showEngineButtons([...restingButtons(v), "engine-lockdown", "engine-remove"]);
 }
 
 // --- Managers (M4, E-02) -----------------------------------------------------
@@ -1926,12 +1972,76 @@ const actions = {
   "engine-unlock": async () => {
     const ok = await confirmChange(
       "Unlock {site}?",
-      "Waking and pairing open again. The site stays stopped until you start it.",
+      "Waking and pairing open again. The site stays resting until it is woken, by its " +
+        "wake code at /atelier or from here.",
       { always: true }
     );
     if (!ok) return;
     await runProgressOp("Unlocking", () => invoke("engine_lockdown", { lock: false }));
     refreshEngine();
+  },
+
+  // ---- Resting mode (M5) ----
+  "engine-rest": async () => {
+    const ok = await confirmChange(
+      "Put {site} to rest?",
+      "A fresh snapshot is saved first, then the site's app and database stop. Visitors " +
+        "keep reading the snapshot; sign-in and forms are paused until it is woken. If the " +
+        "snapshot fails, the site stays awake.",
+      { always: true }
+    );
+    if (!ok) return;
+    await runProgressOp("Putting the site to rest", () => invoke("engine_rest", { rest: true }));
+    refreshEngine();
+    refresh().catch((e) => showError(String(e)));
+  },
+
+  "engine-wake": async () => {
+    await runProgressOp("Waking the site", () => invoke("engine_rest", { rest: false }));
+    refreshEngine();
+    refresh().catch((e) => showError(String(e)));
+  },
+
+  "engine-wake-code": async () => {
+    const ok = await confirmChange(
+      "Make a new wake code for {site}?",
+      "The old code stops working. The new one is shown once.",
+      { always: true }
+    );
+    if (!ok) return;
+    let code = null;
+    try {
+      code = await invoke("engine_wake_code", { revoke: false });
+    } catch (e) {
+      return showError(String(e));
+    }
+    if (code) {
+      $("wake-code-value").textContent = code;
+      $("wake-code").classList.remove("hidden");
+    }
+    refreshEngine();
+  },
+
+  "engine-wake-code-revoke": async () => {
+    const ok = await confirmChange(
+      "Turn waking by code off for {site}?",
+      "The wake code stops working. A Manager can still wake the site, and you can make a " +
+        "new code at any time.",
+      { always: true }
+    );
+    if (!ok) return;
+    try {
+      await invoke("engine_wake_code", { revoke: true });
+    } catch (e) {
+      return showError(String(e));
+    }
+    refreshEngine();
+  },
+
+  "wake-code-copy": (el) => copyText($("wake-code-value").textContent, el),
+  "wake-code-close": () => {
+    $("wake-code-value").textContent = "";
+    $("wake-code").classList.add("hidden");
   },
 
   "engine-remove": async () => {

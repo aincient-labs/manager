@@ -624,6 +624,20 @@
               <button id="engine-unlock" class="btn small full hidden" data-action="engine-unlock">
                 <svg class="ic"><use href="#i-key" /></svg>Unlock
               </button>
+              <!-- Resting mode (M5): rest freezes, then stops app and db;
+                   the wake code wakes it from /atelier. -->
+              <button id="engine-rest" class="btn small full hidden" data-action="engine-rest">
+                <svg class="ic"><use href="#i-power" /></svg>Put the site to rest
+              </button>
+              <button id="engine-wake" class="btn small full hidden" data-action="engine-wake">
+                <svg class="ic"><use href="#i-play" /></svg>Wake the site
+              </button>
+              <button id="engine-wake-code" class="btn small full hidden" data-action="engine-wake-code">
+                <svg class="ic"><use href="#i-key" /></svg>Make a new wake code
+              </button>
+              <button id="engine-wake-code-revoke" class="btn small full hidden" data-action="engine-wake-code-revoke">
+                <svg class="ic"><use href="#i-trash" /></svg>Turn waking by code off
+              </button>
               <button id="engine-remove" class="btn small full hidden" data-action="engine-remove">
                 <svg class="ic"><use href="#i-trash" /></svg>Remove the engine
               </button>
@@ -925,6 +939,26 @@
             <svg class="ic"><use href="#i-copy" /></svg><span>Copy</span>
           </button>
           <button type="button" class="btn primary" data-action="install-code-close">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- A new wake code (M5, m5-3): shown once, like the install code. -->
+    <div id="wake-code" class="overlay hidden">
+      <div class="modal">
+        <h3 class="modal-title">Keep this wake code</h3>
+        <p class="muted">
+          While the site rests, anyone with this code can wake it at
+          <strong>/atelier</strong>. Waking starts the site; it doesn't sign
+          anyone in. The site keeps only a fingerprint of it, so this is the
+          only time you see it.
+        </p>
+        <p id="wake-code-value" class="big-code"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="wake-code-copy">
+            <svg class="ic"><use href="#i-copy" /></svg><span>Copy</span>
+          </button>
+          <button type="button" class="btn primary" data-action="wake-code-close">Done</button>
         </div>
       </div>
     </div>

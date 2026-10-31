@@ -101,7 +101,7 @@ pub fn act(site: &Site, verb: Verb) -> Result<String, String> {
     let c = client(site)?;
     let acted = c.act(verb).map_err(|e| explain(site, e))?;
     Ok(match (verb, acted.job) {
-        (Verb::Unlock, _) => "Unlocked.".to_string(),
+        (Verb::Unlock, _) => "Unlocked: the site is resting.".to_string(),
         (_, Some(job)) => format!("{job} started on the engine."),
         (_, None) => "Done.".to_string(),
     })
@@ -112,6 +112,9 @@ pub fn act(site: &Site, verb: Verb) -> Result<String, String> {
 pub struct PairedEngine {
     pub lockdown: bool,
     pub api: String,
+    /// `resting`, `waking`, `awake`, `locked` or `stopped` (M5).
+    pub state: String,
+    pub wake_code_set: bool,
 }
 
 pub fn engine(site: &Site) -> Result<PairedEngine, String> {
@@ -119,7 +122,19 @@ pub fn engine(site: &Site) -> Result<PairedEngine, String> {
     Ok(PairedEngine {
         lockdown: st.lockdown,
         api: st.api,
+        state: st.state,
+        wake_code_set: st.wake_code_set,
     })
+}
+
+/// Rotate (returns the new code, shown once) or revoke the wake code (m5-3).
+pub fn wake_code(site: &Site, revoke: bool) -> Result<Option<String>, String> {
+    let c = client(site)?;
+    if revoke {
+        c.revoke_wake_code().map_err(|e| explain(site, e))?;
+        return Ok(None);
+    }
+    c.rotate_wake_code().map(Some).map_err(|e| explain(site, e))
 }
 
 /// The Managers panel: every pairing, and for the primary the waiting
