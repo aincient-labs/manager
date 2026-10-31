@@ -443,8 +443,9 @@ async function refresh() {
   if (remote) {
     const before = remoteStates[row.slug];
     if (!(before && before.state === "frozen" && status.running)) {
+      const rested = engineWord(status) === "resting";
       remoteStates[row.slug] = {
-        state: status.running ? "running" : "stopped",
+        state: status.running ? "running" : rested ? "resting" : "stopped",
         version: status.version,
       };
       renderSites();
@@ -495,6 +496,7 @@ const REMOTE_STATE_WORDS = {
   running: "Running",
   frozen: "Frozen",
   stopped: "Stopped",
+  resting: "Resting",
 };
 
 function siteState(row) {
@@ -520,7 +522,11 @@ function siteDot(row) {
   if (!row.host) return row.running ? "up" : "down";
   const st = remoteStates[row.slug];
   if (!st) return "";
-  return { running: "up", frozen: "warn", stopped: "down", unreachable: "warn" }[st.state] || "";
+  return (
+    { running: "up", frozen: "warn", resting: "warn", stopped: "down", unreachable: "warn" }[
+      st.state
+    ] || ""
+  );
 }
 
 // Ask each server for its site's state, after the list painted — one bounded

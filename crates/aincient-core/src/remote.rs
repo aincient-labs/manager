@@ -1897,6 +1897,9 @@ pub enum SiteState {
     },
     /// Reachable, not running.
     Stopped,
+    /// Rested by its engine (M5): the app is down and visitors get the
+    /// snapshot until it is woken. Only a paired site reports it.
+    Resting,
     /// The server didn't answer in time, or answered with an error.
     Unreachable { reason: String },
 }
@@ -1905,7 +1908,7 @@ impl SiteState {
     /// Whether changing it needs the typed slug (D-07) — see
     /// [`crate::guard::is_live`]: frozen and unreachable count as live.
     pub fn is_live(&self) -> bool {
-        !matches!(self, SiteState::Stopped)
+        !matches!(self, SiteState::Stopped | SiteState::Resting)
     }
 }
 
@@ -2848,6 +2851,13 @@ mod tests {
         assert!(gone.is_live(), "unknown counts as live");
         let json = serde_json::to_value(&gone).unwrap();
         assert_eq!(json["state"], "unreachable");
+        // The window's switcher reads the tag: a rested site says so.
+        let resting = serde_json::to_value(SiteState::Resting).unwrap();
+        assert_eq!(resting["state"], "resting");
+        assert!(
+            !SiteState::Resting.is_live(),
+            "its app is down, as the paired guard says"
+        );
     }
 
     #[test]
