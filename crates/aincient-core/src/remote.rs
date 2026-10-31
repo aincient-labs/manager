@@ -1002,9 +1002,25 @@ impl<T: Transport> Session<T> {
         home: Option<&Path>,
         sink: &mut dyn FnMut(Pipe, &str),
     ) -> Result<RemoteBackup> {
+        let host = self.transport.target().to_string();
+        sink(Pipe::Stderr, &format!("Backing up on {host}…"));
         let server = self.backup_on_server(label, sink)?;
         let local = match home {
-            Some(dir) => Some(fetch_backup(&self.transport, &server, dir)?),
+            Some(dir) => {
+                sink(
+                    Pipe::Stderr,
+                    &format!(
+                        "Copying the backup to this computer ({})…",
+                        mib(server.size)
+                    ),
+                );
+                let path = fetch_backup(&self.transport, &server, dir)?;
+                sink(
+                    Pipe::Stderr,
+                    "The copy matches the server's (SHA-256 checked).",
+                );
+                Some(path)
+            }
             None => None,
         };
         Ok(RemoteBackup { server, local })
@@ -1100,6 +1116,10 @@ impl<T: Transport> Session<T> {
             .unwrap_or_default();
         let name = safe_file_name(&original).unwrap_or_else(|| "backup.tar.gz".to_string());
         let (size, sha256) = sha256_file(file)?;
+        sink(
+            Pipe::Stderr,
+            &format!("Uploading the backup ({}) to {host}…", mib(size)),
+        );
         let upload = format!(
             "umask 077\nd=$(mktemp -d \"${{TMPDIR:-/tmp}}/atelier-restore.XXXXXX\") || exit 1\n\
              cat > \"$d\"/{name} || {{ rm -rf \"$d\"; exit 1; }}\n\
@@ -1124,6 +1144,11 @@ impl<T: Transport> Session<T> {
                      sent {size} bytes, sha256 {sha256}) — nothing was restored"
                 );
             }
+            sink(Pipe::Stderr, "The upload arrived intact (SHA-256 checked).");
+            sink(
+                Pipe::Stderr,
+                &format!("Restoring on {host}; the site is unavailable until this finishes…"),
+            );
             self.run_action(
                 &Action::Restore {
                     file: remote_file.clone(),
@@ -1139,6 +1164,11 @@ impl<T: Transport> Session<T> {
         );
         outcome
     }
+}
+
+/// `bytes` as the window shows backup sizes: MiB with one decimal, "MB".
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
 }
 
 /// Copy the server's archive `info` into `dir` on this machine: stream it

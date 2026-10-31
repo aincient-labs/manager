@@ -540,6 +540,21 @@ fn done_export_banner(path: &std::path::Path) {
     println!("Deploy it anywhere — Netlify, Cloudflare Pages, GitHub Pages, or any static host.");
 }
 
+/// Prints each step of a data op as a plain line on stderr, so stdout stays
+/// free for `--json`. A Manager driving this CLI over SSH relays the lines as
+/// they arrive; without them a server backup or restore is a silent minute.
+struct StepLines;
+
+impl ops::Reporter for StepLines {
+    fn stage(&mut self, _stage: ops::Stage, message: &str, _fraction: Option<f32>) {
+        eprintln!("{message}");
+    }
+
+    fn log(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+}
+
 /// Renders core lifecycle progress on the terminal: a headline as each stage
 /// begins, then heartbeat dots while the console finishes booting. Docker's own
 /// output streams underneath untouched (we don't capture it — `captures_output`
@@ -1335,7 +1350,7 @@ fn print_snapshots(list: &ops::SnapshotList) {
 fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
     match command {
         DataCommand::Backup { label, json, .. } => {
-            let path = ops::backup(stack, label.as_deref(), &mut ops::Silent)?;
+            let path = ops::backup(stack, label.as_deref(), &mut StepLines)?;
             if json {
                 // What a Manager driving this CLI over SSH reads (m2-5).
                 let info = ops::describe_backup(&path)?;
@@ -1378,7 +1393,7 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
                 stack,
                 &file,
                 &ops::RestoreOptions { other_site },
-                &mut ops::Silent,
+                &mut StepLines,
             )?;
             println!("{}", style::success("Restore complete."));
             Ok(())
