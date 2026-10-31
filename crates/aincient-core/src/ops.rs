@@ -2027,6 +2027,20 @@ impl SnapshotManifest {
     }
 }
 
+/// An operation that needs the site up found it stopped. Typed so each
+/// front-end says how to start it: this wording names the CLI command; the
+/// window matches the type and points at its own Start button instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotRunning;
+
+impl std::fmt::Display for NotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the appliance isn't running — start it with `atelier app start`")
+    }
+}
+
+impl std::error::Error for NotRunning {}
+
 /// A restore was refused: the archive belongs to another site (m2-6, D-04).
 /// Typed so a front-end can offer the override instead of only showing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2540,7 +2554,7 @@ fn ensure_running(stack: &Stack) -> Result<()> {
     ensure_installed(stack)?;
     preflight().require()?;
     if !status(stack).running {
-        bail!("the appliance isn't running — start it with `atelier app start`");
+        return Err(NotRunning.into());
     }
     Ok(())
 }
@@ -3255,6 +3269,19 @@ mod tests {
         assert_eq!(
             check_identity(Some(&m), Some(ID_A), "Blog (blog)", false).unwrap(),
             IdentityCheck::Same
+        );
+    }
+
+    #[test]
+    fn not_running_names_the_cli_command_and_stays_typed_under_context() {
+        let err = anyhow::Error::from(super::NotRunning).context("backing up");
+        assert!(
+            err.downcast_ref::<super::NotRunning>().is_some(),
+            "the window matches it"
+        );
+        assert!(
+            format!("{err:#}").contains("`atelier app start`"),
+            "{err:#}"
         );
     }
 

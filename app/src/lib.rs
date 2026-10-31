@@ -72,8 +72,17 @@ fn stack(sel: &Selected) -> Result<Stack, String> {
 
 /// Render an anyhow error (with its context chain) as a single string.
 fn err(e: anyhow::Error) -> String {
+    // The core words this one for the CLI (`atelier app start`); the window
+    // has a button for it.
+    if e.downcast_ref::<ops::NotRunning>().is_some() {
+        return NOT_RUNNING.into();
+    }
     format!("{e:#}")
 }
+
+/// [`ops::NotRunning`] in the window's words.
+const NOT_RUNNING: &str =
+    "Your website isn't running. Start it from Home (Start my website), then try again.";
 
 // --- local or remote ---------------------------------------------------------
 
