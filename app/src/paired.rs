@@ -200,7 +200,8 @@ pub fn forget(site: &Site) -> Result<(), String> {
 fn entry(slug: &str, label: &str, url: &str) -> Result<Site, String> {
     let uh = sites::user_home().map_err(|e| format!("{e:#}"))?;
     let label = Some(label.trim()).filter(|l| !l.is_empty());
-    let site = sites::engine_entry(&uh, slug, label, url).map_err(|e| format!("{e:#}"))?;
+    let site =
+        sites::engine_entry(&uh, slug, label, url).map_err(|e| capitalise(&format!("{e:#}")))?;
     let taken = sites::list_sites(&uh)
         .map_err(|e| format!("{e:#}"))?
         .iter()

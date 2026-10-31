@@ -1212,7 +1212,9 @@ pub fn remote_entry(
 
 /// A checked entry for a site paired with its engine (M4): `url` must be
 /// what the engine client accepts, https unless loopback. Plain `http://` to
-/// anything else is refused here, before a code is ever sent.
+/// anything else is refused here, before a code is ever sent — and so is a
+/// URL this Manager already has a site for ([`Registry::validate`] is the
+/// backstop).
 pub fn engine_entry(user_home: &Path, slug: &str, label: Option<&str>, url: &str) -> Result<Site> {
     let url = url.trim().trim_end_matches('/');
     let base = crate::engine_client::EngineUrl::from_domain(url).map_err(|e| anyhow::anyhow!(e))?;
@@ -1222,6 +1224,14 @@ pub fn engine_entry(user_home: &Path, slug: &str, label: Option<&str>, url: &str
         bail!(
             "`{slug}` is not a valid site name — use lowercase letters, digits and `-` \
              (starting with a letter or digit, at most 40 characters)"
+        );
+    }
+    let registry = load_effective(user_home)?.unwrap_or_default();
+    if let Some(had) = registry.sites.iter().find(|s| s.engine_url() == Some(&url)) {
+        bail!(
+            "this Manager already has {} ({}) for {url}; a Manager pairs a site once",
+            had.label,
+            had.slug
         );
     }
     Ok(Site::new_engine(user_home, slug, label, &url))
@@ -2350,6 +2360,27 @@ host = "stage-alias"
                 .engine_url(),
             Some("https://cms.example.com")
         );
+    }
+
+    #[test]
+    fn an_engine_this_manager_already_has_is_named_before_asking() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let site = engine_entry(
+            uh,
+            "vps-code",
+            Some("VPS (code)"),
+            "https://cms.example.com",
+        )
+        .unwrap();
+        add_remote_site(uh, site, |_| Ok(())).unwrap();
+        let e = engine_entry(uh, "vps-join", None, "https://CMS.example.com/").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this Manager already has VPS (code) (vps-code) for https://cms.example.com; a \
+             Manager pairs a site once"
+        );
+        assert!(engine_entry(uh, "other", None, "https://other.example.com").is_ok());
     }
 
     #[test]
