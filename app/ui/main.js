@@ -1777,7 +1777,8 @@ const actions = {
             "Put {site} to rest?",
             "A fresh snapshot is saved first, then the site's app and database stop. Visitors " +
               "keep reading the snapshot; sign-in and forms are paused until it is woken. If the " +
-              "snapshot fails, the site stays awake."
+              "snapshot fails, the site stays awake.",
+            { always: true }
           )
         : confirmChange("Stop {site}?", "Visitors can't reach it until it's started again.")))
     )
