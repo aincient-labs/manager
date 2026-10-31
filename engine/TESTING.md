@@ -150,10 +150,13 @@ an untrusted client can arrive as.
 
 **6. Enable the engine.** It pins the image you built by its ID, writes `compose.engine.yaml` and
 `edge.engine.conf`, restarts the stack and prints the **install code** (`XXXX-XXXX-XXXX-XXXX`,
-shown once) that pairs your first Manager. Keep it private.
+shown once) that pairs your first Manager. Keep it private. The released installer wrote the
+stack files from the released templates, and `enable` refuses while they differ from this build's;
+`doctor --fix` rewrites them (your `.env` values, such as `ATELIER_TRUSTED_PROXIES`, are kept).
 
 ```sh
 # atelier
+atelier doctor --fix
 atelier engine enable --experimental
 ss -ltn | grep 41221            # expect 127.0.0.1:41221 only, no 0.0.0.0 or [::]
 atelier doctor                  # the "(EXPERIMENTAL)" lines should all be [x]
