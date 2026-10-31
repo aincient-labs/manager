@@ -379,6 +379,17 @@ pub struct EngineStatus {
     pub wake_code_set: bool,
     #[serde(default)]
     pub job: Option<JobView>,
+    /// `locked`, `waking`, `resting`, `awake` or `stopped` (M5); empty from
+    /// an engine that predates resting mode.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub resting: bool,
+    /// The idle timer's minutes (0 = off) and when the site was last woken.
+    #[serde(default)]
+    pub idle_rest_minutes: Option<u64>,
+    #[serde(default)]
+    pub woken_at: Option<u64>,
 }
 
 /// What a lifecycle verb answered: a started job (202) or, for `unlock`, the
@@ -542,6 +553,24 @@ impl<T: HttpTransport> EngineClient<T> {
     pub fn act(&self, verb: Verb) -> Result<Acted, EngineError> {
         self.ensure_compatible()?;
         self.call(Method::Post, verb.path(), Auth::Token, None)
+    }
+
+    /// A new wake code (m5-3), returned once; the engine keeps its hash.
+    pub fn rotate_wake_code(&self) -> Result<String, EngineError> {
+        #[derive(Deserialize)]
+        struct Made {
+            code: String,
+        }
+        self.ensure_compatible()?;
+        let m: Made = self.call(Method::Post, "wake/code", Auth::Token, None)?;
+        Ok(m.code)
+    }
+
+    /// No wake code: waking by code is refused until a new one is made.
+    pub fn revoke_wake_code(&self) -> Result<(), EngineError> {
+        self.ensure_compatible()?;
+        let _: Value = self.call(Method::Delete, "wake/code", Auth::Token, None)?;
+        Ok(())
     }
 }
 
@@ -906,6 +935,47 @@ mod tests {
             client(&fake).version().unwrap_err(),
             EngineError::Malformed(_)
         ));
+    }
+
+    #[test]
+    fn the_wake_code_is_rotated_and_revoked_over_the_api() {
+        let fake = Fake::with(vec![
+            (200, V1),
+            (201, r#"{"code":"ABCD-EFGH-JKMN-PQRS"}"#),
+            (200, r#"{"wake_code_set":false}"#),
+        ]);
+        let c = client(&fake);
+        assert_eq!(c.rotate_wake_code().unwrap(), "ABCD-EFGH-JKMN-PQRS");
+        c.revoke_wake_code().unwrap();
+        assert_eq!(
+            fake.paths()[1..],
+            [
+                "POST https://cms.example.com/_atelier/engine/v1/wake/code",
+                "DELETE https://cms.example.com/_atelier/engine/v1/wake/code"
+            ]
+        );
+        assert!(fake.sent.borrow()[1].bearer.is_some());
+        let fake = Fake::with(vec![
+            (200, V1),
+            (409, r#"{"error":"locked down: unlock first"}"#),
+        ]);
+        assert!(matches!(
+            client(&fake).rotate_wake_code(),
+            Err(EngineError::Conflict(_))
+        ));
+        // Resting mode's status fields, and their absence from an older engine.
+        let fake = Fake::with(vec![
+            (200, V1),
+            (
+                200,
+                r#"{"api":"1.1.0","app":"exited","db":"exited","lockdown":false,"state":"resting","resting":true,"idle_rest_minutes":30,"woken_at":null}"#,
+            ),
+        ]);
+        let st = client(&fake).status().unwrap();
+        assert_eq!(
+            (st.state.as_str(), st.resting, st.idle_rest_minutes),
+            ("resting", true, Some(30))
+        );
     }
 
     #[test]

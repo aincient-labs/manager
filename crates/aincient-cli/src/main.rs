@@ -3122,6 +3122,7 @@ mod tests {
             enabled: true,
             container: Some("atelier-engine-1".into()),
             running: true,
+            state: None,
         };
         let guard = local_guard();
         let d = FakeDocker {

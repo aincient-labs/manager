@@ -28,6 +28,9 @@ use crate::Stack;
 
 /// How long an admin verb may take (lockdown and wake run compose).
 pub const ADMIN_DEADLINE: Duration = Duration::from_secs(150);
+/// `admin rest` freezes first: the engine's drush deadline (15 min) plus the
+/// stop.
+pub const REST_DEADLINE: Duration = Duration::from_secs(17 * 60);
 /// The services of the default stack, which [`remove`] restores (C-09).
 pub const DEFAULT_SERVICES: [&str; 3] = ["app", "db", "edge"];
 
@@ -42,6 +45,11 @@ pub struct EngineInfo {
     /// That container is running.
     #[serde(default)]
     pub running: bool,
+    /// The site's state as the engine sees it (M5): `resting`, `awake`,
+    /// `locked`, `waking` or `stopped`; `None` when it wasn't asked or
+    /// didn't answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 impl EngineInfo {
@@ -99,6 +107,7 @@ pub fn probe(stack: &Stack) -> Option<EngineInfo> {
         enabled: true,
         running: found.as_ref().is_some_and(|(_, st, _)| st == "running"),
         container: found.map(|(_, _, name)| name).filter(|n| !n.is_empty()),
+        state: None,
     })
 }
 
@@ -108,6 +117,8 @@ pub enum Lifecycle {
     Status,
     Freeze,
     Live,
+    /// Freeze, then stop app and db; edge serves the resting copy (M5).
+    Rest,
     Wake,
     Lockdown,
     Unlock,
@@ -135,8 +146,10 @@ pub fn needs_engine(what: &str) -> String {
 }
 
 /// Engine or host CLI for `action` (m3-7). With the engine present:
-/// `status` reads the engine's state too, `wake`, `lockdown` and `unlock` go
-/// through it. `freeze` and `live` stay on the host CLI in every case: its
+/// `status` reads the engine's state too, `rest`, `wake`, `lockdown` and
+/// `unlock` go through it. Resting needs the engine (m5-1): without it no
+/// edge marker says "resting" and nothing could wake the site by code, so
+/// `rest` is refused rather than faked as freeze + stop. `freeze` and `live` stay on the host CLI in every case: its
 /// freeze takes the owner's options (label, keep, base URL), the engine's
 /// admin has none. Without the engine, lockdown and unlock are refused (only
 /// the engine has them); the rest is the host CLI, as before.
@@ -146,6 +159,7 @@ pub fn route(action: Lifecycle, engine: Option<&EngineInfo>) -> Via {
         (Lifecycle::Freeze | Lifecycle::Live, _) => Via::HostCli,
         (Lifecycle::Status | Lifecycle::Wake, None) => Via::HostCli,
         (Lifecycle::Lockdown, None) => Via::Refuse(needs_engine("lockdown")),
+        (Lifecycle::Rest, None) => Via::Refuse(needs_engine("rest")),
         (Lifecycle::Unlock, None) => Via::Refuse(needs_engine("unlock")),
         (_, Some(container)) => Via::Engine(container),
     }
@@ -157,7 +171,12 @@ pub enum AdminVerb {
     Status,
     Lockdown,
     Unlock,
+    Rest,
     Wake,
+    /// A new wake code, printed once (m5-3).
+    WakeCode,
+    /// No wake code: waking by code is refused.
+    WakeCodeRevoke,
     /// A one-time install code that pairs the primary Manager (E-02, m4-6).
     /// Only SSH (or this computer's Docker) can make one.
     InstallCode,
@@ -169,18 +188,32 @@ impl AdminVerb {
             AdminVerb::Status => "status",
             AdminVerb::Lockdown => "lockdown",
             AdminVerb::Unlock => "unlock",
+            AdminVerb::Rest => "rest",
             AdminVerb::Wake => "wake",
+            AdminVerb::WakeCode | AdminVerb::WakeCodeRevoke => "wake-code",
             AdminVerb::InstallCode => "install-code",
+        }
+    }
+
+    /// How long the verb may take: `rest` runs a freeze first.
+    pub fn deadline(self) -> Duration {
+        match self {
+            AdminVerb::Rest => REST_DEADLINE,
+            _ => ADMIN_DEADLINE,
         }
     }
 }
 
 /// The `docker` arguments for one admin verb. No `-i`/`-t`: stdin stays closed.
 pub fn admin_argv(container: &str, verb: AdminVerb) -> Vec<String> {
-    ["exec", container, "atelier", "engine", "admin", verb.word()]
+    let mut argv: Vec<String> = ["exec", container, "atelier", "engine", "admin", verb.word()]
         .iter()
         .map(|s| s.to_string())
-        .collect()
+        .collect();
+    if verb == AdminVerb::WakeCodeRevoke {
+        argv.push("--revoke".into());
+    }
+    argv
 }
 
 /// Where `docker` runs: this computer, or a server over SSH
@@ -237,6 +270,12 @@ pub struct AdminStatus {
     pub wake_paused: bool,
     #[serde(default)]
     pub wake_code_set: bool,
+    /// `resting`, `awake`, `locked` or `stopped` (M5); empty from an engine
+    /// that predates resting mode.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub resting: bool,
 }
 
 impl AdminStatus {
@@ -272,7 +311,7 @@ impl<'a, D: DockerExec + ?Sized> EngineAdmin<'a, D> {
     fn exec(&self, verb: AdminVerb) -> Result<String> {
         let out = self
             .docker
-            .docker(&admin_argv(&self.container, verb), ADMIN_DEADLINE)?;
+            .docker(&admin_argv(&self.container, verb), verb.deadline())?;
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
@@ -399,6 +438,49 @@ pub fn install_code_in(out: &str) -> Option<String> {
                 .all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_alphanumeric())))
         .then(|| w.to_ascii_uppercase())
     })
+}
+
+/// Rotate (`revoke = false`) or revoke the site's wake code inside its
+/// engine (m5-3, D-10). Returns the new code, shown once; `None` after a
+/// revoke.
+pub fn wake_code<D: DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<&EngineInfo>,
+    revoke: bool,
+) -> Result<Option<String>> {
+    let admin = EngineAdmin::new(docker, info, "wake-code")?;
+    if revoke {
+        admin.run(AdminVerb::WakeCodeRevoke)?;
+        return Ok(None);
+    }
+    let out = admin.run(AdminVerb::WakeCode)?;
+    install_code_in(&out).map(Some).ok_or_else(|| {
+        anyhow!(
+            "the engine on {} made no wake code the Manager can read",
+            docker.place()
+        )
+    })
+}
+
+/// What the Manager says with a new wake code (m5-3).
+pub fn wake_code_notice(code: &str) -> String {
+    format!(
+        "Wake code: {code}\nShown once; the site keeps only its hash. Anyone with it can wake \
+         the site at /atelier while it rests (it signs nobody in). Rotate it with \
+         `engine wake-code --rotate`, or turn waking by code off with `--revoke`."
+    )
+}
+
+/// The engine's state in words, for status lines.
+pub fn state_words(state: &str) -> &'static str {
+    match state {
+        "resting" => "resting (visitors see the snapshot; sign-in and forms are paused)",
+        "waking" => "waking",
+        "awake" => "awake",
+        "locked" => "locked down (resting, wake off)",
+        "stopped" => "stopped",
+        _ => "unknown",
+    }
 }
 
 /// What a Manager prints next to the site's address after enabling (m4-6).
@@ -612,6 +694,7 @@ mod tests {
             enabled: true,
             container: Some("atelier-blog-engine-1".into()),
             running,
+            state: None,
         }
     }
 
@@ -624,6 +707,7 @@ mod tests {
         assert_eq!(e(Lifecycle::Wake), via);
         assert_eq!(e(Lifecycle::Lockdown), via);
         assert_eq!(e(Lifecycle::Unlock), via);
+        assert_eq!(e(Lifecycle::Rest), via);
         assert_eq!(e(Lifecycle::Freeze), Via::HostCli);
         assert_eq!(e(Lifecycle::Live), Via::HostCli);
     }
@@ -648,6 +732,7 @@ mod tests {
             for (a, word) in [
                 (Lifecycle::Lockdown, "lockdown"),
                 (Lifecycle::Unlock, "unlock"),
+                (Lifecycle::Rest, "rest"),
             ] {
                 match route(a, engine) {
                     Via::Refuse(m) => {
@@ -758,6 +843,48 @@ mod tests {
     }
 
     #[test]
+    fn rest_and_the_wake_code_go_through_docker_exec_with_their_own_argv() {
+        assert_eq!(
+            admin_argv("e-1", AdminVerb::WakeCodeRevoke)[4..],
+            ["admin", "wake-code", "--revoke"]
+        );
+        assert_eq!(admin_argv("e-1", AdminVerb::Rest)[5], "rest");
+        assert_eq!(AdminVerb::Rest.deadline(), REST_DEADLINE);
+        assert!(
+            REST_DEADLINE > Duration::from_secs(15 * 60),
+            "outlasts the engine's drush"
+        );
+        assert_eq!(AdminVerb::Wake.deadline(), ADMIN_DEADLINE);
+
+        let d = FakeDocker::default();
+        d.replies.borrow_mut().extend([
+            Ok(STATUS_V1.to_string()),
+            Ok("abcd-efgh-jkmn-pqrs".to_string()),
+            Ok(STATUS_V1.to_string()),
+            Ok(String::new()),
+        ]);
+        let on = info(true);
+        assert_eq!(
+            wake_code(&d, Some(&on), false).unwrap().as_deref(),
+            Some("ABCD-EFGH-JKMN-PQRS")
+        );
+        assert_eq!(wake_code(&d, Some(&on), true).unwrap(), None);
+        let calls = d.calls.borrow();
+        assert!(calls[1].ends_with("admin wake-code"));
+        assert!(calls[3].ends_with("admin wake-code --revoke"));
+        assert!(wake_code(&d, None, false).is_err());
+        // An engine from before resting mode reads with no state.
+        let st: AdminStatus = serde_json::from_str(STATUS_V1).unwrap();
+        assert_eq!((st.state.as_str(), st.resting), ("", false));
+        let st: AdminStatus = serde_json::from_str(&STATUS_V1.replace(
+            "\"lockdown\"",
+            "\"state\":\"resting\",\"resting\":true,\"lockdown\"",
+        ))
+        .unwrap();
+        assert_eq!((st.state.as_str(), st.resting), ("resting", true));
+    }
+
+    #[test]
     fn an_install_code_is_minted_inside_the_engine_after_the_version_check() {
         let d = FakeDocker::default();
         d.replies.borrow_mut().extend([
@@ -810,6 +937,8 @@ mod tests {
                     lockdown: false,
                     wake_paused: false,
                     wake_code_set: false,
+                    state: String::new(),
+                    resting: false,
                 },
                 fail: None,
                 after: ["edge", "app", "db"]

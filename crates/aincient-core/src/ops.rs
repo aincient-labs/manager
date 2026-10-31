@@ -382,8 +382,22 @@ pub fn status(stack: &Stack) -> Status {
         site_id: stack.site_id(),
         engine: installed
             .then(|| crate::engine_admin::probe(stack))
-            .flatten(),
+            .flatten()
+            .map(with_engine_state),
     }
+}
+
+/// The engine's word for the site (M5: resting, awake, locked, …), when it
+/// runs and answers `admin status`; a server's `app status --json` carries
+/// it to a Manager that reaches it over SSH.
+fn with_engine_state(mut info: crate::engine_admin::EngineInfo) -> crate::engine_admin::EngineInfo {
+    use crate::engine_admin::{EngineAdmin, LocalDocker};
+    info.state = EngineAdmin::new(&LocalDocker, Some(&info), "status")
+        .and_then(|a| a.status_unchecked())
+        .ok()
+        .map(|st| st.state)
+        .filter(|s| !s.is_empty());
+    info
 }
 
 /// Is the stack's `app` container running? One `compose ps`, no HTTP probe —

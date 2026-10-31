@@ -72,6 +72,7 @@ pub fn to_status(site: &Site, st: &EngineStatus) -> Status {
             enabled: true,
             container: None,
             running: true,
+            state: (!st.state.is_empty()).then(|| st.state.clone()),
         }),
     }
 }
