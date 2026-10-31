@@ -1472,7 +1472,7 @@ async fn guided_key(host: String) -> Result<GuidedKeyView, String> {
                 "`{host}` is not a usable SSH target (an alias, host or user@host)"
             ));
         }
-        let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, &host).map_err(err)?;
+        let key = ssh_key::ensure_guided_key(ssh_key::guided_keys(), &host).map_err(err)?;
         Ok(GuidedKeyView {
             command: ssh_key::authorize_command(&key.public_line),
             public_line: key.public_line,

@@ -9,8 +9,10 @@
 //! when the call's transport is dropped. Without a keychain this fails with a
 //! message pointing at the alias route instead.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -79,6 +81,60 @@ impl SecretStore for Keychain {
     fn delete(&self, account: &str) -> Result<()> {
         Err(no_keychain(account, "unsupported platform"))
     }
+}
+
+/// A [`SecretStore`] that remembers, in this process's memory, every secret
+/// it read or wrote, so the keychain is asked once per key rather than once
+/// per ssh session (each read may raise an OS prompt, and is slow). Only found
+/// secrets are kept — a missing one is asked again — and nothing is logged or
+/// written anywhere: a key still reaches disk only as a per-call [`KeyFile`].
+pub struct Cached<S> {
+    store: S,
+    known: Mutex<HashMap<String, String>>,
+}
+
+impl<S> Cached<S> {
+    pub fn new(store: S) -> Self {
+        Cached {
+            store,
+            known: Mutex::default(),
+        }
+    }
+
+    fn known(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.known.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<S: SecretStore> SecretStore for Cached<S> {
+    fn get(&self, account: &str) -> Result<Option<String>> {
+        if let Some(secret) = self.known().get(account) {
+            return Ok(Some(secret.clone()));
+        }
+        let found = self.store.get(account)?;
+        if let Some(secret) = &found {
+            self.known().insert(account.to_string(), secret.clone());
+        }
+        Ok(found)
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<()> {
+        self.store.set(account, secret)?;
+        self.known().insert(account.to_string(), secret.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        self.known().remove(account);
+        self.store.delete(account)
+    }
+}
+
+/// The guided keys, read from the OS keychain once per host for the life of
+/// this process.
+pub fn guided_keys() -> &'static Cached<Keychain> {
+    static KEYS: OnceLock<Cached<Keychain>> = OnceLock::new();
+    KEYS.get_or_init(|| Cached::new(Keychain))
 }
 
 /// A private key materialised for one ssh call: `<0700 temp dir>/id_ed25519`
@@ -268,6 +324,40 @@ pub(crate) mod tests {
         assert_eq!(again.public_line, first.public_line);
         forget_key(&store, "deploy@example.com").unwrap();
         assert_eq!(store.get("deploy@example.com").unwrap(), None);
+    }
+
+    /// Counts the reads that reach the store behind a [`Cached`].
+    #[derive(Default)]
+    struct Counting(Memory, std::cell::Cell<usize>);
+    impl SecretStore for Counting {
+        fn get(&self, account: &str) -> Result<Option<String>> {
+            self.1.set(self.1.get() + 1);
+            self.0.get(account)
+        }
+        fn set(&self, account: &str, secret: &str) -> Result<()> {
+            self.0.set(account, secret)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.0.delete(account)
+        }
+    }
+
+    #[test]
+    fn a_cached_store_reads_each_key_once_and_misses_are_asked_again() {
+        let cached = Cached::new(Counting::default());
+        assert_eq!(cached.get("h").unwrap(), None);
+        assert_eq!(cached.get("h").unwrap(), None);
+        assert_eq!(cached.store.1.get(), 2, "a missing key is not remembered");
+        cached.store.0.set("h", "k1").unwrap();
+        for _ in 0..3 {
+            assert_eq!(cached.get("h").unwrap().as_deref(), Some("k1"));
+        }
+        assert_eq!(cached.store.1.get(), 3, "found once, then from memory");
+        cached.set("h", "k2").unwrap();
+        assert_eq!(cached.get("h").unwrap().as_deref(), Some("k2"));
+        cached.delete("h").unwrap();
+        assert_eq!(cached.get("h").unwrap(), None);
+        assert_eq!(cached.store.0.get("h").unwrap(), None);
     }
 
     #[test]

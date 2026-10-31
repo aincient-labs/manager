@@ -2787,7 +2787,7 @@ fn sites_add_remote(
     };
     let site = sites::remote_entry(uh, slug, label, host, remote_site, key, domain.as_deref())?;
     if guided {
-        let key = ssh_key::ensure_guided_key(&ssh_key::Keychain, host)?;
+        let key = ssh_key::ensure_guided_key(ssh_key::guided_keys(), host)?;
         println!(
             "{} the Manager's key for {host} {} in your OS keychain.",
             style::success(if key.created { "Created" } else { "Found" }),

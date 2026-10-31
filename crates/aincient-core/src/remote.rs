@@ -1635,7 +1635,7 @@ pub fn console_access_in<T: Transport>(session: &Session<T>, site: &Site) -> Res
             server_port,
             console_path,
         } => {
-            let ssh = Ssh::new(remote, &ssh_key::Keychain)?;
+            let ssh = Ssh::new(remote, ssh_key::guided_keys())?;
             let tunnel = open_tunnel(&ssh, server_port, &console_path)?;
             Ok(ConsoleAccess {
                 url: tunnel.url.clone(),
@@ -1868,7 +1868,7 @@ pub fn verify_sha256(file: &Path, sums: &str) -> Result<()> {
 /// Open a session to a remote site's engine over SSH.
 pub fn open(site: &Site, opts: &EngineOptions) -> Result<Session<Ssh>> {
     let remote = remote_of(site)?;
-    let ssh = Ssh::new(remote, &ssh_key::Keychain)?;
+    let ssh = Ssh::new(remote, ssh_key::guided_keys())?;
     Session::connect(ssh, &remote.slug, opts)
 }
 
