@@ -105,6 +105,16 @@ pub fn act(site: &Site, verb: Verb) -> Result<String, String> {
     let acted = c.act(verb).map_err(|e| explain(site, e))?;
     Ok(match (verb, acted.job) {
         (Verb::Unlock, _) => "Unlocked: the site is resting.".to_string(),
+        // The flag is set and the pairings revoked before the engine answers;
+        // stopping app and db is its job, cut short behind a running one.
+        (Verb::Lockdown, _) => format!(
+            "Locked down: wake and pairing closed, junior Managers revoked. The engine stops \
+             app and db{}.",
+            acted
+                .after
+                .map(|j| format!(" once {j} is cut short"))
+                .unwrap_or_default()
+        ),
         (_, Some(job)) => format!("{job} started on the engine."),
         (_, None) => "Done.".to_string(),
     })

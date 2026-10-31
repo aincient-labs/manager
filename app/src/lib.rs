@@ -991,16 +991,22 @@ async fn engine_remove(app: AppHandle, sel: State<'_, Selected>) -> Result<(), S
 }
 
 /// Lock down or unlock through the engine (m3-7; confirmed in the window
-/// first): `docker exec` here or over SSH, the version read first.
+/// first): `docker exec` here or over SSH, the version read first; the API
+/// for a paired site. What the engine answered goes to the step feed too,
+/// which is otherwise empty for these: nothing streams while they run.
 #[tauri::command]
-async fn engine_lockdown(lock: bool, sel: State<'_, Selected>) -> Result<String, String> {
+async fn engine_lockdown(
+    app: AppHandle,
+    lock: bool,
+    sel: State<'_, Selected>,
+) -> Result<String, String> {
     require_experimental()?;
     let verb = if lock {
         AdminVerb::Lockdown
     } else {
         AdminVerb::Unlock
     };
-    match target(&sel)? {
+    let said = match target(&sel)? {
         Target::Remote(site) if is_paired(&site) => {
             let v = if lock { Verb::Lockdown } else { Verb::Unlock };
             blocking(move || paired::act(&site, v)).await
@@ -1024,7 +1030,12 @@ async fn engine_lockdown(lock: bool, sel: State<'_, Selected>) -> Result<String,
             })
             .await
         }
+    }?;
+    let mut sink = feed(&app);
+    for line in said.lines().filter(|l| !l.trim().is_empty()) {
+        sink(Pipe::Stdout, line);
     }
+    Ok(said)
 }
 
 /// Rest or wake the selected site through its engine (M5, m5-1, m5-3;
