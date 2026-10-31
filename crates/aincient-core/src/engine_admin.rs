@@ -180,6 +180,8 @@ pub enum AdminVerb {
     /// A one-time install code that pairs the primary Manager (E-02, m4-6).
     /// Only SSH (or this computer's Docker) can make one.
     InstallCode,
+    /// One line per pairing (none: no Manager is paired yet).
+    Pairings,
 }
 
 impl AdminVerb {
@@ -192,6 +194,7 @@ impl AdminVerb {
             AdminVerb::Wake => "wake",
             AdminVerb::WakeCode | AdminVerb::WakeCodeRevoke => "wake-code",
             AdminVerb::InstallCode => "install-code",
+            AdminVerb::Pairings => "pairings",
         }
     }
 
@@ -438,21 +441,91 @@ pub fn compose_config_json(
 
 /// Turn the engine on for a stack on this computer and start it: the image
 /// made ready and pinned ([`engine_image`]: the released one pulled by
-/// digest, or a developer build's local ID), then
-/// [`engine::enable`], then `compose up -d --remove-orphans`, then a first
-/// install code ([`install_code`], m4-6), returned to show next to the site's
-/// address: `None` when the engine wasn't ready to make one (the site is
-/// enabled anyway; `engine install-code` makes one later). The caller has the
-/// user's opt-in (the CLI's `--experimental`, the GUI's setting).
-pub fn enable_local(stack: &Stack) -> Result<Option<String>> {
+/// digest, or a developer build's local ID), then [`engine::enable`], then
+/// `compose up` ([`enable_up_args`]), then what pairs the first Manager
+/// ([`first_pairing`], m4-6), to show next to the site's address: `None`
+/// when the engine wasn't ready to make a code (the site is enabled anyway;
+/// `engine install-code` makes one later). The caller has the user's opt-in
+/// (the CLI's `--experimental`, the GUI's setting).
+pub fn enable_local(stack: &Stack) -> Result<Option<FirstPairing>> {
     let image = engine_image()?;
+    let keep = keeps_app_and_db(stack);
     engine::enable(stack, &image.pin, &|files, env| {
         compose_config_json(stack, files, env)
     })?;
     let mut c = compose(stack);
-    c.args(["up", "-d", "--remove-orphans"]);
+    c.args(enable_up_args(keep));
     crate::docker::run_capture(c, "start the stack with the engine")?;
-    Ok(install_code(&LocalDocker, probe(stack).as_ref()).ok())
+    Ok(first_pairing(&LocalDocker, probe(stack).as_ref()).ok())
+}
+
+/// Whether enabling must leave `app` and `db` as they are: the engine is
+/// already on and they aren't both running (resting, locked down, or
+/// stopped by hand). A first enable starts the whole stack, as before.
+pub fn keeps_app_and_db(stack: &Stack) -> bool {
+    engine::is_enabled(stack) && !app_and_db_running(stack)
+}
+
+/// `app` and `db` both running, by one `compose ps`. A failed read counts as
+/// running, so enable behaves as it always has.
+pub fn app_and_db_running(stack: &Stack) -> bool {
+    let mut c = compose(stack);
+    c.args(["ps", "-a", "--format", "json", "app", "db"]);
+    let Some(out) = output_within(&mut c, Duration::from_secs(20))
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return true;
+    };
+    let ps = parse_ps(&String::from_utf8_lossy(&out.stdout));
+    ["app", "db"]
+        .iter()
+        .all(|svc| ps.iter().any(|(s, st, _)| s == svc && st == "running"))
+}
+
+/// The `compose` arguments that apply the engine's files. `keep_app_and_db`
+/// ([`keeps_app_and_db`]): only `engine` and `edge`, without the services
+/// they depend on, so a re-enable doesn't wake a resting or locked-down site
+/// behind the engine's back (edge depends on app, app on db).
+pub fn enable_up_args(keep_app_and_db: bool) -> Vec<&'static str> {
+    let mut args = vec!["up", "-d", "--remove-orphans"];
+    if keep_app_and_db {
+        args.extend(["--no-deps", "engine", "edge"]);
+    }
+    args
+}
+
+/// What enable leaves for pairing (m4-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstPairing {
+    /// A new install code, shown once.
+    Code(String),
+    /// A Manager is paired already, so no code was minted: a new one would
+    /// replace an unused code, and a new primary demotes the old one.
+    AlreadyPaired,
+}
+
+/// What a re-enable says instead of an install code.
+pub const ALREADY_PAIRED: &str = "The engine is already paired with a Manager, so no install \
+     code was made. To make one deliberately: atelier engine install-code --experimental";
+
+/// The install code for the site's first Manager, unless one is paired
+/// already. A pairing list that can't be read falls through to minting, as a
+/// first enable does.
+pub fn first_pairing<D: DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<&EngineInfo>,
+) -> Result<FirstPairing> {
+    if has_pairings(docker, info).unwrap_or(false) {
+        return Ok(FirstPairing::AlreadyPaired);
+    }
+    install_code(docker, info).map(FirstPairing::Code)
+}
+
+/// Whether any Manager is paired (`admin pairings` lists one per line).
+pub fn has_pairings<D: DockerExec + ?Sized>(docker: &D, info: Option<&EngineInfo>) -> Result<bool> {
+    let out = EngineAdmin::new(docker, info, "pairings")?.run(AdminVerb::Pairings)?;
+    Ok(out.lines().any(|l| !l.trim().is_empty()))
 }
 
 /// Mint a one-time install code inside the engine (`admin install-code`,
@@ -959,6 +1032,59 @@ mod tests {
             "a request code isn't one"
         );
         assert!(install_code_notice("C").contains("pairs your first Manager"));
+    }
+
+    #[test]
+    fn a_re_enable_on_a_resting_site_starts_only_engine_and_edge() {
+        assert_eq!(enable_up_args(false), ["up", "-d", "--remove-orphans"]);
+        assert_eq!(
+            enable_up_args(true),
+            [
+                "up",
+                "-d",
+                "--remove-orphans",
+                "--no-deps",
+                "engine",
+                "edge"
+            ]
+        );
+        // A first enable (no engine yet) starts the whole stack, as before.
+        let dir = std::env::temp_dir().join(format!("atelier-keep-{}", std::process::id()));
+        assert!(!keeps_app_and_db(&Stack::at(&dir)));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn enable_mints_an_install_code_only_while_no_manager_is_paired() {
+        let pairing = "a00000000001  laptop    created 1  last used 2  (primary)";
+        let d = FakeDocker::default();
+        d.replies
+            .borrow_mut()
+            .extend([Ok(STATUS_V1.to_string()), Ok(pairing.to_string())]);
+        assert_eq!(
+            first_pairing(&d, Some(&info(true))).unwrap(),
+            FirstPairing::AlreadyPaired
+        );
+        assert_eq!(
+            d.calls.borrow()[1],
+            "exec atelier-blog-engine-1 atelier engine admin pairings"
+        );
+        assert_eq!(d.calls.borrow().len(), 2, "no install code minted");
+
+        let d = FakeDocker::default();
+        d.replies.borrow_mut().extend([
+            Ok(STATUS_V1.to_string()),
+            Ok("\n".to_string()),
+            Ok(STATUS_V1.to_string()),
+            Ok("ab2c-defg-hjkm-npqr".to_string()),
+        ]);
+        assert_eq!(
+            first_pairing(&d, Some(&info(true))).unwrap(),
+            FirstPairing::Code("AB2C-DEFG-HJKM-NPQR".into())
+        );
+        assert!(d.calls.borrow()[3].ends_with("admin install-code"));
+        assert!(first_pairing(&d, None).is_err());
+        assert!(ALREADY_PAIRED.contains("engine install-code --experimental"));
     }
 
     /// A scripted stack for [`remove`].

@@ -19,7 +19,7 @@
 
 use aincient_core::docker::{compose, run_inherited};
 use aincient_core::engine::{self as optin, ENGINE_IMAGE};
-use aincient_core::engine_admin::{self, LocalRemove};
+use aincient_core::engine_admin::{self, FirstPairing, LocalRemove};
 use aincient_core::{ChangeGuard, Stack};
 use aincient_engine::admin::AdminCommand;
 use anyhow::Result;
@@ -40,7 +40,8 @@ pub enum EngineCommand {
     },
     /// Add the EXPERIMENTAL engine to this site. It holds the host's Docker
     /// socket: root on this machine. Prints the install code that pairs the
-    /// first Manager.
+    /// first Manager, unless one is paired already. Re-run on a resting or
+    /// locked-down site, it leaves app and db stopped.
     Enable,
     /// Remove the engine's files and restart the stack without it (no wake,
     /// no checks: `remove` is the Manager's action). Its volumes stay.
@@ -258,24 +259,34 @@ fn enable(stack: &Stack) -> Result<()> {
             id
         }
     };
+    // Read before the files change: a re-enable leaves a resting or
+    // locked-down site's app and db as they are.
+    let keep = engine_admin::keeps_app_and_db(stack);
     optin::enable(stack, &pin, &|files, env| {
         engine_admin::compose_config_json(stack, files, env)
     })?;
     println!("Engine image pinned: {pin}");
     let mut c = compose(stack);
-    c.args(["up", "-d", "--remove-orphans"]);
+    c.args(engine_admin::enable_up_args(keep));
     run_inherited(c, "start the stack with the engine")?;
+    if keep {
+        println!(
+            "app and db aren't running (resting, locked down or stopped), so only engine and \
+             edge were started; app and db stay as they were."
+        );
+    }
     println!(
         "Engine enabled (EXPERIMENTAL). API: http://localhost:{}/_atelier/engine/v1/version",
         stack.http_port()
     );
     // m4-6: the code that pairs the first Manager, next to the site's address.
     println!("Site:  {}", stack.console_url());
-    match engine_admin::install_code(
+    match engine_admin::first_pairing(
         &engine_admin::LocalDocker,
         engine_admin::probe(stack).as_ref(),
     ) {
-        Ok(code) => println!("{}", engine_admin::install_code_notice(&code)),
+        Ok(FirstPairing::Code(code)) => println!("{}", engine_admin::install_code_notice(&code)),
+        Ok(FirstPairing::AlreadyPaired) => println!("{}", engine_admin::ALREADY_PAIRED),
         Err(e) => println!(
             "No install code yet ({e:#}). Make one with: atelier engine install-code \
              --experimental (or docker exec {}-engine-1 atelier engine admin install-code)",

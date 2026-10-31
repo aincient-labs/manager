@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use aincient_core::docker::Pipe;
-use aincient_core::engine_admin::{self, AdminVerb, EngineAdmin, EngineInfo};
+use aincient_core::engine_admin::{self, AdminVerb, EngineAdmin, EngineInfo, FirstPairing};
 use aincient_core::engine_client::{EngineError, Verb};
 use aincient_core::settings::{self, Settings};
 use aincient_core::{
@@ -897,7 +897,8 @@ async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
 /// computer core's enable + `up`; on a server its own `atelier engine enable
 /// --experimental`, which runs `up` there. Returns the install code that
 /// pairs the first Manager (m4-6), when the engine made one, for the window
-/// to show once next to the site's address.
+/// to show once next to the site's address; with a Manager paired already
+/// none is made, and the log feed says so.
 #[tauri::command]
 async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<Option<String>, String> {
     require_experimental()?;
@@ -906,7 +907,19 @@ async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<Optio
             &site.slug,
             site.engine_url().unwrap_or_default(),
         )),
-        Target::Local(s) => blocking(move || engine_admin::enable_local(&s).map_err(err)).await,
+        Target::Local(s) => {
+            blocking(move || {
+                Ok(match engine_admin::enable_local(&s).map_err(err)? {
+                    Some(FirstPairing::Code(code)) => Some(code),
+                    Some(FirstPairing::AlreadyPaired) => {
+                        feed(&app)(Pipe::Stdout, engine_admin::ALREADY_PAIRED);
+                        None
+                    }
+                    None => None,
+                })
+            })
+            .await
+        }
         Target::Remote(site) => {
             blocking(move || {
                 let mut code = None;
