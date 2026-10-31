@@ -997,7 +997,7 @@ function renderStatus(status) {
   // Keep any open panels honest about the new state.
   if (currentTab === "publish") updatePublishGate();
   if (currentTab === "settings") {
-    $("image-tag").textContent = status.image || "—";
+    $("image-tag").textContent = applianceName(status);
     renderChannel();
   }
 }
@@ -1222,8 +1222,18 @@ async function refreshBackups() {
 
 // --- Settings panel ---------------------------------------------------------
 
+// What the System tab calls the appliance: the version its container reports
+// (v0.19.2), else its image — a bare digest cut to a short hash.
+function applianceName(st) {
+  if (!st) return "—";
+  if (st.version) return st.version;
+  const digest = /^(?:(.*)@)?sha256:([0-9a-f]{12})[0-9a-f]*$/.exec(st.image || "");
+  if (digest) return `${digest[1] ? `${digest[1]}@` : ""}sha256:${digest[2]}`;
+  return st.image || "—";
+}
+
 function loadSettings() {
-  $("image-tag").textContent = (lastStatus && lastStatus.image) || "—";
+  $("image-tag").textContent = applianceName(lastStatus);
   $("manager-version-row").textContent = managerVersion || "—";
   renderChannel();
   loadExperimental();
