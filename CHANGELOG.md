@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Every destructive confirmation names where it acts ("on this computer" or the server). On a
-  server site that is live, you type the site's short name; `--yes` alone doesn't skip it, so
+  server site that is running, frozen or not, you type the site's short name; `--yes` alone doesn't skip it, so
   scripts pass `--yes --confirm-slug <slug>`. `app stop` and `site freeze|use|live|prune` take
   `--yes`.
 
