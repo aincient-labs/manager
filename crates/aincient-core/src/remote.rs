@@ -1928,7 +1928,13 @@ pub fn state_of(status: Result<Status>, snapshots: Option<SnapshotList>) -> Site
         Err(e) => SiteState::Unreachable {
             reason: format!("{e:#}"),
         },
-        Ok(st) if !st.running => SiteState::Stopped,
+        // Not up: the engine's word, when the server has one (M5).
+        Ok(st) if !st.running => match st.engine.as_ref().and_then(|e| e.state.as_deref()) {
+            Some("resting") => SiteState::Resting,
+            Some("waking") => SiteState::Waking,
+            Some("locked") => SiteState::Locked,
+            _ => SiteState::Stopped,
+        },
         Ok(st) => match snapshots {
             Some(l) if l.serving != "live" => SiteState::Frozen {
                 snapshot: l.serving,
@@ -2853,7 +2859,23 @@ mod tests {
         assert!(frozen.is_live(), "a frozen site is live");
         let mut off = st;
         off.running = false;
-        assert_eq!(state_of(Ok(off), None), SiteState::Stopped);
+        assert_eq!(state_of(Ok(off.clone()), None), SiteState::Stopped);
+        // An SSH site with the engine: its word, not Stopped.
+        for (word, want) in [
+            ("resting", SiteState::Resting),
+            ("waking", SiteState::Waking),
+            ("locked", SiteState::Locked),
+            ("stopped", SiteState::Stopped),
+        ] {
+            let mut rested = off.clone();
+            rested.engine = Some(crate::engine_admin::EngineInfo {
+                enabled: true,
+                container: Some("atelier-engine-1".into()),
+                running: true,
+                state: Some(word.into()),
+            });
+            assert_eq!(state_of(Ok(rested), None), want, "{word}");
+        }
         let gone = state_of(Err(anyhow!("ssh: connect timed out")), None);
         assert!(gone.is_live(), "unknown counts as live");
         let json = serde_json::to_value(&gone).unwrap();
