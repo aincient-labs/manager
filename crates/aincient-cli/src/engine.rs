@@ -279,11 +279,27 @@ pub fn wake_code_state(set: bool, locked: bool) -> String {
 }
 
 fn enable(stack: &Stack) -> Result<()> {
-    let id = engine_admin::local_image_id()?;
-    optin::enable(stack, &id, &|files, env| {
+    // 0487: a released Manager pulls the engine image published with it, by
+    // digest; a developer build carries none and pins the local build.
+    let pin = match optin::released_engine_image() {
+        Some(pin) => {
+            println!("Pulling the engine image {pin} …");
+            engine_admin::pull_image(&pin)?;
+            pin
+        }
+        None => {
+            let id = engine_admin::local_image_id()?;
+            println!(
+                "Developer build: this Manager carries no released engine image, so it pins \
+                 the local {ENGINE_IMAGE} build ({id})."
+            );
+            id
+        }
+    };
+    optin::enable(stack, &pin, &|files, env| {
         engine_admin::compose_config_json(stack, files, env)
     })?;
-    println!("Engine image pinned: {ENGINE_IMAGE} = {id}");
+    println!("Engine image pinned: {pin}");
     let mut c = compose(stack);
     c.args(["up", "-d", "--remove-orphans"]);
     run_inherited(c, "start the stack with the engine")?;
