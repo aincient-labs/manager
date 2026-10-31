@@ -371,7 +371,7 @@ pub fn new_site_id() -> Result<String> {
 /// A located appliance stack directory.
 ///
 /// `slug` / `label` / `project` are set when the directory is a registered site
-/// in `sites.toml` (see [`crate::sites`]); all three are `None` for an
+/// in the sites registry (see [`crate::sites`]); all three are `None` for an
 /// unregistered home, which keeps today's derived project name.
 #[derive(Debug, Clone)]
 pub struct Stack {
@@ -406,7 +406,7 @@ impl Stack {
         }
     }
 
-    /// Resolve the stack: `ATELIER_HOME` > the `sites.toml` active site >
+    /// Resolve the stack: `ATELIER_HOME` > the registry's active site >
     /// `~/.atelier`. With no registry on disk this is exactly the historical
     /// `ATELIER_HOME`-else-`~/.atelier` behaviour.
     pub fn locate() -> Result<Self> {

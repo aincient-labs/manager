@@ -113,7 +113,7 @@ enum Command {
     },
 }
 
-/// The multi-site registry (`~/.atelier/sites.toml`).
+/// The multi-site registry (`~/.atelier/sites.toml`; server sites in `sites.remote.toml`).
 #[derive(Subcommand)]
 enum SitesCommand {
     /// List your sites: name, port, whether each is running, and its version.
@@ -2037,7 +2037,7 @@ fn status(stack: &Stack, json: bool) -> Result<()> {
     // Name the site once there is a list to name it from — a single-site
     // install that never touched `atelier sites` reads exactly as before.
     let registry_exists = sites::user_home()
-        .map(|uh| sites::registry_path(&uh).is_file())
+        .map(|uh| sites::registry_exists(&uh))
         .unwrap_or(false);
     if let (true, Some(slug), Some(label)) = (registry_exists, &stack.slug, &stack.label) {
         println!("  Site:     {label} ({slug})");

@@ -32,7 +32,7 @@ fn is_paired(site: &Site) -> bool {
 /// is registered (a fresh machine, a hand-rolled `ATELIER_HOME`), which keeps
 /// the single-site behaviour of `Stack::locate`.
 ///
-/// Held by the window rather than read from `sites.toml` on every call: an
+/// Held by the window rather than read from the sites registry on every call: an
 /// `atelier sites use` in a terminal must not move the GUI to another site
 /// between two clicks. Every command resolves its stack from this, so no action
 /// runs against a site the header isn't showing.

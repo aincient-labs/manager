@@ -1,4 +1,6 @@
-//! The multi-site registry: `~/.atelier/sites.toml` (DECISIONS 0393).
+//! The multi-site registry: `~/.atelier/sites.toml` for the sites on this
+//! computer (DECISIONS 0393) and `~/.atelier/sites.remote.toml` for the sites on
+//! servers (DECISIONS 0486).
 //!
 //! Per-site isolation already works — one [`Stack`] directory is one appliance
 //! with its own Compose project, volumes, port and backups. What this module adds
@@ -6,6 +8,7 @@
 //! process environment variable:
 //!
 //! ```toml
+//! # ~/.atelier/sites.toml — local sites only
 //! active = "default"
 //!
 //! [[site]]
@@ -19,6 +22,11 @@
 //! label = "Blog"
 //! home = "~/.atelier/sites/blog"
 //! project = "atelier-blog"
+//! ```
+//!
+//! ```toml
+//! # ~/.atelier/sites.remote.toml — sites on servers
+//! active = "prod"            # only when a server site is the active one
 //!
 //! [[site]]                   # a REMOTE site (M2, D-06): no home, no project
 //! slug = "prod"
@@ -35,6 +43,24 @@
 //!                                      # is in the OS keychain, never here
 //! ```
 //!
+//! **`sites.toml` keeps exactly the shape Manager 0.12.1 reads** (DECISIONS
+//! 0486): `active` plus `[[site]]` entries with `slug`, `label`, `home` and
+//! `project`, nothing else. 0.12.1 parses it with `deny_unknown_fields` and
+//! refuses a dangling `active`, so a server entry or a server slug there made a
+//! downgraded Manager reject the whole file and lose every local site. Hence:
+//!
+//! - In memory [`Registry`] is still one list; [`Registry::load`] merges both
+//!   files and [`Registry::save`] splits them by kind. Validation (unique slugs,
+//!   one entry per server site or engine URL, …) runs across the merged set.
+//! - The active site: `sites.toml` names it when it is local. When a server
+//!   site is active, `sites.toml` has no `active` (0.12.1 then falls back to
+//!   `~/.atelier`) and `sites.remote.toml` names it. On load an `active` in
+//!   `sites.toml` wins — it is either ours or an older Manager's later choice.
+//! - Migration: a `sites.toml` holding server entries (written by internal
+//!   builds before 0486) is split on load — `sites.remote.toml` is written
+//!   first, then `sites.toml`, so no entry is ever only in memory. An entry left
+//!   in both files by an interrupted split is read once.
+//!
 //! A remote site is driven through the server's own `atelier` CLI over SSH
 //! (D-01, see [`crate::remote`]). It has no stack directory here and claims no
 //! port; every home/project/port rule below applies to local sites only.
@@ -43,12 +69,13 @@
 //! Compose project is derived from its directory name, so relocating one orphans
 //! its `db-data` volume — the site comes back empty while the bytes sit on disk
 //! under a name nothing reads. Legacy adoption therefore registers `~/.atelier`
-//! *where it is*. This module writes `sites.toml` (via temp file + rename in the
-//! same directory) and, for [`add_site`] only, a new site's stack files into a
-//! new or empty `sites/<slug>/`. [`remove_site`] unregisters; it deletes nothing.
+//! *where it is*. This module writes `sites.toml` and `sites.remote.toml` (each
+//! via temp file + rename in the same directory) and, for [`add_site`] only, a
+//! new site's stack files into a new or empty `sites/<slug>/`. [`remove_site`]
+//! unregisters; it deletes nothing.
 //!
 //! Resolution order — explicit beats implicit:
-//! `--site <slug>` > `ATELIER_HOME` > `sites.toml` `active` > `~/.atelier`.
+//! `--site <slug>` > `ATELIER_HOME` > the registry's active site > `~/.atelier`.
 //! [`resolve`] is a pure function of those inputs; [`locate`] gathers them from
 //! the process.
 
@@ -63,8 +90,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::stack::{Stack, DEFAULT_PORT};
 
-/// The registry's file name, inside the default stack directory.
+/// The registry's file name for local sites, inside the default stack directory.
 pub const SITES_FILE: &str = "sites.toml";
+/// The registry's file name for sites on servers (DECISIONS 0486), beside
+/// [`SITES_FILE`].
+pub const REMOTE_SITES_FILE: &str = "sites.remote.toml";
 /// Local ports SSH tunnels to remote consoles listen on (D-02). Local sites
 /// never get one of these ([`next_free_port`] skips the range and `sites add
 /// --port` refuses it), so a tunnel can never take a local site's port.
@@ -86,9 +116,20 @@ pub fn default_home(user_home: &Path) -> PathBuf {
     user_home.join(DEFAULT_DIR)
 }
 
-/// Where the registry lives: `<user home>/.atelier/sites.toml`.
+/// Where the registry of local sites lives: `<user home>/.atelier/sites.toml`.
 pub fn registry_path(user_home: &Path) -> PathBuf {
     default_home(user_home).join(SITES_FILE)
+}
+
+/// Where the registry of server sites lives:
+/// `<user home>/.atelier/sites.remote.toml` (DECISIONS 0486).
+pub fn remote_registry_path(user_home: &Path) -> PathBuf {
+    default_home(user_home).join(REMOTE_SITES_FILE)
+}
+
+/// Whether any site has been registered on disk: either registry file exists.
+pub fn registry_exists(user_home: &Path) -> bool {
+    registry_path(user_home).is_file() || remote_registry_path(user_home).is_file()
 }
 
 /// Where a new registry site's stack goes: `<user home>/.atelier/sites/<slug>`.
@@ -310,7 +351,7 @@ impl Site {
     }
 }
 
-/// The parsed `sites.toml`.
+/// The parsed registry: `sites.toml` and `sites.remote.toml`, merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registry {
     /// Slug of the active site, if one is set.
@@ -384,96 +425,210 @@ pub fn remote_placeholder_home(user_home: &Path, slug: &str) -> PathBuf {
 const FILE_HEADER: &str = "# Atelier sites — managed by the atelier CLI and the manager app.\n\
 # Each site's `project` is pinned: editing it detaches the site from its data.\n\n";
 
-impl Registry {
-    /// Read the registry. `Ok(None)` when the file does not exist — no registry,
-    /// which means exactly today's single-stack behaviour. A file that exists but
-    /// cannot be read, parsed or validated is an **error**, never treated as
-    /// empty: silently replacing it would forget every site it lists.
-    pub fn load(user_home: &Path) -> Result<Option<Self>> {
-        let path = registry_path(user_home);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
-        };
-        Self::parse(&text, user_home)
-            .map(Some)
-            .with_context(|| format!("{} is not a valid sites registry", path.display()))
-    }
+const REMOTE_FILE_HEADER: &str =
+    "# Atelier sites on servers — managed by the atelier CLI and the manager app.\n\
+# Kept apart from sites.toml so an older Manager still reads that file.\n\n";
 
-    /// Parse and validate registry text. `user_home` expands `~`.
-    pub fn parse(text: &str, user_home: &Path) -> Result<Self> {
-        let file: RegistryFile = toml::from_str(text).context("could not parse TOML")?;
-        let mut sites = Vec::with_capacity(file.sites.len());
-        for entry in file.sites {
-            if let Some(url) = entry.engine {
-                if entry.home.is_some()
-                    || entry.project.is_some()
-                    || entry.host.is_some()
-                    || entry.remote_site.is_some()
-                    || entry.key.is_some()
-                    || entry.domain.is_some()
-                {
-                    bail!(
-                        "site `{}` is paired with its engine ({url}): it has no `home`, \
-                         `project`, `host`, `remote_site`, `key` or `domain`",
-                        entry.slug
-                    );
-                }
-                let mut site = Site::new_engine(user_home, &entry.slug, None, &url);
-                site.label = entry.label;
-                sites.push(site);
-                continue;
-            }
-            if let Some(host) = entry.host {
-                if entry.home.is_some() || entry.project.is_some() {
-                    bail!(
-                        "site `{}` is remote (host `{host}`): it has no local `home` or `project`",
-                        entry.slug
-                    );
-                }
-                let key = KeyMode::from_toml(entry.key.as_deref())
-                    .with_context(|| format!("site `{}`", entry.slug))?;
-                sites.push(Site::new_remote(
-                    user_home,
-                    &entry.slug,
-                    Some(&entry.label),
-                    &host,
-                    entry.remote_site.as_deref(),
-                    key,
-                ));
-                // `new_remote` falls back to the slug for an empty label; keep
-                // the file's label verbatim.
-                let site = sites.last_mut().expect("just pushed");
-                site.label = entry.label;
-                if let Some(remote) = site.remote.as_mut() {
-                    remote.domain = entry.domain;
-                }
-                continue;
-            }
-            if entry.remote_site.is_some() || entry.key.is_some() || entry.domain.is_some() {
+/// One registry file, parsed but not yet validated.
+struct ParsedFile {
+    active: Option<String>,
+    sites: Vec<Site>,
+}
+
+/// Read a registry file; `Ok(None)` when it does not exist.
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("could not read {}", path.display())),
+    }
+}
+
+/// Write `text` to `path` atomically: a temp file beside it, renamed over it.
+/// A crash mid-write leaves the previous file intact.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let dir = path.parent().context("a registry file has a directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let name = path
+        .file_name()
+        .context("a registry file has a name")?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, text).with_context(|| format!("could not write {}", tmp.display()))?;
+    // The only renames in this module: our own temp file onto a registry file.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("could not replace {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Merge the two files into one registry. Sites keep file order, local file
+/// first. A server entry found in both files (a split interrupted between its
+/// two writes) is read once; any other repeat is left for [`Registry::validate`]
+/// to refuse. An `active` in `sites.toml` wins over the remote file's.
+fn merge(local: Option<ParsedFile>, remote: Option<ParsedFile>) -> Registry {
+    let (local_active, mut sites) = local.map(|f| (f.active, f.sites)).unwrap_or_default();
+    let (remote_active, remote_sites) = remote.map(|f| (f.active, f.sites)).unwrap_or_default();
+    for site in remote_sites {
+        if site.is_remote() && sites.contains(&site) {
+            continue;
+        }
+        sites.push(site);
+    }
+    Registry {
+        active: local_active.or(remote_active),
+        sites,
+    }
+}
+
+/// Parse one registry file's text in the full schema — local, server and
+/// engine entries alike. No cross-entry validation.
+fn parse_file(text: &str, user_home: &Path) -> Result<ParsedFile> {
+    let file: RegistryFile = toml::from_str(text).context("could not parse TOML")?;
+    let mut sites = Vec::with_capacity(file.sites.len());
+    for entry in file.sites {
+        if let Some(url) = entry.engine {
+            if entry.home.is_some()
+                || entry.project.is_some()
+                || entry.host.is_some()
+                || entry.remote_site.is_some()
+                || entry.key.is_some()
+                || entry.domain.is_some()
+            {
                 bail!(
-                    "site `{}` has `remote_site`/`key`/`domain` but no `host`",
+                    "site `{}` is paired with its engine ({url}): it has no `home`, \
+                         `project`, `host`, `remote_site`, `key` or `domain`",
                     entry.slug
                 );
             }
-            let (Some(raw_home), Some(project)) = (entry.home, entry.project) else {
-                bail!("site `{}` needs a `home` and a `project`", entry.slug);
-            };
-            let home = expand_home(&raw_home, user_home).with_context(|| {
-                format!("site `{}`: home `{raw_home}` is not absolute", entry.slug)
-            })?;
-            sites.push(Site {
-                slug: entry.slug,
-                label: entry.label,
-                home,
-                project,
-                remote: None,
-            });
+            let mut site = Site::new_engine(user_home, &entry.slug, None, &url);
+            site.label = entry.label;
+            sites.push(site);
+            continue;
         }
+        if let Some(host) = entry.host {
+            if entry.home.is_some() || entry.project.is_some() {
+                bail!(
+                    "site `{}` is remote (host `{host}`): it has no local `home` or `project`",
+                    entry.slug
+                );
+            }
+            let key = KeyMode::from_toml(entry.key.as_deref())
+                .with_context(|| format!("site `{}`", entry.slug))?;
+            sites.push(Site::new_remote(
+                user_home,
+                &entry.slug,
+                Some(&entry.label),
+                &host,
+                entry.remote_site.as_deref(),
+                key,
+            ));
+            // `new_remote` falls back to the slug for an empty label; keep
+            // the file's label verbatim.
+            let site = sites.last_mut().expect("just pushed");
+            site.label = entry.label;
+            if let Some(remote) = site.remote.as_mut() {
+                remote.domain = entry.domain;
+            }
+            continue;
+        }
+        if entry.remote_site.is_some() || entry.key.is_some() || entry.domain.is_some() {
+            bail!(
+                "site `{}` has `remote_site`/`key`/`domain` but no `host`",
+                entry.slug
+            );
+        }
+        let (Some(raw_home), Some(project)) = (entry.home, entry.project) else {
+            bail!("site `{}` needs a `home` and a `project`", entry.slug);
+        };
+        let home = expand_home(&raw_home, user_home)
+            .with_context(|| format!("site `{}`: home `{raw_home}` is not absolute", entry.slug))?;
+        sites.push(Site {
+            slug: entry.slug,
+            label: entry.label,
+            home,
+            project,
+            remote: None,
+        });
+    }
+    Ok(ParsedFile {
+        active: file.active,
+        sites,
+    })
+}
+
+impl Registry {
+    /// Read the registry: `sites.toml` and `sites.remote.toml`, merged.
+    /// `Ok(None)` when neither file exists — no registry, which means exactly
+    /// today's single-stack behaviour. A file that exists but cannot be read,
+    /// parsed or validated is an **error**, never treated as empty: silently
+    /// replacing it would forget every site it lists.
+    ///
+    /// A `sites.toml` that still holds server sites (written before DECISIONS
+    /// 0486) is split here: [`Registry::save`] writes `sites.remote.toml`
+    /// first, then `sites.toml`. A failed split is not an error — the merged
+    /// registry is still right, and the next load tries again.
+    pub fn load(user_home: &Path) -> Result<Option<Self>> {
+        let local_path = registry_path(user_home);
+        let remote_path = remote_registry_path(user_home);
+        let local_text = read_optional(&local_path)?;
+        let remote_text = read_optional(&remote_path)?;
+        if local_text.is_none() && remote_text.is_none() {
+            return Ok(None);
+        }
+        let invalid = |path: &Path| format!("{} is not a valid sites registry", path.display());
+        let local = local_text
+            .as_deref()
+            .map(|t| parse_file(t, user_home))
+            .transpose()
+            .with_context(|| invalid(&local_path))?;
+        let remote = remote_text
+            .as_deref()
+            .map(|t| parse_file(t, user_home))
+            .transpose()
+            .with_context(|| invalid(&remote_path))?;
+        if let Some(site) = remote
+            .iter()
+            .flat_map(|f| &f.sites)
+            .find(|s| !s.is_remote())
+        {
+            bail!(
+                "{}: site `{}` is on this computer — it belongs in {}",
+                invalid(&remote_path),
+                site.slug,
+                local_path.display()
+            );
+        }
+        let needs_split = local
+            .as_ref()
+            .is_some_and(|f| f.sites.iter().any(Site::is_remote));
+        let registry = merge(local, remote);
+        registry.validate().with_context(|| {
+            if remote_text.is_some() {
+                format!(
+                    "{} and {} are not a valid sites registry together",
+                    local_path.display(),
+                    remote_path.display()
+                )
+            } else {
+                invalid(&local_path)
+            }
+        })?;
+        if needs_split {
+            // Best effort: what is on disk already reads as this registry.
+            let _ = registry.save(user_home);
+        }
+        Ok(Some(registry))
+    }
+
+    /// Parse and validate the text of **one** registry file, in the full
+    /// schema (local, server and engine entries alike). `user_home` expands `~`.
+    pub fn parse(text: &str, user_home: &Path) -> Result<Self> {
+        let file = parse_file(text, user_home)?;
         let registry = Registry {
             active: file.active,
-            sites,
+            sites: file.sites,
         };
         registry.validate()?;
         Ok(registry)
@@ -567,51 +722,25 @@ impl Registry {
         Ok(())
     }
 
-    /// The registry as `sites.toml` text. Homes under `user_home` are written as
-    /// `~/…` so the file stays readable and portable across a home rename.
+    /// The `sites.toml` text: the local sites only, and `active` only when it
+    /// names one of them — exactly the shape Manager 0.12.1 reads (DECISIONS
+    /// 0486). Homes under `user_home` are written as `~/…` so the file stays
+    /// readable and portable across a home rename.
     pub fn to_toml(&self, user_home: &Path) -> Result<String> {
         let file = RegistryFile {
-            active: self.active.clone(),
+            active: self.active_if(|s| !s.is_remote()),
             sites: self
-                .sites
-                .iter()
-                .map(|s| match &s.remote {
-                    None => SiteEntry {
-                        slug: s.slug.clone(),
-                        label: s.label.clone(),
-                        home: Some(contract_home(&s.home, user_home)),
-                        project: Some(s.project.clone()),
-                        host: None,
-                        remote_site: None,
-                        key: None,
-                        domain: None,
-                        engine: None,
-                    },
-                    Some(Remote {
-                        transport: Transport::Engine { url },
-                        ..
-                    }) => SiteEntry {
-                        slug: s.slug.clone(),
-                        label: s.label.clone(),
-                        home: None,
-                        project: None,
-                        host: None,
-                        remote_site: None,
-                        key: None,
-                        domain: None,
-                        engine: Some(url.clone()),
-                    },
-                    Some(r) => SiteEntry {
-                        slug: s.slug.clone(),
-                        label: s.label.clone(),
-                        home: None,
-                        project: None,
-                        host: Some(r.host.clone()),
-                        remote_site: Some(r.slug.clone()),
-                        key: r.key.as_toml(),
-                        domain: r.domain.clone(),
-                        engine: None,
-                    },
+                .local_sites()
+                .map(|s| SiteEntry {
+                    slug: s.slug.clone(),
+                    label: s.label.clone(),
+                    home: Some(contract_home(&s.home, user_home)),
+                    project: Some(s.project.clone()),
+                    host: None,
+                    remote_site: None,
+                    key: None,
+                    domain: None,
+                    engine: None,
                 })
                 .collect(),
         };
@@ -619,24 +748,68 @@ impl Registry {
         Ok(format!("{FILE_HEADER}{body}"))
     }
 
-    /// Validate, then write atomically: a temp file beside `sites.toml`, renamed
-    /// over it. A crash mid-write leaves the previous registry intact. Creates
-    /// nothing but that one file (and the `~/.atelier` directory if absent).
+    /// The `sites.remote.toml` text: the server and engine-paired sites, and
+    /// `active` only when it names one of them.
+    pub fn to_remote_toml(&self) -> Result<String> {
+        let file = RegistryFile {
+            active: self.active_if(Site::is_remote),
+            sites: self
+                .remote_sites()
+                .filter_map(|s| {
+                    let r = s.remote.as_ref()?;
+                    let blank = SiteEntry {
+                        slug: s.slug.clone(),
+                        label: s.label.clone(),
+                        home: None,
+                        project: None,
+                        host: None,
+                        remote_site: None,
+                        key: None,
+                        domain: None,
+                        engine: None,
+                    };
+                    Some(match &r.transport {
+                        Transport::Engine { url } => SiteEntry {
+                            engine: Some(url.clone()),
+                            ..blank
+                        },
+                        Transport::Ssh => SiteEntry {
+                            host: Some(r.host.clone()),
+                            remote_site: Some(r.slug.clone()),
+                            key: r.key.as_toml(),
+                            domain: r.domain.clone(),
+                            ..blank
+                        },
+                    })
+                })
+                .collect(),
+        };
+        let body =
+            toml::to_string(&file).context("could not serialize the server sites registry")?;
+        Ok(format!("{REMOTE_FILE_HEADER}{body}"))
+    }
+
+    /// The active slug when the active site matches `kind`.
+    fn active_if(&self, kind: impl Fn(&Site) -> bool) -> Option<String> {
+        self.active_site()
+            .filter(|s| kind(s))
+            .map(|s| s.slug.clone())
+    }
+
+    /// Validate, then write both files atomically (each a temp file beside it,
+    /// renamed over it; a crash mid-write leaves that file as it was).
+    /// `sites.remote.toml` is written first — only when there are server sites
+    /// or the file already exists — then `sites.toml`, so a server site moving
+    /// out of `sites.toml` is on disk in its new home before it leaves the old.
+    /// Creates nothing but those files (and `~/.atelier` if absent).
     pub fn save(&self, user_home: &Path) -> Result<()> {
         self.validate()?;
-        let text = self.to_toml(user_home)?;
-        let dir = default_home(user_home);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("could not create {}", dir.display()))?;
-        let path = registry_path(user_home);
-        let tmp = dir.join(format!(".{SITES_FILE}.tmp-{}", std::process::id()));
-        std::fs::write(&tmp, text).with_context(|| format!("could not write {}", tmp.display()))?;
-        // The only rename in this module: our own temp file onto sites.toml.
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e).with_context(|| format!("could not replace {}", path.display()));
+        let local = self.to_toml(user_home)?;
+        let remote_path = remote_registry_path(user_home);
+        if self.remote_sites().next().is_some() || remote_path.exists() {
+            write_atomic(&remote_path, &self.to_remote_toml()?)?;
         }
-        Ok(())
+        write_atomic(&registry_path(user_home), &local)
     }
 
     /// The site registered under `slug`.
@@ -655,6 +828,12 @@ impl Registry {
     /// and port rules apply to.
     pub fn local_sites(&self) -> impl Iterator<Item = &Site> {
         self.sites.iter().filter(|s| !s.is_remote())
+    }
+
+    /// The sites on servers (SSH or engine-paired): what `sites.remote.toml`
+    /// holds.
+    pub fn remote_sites(&self) -> impl Iterator<Item = &Site> {
+        self.sites.iter().filter(|s| s.is_remote())
     }
 
     /// The active site, if one is set.
@@ -822,7 +1001,7 @@ pub fn resolve(
 }
 
 /// [`resolve`] with its inputs gathered from the process: `ATELIER_HOME`, the
-/// user's home directory and `sites.toml`.
+/// user's home directory and the registry files.
 ///
 /// The registry is only read when a rung needs it. Under `ATELIER_HOME` (no
 /// `--site`) an unreadable registry is ignored, so the operator's override can
@@ -930,7 +1109,7 @@ pub fn host_port_is_free(port: u16) -> bool {
 /// to do — no installed `~/.atelier`, or it is already registered.
 ///
 /// One-way and idempotent, like the `Stack::migrate_*` repairs. It writes only
-/// `sites.toml`; the stack directory is never moved, renamed or touched.
+/// the registry; the stack directory is never moved, renamed or touched.
 /// A corrupt registry is an error, never overwritten.
 pub fn adopt_legacy(user_home: &Path) -> Result<Option<Site>> {
     let home = default_home(user_home);
@@ -972,7 +1151,7 @@ pub fn adopt_legacy(user_home: &Path) -> Result<Option<Site>> {
 // first write on a machine with an existing `~/.atelier` registers it in place
 // first. None of them moves, renames or deletes a stack directory: `add` only
 // creates files in a new (or empty) `sites/<slug>/`, and everything else edits
-// `sites.toml` alone.
+// the registry files alone.
 
 /// One row of `atelier sites list` — everything that can be read from disk.
 /// Whether the site is running is Docker's to answer; the front-end asks it.
@@ -1250,7 +1429,7 @@ pub struct AddedRemoteSite {
 ///
 /// `verify` is the caller's proof that the server answers and runs that site
 /// (in production: [`crate::remote`] over SSH). It runs after every local check
-/// and **before** anything is written; when it fails, `sites.toml` is left
+/// and **before** anything is written; when it fails, the registry is left
 /// exactly as it was — not even legacy adoption has happened.
 pub fn add_remote_site(
     user_home: &Path,
@@ -1363,7 +1542,7 @@ pub struct RemovedSite {
     pub was_active: bool,
 }
 
-/// **Unregister** `slug`: drop it from `sites.toml`. Nothing on disk or in
+/// **Unregister** `slug`: drop it from the registry. Nothing on disk or in
 /// Docker is deleted — the stack directory, its backups and its volumes stay,
 /// and `add_site` with the same slug registers it again in place.
 ///
@@ -2266,7 +2445,7 @@ host = "stage-alias"
         let stage = r.get("stage").unwrap().remote.clone().unwrap();
         assert_eq!((stage.slug.as_str(), stage.key), ("stage", KeyMode::Ssh));
 
-        let out = r.to_toml(uh).unwrap();
+        let out = r.to_remote_toml().unwrap();
         assert!(
             out.contains(
                 "host = \"deploy@example.com\"\nremote_site = \"default\"\nkey = \"guided\""
@@ -2277,26 +2456,353 @@ host = "stage-alias"
             !out.contains("remote/prod"),
             "no placeholder home is written: {out}"
         );
-        assert_eq!(Registry::parse(&out, uh).unwrap(), r);
+        let servers: Vec<Site> = r.remote_sites().cloned().collect();
+        assert_eq!(Registry::parse(&out, uh).unwrap().sites, servers);
+        // …and the local site goes to sites.toml alone.
+        let local = r.to_toml(uh).unwrap();
+        assert!(local.contains("slug = \"default\""), "{local}");
+        assert!(!local.contains("prod"), "{local}");
+    }
+
+    /// `sites.toml` exactly as released Manager 0.12.1 reads it
+    /// (`git show v0.12.1:crates/aincient-core/src/sites.rs`): both structs
+    /// `deny_unknown_fields`, and its `validate` refuses a dangling `active`.
+    mod v0_12_1 {
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct RegistryFile {
+            #[serde(default)]
+            pub active: Option<String>,
+            #[serde(default, rename = "site")]
+            pub sites: Vec<SiteEntry>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct SiteEntry {
+            pub slug: String,
+            #[allow(dead_code)]
+            pub label: String,
+            pub home: String,
+            pub project: String,
+        }
+
+        /// Parse as 0.12.1 does, plus the checks of its `validate` that a
+        /// file we write could trip: a dangling `active`, repeated slugs,
+        /// projects or homes, a relative home.
+        pub fn read(text: &str) -> Result<RegistryFile, String> {
+            let file: RegistryFile = toml::from_str(text).map_err(|e| e.to_string())?;
+            let mut slugs = std::collections::HashSet::new();
+            let mut projects = std::collections::HashSet::new();
+            let mut homes = std::collections::HashSet::new();
+            for s in &file.sites {
+                if !slugs.insert(s.slug.clone())
+                    || !projects.insert(s.project.clone())
+                    || !homes.insert(s.home.clone())
+                    || !(s.home == "~" || s.home.starts_with("~/") || s.home.starts_with('/'))
+                {
+                    return Err(format!("0.12.1 refuses site `{}`", s.slug));
+                }
+            }
+            if let Some(active) = &file.active {
+                if !slugs.contains(active) {
+                    return Err(format!("the active site `{active}` is not registered"));
+                }
+            }
+            Ok(file)
+        }
+    }
+
+    /// The owner's registry as the pre-0486 internal builds wrote it: three
+    /// local sites, an SSH site with a domain and an engine-paired site that is
+    /// active — the file 0.12.1 refused over `domain`.
+    fn mixed_pre_0486_file() -> String {
+        format!(
+            "{FILE_HEADER}active = \"vps-code\"\n\n\
+             [[site]]\nslug = \"default\"\nlabel = \"My Site\"\nhome = \"~/.atelier\"\nproject = \"atelier\"\n\n\
+             [[site]]\nslug = \"foo-bar-baz\"\nlabel = \"Foo Bar Baz\"\nhome = \"~/.atelier/sites/foo-bar-baz\"\nproject = \"atelier-foo-bar-baz\"\n\n\
+             [[site]]\nslug = \"engine-poc\"\nlabel = \"Engine PoC\"\nhome = \"~/.atelier/sites/engine-poc\"\nproject = \"atelier-engine-poc\"\n\n\
+             [[site]]\nslug = \"vps\"\nlabel = \"VPS\"\nhost = \"vps\"\nremote_site = \"default\"\nkey = \"guided\"\ndomain = \"89-167-68-246.sslip.io\"\n\n\
+             [[site]]\nslug = \"vps-code\"\nlabel = \"VPS (code)\"\nengine = \"https://89-167-68-246.sslip.io\"\n"
+        )
+    }
+
+    fn slugs(r: &Registry) -> Vec<&str> {
+        r.sites.iter().map(|s| s.slug.as_str()).collect()
     }
 
     #[test]
-    fn an_m2_file_with_ssh_sites_round_trips_byte_for_byte() {
-        // What the M2 Manager writes, domain and guided key included: the
-        // engine field (M4) must not change a byte of it.
+    fn released_0_12_1_reads_the_sites_toml_we_write() {
+        // The downgrade regression (DECISIONS 0486): whatever sites are on a
+        // server and whichever site is active, 0.12.1 parses sites.toml and
+        // sees every local site.
         let th = TempHome::new();
         let uh = th.path();
-        let text = format!(
-            "{FILE_HEADER}active = \"prod\"\n\n\
-             [[site]]\nslug = \"default\"\nlabel = \"My Site\"\nhome = \"~/.atelier\"\nproject = \"atelier\"\n\n\
-             [[site]]\nslug = \"prod\"\nlabel = \"Production\"\nhost = \"deploy@example.com\"\nremote_site = \"default\"\nkey = \"guided\"\ndomain = \"cms.example.com\"\n"
+        let mut domain_site = remote(uh, "prod", "deploy@example.com");
+        domain_site.remote.as_mut().unwrap().domain = Some("cms.example.com".into());
+        domain_site.remote.as_mut().unwrap().key = KeyMode::Guided;
+        let mut r = Registry {
+            active: None,
+            sites: vec![
+                legacy_site(uh),
+                site(uh, "blog"),
+                domain_site,
+                Site::new_engine(uh, "vps", Some("VPS"), "https://cms.example.org"),
+            ],
+        };
+        for active in [None, Some("blog"), Some("prod"), Some("vps")] {
+            r.active = active.map(str::to_string);
+            r.save(uh).unwrap();
+            let text = std::fs::read_to_string(registry_path(uh)).unwrap();
+            let old = v0_12_1::read(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+            let old_slugs: Vec<&str> = old.sites.iter().map(|s| s.slug.as_str()).collect();
+            assert_eq!(old_slugs, ["default", "blog"], "{text}");
+            assert_eq!(
+                old.active.as_deref(),
+                active.filter(|a| *a == "blog"),
+                "only a local active site is named in sites.toml"
+            );
+            assert_eq!(Registry::load(uh).unwrap().unwrap(), r, "active {active:?}");
+        }
+    }
+
+    #[test]
+    fn both_files_round_trip_through_disk() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let mut prod = remote(uh, "prod", "deploy@example.com");
+        prod.remote.as_mut().unwrap().domain = Some("cms.example.com".into());
+        let r = Registry {
+            active: Some("prod".to_string()),
+            sites: vec![
+                legacy_site(uh),
+                prod,
+                site(uh, "blog"),
+                Site::new_engine(uh, "vps", Some("VPS"), "https://cms.example.org"),
+            ],
+        };
+        r.save(uh).unwrap();
+        let local = std::fs::read_to_string(registry_path(uh)).unwrap();
+        let remote_text = std::fs::read_to_string(remote_registry_path(uh)).unwrap();
+        assert!(!local.contains("active"), "{local}");
+        assert!(!local.contains("prod") && !local.contains("vps"), "{local}");
+        assert!(remote_text.starts_with(REMOTE_FILE_HEADER), "{remote_text}");
+        assert!(remote_text.contains("active = \"prod\""), "{remote_text}");
+        assert!(
+            remote_text.contains("domain = \"cms.example.com\""),
+            "{remote_text}"
         );
+        assert!(
+            remote_text.contains("engine = \"https://cms.example.org\""),
+            "{remote_text}"
+        );
+        assert!(!remote_text.contains("home ="), "{remote_text}");
+
+        // Loaded back: local sites first (sites.toml order), then the server's.
+        let back = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(slugs(&back), ["default", "blog", "prod", "vps"]);
+        assert_eq!(back.active.as_deref(), Some("prod"));
+        for s in &r.sites {
+            assert_eq!(back.get(&s.slug), Some(s));
+        }
+        // A second save is byte-identical; no temp file is left behind.
+        back.save(uh).unwrap();
+        assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), local);
+        assert_eq!(
+            std::fs::read_to_string(remote_registry_path(uh)).unwrap(),
+            remote_text
+        );
+        let mut names: Vec<_> = std::fs::read_dir(default_home(uh))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, [REMOTE_SITES_FILE, SITES_FILE]);
+
+        // Removing the last server site keeps the file, empty.
+        remove_site(uh, "prod").unwrap();
+        remove_site(uh, "vps").unwrap();
+        let after = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(slugs(&after), ["default", "blog"]);
+        assert_eq!(after.active, None);
+        let emptied = std::fs::read_to_string(remote_registry_path(uh)).unwrap();
+        assert_eq!(
+            Registry::parse(&emptied, uh).unwrap(),
+            Registry::default(),
+            "{emptied}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_sites_toml_is_split_on_load_and_loses_nothing() {
+        let th = TempHome::new();
+        let uh = th.path();
+        let text = mixed_pre_0486_file();
         std::fs::create_dir_all(default_home(uh)).unwrap();
         std::fs::write(registry_path(uh), &text).unwrap();
+        assert!(v0_12_1::read(&text).is_err(), "the file 0.12.1 refused");
+        let before = Registry::parse(&text, uh).unwrap();
+
         let r = Registry::load(uh).unwrap().unwrap();
-        assert_eq!(r.get("prod").unwrap().engine_url(), None);
+        assert_eq!(r, before, "nothing lost, nothing reordered, same active");
+        assert_eq!(
+            slugs(&r),
+            ["default", "foo-bar-baz", "engine-poc", "vps", "vps-code"]
+        );
+        assert_eq!(r.active.as_deref(), Some("vps-code"));
+
+        // On disk now: the split.
+        let local = std::fs::read_to_string(registry_path(uh)).unwrap();
+        let old = v0_12_1::read(&local).unwrap_or_else(|e| panic!("{e}\n{local}"));
+        let old_slugs: Vec<&str> = old.sites.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(old_slugs, ["default", "foo-bar-baz", "engine-poc"]);
+        assert_eq!(old.active, None, "a server site is active");
+        let remote_text = std::fs::read_to_string(remote_registry_path(uh)).unwrap();
+        let remote_file = Registry::parse(&remote_text, uh).unwrap();
+        assert_eq!(slugs(&remote_file), ["vps", "vps-code"]);
+        assert_eq!(remote_file.active.as_deref(), Some("vps-code"));
+        assert_eq!(
+            remote_file
+                .get("vps")
+                .unwrap()
+                .remote
+                .as_ref()
+                .unwrap()
+                .domain
+                .as_deref(),
+            Some("89-167-68-246.sslip.io")
+        );
+
+        // Reading again reads the same registry and writes nothing.
+        assert_eq!(Registry::load(uh).unwrap().unwrap(), before);
+        assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), local);
+        assert_eq!(
+            std::fs::read_to_string(remote_registry_path(uh)).unwrap(),
+            remote_text
+        );
+    }
+
+    #[test]
+    fn an_interrupted_split_is_read_once_and_finished() {
+        // The remote file was written, then the process died before
+        // sites.toml was rewritten: both files hold vps and vps-code.
+        let th = TempHome::new();
+        let uh = th.path();
+        let text = mixed_pre_0486_file();
+        let before = Registry::parse(&text, uh).unwrap();
+        std::fs::create_dir_all(default_home(uh)).unwrap();
+        std::fs::write(remote_registry_path(uh), before.to_remote_toml().unwrap()).unwrap();
+        std::fs::write(registry_path(uh), &text).unwrap();
+
+        assert_eq!(Registry::load(uh).unwrap().unwrap(), before);
+        let local = std::fs::read_to_string(registry_path(uh)).unwrap();
+        assert!(v0_12_1::read(&local).is_ok(), "{local}");
+
+        // A *different* entry under a slug both files claim is no leftover.
+        let mut other = before.clone();
+        other.sites.retain(Site::is_remote);
+        other.sites[0].label = "Another VPS".into();
+        std::fs::write(remote_registry_path(uh), other.to_remote_toml().unwrap()).unwrap();
+        std::fs::write(registry_path(uh), &text).unwrap();
+        let err = format!("{:#}", Registry::load(uh).unwrap_err());
+        assert!(err.contains("`vps` is listed twice"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(registry_path(uh)).unwrap(),
+            text,
+            "a refused registry is left alone"
+        );
+    }
+
+    #[test]
+    fn the_active_site_moves_between_the_files() {
+        let th = TempHome::new();
+        let uh = th.path();
+        install_legacy(uh);
+        add_remote_site(uh, remote(uh, "prod", "example.com"), |_| Ok(())).unwrap();
+        let local_active = || {
+            v0_12_1::read(&std::fs::read_to_string(registry_path(uh)).unwrap())
+                .unwrap()
+                .active
+        };
+        let remote_active = || {
+            Registry::parse(
+                &std::fs::read_to_string(remote_registry_path(uh)).unwrap(),
+                uh,
+            )
+            .unwrap()
+            .active
+        };
+        assert_eq!(local_active().as_deref(), Some(DEFAULT_SLUG));
+        assert_eq!(remote_active(), None);
+
+        use_site(uh, "prod").unwrap();
+        assert_eq!(local_active(), None, "0.12.1 falls back to ~/.atelier");
+        assert_eq!(remote_active().as_deref(), Some("prod"));
+        assert_eq!(
+            Registry::load(uh).unwrap().unwrap().active.as_deref(),
+            Some("prod")
+        );
+
+        use_site(uh, DEFAULT_SLUG).unwrap();
+        assert_eq!(local_active().as_deref(), Some(DEFAULT_SLUG));
+        assert_eq!(remote_active(), None);
+
+        // An older Manager picks a local site while a server site is active
+        // here: its later choice in sites.toml wins, and the stale remote
+        // marker is dropped on the next save.
+        use_site(uh, "prod").unwrap();
+        let mut local = std::fs::read_to_string(registry_path(uh)).unwrap();
+        local = local.replacen("[[site]]", "active = \"default\"\n\n[[site]]", 1);
+        std::fs::write(registry_path(uh), &local).unwrap();
+        let r = Registry::load(uh).unwrap().unwrap();
+        assert_eq!(r.active.as_deref(), Some(DEFAULT_SLUG));
         r.save(uh).unwrap();
-        assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), text);
+        assert_eq!(remote_active(), None);
+    }
+
+    #[test]
+    fn validation_runs_across_both_files() {
+        let th = TempHome::new();
+        let uh = th.path();
+        std::fs::create_dir_all(default_home(uh)).unwrap();
+        let local = format!(
+            "{FILE_HEADER}[[site]]\nslug = \"prod\"\nlabel = \"P\"\nhome = \"~/.atelier\"\nproject = \"atelier\"\n"
+        );
+        std::fs::write(registry_path(uh), &local).unwrap();
+        let cases = [
+            // the same slug in both files
+            "[[site]]\nslug = \"prod\"\nlabel = \"P\"\nhost = \"h\"\n",
+            // a dangling active
+            "active = \"nope\"\n[[site]]\nslug = \"a\"\nlabel = \"A\"\nhost = \"h\"\n",
+            // a local site in the remote file
+            "[[site]]\nslug = \"b\"\nlabel = \"B\"\nhome = \"~/x\"\nproject = \"x\"\n",
+            // one engine paired twice
+            "[[site]]\nslug = \"a\"\nlabel = \"A\"\nengine = \"https://x.com\"\n\n\
+             [[site]]\nslug = \"b\"\nlabel = \"B\"\nengine = \"https://x.com\"\n",
+            // an unknown key
+            "unknown = 1\n",
+        ];
+        for text in cases {
+            std::fs::write(remote_registry_path(uh), text).unwrap();
+            assert!(Registry::load(uh).is_err(), "accepted:\n{text}");
+            assert_eq!(std::fs::read_to_string(registry_path(uh)).unwrap(), local);
+            assert_eq!(
+                std::fs::read_to_string(remote_registry_path(uh)).unwrap(),
+                text
+            );
+        }
+        // A server site may not take a local site's slug, from either side.
+        std::fs::remove_file(remote_registry_path(uh)).unwrap();
+        assert!(add_remote_site(uh, remote(uh, "prod", "h"), |_| unreachable!()).is_err());
+        add_remote_site(uh, remote(uh, "srv", "h"), |_| Ok(())).unwrap();
+        assert!(add_site(uh, "srv", None, None, all_free).is_err());
+        // The engine check in `engine_entry` sees the remote file too.
+        let vps = engine_entry(uh, "vps", None, "https://cms.example.com").unwrap();
+        add_remote_site(uh, vps, |_| Ok(())).unwrap();
+        assert!(engine_entry(uh, "vps2", None, "https://cms.example.com").is_err());
+        assert!(registry_exists(uh));
     }
 
     #[test]
@@ -2316,10 +2822,10 @@ host = "stage-alias"
                 url: "https://cms.example.com".into()
             }
         );
-        let out = r.to_toml(uh).unwrap();
+        let out = r.to_remote_toml().unwrap();
         assert_eq!(
             out,
-            format!("{FILE_HEADER}{text}"),
+            format!("{REMOTE_FILE_HEADER}{text}"),
             "no token, no host, no key"
         );
         assert_eq!(Registry::parse(&out, uh).unwrap(), r);
@@ -2444,7 +2950,7 @@ host = "stage-alias"
         let r = Registry::parse(text, uh).unwrap();
         let remote = r.get("prod").unwrap().remote.clone().unwrap();
         assert_eq!(remote.domain.as_deref(), Some("cms.example.com"));
-        let out = r.to_toml(uh).unwrap();
+        let out = r.to_remote_toml().unwrap();
         assert!(out.contains("domain = \"cms.example.com\""), "{out}");
         assert_eq!(Registry::parse(&out, uh).unwrap(), r);
         for ok in [
