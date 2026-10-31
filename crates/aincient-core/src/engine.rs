@@ -136,6 +136,14 @@ pub const ENGINE_COMPOSE_TEMPLATE: &str = r#"# Atelier engine: EXPERIMENTAL, opt
 # `app` and `db` never join it. Edge reaches it at /_atelier/engine/v1/ through
 # edge.engine.conf, which replaces edge.conf only while this file is in use.
 services:
+  db:
+    # Resting mode stops db; a wake starts it again, and app waits for it to be
+    # healthy (compose.yaml's depends_on). The shipped check runs every 10s, so
+    # a wake sat ~10s on a database that was ready in under one. While it
+    # starts, check every second; the check itself is unchanged.
+    healthcheck:
+      start_period: 60s
+      start_interval: 1s
   app:
     volumes:
       - engine-inbox:/opt/drupal/engine-inbox
@@ -1058,7 +1066,27 @@ mod tests {
             .next()
             .unwrap();
         assert!(!app.contains("networks"), "E-05: app stays on default");
-        assert!(!c.contains("  db:"), "db is untouched");
+        // db gains only a faster check while it starts (a wake, C-03): no
+        // network, volume, port or anything else.
+        let db = services
+            .split("  db:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n  app:\n")
+            .next()
+            .unwrap();
+        let db: Vec<_> = db
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect();
+        assert_eq!(
+            db,
+            [
+                "    healthcheck:",
+                "      start_period: 60s",
+                "      start_interval: 1s"
+            ]
+        );
         assert!(c.contains("  edge:\n    networks:\n      - default\n      - engine\n"));
         assert!(c.contains("    networks:\n      - engine\n    # Bounded"));
         assert!(c.contains("  engine:\n    # No route out: the engine talks to Docker over the socket, not the network.\n    internal: true\n"));
