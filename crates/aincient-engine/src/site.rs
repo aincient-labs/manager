@@ -189,9 +189,42 @@ pub fn service_state(states: &Value, service: &str) -> String {
         .unwrap_or_else(|| "missing".into())
 }
 
+/// The version `service`'s image was stamped with, from the `Labels` that
+/// `compose ps` reports (`k=v,k=v`), whether or not it runs.
+pub fn service_version(states: &Value, service: &str) -> Option<String> {
+    let labels = states
+        .as_array()?
+        .iter()
+        .find(|v| v["Service"] == service)?["Labels"]
+        .as_str()?;
+    labels.split(',').find_map(|kv| {
+        kv.strip_prefix(aincient_core::ops::VERSION_LABEL)?
+            .strip_prefix('=')
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_app_version_comes_off_its_labels_running_or_not() {
+        let states = serde_json::json!([
+            {"Service": "db", "State": "exited", "Labels": "org.opencontainers.image.version=16"},
+            {"Service": "app", "State": "exited",
+             "Labels": "com.docker.compose.project=atelier,org.opencontainers.image.version=v0.19.2+internal.57f8151,org.opencontainers.image.title=Atelier"},
+        ]);
+        assert_eq!(
+            service_version(&states, "app").as_deref(),
+            Some("v0.19.2+internal.57f8151")
+        );
+        assert_eq!(service_version(&states, "edge"), None);
+        let unstamped = serde_json::json!([{"Service": "app", "Labels": "a=b"}]);
+        assert_eq!(service_version(&unstamped, "app"), None);
+        assert_eq!(service_version(&Value::Null, "app"), None);
+    }
 
     #[test]
     fn drush_verbs_are_constants() {

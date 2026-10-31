@@ -116,10 +116,11 @@ pub struct Status {
     pub channel: Channel,
     /// Local image digest (best effort).
     pub image_digest: Option<String>,
-    /// The `org.opencontainers.image.version` the running `app` container reports —
-    /// what the site actually calls itself (`v0.6.1`, `edge+f8bdcb9`). `None` when
-    /// nothing is running, or the image predates the stamp. Read off the container,
-    /// so it's the version genuinely serving, not whatever the tag now points at.
+    /// The `org.opencontainers.image.version` the `app` container reports —
+    /// what the site actually calls itself (`v0.6.1`, `edge+f8bdcb9`), running
+    /// or stopped (a resting site keeps its container). `None` without an `app`
+    /// container, or when the image predates the stamp. Read off the container,
+    /// so it's the version installed, not whatever the tag now points at.
     pub version: Option<String>,
     /// The site's identity (m2-6, D-04) — see [`Stack::site_id`]. `None` until
     /// its first backup, and from a server whose CLI predates it.
@@ -378,7 +379,7 @@ pub fn status(stack: &Stack) -> Status {
         image: stack.image(),
         channel: stack.channel(),
         image_digest: local_digest(&stack.image()),
-        version: running.then(|| running_image_version(stack)).flatten(),
+        version: installed.then(|| app_image_version(stack)).flatten(),
         site_id: stack.site_id(),
         engine: installed
             .then(|| crate::engine_admin::probe(stack))
@@ -1209,14 +1210,14 @@ fn running_image_extensions(stack: &Stack) -> Option<Vec<String>> {
     parse_extension_list(try_capture(c)?.trim())
 }
 
-/// The [`VERSION_LABEL`] of the image the `app` container is actually running,
-/// read off the container the same way (and for the same reason) as
-/// [`running_image_extensions`]: it survives `stack.set_image()` having moved the
-/// tag on, so it's the version genuinely serving. `None` when the container isn't
-/// there or the label isn't (an image built before the stamp existed).
-fn running_image_version(stack: &Stack) -> Option<String> {
+/// The [`VERSION_LABEL`] of the image the `app` container was made from,
+/// running or stopped, read off the container the same way (and for the same
+/// reason) as [`running_image_extensions`]: it survives `stack.set_image()`
+/// having moved the tag on. `None` when the container isn't there or the label
+/// isn't (an image built before the stamp existed).
+fn app_image_version(stack: &Stack) -> Option<String> {
     let mut ps = compose(stack);
-    ps.args(["ps", "-q", "app"]);
+    ps.args(["ps", "-a", "-q", "app"]);
     let cid = try_capture(ps)?;
     let cid = cid.lines().next()?.trim();
     if cid.is_empty() {
@@ -2616,7 +2617,8 @@ fn parse_http_status(bytes: &[u8]) -> Option<u16> {
 }
 
 /// The OCI label the image build stamps with the version it is (DECISIONS 0308).
-const VERSION_LABEL: &str = "org.opencontainers.image.version";
+/// The image label every appliance build is stamped with: its version.
+pub const VERSION_LABEL: &str = "org.opencontainers.image.version";
 
 /// The label carrying an image's upgrade floor — the oldest version whose database
 /// its `converge.sh` will migrate. Baked from `docker/upgrade-floor`.

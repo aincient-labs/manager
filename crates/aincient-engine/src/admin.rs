@@ -10,7 +10,7 @@
 use crate::codes::{self, now};
 use crate::inbox::Inbox;
 use crate::rest;
-use crate::site::{service_state, Site};
+use crate::site::{service_state, service_version, Site};
 use crate::state::{self, Revoked, Revoker, Store};
 use crate::{API_VERSION, ENGINE_VERSION};
 use anyhow::{bail, Context, Result};
@@ -116,6 +116,7 @@ pub fn run(
             "idle_rest_minutes": site.idle_rest_minutes(),
             "app": app,
             "db": service_state(&states, "db"),
+            "version": service_version(&states, "app"),
             "lockdown": flags.as_ref().map_or(true, |f| f.lockdown),
             "wake_paused": flags.as_ref().is_ok_and(|f| f.wake_paused(now())),
             "wake_code_set": flags.as_ref().is_ok_and(|f| f.wake_hash.is_some()),

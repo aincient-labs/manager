@@ -390,6 +390,10 @@ pub struct EngineStatus {
     pub idle_rest_minutes: Option<u64>,
     #[serde(default)]
     pub woken_at: Option<u64>,
+    /// The appliance's version, off the `app` container's image label; absent
+    /// from an engine that predates it.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 /// What a lifecycle verb answered: a started job (202) or, for `unlock`, the

@@ -66,7 +66,7 @@ pub fn to_status(site: &Site, st: &EngineStatus) -> Status {
         image: String::new(),
         channel: Channel::Stable,
         image_digest: None,
-        version: None,
+        version: st.version.clone(),
         site_id: None,
         engine: Some(EngineInfo {
             enabled: true,

@@ -41,7 +41,7 @@ use crate::codes::{self, now};
 use crate::http::{self, Reply, Request};
 use crate::inbox::Inbox;
 use crate::rest;
-use crate::site::{service_state, Drush, Site};
+use crate::site::{service_state, service_version, Drush, Site};
 use crate::state::{self, Asked, Collected, Pairing, Redeemed, Revoked, Revoker, Store, WakeGate};
 use crate::{API_VERSION, ENGINE_VERSION};
 use anyhow::{bail, Context, Result};
@@ -882,6 +882,7 @@ impl Engine {
             "woken_at": flags.woken_at,
             "app": app,
             "db": service_state(&states, "db"),
+            "version": service_version(&states, "app"),
             "lockdown": flags.lockdown,
             "wake_paused": flags.wake_paused(now()),
             "wake_paused_until": flags.wake_pause.until,
