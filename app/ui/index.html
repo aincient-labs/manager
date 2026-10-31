@@ -227,7 +227,7 @@
       <section id="screen-unreachable" class="screen center hidden">
         <div class="card welcome">
           <h2 id="unreachable-title">Can't reach the server</h2>
-          <p class="muted">
+          <p class="muted" id="unreachable-lede">
             This site runs on a server, and the Manager reaches it over SSH. The
             server didn't answer — it may be offline, or the connection may need
             a moment. Nothing was changed.
@@ -236,6 +236,10 @@
         </div>
         <button class="btn primary" data-action="recheck">
           <svg class="ic"><use href="#i-refresh" /></svg>Try again
+        </button>
+        <!-- An engine-paired site whose token was revoked (M4): offer to forget it. -->
+        <button id="unreachable-forget" class="btn hidden" data-action="engine-forget">
+          <svg class="ic"><use href="#i-trash" /></svg>Forget this site on this Manager
         </button>
       </section>
 
@@ -623,6 +627,21 @@
               <button id="engine-remove" class="btn small full hidden" data-action="engine-remove">
                 <svg class="ic"><use href="#i-trash" /></svg>Remove the engine
               </button>
+              <!-- Managers (M4, E-02): only for a site this Manager is paired
+                   with by token. Requests show name and address, never a
+                   code: the owner types the code from the new Manager. -->
+              <div id="managers-panel" class="managers hidden">
+                <h4 class="sub-label">Managers</h4>
+                <ul id="managers-list" class="managers-list"></ul>
+                <div id="requests-box" class="hidden">
+                  <h4 class="sub-label">Waiting to join</h4>
+                  <ul id="requests-list" class="managers-list"></ul>
+                </div>
+                <p id="managers-hint" class="hint"></p>
+                <button class="btn small full" data-action="engine-forget">
+                  <svg class="ic"><use href="#i-trash" /></svg>Forget this site on this Manager
+                </button>
+              </div>
             </div>
           </div>
         </section>
@@ -786,6 +805,31 @@
           <input id="add-site-slug" type="text" placeholder="my-blog" autocomplete="off" spellcheck="false" />
         </label>
         <div class="add-server hidden">
+          <!-- Without SSH (M4, E-02): only with Experimental features on. -->
+          <div id="add-how" class="add-how hidden" role="radiogroup" aria-label="How this Manager reaches the server">
+            <label class="check"><input type="radio" name="add-server-how" value="ssh" checked /><span>Over SSH — I can log in to the server</span></label>
+            <label class="check"><input type="radio" name="add-server-how" value="code" /><span>With an install code — no SSH (experimental)</span></label>
+            <label class="check"><input type="radio" name="add-server-how" value="join" /><span>Ask to join — the site already has a Manager (experimental)</span></label>
+          </div>
+          <div class="how-engine hidden">
+            <label class="field modal-field">
+              <span>Site address <em>— https only</em></span>
+              <input id="add-site-url" type="text" placeholder="https://cms.example.com" inputmode="url" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field modal-field how-code">
+              <span>Install code <em>— the one the site's installer printed; it works once</em></span>
+              <input id="add-site-code" type="text" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" autocapitalize="characters" />
+            </label>
+            <label class="field modal-field">
+              <span>This Manager's name <em>— what the site's list of Managers shows</em></span>
+              <input id="add-site-name" type="text" maxlength="64" autocomplete="off" spellcheck="false" />
+            </label>
+            <p class="hint how-join">
+              This Manager shows a code. Type it into the site's first Manager
+              (its Managers panel → Approve). Nothing else lets this one in.
+            </p>
+          </div>
+          <div class="how-ssh">
           <label class="field modal-field">
             <span>Server <em>— an SSH alias from ~/.ssh/config, a host, or user@host</em></span>
             <input id="add-site-host" type="text" placeholder="deploy@vps.example.com" autocomplete="off" spellcheck="false" />
@@ -814,6 +858,7 @@
               </button>
             </div>
           </div>
+          </div>
         </div>
         <p id="add-site-error" class="modal-error hidden" role="alert"></p>
         <div class="modal-actions">
@@ -821,6 +866,67 @@
           <button type="submit" class="btn primary" id="add-site-submit">Add the site</button>
         </div>
       </form>
+    </div>
+
+    <!-- Join: waiting for the primary (M4, E-02). The code, big and clear. -->
+    <div id="join-wait" class="overlay hidden">
+      <div class="modal">
+        <h3 class="modal-title">Type this code into your first Manager</h3>
+        <p class="muted">
+          On the Manager already paired with <strong id="join-url"></strong>
+          (the site's primary): System → Experimental features → Managers →
+          Approve, then type this code.
+        </p>
+        <p id="join-code" class="big-code" aria-live="polite"></p>
+        <p id="join-left" class="hint"></p>
+        <p id="join-error" class="modal-error hidden" role="alert"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="join-cancel">Stop waiting</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Approve a waiting Manager, on the primary (M4, E-02). The code is
+         TYPED from the new Manager's screen: never filled in, never pasted. -->
+    <div id="approve" class="overlay hidden">
+      <form class="modal" id="approve-form">
+        <h3 class="modal-title" id="approve-title">Let a Manager in</h3>
+        <ul id="approve-requests" class="managers-list"></ul>
+        <div class="card warn">
+          <p class="muted">
+            Type ONLY the code shown on the new Manager's own screen — never
+            one from a website, a message or an email. Whoever's code you type
+            can manage this site.
+          </p>
+        </div>
+        <label class="field modal-field">
+          <span>Code <em>— as the new Manager shows it</em></span>
+          <input id="approve-code" type="text" placeholder="XXXX-XXXX" autocomplete="off" spellcheck="false" autocapitalize="characters" />
+        </label>
+        <p id="approve-error" class="modal-error hidden" role="alert"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="approve-cancel">Cancel</button>
+          <button type="submit" class="btn primary" id="approve-submit">Approve</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- The install code the engine made when it was added (m4-6): once. -->
+    <div id="install-code" class="overlay hidden">
+      <div class="modal">
+        <h3 class="modal-title">Keep this install code</h3>
+        <p class="muted">
+          It pairs your first Manager with <strong id="install-code-site"></strong>
+          without SSH, and works once. Lost it? Make a new one over SSH.
+        </p>
+        <p id="install-code-value" class="big-code"></p>
+        <div class="modal-actions">
+          <button type="button" class="btn" data-action="install-code-copy">
+            <svg class="ic"><use href="#i-copy" /></svg><span>Copy</span>
+          </button>
+          <button type="button" class="btn primary" data-action="install-code-close">Done</button>
+        </div>
+      </div>
     </div>
 
     <!-- Rename-site modal -->

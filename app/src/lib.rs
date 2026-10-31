@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use aincient_core::docker::Pipe;
 use aincient_core::engine_admin::{self, AdminVerb, EngineAdmin, EngineInfo};
-use aincient_core::engine_client::EngineError;
+use aincient_core::engine_client::{EngineError, Verb};
 use aincient_core::settings::{self, Settings};
 use aincient_core::{
     doctor, ops, remote, sites, ssh_key, update_cache, Backup, CacheStatus, ChangeGuard, Channel,
@@ -20,6 +20,13 @@ use aincient_core::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+
+mod paired;
+
+/// A site paired with its engine (M4): no SSH, the engine's verbs only.
+fn is_paired(site: &Site) -> bool {
+    site.engine_url().is_some()
+}
 
 /// The site this window operates on — its registry slug, or `None` when nothing
 /// is registered (a fresh machine, a hand-rolled `ATELIER_HOME`), which keeps
@@ -271,6 +278,10 @@ async fn preflight_problem(sel: State<'_, Selected>) -> Result<Option<String>, S
 async fn get_status(sel: State<'_, Selected>) -> Result<Status, String> {
     match target(&sel)? {
         Target::Local(s) => blocking(move || Ok(ops::status(&s))).await,
+        Target::Remote(site) if is_paired(&site) => {
+            require_experimental_for(&site)?;
+            blocking(move || paired::status(&site)).await
+        }
         Target::Remote(site) => {
             blocking(move || {
                 let host = host_of(&site);
@@ -301,6 +312,9 @@ async fn get_status(sel: State<'_, Selected>) -> Result<Status, String> {
 async fn change_guard(sel: State<'_, Selected>) -> Result<ChangeGuard, String> {
     match target(&sel)? {
         Target::Local(s) => Ok(ChangeGuard::local(&s)),
+        Target::Remote(site) if is_paired(&site) => {
+            blocking(move || Ok(paired::guard(&site))).await
+        }
         Target::Remote(site) => {
             blocking(move || {
                 let host = host_of(&site);
@@ -326,6 +340,14 @@ async fn probe_site(slug: String) -> Result<remote::SiteState, String> {
             .site
             .filter(Site::is_remote)
             .ok_or_else(|| format!("`{slug}` is not a site on a server"))?;
+        if is_paired(&site) {
+            if require_experimental().is_err() {
+                return Ok(remote::SiteState::Unreachable {
+                    reason: EXPERIMENTAL_OFF.into(),
+                });
+            }
+            return Ok(paired::probe(&site));
+        }
         Ok(remote::probe_state(&site, remote::PROBE_STATE_LIMIT))
     })
     .await
@@ -697,6 +719,10 @@ async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String
             })
             .await
         }
+        Target::Remote(site) if is_paired(&site) => {
+            require_experimental()?;
+            blocking(move || paired::act(&site, Verb::Wake).map(|_| ())).await
+        }
         Target::Remote(site) => run_remote(app, site, remote::Action::Start).await,
     }
 }
@@ -745,6 +771,14 @@ fn require_experimental() -> Result<(), String> {
     }
 }
 
+/// What a paired site says while Experimental features are off.
+const EXPERIMENTAL_OFF: &str = "This site is paired through the experimental engine. Turn on \
+     Experimental features in System to manage it.";
+
+fn require_experimental_for(site: &Site) -> Result<(), String> {
+    require_experimental().map_err(|_| format!("{} — {EXPERIMENTAL_OFF}", site.label))
+}
+
 /// The selected site's engine, as the window shows it.
 #[derive(Serialize, Default)]
 struct EngineView {
@@ -758,6 +792,9 @@ struct EngineView {
     manager_too_old: bool,
     /// Why the engine couldn't be read, in words.
     problem: Option<String>,
+    /// The site is paired with its engine (M4): no SSH, so the engine can't
+    /// be added or removed from here, and the Managers panel applies.
+    paired: bool,
 }
 
 fn engine_view<D: engine_admin::DockerExec + ?Sized>(
@@ -795,6 +832,20 @@ fn engine_view<D: engine_admin::DockerExec + ?Sized>(
 async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
     require_experimental()?;
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => {
+            blocking(move || {
+                let e = paired::engine(&site)?;
+                Ok(EngineView {
+                    enabled: true,
+                    running: true,
+                    lockdown: Some(e.lockdown),
+                    api: Some(e.api),
+                    paired: true,
+                    ..EngineView::default()
+                })
+            })
+            .await
+        }
         Target::Local(s) => {
             blocking(move || {
                 Ok(engine_view(
@@ -834,6 +885,10 @@ async fn engine_state(sel: State<'_, Selected>) -> Result<EngineView, String> {
 async fn engine_enable(app: AppHandle, sel: State<'_, Selected>) -> Result<Option<String>, String> {
     require_experimental()?;
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => Err(remote::no_ssh(
+            &site.slug,
+            site.engine_url().unwrap_or_default(),
+        )),
         Target::Local(s) => blocking(move || engine_admin::enable_local(&s).map_err(err)).await,
         Target::Remote(site) => {
             blocking(move || {
@@ -916,6 +971,10 @@ async fn engine_lockdown(lock: bool, sel: State<'_, Selected>) -> Result<String,
         AdminVerb::Unlock
     };
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => {
+            let v = if lock { Verb::Lockdown } else { Verb::Unlock };
+            blocking(move || paired::act(&site, v)).await
+        }
         Target::Local(s) => {
             blocking(move || {
                 let info = engine_admin::probe(&s);
@@ -1149,6 +1208,11 @@ async fn open_remote_console(app: AppHandle, site: Site) -> Result<(), String> {
 #[tauri::command]
 async fn open_console(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => ops::open_url(&format!(
+            "{}/atelier",
+            site.engine_url().unwrap_or_default()
+        ))
+        .map_err(err),
         Target::Local(s) => ops::open_console(&s).map_err(err),
         Target::Remote(site) => open_remote_console(app, site).await,
     }
@@ -1161,6 +1225,11 @@ async fn open_console(app: AppHandle, sel: State<'_, Selected>) -> Result<(), St
 #[tauri::command]
 async fn open_console_authed(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => ops::open_url(&format!(
+            "{}/atelier",
+            site.engine_url().unwrap_or_default()
+        ))
+        .map_err(err),
         Target::Local(s) => blocking(move || ops::open_console_authed(&s).map_err(err)).await,
         Target::Remote(site) => open_remote_console(app, site).await,
     }
@@ -1186,6 +1255,11 @@ fn reveal_path(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_login(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
     match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => ops::open_url(&format!(
+            "{}/atelier",
+            site.engine_url().unwrap_or_default()
+        ))
+        .map_err(err),
         Target::Local(s) => ops::open_login(&s).map_err(err),
         Target::Remote(site) => open_remote_console(app, site).await,
     }
@@ -1379,11 +1453,122 @@ async fn rename_site(slug: String, label: String) -> Result<(), String> {
     .await
 }
 
+// --- pairing without SSH (M4, E-02; experimental) ----------------------------
+
+/// What this Manager calls itself when it pairs, unless the owner types
+/// another.
+#[tauri::command]
+async fn manager_name() -> Result<String, String> {
+    blocking(|| Ok(aincient_core::pairing::default_name())).await
+}
+
+/// "Add a site → On a server → With an install code" (m4-2): pair, keep the
+/// token in the keychain, register and switch to it.
+#[tauri::command]
+async fn pair_with_install_code(
+    slug: String,
+    label: String,
+    url: String,
+    code: String,
+    name: String,
+    sel: State<'_, Selected>,
+    tunnel: State<'_, ConsoleTunnel>,
+) -> Result<(), String> {
+    require_experimental()?;
+    let chosen = slug.clone();
+    blocking(move || paired::add_with_install_code(&slug, &label, &url, &code, &name)).await?;
+    tunnel.close();
+    sel.set(chosen);
+    Ok(())
+}
+
+/// "Add a site → On a server → Ask to join" (m4-5): the code to show.
+#[tauri::command]
+async fn join_start(
+    slug: String,
+    label: String,
+    url: String,
+    name: String,
+    joining: State<'_, paired::Joining>,
+) -> Result<paired::JoinView, String> {
+    require_experimental()?;
+    let j = joining.inner().clone();
+    // One short request; the waiting is the window's polling.
+    blocking(move || paired::join_start(&j, &slug, &label, &url, &name)).await
+}
+
+/// One poll of the join this window waits on.
+#[tauri::command]
+async fn join_poll(
+    joining: State<'_, paired::Joining>,
+    sel: State<'_, Selected>,
+    tunnel: State<'_, ConsoleTunnel>,
+) -> Result<paired::Polled, String> {
+    require_experimental()?;
+    let j = joining.inner().clone();
+    let polled = blocking(move || paired::join_poll(&j)).await?;
+    if let paired::Polled::Paired { slug } = &polled {
+        tunnel.close();
+        sel.set(slug.clone());
+    }
+    Ok(polled)
+}
+
+#[tauri::command]
+fn join_cancel(joining: State<'_, paired::Joining>) {
+    paired::join_cancel(joining.inner());
+}
+
+/// The selected engine-paired site, or a refusal.
+fn paired_site(sel: &Selected) -> Result<Site, String> {
+    require_experimental()?;
+    match target(sel)? {
+        Target::Remote(site) if is_paired(&site) => Ok(site),
+        _ => Err("This site isn't paired with its engine by this Manager.".into()),
+    }
+}
+
+/// The Managers panel (m4-3, m4-5).
+#[tauri::command]
+async fn engine_managers(sel: State<'_, Selected>) -> Result<paired::ManagersView, String> {
+    let site = paired_site(&sel)?;
+    blocking(move || paired::managers(&site)).await
+}
+
+/// On the primary: approve the request whose code the owner TYPED (the
+/// window never fills it in). Returns the approved Manager's name.
+#[tauri::command]
+async fn engine_approve(code: String, sel: State<'_, Selected>) -> Result<String, String> {
+    let site = paired_site(&sel)?;
+    blocking(move || paired::approve(&site, &code)).await
+}
+
+#[tauri::command]
+async fn engine_revoke(id: String, sel: State<'_, Selected>) -> Result<(), String> {
+    let site = paired_site(&sel)?;
+    blocking(move || paired::revoke(&site, &id)).await
+}
+
+/// "Forget this site": revoke this Manager's pairing, delete its token,
+/// drop the site. Allowed with Experimental features off too, like
+/// removing the engine: leaving must never be hidden behind the opt-in.
+#[tauri::command]
+async fn engine_forget(sel: State<'_, Selected>) -> Result<(), String> {
+    let site = match target(&sel)? {
+        Target::Remote(site) if is_paired(&site) => site,
+        _ => return Err("This site isn't paired with its engine.".into()),
+    };
+    blocking(move || paired::forget(&site)).await?;
+    *sel.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Selected::from_resolution())
+        .manage(paired::Joining::default())
         .manage(ConsoleTunnel::default())
         .invoke_handler(tauri::generate_handler![
             check_preflight,
@@ -1433,6 +1618,15 @@ pub fn run() {
             engine_enable,
             engine_remove,
             engine_lockdown,
+            manager_name,
+            pair_with_install_code,
+            join_start,
+            join_poll,
+            join_cancel,
+            engine_managers,
+            engine_approve,
+            engine_revoke,
+            engine_forget,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Atelier Manager")

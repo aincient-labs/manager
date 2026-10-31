@@ -427,8 +427,15 @@ async function refresh() {
     // A server that didn't answer: say which, and offer to try again.
     remoteStates[row.slug] = { state: "unreachable", reason: String(e) };
     renderSites();
-    $("unreachable-title").textContent = `Can't reach ${row.host}`;
+    const removed = String(e).includes(REMOVED_PHRASE);
+    $("unreachable-title").textContent = removed
+      ? `This Manager was removed from ${row.label}`
+      : `Can't reach ${row.host}`;
+    $("unreachable-lede").textContent = row.engine
+      ? "This site is reached through its engine over HTTPS, without SSH. Nothing was changed."
+      : UNREACHABLE_SSH_LEDE;
     $("unreachable-msg").textContent = String(e);
+    $("unreachable-forget").classList.toggle("hidden", !row.engine);
     setView("unreachable");
     return;
   }
@@ -458,6 +465,12 @@ async function refresh() {
   // (manager#6); startUpdateRefresh() owns those.
   refreshUpdate();
 }
+
+// A refused token on an engine-paired site (M4): the Rust side says this.
+const REMOVED_PHRASE = "this Manager was removed from";
+const UNREACHABLE_SSH_LEDE =
+  "This site runs on a server, and the Manager reaches it over SSH. The server didn't " +
+  "answer — it may be offline, or the connection may need a moment. Nothing was changed.";
 
 // --- sites (header switcher) -----------------------------------------------
 // One Manager, several sites (DECISIONS 0475 · M1). The backend holds which site
@@ -659,8 +672,47 @@ function setAddMode(mode) {
   document.querySelectorAll("#add-site .add-server").forEach((el) =>
     el.classList.toggle("hidden", mode !== "server")
   );
-  $("add-site-submit").textContent = mode === "server" ? "Attach the site" : "Add the site";
+  $("add-how").classList.toggle("hidden", !(mode === "server" && experimental));
+  if (!experimental) document.querySelector('input[name="add-server-how"][value="ssh"]').checked = true;
+  setHowMode();
+}
+
+// Over SSH, with an install code, or asking to join (M4; experimental only).
+function addHowMode() {
+  const checked = document.querySelector('input[name="add-server-how"]:checked');
+  return addMode === "server" && experimental && checked ? checked.value : "ssh";
+}
+
+function setHowMode() {
+  const how = addHowMode();
+  const server = addMode === "server";
+  document.querySelectorAll("#add-site .how-ssh").forEach((el) =>
+    el.classList.toggle("hidden", how !== "ssh")
+  );
+  document.querySelectorAll("#add-site .how-engine").forEach((el) =>
+    el.classList.toggle("hidden", how === "ssh")
+  );
+  document.querySelectorAll("#add-site .how-code").forEach((el) =>
+    el.classList.toggle("hidden", how !== "code")
+  );
+  document.querySelectorAll("#add-site .how-join").forEach((el) =>
+    el.classList.toggle("hidden", how !== "join")
+  );
+  $("add-site-submit").textContent = !server
+    ? "Add the site"
+    : how === "code"
+      ? "Pair with the site"
+      : how === "join"
+        ? "Ask to join"
+        : "Attach the site";
   $("add-site-error").classList.add("hidden");
+  if (how !== "ssh" && !$("add-site-name").value) {
+    invoke("manager_name")
+      .then((n) => {
+        if (!$("add-site-name").value) $("add-site-name").value = n;
+      })
+      .catch(() => {});
+  }
 }
 
 function addKeyMode() {
@@ -673,7 +725,16 @@ function openAddSite() {
   slugEdited = false;
   $("add-site-label").value = "";
   $("add-site-slug").value = "";
-  for (const id of ["add-site-host", "add-site-remote", "add-site-domain"]) $(id).value = "";
+  for (const id of [
+    "add-site-host",
+    "add-site-remote",
+    "add-site-domain",
+    "add-site-url",
+    "add-site-code",
+    "add-site-name",
+  ])
+    $(id).value = "";
+  document.querySelector('input[name="add-server-how"][value="ssh"]').checked = true;
   document.querySelector('input[name="add-site-key"][value="ssh"]').checked = true;
   $("add-site-guided").classList.add("hidden");
   $("add-site-key-out").classList.add("hidden");
@@ -696,14 +757,37 @@ async function submitAddSite() {
     return fail("The short name needs lowercase letters, digits and dashes, starting with a letter or digit.");
   if (siteRows.some((r) => r.slug === slug)) return fail(`There's already a site called "${slug}".`);
   const server = addMode === "server";
+  const how = addHowMode();
   const host = $("add-site-host").value.trim();
-  if (server && !host) return fail("Name the server: an SSH alias, a host, or user@host.");
+  const url = $("add-site-url").value.trim();
+  const name = $("add-site-name").value.trim();
+  if (server && how === "ssh" && !host)
+    return fail("Name the server: an SSH alias, a host, or user@host.");
+  if (server && how !== "ssh") {
+    if (!/^https:\/\//i.test(url))
+      return fail("The site's address starts with https:// — the Manager never pairs over plain http.");
+    if (!name) return fail("Give this Manager a name.");
+    if (how === "code" && !$("add-site-code").value.trim())
+      return fail("Type the install code the site's installer printed.");
+  }
   const submit = $("add-site-submit");
   const idle = submit.textContent;
   submit.disabled = true;
-  if (server) submit.textContent = `Connecting to ${host}…`;
+  if (server) submit.textContent = how === "ssh" ? `Connecting to ${host}…` : "Talking to the site…";
   try {
-    if (server) {
+    if (server && how === "code") {
+      await invoke("pair_with_install_code", {
+        slug,
+        label,
+        url,
+        code: $("add-site-code").value.trim(),
+        name,
+      });
+    } else if (server && how === "join") {
+      const view = await invoke("join_start", { slug, label, url, name });
+      $("add-site").classList.add("hidden");
+      return waitForJoin(view);
+    } else if (server) {
       await invoke("add_remote_site", {
         slug,
         label,
@@ -726,6 +810,56 @@ async function submitAddSite() {
   resetSiteUi();
   currentTab = "home";
   await refresh().catch((e) => showError(String(e)));
+}
+
+// --- joining an engine-paired site (M4, E-02) -------------------------------
+// The code, big and clear, while the window polls; the primary's owner types
+// it. Polls 2 s, growing to 5 s; the request dies after 10 minutes.
+
+let joinTimer = null;
+
+function stopJoin() {
+  if (joinTimer) clearTimeout(joinTimer);
+  joinTimer = null;
+  $("join-wait").classList.add("hidden");
+}
+
+function waitForJoin(view) {
+  $("join-code").textContent = view.code;
+  $("join-url").textContent = view.url;
+  $("join-error").classList.add("hidden");
+  $("join-left").textContent = `It works for ${Math.round(view.expires_in / 60)} minutes. Waiting…`;
+  $("join-wait").classList.remove("hidden");
+  let n = 0;
+  const poll = async () => {
+    let r;
+    try {
+      r = await invoke("join_poll");
+    } catch (e) {
+      $("join-error").textContent = String(e);
+      $("join-error").classList.remove("hidden");
+      joinTimer = setTimeout(poll, 5000);
+      return;
+    }
+    if (r.state === "paired") {
+      stopJoin();
+      selectedSlug = r.slug;
+      resetSiteUi();
+      currentTab = "home";
+      await refresh().catch((e) => showError(String(e)));
+      return;
+    }
+    if (r.state === "expired") {
+      stopJoin();
+      showError("The request expired (or the site locked down) before it was approved. Ask to join again for a new code.");
+      return;
+    }
+    const m = Math.floor(r.left / 60);
+    $("join-left").textContent = `Waiting for the approval… ${m}:${String(r.left % 60).padStart(2, "0")} left.`;
+    n += 1;
+    joinTimer = setTimeout(poll, Math.min(2000 + 1000 * n, 5000));
+  };
+  joinTimer = setTimeout(poll, 2000);
 }
 
 function openRenameSite() {
@@ -1121,6 +1255,15 @@ async function refreshEngine() {
     problem.classList.remove("hidden");
     return;
   }
+  $("managers-panel").classList.toggle("hidden", !v.paired);
+  if (v.paired) {
+    // Paired by token, without SSH: lock down / unlock and the Managers;
+    // adding or removing the engine needs SSH.
+    state.textContent = v.lockdown ? "Locked down" : `Paired (API ${v.api})`;
+    showEngineButtons(v.lockdown ? ["engine-unlock"] : ["engine-lockdown"]);
+    refreshManagers();
+    return;
+  }
   if (!v.enabled) {
     state.textContent = "Not on this site";
     showEngineButtons(["engine-enable"]);
@@ -1147,6 +1290,118 @@ async function refreshEngine() {
   }
   state.textContent = `Running (API ${v.api})`;
   showEngineButtons(["engine-lockdown", "engine-remove"]);
+}
+
+// --- Managers (M4, E-02) -----------------------------------------------------
+// Every Manager paired with this site, senior first. The primary also sees who
+// waits to join: name and address, never a code.
+
+let lastManagers = null;
+
+function ago(at) {
+  if (!at) return "never";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - at);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} days ago`;
+}
+
+async function refreshManagers() {
+  const list = $("managers-list");
+  const hint = $("managers-hint");
+  let v;
+  try {
+    v = await invoke("engine_managers");
+  } catch (e) {
+    list.replaceChildren();
+    hint.textContent = String(e);
+    $("requests-box").classList.add("hidden");
+    return;
+  }
+  lastManagers = v;
+  const myIndex = v.pairings.findIndex((p) => p.id === v.self);
+  const frag = document.createDocumentFragment();
+  v.pairings.forEach((p, i) => {
+    const li = document.createElement("li");
+    const rank = p.primary ? "Primary" : `#${i + 1}`;
+    const me = p.id === v.self ? " · this Manager" : "";
+    li.innerHTML =
+      `<span class="m-text"><span class="m-name">${esc(p.name)}</span>` +
+      `<span class="m-meta">${rank}${me} · last seen ${esc(ago(p.last_used))}</span></span>`;
+    // A Manager revokes only those junior to it (listed after it), never the primary.
+    if (p.id !== v.self && !p.primary && myIndex >= 0 && i > myIndex) {
+      const b = document.createElement("button");
+      b.className = "btn small";
+      b.dataset.action = "engine-revoke";
+      b.dataset.id = p.id;
+      b.dataset.name = p.name;
+      b.textContent = "Revoke";
+      li.appendChild(b);
+    }
+    frag.appendChild(li);
+  });
+  list.replaceChildren(frag);
+  const waiting = (v.requests || []).filter((r) => !r.approved);
+  $("requests-box").classList.toggle("hidden", !v.primary || waiting.length === 0);
+  const rf = document.createDocumentFragment();
+  for (const r of waiting) {
+    const li = document.createElement("li");
+    li.innerHTML =
+      `<span class="m-text"><span class="m-name">${esc(r.name)}</span>` +
+      `<span class="m-meta">from ${esc(r.ip)} · asked ${esc(ago(r.created))}</span></span>` +
+      `<button class="btn small primary" data-action="approve-open">Approve…</button>`;
+    rf.appendChild(li);
+  }
+  $("requests-list").replaceChildren(rf);
+  hint.textContent = v.primary
+    ? "This is the site's primary Manager: new Managers join by asking, then you type the code they show."
+    : "Only the site's primary Manager approves new ones.";
+}
+
+function openApprove() {
+  const v = lastManagers;
+  if (!v) return;
+  const row = currentSite();
+  $("approve-title").textContent = `Let a Manager into ${row ? row.label : "this site"}`;
+  const frag = document.createDocumentFragment();
+  for (const r of (v.requests || []).filter((r) => !r.approved)) {
+    const li = document.createElement("li");
+    li.innerHTML =
+      `<span class="m-text"><span class="m-name">${esc(r.name)}</span>` +
+      `<span class="m-meta">asking from ${esc(r.ip)} · ${esc(ago(r.created))}</span></span>`;
+    frag.appendChild(li);
+  }
+  $("approve-requests").replaceChildren(frag);
+  // Never filled in: the owner reads the code off the new Manager and types it.
+  $("approve-code").value = "";
+  $("approve-error").classList.add("hidden");
+  $("approve").classList.remove("hidden");
+  setTimeout(() => $("approve-code").focus(), 0);
+}
+
+async function submitApprove() {
+  const code = $("approve-code").value.trim();
+  const errEl = $("approve-error");
+  const fail = (m) => {
+    errEl.textContent = m;
+    errEl.classList.remove("hidden");
+  };
+  if (!code) return fail("Type the code the new Manager shows.");
+  $("approve").classList.add("hidden");
+  const ok = await confirmChange("Let the Manager showing that code manage {site}?", "", {
+    always: true,
+  });
+  if (!ok) return;
+  let name;
+  try {
+    name = await invoke("engine_approve", { code });
+  } catch (e) {
+    $("approve").classList.remove("hidden");
+    return fail(String(e));
+  }
+  await refreshManagers();
+  $("managers-hint").textContent = `Approved "${name}". It finishes pairing on its own within seconds; refresh to see it listed.`;
 }
 
 // Which images this install follows. The menu offers released versions and
@@ -1595,8 +1850,64 @@ const actions = {
       { always: true }
     );
     if (!ok) return;
-    await runProgressOp("Adding the engine", () => invoke("engine_enable"));
+    let code = null;
+    await runProgressOp("Adding the engine", async () => {
+      code = await invoke("engine_enable");
+    });
+    if (code) {
+      // m4-6: shown once, next to the site's address.
+      const row = currentSite();
+      $("install-code-site").textContent =
+        (lastStatus && lastStatus.site_url) || (row ? row.label : "this site");
+      $("install-code-value").textContent = code;
+      $("install-code").classList.remove("hidden");
+    }
     refreshEngine();
+  },
+
+  // ---- Pairing without SSH (M4, E-02) ----
+  "install-code-copy": (el) => copyText($("install-code-value").textContent, el),
+  "install-code-close": () => {
+    $("install-code-value").textContent = "";
+    $("install-code").classList.add("hidden");
+  },
+  "join-cancel": async () => {
+    stopJoin();
+    await invoke("join_cancel").catch(() => {});
+  },
+  "approve-open": () => openApprove(),
+  "approve-cancel": () => $("approve").classList.add("hidden"),
+  "engine-revoke": async (el) => {
+    const ok = await confirmChange(
+      `Revoke "${el.dataset.name}" from {site}?`,
+      "It stops working on its next call. It can join again only if the primary approves it.",
+      { always: true }
+    );
+    if (!ok) return;
+    try {
+      await invoke("engine_revoke", { id: el.dataset.id });
+    } catch (e) {
+      showError(String(e));
+    }
+    refreshManagers();
+  },
+  "engine-forget": async () => {
+    const ok = await confirmModal(
+      "This Manager's pairing is revoked on the site (if it still exists), its key is deleted " +
+        "from your keychain, and the site leaves your list. Joining again needs the primary's approval.",
+      { title: "Forget this site on this Manager?" }
+    );
+    if (!ok) return;
+    try {
+      await invoke("engine_forget");
+    } catch (e) {
+      return showError(String(e));
+    }
+    selectedSlug = null;
+    resetSiteUi();
+    currentTab = "home";
+    setView("loading");
+    await refresh().catch((e) => showError(String(e)));
   },
 
   "engine-lockdown": async () => {
@@ -1709,6 +2020,21 @@ $("add-site-form").addEventListener("submit", (e) => {
   e.preventDefault();
   submitAddSite();
 });
+$("approve-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  submitApprove();
+});
+// The code is typed from the new Manager's screen: no paste, no drop.
+for (const ev of ["paste", "drop"]) {
+  $("approve-code").addEventListener(ev, (e) => {
+    e.preventDefault();
+    $("approve-error").textContent = "Type the code as the new Manager shows it.";
+    $("approve-error").classList.remove("hidden");
+  });
+}
+document.querySelectorAll('input[name="add-server-how"]').forEach((el) =>
+  el.addEventListener("change", setHowMode)
+);
 $("rename-site-form").addEventListener("submit", (e) => {
   e.preventDefault();
   submitRenameSite();
@@ -1733,6 +2059,7 @@ document.addEventListener("keydown", (e) => {
   }
   $("add-site").classList.add("hidden");
   $("rename-site").classList.add("hidden");
+  $("approve").classList.add("hidden");
   if (!$("mismatch").classList.contains("hidden")) $("mismatch-no").click();
 });
 

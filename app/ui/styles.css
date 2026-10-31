@@ -1706,3 +1706,59 @@ body:not(.remote) .remote-only {
 body.busy, body.busy * {
   cursor: progress !important;
 }
+
+/* Pairing without SSH (M4, E-02): the code a Manager shows or keeps. */
+.big-code,
+.modal .big-code {
+  font-family: var(--font-mono);
+  font-size: 1.9rem;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-align: center;
+  padding: 14px 8px;
+  margin: 12px 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  color: var(--text);
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+.add-how {
+  margin: 4px 0 10px;
+}
+.managers {
+  margin-top: 12px;
+}
+.sub-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin: 12px 0 6px;
+}
+.managers-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+}
+.managers-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.managers-list .m-text {
+  flex: 1;
+  min-width: 0;
+}
+.managers-list .m-name {
+  display: block;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.managers-list .m-meta {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
