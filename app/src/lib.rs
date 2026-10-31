@@ -1031,26 +1031,37 @@ async fn engine_lockdown(
             .await
         }
     }?;
-    let mut sink = feed(&app);
+    say_lines(&app, &said);
+    Ok(said)
+}
+
+/// An engine's answer, line by line, into the step feed: for the verbs that
+/// stream nothing while they run (lockdown, unlock, rest, wake).
+fn say_lines(app: &AppHandle, said: &str) {
+    let mut sink = feed(app);
     for line in said.lines().filter(|l| !l.trim().is_empty()) {
         sink(Pipe::Stdout, line);
     }
-    Ok(said)
 }
 
 /// Rest or wake the selected site through its engine (M5, m5-1, m5-3;
 /// rest is confirmed in the window first, D-07). Resting needs the engine:
 /// `docker exec` here or over SSH, the API for a paired site. A failed
-/// freeze keeps the site awake, and the error says why.
+/// freeze keeps the site awake, and the error says why. What the engine
+/// answered goes to the step feed, as for lockdown.
 #[tauri::command]
-async fn engine_rest(rest: bool, sel: State<'_, Selected>) -> Result<String, String> {
+async fn engine_rest(
+    app: AppHandle,
+    rest: bool,
+    sel: State<'_, Selected>,
+) -> Result<String, String> {
     require_experimental()?;
     let (verb, word) = if rest {
         (AdminVerb::Rest, "rest")
     } else {
         (AdminVerb::Wake, "wake")
     };
-    match target(&sel)? {
+    let said = match target(&sel)? {
         Target::Remote(site) if is_paired(&site) => {
             let v = if rest { Verb::Rest } else { Verb::Wake };
             blocking(move || paired::act(&site, v)).await
@@ -1074,7 +1085,9 @@ async fn engine_rest(rest: bool, sel: State<'_, Selected>) -> Result<String, Str
             })
             .await
         }
-    }
+    }?;
+    say_lines(&app, &said);
+    Ok(said)
 }
 
 /// A new wake code for the selected site (shown once in the window), or

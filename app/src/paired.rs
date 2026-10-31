@@ -115,6 +115,11 @@ pub fn act(site: &Site, verb: Verb) -> Result<String, String> {
                 .map(|j| format!(" once {j} is cut short"))
                 .unwrap_or_default()
         ),
+        // Rest and wake are the engine's jobs: the answer is that one started.
+        (Verb::Rest, Some(_)) => {
+            "Rest started on the engine: a fresh snapshot first, then app and db stop.".to_string()
+        }
+        (Verb::Wake, Some(_)) => "Wake started on the engine: db and app are starting.".to_string(),
         (_, Some(job)) => format!("{job} started on the engine."),
         (_, None) => "Done.".to_string(),
     })
