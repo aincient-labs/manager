@@ -3,12 +3,13 @@
 //! whoever can `docker exec` is already root-equivalent. The installer runs
 //! `admin install-code` (m4-6). Every change is audited as `ssh`.
 //!
-//! The Manager drives a site over SSH through these too (m3-7): `status`,
-//! `lockdown`, `unlock` and `wake`. Each takes no argument that reaches
+//! The Manager drives a site over SSH through these too (m3-7, m5): `status`,
+//! `lockdown`, `unlock`, `rest`, `wake` and `wake-code`. Each takes no argument that reaches
 //! Docker; the site calls are [`Site`]'s fixed ones.
 
 use crate::codes::{self, now};
 use crate::inbox::Inbox;
+use crate::rest;
 use crate::site::{service_state, Site};
 use crate::state::{self, Revoked, Revoker, Store};
 use crate::{API_VERSION, ENGINE_VERSION};
@@ -26,10 +27,13 @@ pub enum AdminCommand {
     Requests,
     /// Let a waiting Manager in by the code it shows.
     Approve { code: String },
-    /// Make a new wake code and print it once (`--set` reads your own from stdin).
+    /// Make a new wake code and print it once (`--set` reads your own from
+    /// stdin; `--revoke` removes it, so waking by code is refused).
     WakeCode {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "revoke")]
         set: bool,
+        #[arg(long)]
+        revoke: bool,
     },
     /// List pairings.
     Pairings,
@@ -45,10 +49,14 @@ pub enum AdminCommand {
     /// Drupal's and is never refused; while the flag is set the engine keeps
     /// the site stopped.
     Lockdown,
-    /// Leave lockdown (doesn't wake the site).
+    /// Leave lockdown: the site is resting, with wake open again (D-09).
     Unlock,
-    /// Start `db` then `app` (refused while locked down). Doesn't wait for
-    /// Drupal to answer.
+    /// Rest (D-11, D-12): freeze first, then stop `app` and `db`; edge serves
+    /// the snapshot and the resting copy. A failed freeze keeps the site
+    /// awake. Refused while locked down.
+    Rest,
+    /// Start `db` then `app` (refused while locked down); edge stops showing
+    /// the resting copy. Doesn't wait for Drupal to answer.
     Wake,
     /// Resume wake by code after it paused.
     ResumeWake,
@@ -71,13 +79,14 @@ pub fn run(
     out: &mut dyn Write,
 ) -> Result<()> {
     let wake = match &cmd {
-        AdminCommand::WakeCode { set: true } => {
+        AdminCommand::WakeCode { revoke: true, .. } => None,
+        AdminCommand::WakeCode { set: true, .. } => {
             let mut s = String::new();
             stdin.take(4096).read_to_string(&mut s)?;
             let hash = codes::hash_wake_code(&s, false)?;
             Some((None, hash))
         }
-        AdminCommand::WakeCode { set: false } => {
+        AdminCommand::WakeCode { set: false, .. } => {
             let code = codes::mint_wake_code();
             let hash = codes::hash_wake_code(&code, true)?;
             Some((Some(code), hash))
@@ -94,10 +103,18 @@ pub fn run(
         // Unreadable state reads as locked down, as the engine treats it.
         let flags = store.lock().and_then(|l| l.flags());
         let states = site.states().unwrap_or(serde_json::Value::Null);
+        let app = service_state(&states, "app");
+        let state = match &flags {
+            Ok(f) => rest::state_word(f, false, &app),
+            Err(_) => "locked",
+        };
         let v = serde_json::json!({
             "api": API_VERSION,
             "engine": ENGINE_VERSION,
-            "app": service_state(&states, "app"),
+            "state": state,
+            "resting": flags.as_ref().map_or(true, |f| f.resting || f.lockdown),
+            "idle_rest_minutes": site.idle_rest_minutes(),
+            "app": app,
             "db": service_state(&states, "db"),
             "lockdown": flags.as_ref().map_or(true, |f| f.lockdown),
             "wake_paused": flags.as_ref().is_ok_and(|f| f.wake_paused(now())),
@@ -153,7 +170,15 @@ pub fn run(
                 r.name
             )?;
         }
-        AdminCommand::WakeCode { set } => {
+        AdminCommand::WakeCode { revoke: true, .. } => {
+            l.update_flags(|f| {
+                f.wake_hash = None;
+                f.wake_generated = false;
+            })?;
+            audit("wake-code", "revoked");
+            eprintln!("Wake code revoked: waking by code is refused until a new one is made.");
+        }
+        AdminCommand::WakeCode { set, .. } => {
             let (code, hash) = wake.expect("hashed above");
             l.update_flags(|f| {
                 f.wake_hash = Some(hash);
@@ -201,6 +226,7 @@ pub fn run(
             let gone = l.lock_down("ssh")?;
             publish(&l)?;
             drop(l);
+            rest::sync_edge(store, inbox);
             audit(
                 "lockdown",
                 &format!("flag set; revoked junior pairings: {gone:?}"),
@@ -221,16 +247,34 @@ pub fn run(
         }
         AdminCommand::Unlock => {
             l.update_flags(|f| f.lockdown = false)?;
-            audit("unlock", "ok");
-            writeln!(out, "Unlocked. The site stays resting until it is woken.")?;
+            drop(l);
+            rest::sync_edge(store, inbox);
+            audit("unlock", "ok, resting");
+            writeln!(
+                out,
+                "Unlocked. The site is resting: its wake code and Managers can wake it."
+            )?;
+        }
+        AdminCommand::Rest => {
+            drop(l);
+            if let Err(e) = rest::rest(site, store, inbox, &|| false) {
+                audit("rest", &format!("failed: {e:#}"));
+                return Err(e);
+            }
+            audit("rest", "frozen; app and db stopped");
+            writeln!(out, "Resting: frozen, app and db stopped.")?;
         }
         AdminCommand::Wake => {
-            if l.flags()?.lockdown {
-                audit("wake", "refused: locked down");
-                bail!("locked down: unlock first");
-            }
             drop(l);
-            site.start_db_and_app(&|| false)?;
+            if let Err(e) = rest::begin_wake(store, inbox) {
+                audit("wake", "refused: locked down");
+                return Err(e);
+            }
+            if let Err(e) = site.start_db_and_app(&|| false) {
+                rest::wake_failed(site, store, inbox);
+                audit("wake", &format!("failed: {e:#}"));
+                return Err(e);
+            }
             audit("wake", "db and app started");
             writeln!(out, "Woken: db and app started.")?;
         }
@@ -362,7 +406,16 @@ mod tests {
         let code = admin(&store, &inbox, AdminCommand::InstallCode, "").unwrap();
         let code = code.trim();
         assert_eq!(code.len(), 19);
-        let wake = admin(&store, &inbox, AdminCommand::WakeCode { set: false }, "").unwrap();
+        let wake = admin(
+            &store,
+            &inbox,
+            AdminCommand::WakeCode {
+                set: false,
+                revoke: false,
+            },
+            "",
+        )
+        .unwrap();
         let on_disk = std::fs::read_to_string(d.0.join("state/engine.json")).unwrap();
         assert!(!on_disk.contains(&codes::normalize_code(code)));
         assert!(!on_disk.contains(&codes::normalize_code(wake.trim())));
@@ -371,7 +424,10 @@ mod tests {
         let own = admin(
             &store,
             &inbox,
-            AdminCommand::WakeCode { set: true },
+            AdminCommand::WakeCode {
+                set: true,
+                revoke: false,
+            },
             "My Own Wake Code\n",
         )
         .unwrap();
@@ -380,7 +436,10 @@ mod tests {
         assert!(admin(
             &store,
             &inbox,
-            AdminCommand::WakeCode { set: true },
+            AdminCommand::WakeCode {
+                set: true,
+                revoke: false
+            },
             "short"
         )
         .is_err());

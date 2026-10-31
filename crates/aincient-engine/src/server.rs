@@ -15,7 +15,9 @@
 //! | `POST /v1/pair/collect` `{handle}` | handle |
 //! | `GET /v1/wake` | none (the wake page) |
 //! | `POST /v1/wake` `{code}` or form | wake code |
+//! | `GET /v1/wake/status` | none: `waking`, `ready` or `failed`, nothing more |
 //! | `POST /v1/wake/paired` | token |
+//! | `POST /v1/wake/code` · `DELETE /v1/wake/code` | token: rotate (shown once) or revoke |
 //! | `GET /v1/status` | token |
 //! | `POST /v1/freeze` · `live` · `rest` · `lockdown` · `unlock` | token |
 //! | `GET /v1/pairings` · `DELETE /v1/pairings/self` · `DELETE /v1/pairings/<id>` | token |
@@ -28,10 +30,17 @@
 //!
 //! **Lockdown** (D-09, floor 11) refuses every verb but `status`, `pairings`,
 //! revoke, `audit`, `unlock` and `lockdown` itself, which is never refused.
+//!
+//! **Resting** (M5, D-11, D-12): `rest` freezes, then marks the site resting
+//! (edge's marker, [`Inbox::signal_edge`]) and stops `app` and `db`; a wake
+//! clears the mark first and starts them. While a woken site gets no console
+//! request for the `.env`'s idle minutes, the engine rests it again
+//! ([`Engine::tick`]).
 
 use crate::codes::{self, now};
 use crate::http::{self, Reply, Request};
 use crate::inbox::Inbox;
+use crate::rest;
 use crate::site::{service_state, Drush, Site};
 use crate::state::{self, Asked, Collected, Pairing, Redeemed, Revoked, Revoker, Store, WakeGate};
 use crate::{API_VERSION, ENGINE_VERSION};
@@ -76,6 +85,11 @@ pub enum Route {
     WakePage,
     /// Wake by code: public, rate-limited hard at edge.
     Wake,
+    /// How a wake goes, for the progress page: public, three words only.
+    WakeStatus,
+    /// A new wake code, shown once; or none (revoked).
+    WakeCode,
+    WakeCodeRevoke,
     /// Wake by a paired Manager: its own path, outside the code limit.
     WakePaired,
     Status,
@@ -102,6 +116,8 @@ pub const PATHS: &[&str] = &[
     "pair/collect",
     "wake",
     "wake/paired",
+    "wake/status",
+    "wake/code",
     "status",
     "freeze",
     "live",
@@ -128,6 +144,9 @@ pub fn route(method: &str, url: &str) -> Route {
         "/v1/wake" if method == "GET" => ("GET", Route::WakePage),
         "/v1/wake" => ("POST", Route::Wake),
         "/v1/wake/paired" => ("POST", Route::WakePaired),
+        "/v1/wake/status" => ("GET", Route::WakeStatus),
+        "/v1/wake/code" if method == "DELETE" => ("DELETE", Route::WakeCodeRevoke),
+        "/v1/wake/code" => ("POST", Route::WakeCode),
         "/v1/status" => ("GET", Route::Status),
         "/v1/freeze" => ("POST", Route::Verb(Verb::Freeze)),
         "/v1/live" => ("POST", Route::Verb(Verb::Live)),
@@ -354,6 +373,7 @@ impl Engine {
                 )
             }
             Route::WakePage => return wake_page(None),
+            Route::WakeStatus => return self.wake_status(),
             Route::Pair => return self.pair(b, &ip).unwrap_or_else(|r| r),
             Route::PairRequest => return self.ask(b, &ip).unwrap_or_else(|r| r),
             Route::PairCollect => return self.collect(b, &ip).unwrap_or_else(|r| r),
@@ -498,6 +518,7 @@ impl Engine {
                 // dies, and pairing stays closed until unlock. One lock, which
                 // adding a pairing takes too.
                 let gone = self.store.lock()?.lock_down(me)?;
+                rest::sync_edge(&self.store, &self.inbox);
                 self.publish_pairings();
                 audit(
                     "lockdown",
@@ -509,8 +530,11 @@ impl Engine {
                 // Only this Manager and senior ones survive a lockdown, and
                 // none can pair during one, so whoever calls this was paired
                 // before the incident.
+                // Back to resting with wake open (D-09), never straight awake:
+                // lockdown set `resting`, and unlock leaves it.
                 self.store.lock()?.update_flags(|f| f.lockdown = false)?;
-                audit("unlock", "ok");
+                rest::sync_edge(&self.store, &self.inbox);
+                audit("unlock", "ok, resting");
                 reply(200, json!({ "lockdown": false }))
             }
             Route::ResumeWake => {
@@ -527,6 +551,29 @@ impl Engine {
                 reply(200, json!({ "requests": state::request_views(&all) }))
             }
             Route::Approve => self.approve(b, me, &actor, ip)?,
+            Route::WakeCode => {
+                let code = codes::mint_wake_code();
+                let hash = {
+                    let _one = lock(&self.argon);
+                    codes::hash_wake_code(&code, true)?
+                };
+                self.store.lock()?.update_flags(|f| {
+                    f.wake_hash = Some(hash);
+                    f.wake_generated = true;
+                    f.wake_resumed();
+                })?;
+                audit("wake/code", "rotated");
+                // Shown once: the engine keeps only its hash (floor 4).
+                reply(201, json!({ "code": code }))
+            }
+            Route::WakeCodeRevoke => {
+                self.store.lock()?.update_flags(|f| {
+                    f.wake_hash = None;
+                    f.wake_generated = false;
+                })?;
+                audit("wake/code", "revoked");
+                reply(200, json!({ "wake_code_set": false }))
+            }
             Route::RevokeSelf => self.revoke(Revoker::Pairing(me), me, &actor, ip)?,
             Route::Revoke(id) => self.revoke(Revoker::Pairing(me), &id, &actor, ip)?,
             Route::Audit => reply(200, json!({ "entries": self.store.audit.tail(200) })),
@@ -536,6 +583,7 @@ impl Engine {
             | Route::PairCollect
             | Route::WakePage
             | Route::Wake
+            | Route::WakeStatus
             | Route::NotFound
             | Route::MethodNotAllowed => unreachable!("answered before authentication"),
         })
@@ -808,13 +856,13 @@ impl Engine {
             return self.internal(&e);
         }
         let r = self.start_job(JobKind::Wake, "wake-code", ip);
-        if form {
-            page(
-                r.status,
-                "Waking the site. It is ready in under a minute; this page doesn't refresh itself.",
-            )
-        } else {
-            r
+        match (form, r.status) {
+            (true, 202) => progress_page(),
+            (true, status) => page(
+                status,
+                "The site is busy with another change. Try again in a minute.",
+            ),
+            (false, _) => r,
         }
     }
 
@@ -822,9 +870,17 @@ impl Engine {
         let flags = self.store.lock()?.flags()?;
         let job = lock(&self.job).clone();
         let states = self.states(false);
+        let app = service_state(&states, "app");
+        let waking = job
+            .as_ref()
+            .is_some_and(|j| j.kind == JobKind::Wake && j.finished.is_none());
         Ok(json!({
             "api": API_VERSION,
-            "app": service_state(&states, "app"),
+            "state": rest::state_word(&flags, waking, &app),
+            "resting": flags.resting,
+            "idle_rest_minutes": self.site.idle_rest_minutes(),
+            "woken_at": flags.woken_at,
+            "app": app,
             "db": service_state(&states, "db"),
             "lockdown": flags.lockdown,
             "wake_paused": flags.wake_paused(now()),
@@ -907,6 +963,8 @@ impl Engine {
             // A panic ends this job as a failure, never with the slot held.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run(kind)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("the job panicked")));
+            // The services changed: the next `status` asks compose again.
+            *lock(&self.states) = (None, Value::Null);
             let error = result.as_ref().err().map(|e| format!("{e:#}"));
             self.store.audit(
                 actor,
@@ -942,26 +1000,28 @@ impl Engine {
         match kind {
             JobKind::Freeze => self.site.drush(Drush::Freeze, &cut),
             JobKind::Live => self.site.drush(Drush::GoLive, &cut),
-            JobKind::Rest => {
-                if service_state(&self.states(true), "app") == "running" {
-                    // D-11: a failed freeze keeps the site awake and says why.
-                    self.site
-                        .drush(Drush::Freeze, &cut)
-                        .context("the freeze failed, so the site stays awake")?;
-                }
-                self.site.stop_app_and_db(&cut)
-            }
+            // D-11, D-12: freeze, then rest; a failed freeze keeps it awake.
+            JobKind::Rest => rest::rest(self.site.as_ref(), &self.store, &self.inbox, &cut),
             // Incident first: stop, and run nothing of Drupal's on the way
             // (a compromised Drupal could make a freeze hang or flood). Edge
-            // then serves the last snapshot made before, or its "starting"
-            // page.
-            JobKind::Lockdown => self.site.stop_app_and_db(&|| false),
+            // then serves the last snapshot made before, with the resting
+            // copy (no wake form) for everything else.
+            JobKind::Lockdown => {
+                rest::sync_edge(&self.store, &self.inbox);
+                self.site.stop_app_and_db(&|| false)
+            }
             JobKind::Wake => {
-                if self.locked_down() {
-                    bail!("locked down before the wake started");
+                rest::begin_wake(&self.store, &self.inbox)?;
+                let r = self
+                    .site
+                    .start_db_and_app(&cut)
+                    .and_then(|()| self.wait_ready());
+                if r.is_err() && !self.locked_down() {
+                    // Back to a clean resting site rather than half awake
+                    // behind no resting copy.
+                    rest::wake_failed(self.site.as_ref(), &self.store, &self.inbox);
                 }
-                self.site.start_db_and_app(&cut)?;
-                self.wait_ready()
+                r
             }
         }
     }
@@ -1002,6 +1062,110 @@ impl Engine {
         bail!("the site didn't come up within {}s", WAKE_BUDGET.as_secs())
     }
 
+    fn busy(&self) -> bool {
+        lock(&self.job)
+            .as_ref()
+            .is_some_and(|j| j.finished.is_none())
+    }
+
+    /// A resting site whose `app` runs with no job of the engine's was
+    /// started by hand (`atelier app start`, compose): it is awake, so edge
+    /// stops showing the resting copy, and the idle timer runs for it.
+    fn reconcile_resting(&self) {
+        let resting = self
+            .store
+            .lock()
+            .and_then(|l| l.flags())
+            .is_ok_and(|f| f.resting && !f.lockdown);
+        if !resting || self.busy() {
+            return;
+        }
+        if service_state(&self.states(true), "app") != "running" {
+            return;
+        }
+        let at = now();
+        let changed = self.store.lock().and_then(|l| {
+            l.update_flags(|f| {
+                let still = f.resting && !f.lockdown;
+                if still {
+                    f.resting = false;
+                    f.woken_at = Some(at);
+                }
+                still
+            })
+        });
+        if changed.unwrap_or(false) {
+            rest::sync_edge(&self.store, &self.inbox);
+            self.store.audit(
+                "engine",
+                "-",
+                "wake",
+                "app running: woken outside the engine",
+            );
+        }
+    }
+
+    /// The idle timer (D-11, m5-5): a site the engine woke goes back to rest
+    /// once nobody signed in has used the console for the `.env`'s idle
+    /// minutes. "Used" is edge's activity log: console requests Drupal
+    /// answered 2xx, which an anonymous visitor can't produce (the console
+    /// answers them 403 or a redirect). A rest that fails (the freeze) keeps
+    /// the site awake and is tried again one idle period later, not at once.
+    pub fn idle_check(self: &Arc<Self>, at: u64) {
+        let Ok(f) = self.store.lock().and_then(|l| l.flags()) else {
+            return;
+        };
+        let Some(woken) = f.woken_at.filter(|_| !f.resting && !f.lockdown) else {
+            return;
+        };
+        let minutes = self.site.idle_rest_minutes();
+        if minutes == 0 || self.busy() {
+            return;
+        }
+        let last = woken.max(self.inbox.last_activity().unwrap_or(0));
+        if at < last.saturating_add(minutes * 60) {
+            return;
+        }
+        if let Err(e) = self
+            .store
+            .lock()
+            .and_then(|l| l.update_flags(|f| f.woken_at = Some(at)))
+        {
+            eprintln!("engine: {e:#}");
+            return;
+        }
+        self.store.audit(
+            "idle timer",
+            "-",
+            "rest",
+            &format!("no console request for {minutes} min"),
+        );
+        self.start_job(JobKind::Rest, "idle timer", "-");
+    }
+
+    /// `waking`, `ready` or `failed`, for the wake progress page (m5-4):
+    /// anyone may ask, so it says nothing else (no services, no job, no
+    /// error) and runs no compose: it reads the flags and the job slot.
+    fn wake_status(&self) -> Reply {
+        let job = lock(&self.job).clone();
+        let flags = self.store.lock().and_then(|l| l.flags());
+        let word = match (&job, &flags) {
+            (Some(j), _) if j.kind == JobKind::Wake && j.finished.is_none() => "waking",
+            (Some(j), _) if j.kind == JobKind::Wake && j.error.is_some() => "failed",
+            (_, Ok(f))
+                if !f.resting
+                    && !f.lockdown
+                    && job.as_ref().is_none_or(|j| j.finished.is_some()) =>
+            {
+                "ready"
+            }
+            _ => "failed",
+        };
+        let mut r = reply(200, json!({ "state": word }));
+        r.headers.push(("Cache-Control", "no-store"));
+        r
+    }
+
     fn publish_pairings(&self) {
         if let Ok(all) = self.store.lock().and_then(|l| l.pairings()) {
             self.inbox.publish(
@@ -1017,6 +1181,9 @@ impl Engine {
     pub fn tick(self: &Arc<Self>, n: u32) {
         if n % ENFORCE_EVERY == 0 {
             self.enforce_lockdown();
+            self.reconcile_resting();
+            self.idle_check(now());
+            rest::sync_edge(&self.store, &self.inbox);
             self.publish_pairings();
         }
         match self.inbox.take_revoke() {
@@ -1070,35 +1237,98 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The look every engine page shares: plain, readable, no external asset.
+const PAGE_STYLE: &str = "body{font:16px/1.5 system-ui,sans-serif;margin:15vh auto;\
+max-width:32rem;padding:0 1.5rem;color:#222;background:#fff}h1{font-size:1.4rem}\
+input,button{font:inherit;padding:.4rem .6rem}\
+@media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}";
+
+fn engine_page(status: u16, csp: &'static str, title: &str, body: &str) -> Reply {
+    Reply {
+        status,
+        content_type: "text/html; charset=utf-8",
+        // Never framed: a page on this origin can't overlay the form and
+        // read the code as it is typed. Never cached: it says how things are.
+        headers: vec![
+            ("X-Frame-Options", "DENY"),
+            ("Content-Security-Policy", csp),
+            ("Cache-Control", "no-store"),
+            ("Referrer-Policy", "no-referrer"),
+        ],
+        body: format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>{title}</title><style>{PAGE_STYLE}</style></head><body>{body}</body></html>"
+        ),
+    }
+}
+
+const FORM_CSP: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
+
 /// The wake page a resting site's visitor or owner uses. Static text only:
 /// `msg` is always one of the engine's own sentences, never request input.
 fn wake_page(msg: Option<&str>) -> Reply {
     let note = msg
         .map(|m| format!("<p role=\"status\">{m}</p>"))
         .unwrap_or_default();
-    Reply {
-        status: 200,
-        content_type: "text/html; charset=utf-8",
-        // Never framed: a page on this origin can't overlay the form and
-        // read the code as it is typed.
-        headers: vec![
-            ("X-Frame-Options", "DENY"),
-            (
-                "Content-Security-Policy",
-                "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-            ),
-        ],
-        body: format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<title>Wake this site</title><style>body{{font:16px/1.5 system-ui,sans-serif;margin:15vh auto;\
-max-width:30rem;padding:0 1.5rem;color:#222}}input,button{{font:inherit;padding:.4rem .6rem}}</style>\
-</head><body><h1>This site is resting</h1><p>Visitors see the saved copy. To work on it, \
-enter its wake code. Waking doesn't sign you in.</p>{note}\
-<form method=\"post\" action=\"/_atelier/engine/v1/wake\"><label>Wake code \
-<input name=\"code\" autocomplete=\"off\" required></label> <button>Wake</button></form></body></html>"
+    engine_page(
+        200,
+        FORM_CSP,
+        "Wake this site",
+        &format!(
+            "<main><h1>This site is resting</h1><p>Visitors see its saved pages. To work on \
+it, enter its wake code. Waking starts the site; it doesn't sign you in.</p>{note}\
+<form method=\"post\" action=\"/_atelier/engine/v1/wake\"><label for=\"code\">Wake code</label> \
+<input id=\"code\" name=\"code\" autocomplete=\"off\" required> <button>Wake</button></form></main>"
         ),
-    }
+    )
+}
+
+/// The progress page's one script: poll [`Engine::wake_status`] and open the
+/// console once Drupal answers. It reads three words and nothing else.
+pub const PROGRESS_SCRIPT: &str = "(function(){var s=document.getElementById('s'),n=0;\
+function say(t){s.textContent=t;}\
+function poll(){fetch('/_atelier/engine/v1/wake/status',{cache:'no-store',credentials:'omit'})\
+.then(function(r){return r.json();}).then(function(v){\
+if(v.state==='ready'){say('Ready. Opening the console\\u2026');location.assign('/atelier');}\
+else if(v.state==='failed'){say('The site didn\\u2019t wake. Try again in a minute, or ask its owner.');}\
+else if(++n<90){setTimeout(poll,2000);}\
+else{say('This is taking longer than it should. Open the console again in a minute.');}})\
+.catch(function(){if(++n<90)setTimeout(poll,2000);});}\
+setTimeout(poll,1000);})();";
+
+/// The script's CSP: only this script, by its hash, may run; it may fetch
+/// only this origin.
+fn progress_csp() -> &'static str {
+    static CSP: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        let hash = codes::base64(&codes::sha256(PROGRESS_SCRIPT.as_bytes()));
+        Box::leak(
+            format!(
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{hash}'; \
+                 connect-src 'self'; form-action 'self'; frame-ancestors 'none'"
+            )
+            .into_boxed_str(),
+        )
+    })
+}
+
+/// After a right wake code (m5-4): the site is starting; the page follows the
+/// wake and opens the console when Drupal answers. Without scripts it still
+/// says what to do.
+fn progress_page() -> Reply {
+    engine_page(
+        202,
+        progress_csp(),
+        "Waking this site",
+        &format!(
+            "<main><h1>Waking the site</h1><p id=\"s\" role=\"status\" aria-live=\"polite\">\
+Starting. This takes under a minute; the console opens by itself when it is ready.</p>\
+<noscript><p>When it is ready, <a href=\"/atelier\">open the console</a>.</p></noscript>\
+<script>{PROGRESS_SCRIPT}</script></main>"
+        ),
+    )
 }
 
 #[cfg(test)]

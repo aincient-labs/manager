@@ -15,7 +15,8 @@
 //! | [`http`] | HTTP for one client: peer check at accept, deadline, caps |
 //! | [`state`] | pairings by seniority, requests, codes, wake caps |
 //! | [`audit`] | the append-only audit log and its retention |
-//! | [`inbox`] | the Drupal ↔ engine files (inbox carries only `revoke.request`) |
+//! | [`inbox`] | the Drupal ↔ engine files (inbox carries only `revoke.request`), and edge's resting markers |
+//! | [`rest`] | resting mode: rest, wake, the markers edge reads (M5) |
 //! | [`site`] | the only Docker/Compose calls the engine makes |
 //! | [`proc`] | subprocesses with a deadline, an output cap and a group kill |
 //! | [`codes`] | codes, tokens, names, hashing |
@@ -28,6 +29,7 @@ pub mod codes;
 pub mod http;
 pub mod inbox;
 pub mod proc;
+pub mod rest;
 pub mod server;
 pub mod site;
 pub mod state;
@@ -62,6 +64,10 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const STATE_DIR: &str = "/state";
 pub const INBOX_DIR: &str = "/inbox";
 pub const OUTBOX_DIR: &str = "/outbox";
+/// `engine-signal`: the resting markers edge mounts read-only (M5, C-07).
+pub const SIGNAL_DIR: &str = "/signal";
+/// `engine-activity`: edge's console-request log, for the idle timer (D-11).
+pub const ACTIVITY_DIR: &str = "/activity";
 /// Edge on the engine network: the only peer admitted.
 pub const EDGE: &str = "edge:80";
 
@@ -95,7 +101,7 @@ pub fn serve(listen: &str, get: impl Fn(&str) -> Option<String>) -> Result<()> {
     };
     let engine = server::Engine::new(
         store,
-        inbox::Inbox::at(INBOX_DIR, OUTBOX_DIR),
+        inbox::Inbox::at(INBOX_DIR, OUTBOX_DIR).with_edge(SIGNAL_DIR, ACTIVITY_DIR),
         Box::new(site),
         EDGE,
     )?;
@@ -111,6 +117,7 @@ pub fn serve(listen: &str, get: impl Fn(&str) -> Option<String>) -> Result<()> {
 pub fn admin(cmd: admin::AdminCommand) -> Result<()> {
     let state_dir = std::env::var("ATELIER_ENGINE_STATE").unwrap_or_else(|_| STATE_DIR.into());
     let store = state::Store::at(state_dir)?;
+    let inside = std::env::var("ATELIER_STACK_DIR").is_ok();
     let site: Box<dyn site::Site> = match (
         std::env::var("ATELIER_STACK_DIR"),
         std::env::var("ATELIER_PROJECT"),
@@ -125,10 +132,14 @@ pub fn admin(cmd: admin::AdminCommand) -> Result<()> {
         }
         _ => Box::new(site::NoSite),
     };
+    let mut ib = inbox::Inbox::at(INBOX_DIR, OUTBOX_DIR);
+    if inside {
+        ib = ib.with_edge(SIGNAL_DIR, ACTIVITY_DIR);
+    }
     admin::run(
         cmd,
         &store,
-        &inbox::Inbox::at(INBOX_DIR, OUTBOX_DIR),
+        &ib,
         site.as_ref(),
         &mut std::io::stdin(),
         &mut std::io::stdout(),

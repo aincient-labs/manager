@@ -103,6 +103,15 @@ pub struct Flags {
     pub wake_generated: bool,
     /// Lockdown (D-09): resting with wake by code disabled, pairing closed.
     pub lockdown: bool,
+    /// Resting (D-12, m5-1): the engine froze the site and stopped `app` and
+    /// `db`; edge serves the snapshot and the resting copy (C-07). Set by
+    /// rest and lockdown, cleared by a wake. Edge learns it from the marker
+    /// files [`crate::inbox::Inbox::signal_edge`] writes, never from a request.
+    pub resting: bool,
+    /// When the engine last woke the site (or noticed it woken by hand):
+    /// the idle timer (D-11, m5-5) runs only while this is set, counting
+    /// from the later of it and the last console request.
+    pub woken_at: Option<u64>,
     /// SHA-256 of the unused install code, if one was made.
     pub install_hash: Option<String>,
     /// Wake by code paused for everyone. It ends on its own, so no owner is
@@ -644,7 +653,13 @@ impl Locked<'_> {
     /// every pairing junior to `me`, and every pending request dropped.
     /// Returns the revoked ids.
     pub fn lock_down(&self, me: &str) -> Result<Vec<String>> {
-        self.update_flags(|f| f.lockdown = true)?;
+        // Lockdown is resting with wake disabled (D-09): unlock leaves the
+        // site resting, never straight awake.
+        self.update_flags(|f| {
+            f.lockdown = true;
+            f.resting = true;
+            f.woken_at = None;
+        })?;
         let gone = self.revoke_junior_to(me)?;
         self.clear_requests()?;
         Ok(gone)

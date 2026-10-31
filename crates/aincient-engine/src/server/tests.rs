@@ -4,7 +4,7 @@ use super::*;
 use crate::admin::{self, AdminCommand};
 use crate::site::Cut;
 use crate::state::tests::TempDir;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The site, faked: records every call; `app` and `db` are up or not.
 #[derive(Default)]
@@ -13,6 +13,10 @@ struct Fake {
     up: AtomicBool,
     /// drush never returns on its own (a compromised Drupal), only when cut.
     drush_hangs: AtomicBool,
+    /// drush fails (an export that breaks).
+    drush_fails: AtomicBool,
+    /// The idle timer's minutes; 0 is the default (30) here.
+    idle: AtomicU64,
 }
 
 impl Fake {
@@ -47,6 +51,9 @@ impl Site for Shared {
     }
     fn drush(&self, verb: Drush, cut: Cut) -> Result<()> {
         self.0.record(&format!("drush {verb:?}"));
+        if self.0.drush_fails.load(Ordering::SeqCst) {
+            bail!("the export failed");
+        }
         let t0 = Instant::now();
         while self.0.drush_hangs.load(Ordering::SeqCst) {
             if cut() {
@@ -59,6 +66,13 @@ impl Site for Shared {
     }
     fn answers(&self) -> bool {
         self.0.up.load(Ordering::SeqCst)
+    }
+    fn idle_rest_minutes(&self) -> u64 {
+        match self.0.idle.load(Ordering::SeqCst) {
+            0 => aincient_core::engine::IDLE_REST_DEFAULT_MINUTES,
+            u64::MAX => 0,
+            m => m,
+        }
     }
 }
 
@@ -77,8 +91,10 @@ fn engine() -> T {
     let fake = Arc::new(Fake::default());
     fake.up.store(true, Ordering::SeqCst);
     let store = Store::at(d.0.join("state")).unwrap();
-    let inbox = Inbox::at(d.0.join("inbox"), d.0.join("outbox"));
+    let inbox = Inbox::at(d.0.join("inbox"), d.0.join("outbox"))
+        .with_edge(d.0.join("signal"), d.0.join("activity"));
     std::fs::create_dir_all(&inbox.dir).unwrap();
+    std::fs::create_dir_all(d.0.join("activity")).unwrap();
     std::fs::create_dir_all(&inbox.out).unwrap();
     let e = Engine::new(
         store,
@@ -197,6 +213,15 @@ impl T {
         }
     }
 
+    fn flags(&self) -> state::Flags {
+        self.e.store.lock().unwrap().flags().unwrap()
+    }
+
+    /// Edge's markers: `(resting, locked)`.
+    fn edge(&self) -> (bool, bool) {
+        self.e.inbox.edge_signal().unwrap()
+    }
+
     fn audit_text(&self) -> String {
         std::fs::read_to_string(self.d.0.join("state/audit.log")).unwrap_or_default()
     }
@@ -212,6 +237,11 @@ fn only_listed_paths_route() {
     assert_eq!(route("GET", "/v1/version?x=1"), Route::Version);
     assert_eq!(route("POST", "/v1/version"), Route::MethodNotAllowed);
     assert_eq!(route("GET", "/v1/wake"), Route::WakePage);
+    assert_eq!(route("GET", "/v1/wake/status"), Route::WakeStatus);
+    assert_eq!(route("POST", "/v1/wake/status"), Route::MethodNotAllowed);
+    assert_eq!(route("POST", "/v1/wake/code"), Route::WakeCode);
+    assert_eq!(route("DELETE", "/v1/wake/code"), Route::WakeCodeRevoke);
+    assert_eq!(route("GET", "/v1/wake/code"), Route::MethodNotAllowed);
     assert_eq!(route("POST", "/v1/wake"), Route::Wake);
     assert_eq!(route("PUT", "/v1/wake"), Route::MethodNotAllowed);
     assert_eq!(route("GET", "/v1/rest"), Route::MethodNotAllowed);
@@ -298,6 +328,7 @@ fn every_route_has_its_auth_rule() {
     assert_eq!(v["api"], API_VERSION);
     assert_eq!(v["engine"], ENGINE_VERSION);
     assert_eq!(t.call("GET", "/v1/wake", None, "").0, 200);
+    assert_eq!(t.call("GET", "/v1/wake/status", None, "").0, 200);
     assert_eq!(
         t.call_from(
             "192.0.2.30",
@@ -355,12 +386,17 @@ fn every_route_has_its_auth_rule() {
         ("GET", "/v1/pairings/requests"),
         ("POST", "/v1/pairings/approve"),
         ("POST", "/v1/wake/resume"),
+        ("POST", "/v1/wake/code"),
+        ("DELETE", "/v1/wake/code"),
     ];
-    for (m, p) in token_routes {
-        assert_eq!(t.call(m, p, None, "").0, 401, "{m} {p} without a token");
-        assert_eq!(t.call(m, p, Some("junk"), "").0, 401, "{m} {p} junk");
+    for (i, (m, p)) in token_routes.into_iter().enumerate() {
+        // Each from its own address: bad tokens per address are capped.
+        let ip = format!("198.51.100.{}", 100 + i);
+        let t = |m, p, tok: Option<&str>, b| t.call_from(&ip, m, p, tok, b);
+        assert_eq!(t(m, p, None, "").0, 401, "{m} {p} without a token");
+        assert_eq!(t(m, p, Some("junk"), "").0, 401, "{m} {p} junk");
         assert_eq!(
-            t.call(m, p, Some(&codes::new_token()), "").0,
+            t(m, p, Some(&codes::new_token()), "").0,
             401,
             "{m} {p} made-up"
         );
@@ -624,7 +660,10 @@ fn lockdown_revokes_juniors_refuses_verbs_and_closes_pairing() {
         &json!({"code": v["code"]}).to_string(),
     );
     t.admin(
-        AdminCommand::WakeCode { set: true },
+        AdminCommand::WakeCode {
+            set: true,
+            revoke: false,
+        },
         "the owner's wake code",
     );
     let code = t.admin(AdminCommand::InstallCode, "");
@@ -815,7 +854,13 @@ fn wake_by_code_pauses_per_address_and_then_for_everyone() {
     let t = engine();
     let (_, owner) = t.primary();
     t.fake.up.store(false, Ordering::SeqCst);
-    let wake = t.admin(AdminCommand::WakeCode { set: false }, "");
+    let wake = t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: false,
+        },
+        "",
+    );
     let try_from = |ip: &str, code: &str| {
         t.call_from(
             ip,
@@ -885,7 +930,13 @@ fn wake_by_code_pauses_per_address_and_then_for_everyone() {
 #[test]
 fn the_wake_form_answers_with_the_page_and_never_echoes_input() {
     let t = engine();
-    t.admin(AdminCommand::WakeCode { set: false }, "");
+    t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: false,
+        },
+        "",
+    );
     let r = t.e.handle(Request {
         method: "POST".into(),
         url: "/v1/wake".into(),
@@ -1088,4 +1139,337 @@ fn a_forwarded_address_counts_only_from_edge() {
     let log = t.audit_text();
     assert!(log.contains("172.20.0.9"), "{log}");
     assert!(!log.contains("198.51.100."), "{log}");
+}
+
+/// m5-1, D-11, D-12: rest freezes, marks edge, stops app and db; a wake
+/// clears the mark first and starts them; status names the state.
+#[test]
+fn rest_marks_edge_resting_and_a_wake_clears_it() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    assert_eq!(t.edge(), (false, false));
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "awake");
+    assert_eq!(t.call("POST", "/v1/rest", Some(&owner), "").0, 202);
+    let job = t.job_done(&owner);
+    assert!(job["error"].is_null(), "{job}");
+    assert_eq!(t.fake.calls(), ["drush Freeze", "stop"], "freeze first");
+    assert_eq!(t.edge(), (true, false), "edge shows the resting copy");
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "resting");
+    assert_eq!(st["resting"], true);
+    assert!(st["woken_at"].is_null());
+
+    assert_eq!(t.call("POST", "/v1/wake/paired", Some(&owner), "").0, 202);
+    let job = t.job_done(&owner);
+    assert!(job["error"].is_null(), "{job}");
+    assert_eq!(t.edge(), (false, false));
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "awake");
+    assert!(st["woken_at"].as_u64().unwrap() >= now() - 5, "{st}");
+    assert_eq!(st["idle_rest_minutes"], 30);
+}
+
+/// m5-e4, D-11: a failed freeze stops nothing, marks nothing, and says why.
+#[test]
+fn a_failed_freeze_marks_nothing_and_keeps_the_site_awake() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    t.fake.drush_fails.store(true, Ordering::SeqCst);
+    assert_eq!(t.call("POST", "/v1/rest", Some(&owner), "").0, 202);
+    let job = t.job_done(&owner);
+    let err = s_(&job["error"]);
+    assert!(
+        err.contains("stays awake") && err.contains("export failed"),
+        "{err}"
+    );
+    assert_eq!(t.fake.calls(), ["drush Freeze"], "nothing stopped");
+    assert!(t.fake.up.load(Ordering::SeqCst));
+    assert_eq!(t.edge(), (false, false));
+    assert!(!t.flags().resting);
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "awake");
+}
+
+/// m5-6, D-09: lockdown is resting with wake by code refused unchecked;
+/// unlock leaves the site resting with wake open, not awake.
+#[test]
+fn lockdown_rests_refuses_the_wake_code_and_unlock_leaves_it_resting() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    let code = t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: false,
+        },
+        "",
+    );
+    assert_eq!(t.call("POST", "/v1/lockdown", Some(&owner), "").0, 202);
+    t.job_done(&owner);
+    assert_eq!(t.edge(), (true, true), "resting copy, no wake form");
+    assert!(!t.fake.up.load(Ordering::SeqCst));
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "locked");
+    let before = t.flags().wake_tries.clone().count(now());
+    let (s, _) = t.call(
+        "POST",
+        "/v1/wake",
+        None,
+        &json!({ "code": code }).to_string(),
+    );
+    assert_eq!(s, 403, "the right code is refused");
+    assert_eq!(
+        t.flags().wake_tries.clone().count(now()),
+        before,
+        "refused before the code is counted or checked"
+    );
+    assert_eq!(t.call("POST", "/v1/wake/code", Some(&owner), "").0, 409);
+
+    assert_eq!(t.call("POST", "/v1/unlock", Some(&owner), "").0, 200);
+    assert_eq!(t.edge(), (true, false), "resting, wake form back");
+    assert!(!t.fake.up.load(Ordering::SeqCst), "unlock wakes nothing");
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["state"], "resting");
+    let (s, v) = t.call(
+        "POST",
+        "/v1/wake",
+        None,
+        &json!({ "code": code }).to_string(),
+    );
+    assert_eq!(s, 202, "{v}");
+    t.job_done(&owner);
+    assert_eq!(t.edge(), (false, false));
+    assert!(t.fake.up.load(Ordering::SeqCst));
+}
+
+/// m5-5, D-11: a woken site rests after the idle minutes without a console
+/// request; console activity, a `0` setting or a site nobody woke keep it
+/// up; a failed rest waits another period.
+#[test]
+fn the_idle_timer_rests_a_woken_site_after_its_idle_minutes() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    let at = now();
+    // Not woken by the engine: never timed.
+    t.e.idle_check(at + 10 * 3600);
+    assert!(t.fake.calls().is_empty());
+
+    assert_eq!(t.call("POST", "/v1/wake/paired", Some(&owner), "").0, 202);
+    t.job_done(&owner);
+    let woken = t.flags().woken_at.unwrap();
+    t.e.idle_check(woken + 29 * 60);
+    assert_eq!(t.fake.calls(), ["start"], "not yet");
+
+    // A console request (edge's activity log) restarts the count.
+    std::fs::write(t.d.0.join("activity/console.log"), "1\n").unwrap();
+    let logged = t.e.inbox.last_activity().unwrap();
+    assert!(logged >= at);
+    t.e.idle_check(logged + 29 * 60);
+    assert_eq!(t.fake.calls(), ["start"]);
+
+    // Off.
+    t.fake.idle.store(u64::MAX, Ordering::SeqCst);
+    t.e.idle_check(logged + 100 * 60);
+    assert_eq!(t.fake.calls(), ["start"]);
+    t.fake.idle.store(0, Ordering::SeqCst);
+
+    // A failing freeze: tried once, then not again until another period.
+    t.fake.drush_fails.store(true, Ordering::SeqCst);
+    let late = logged + 31 * 60;
+    t.e.idle_check(late);
+    let job = t.job_done(&owner);
+    assert!(s_(&job["error"]).contains("stays awake"));
+    assert_eq!(t.flags().woken_at, Some(late), "counted again from now");
+    t.e.idle_check(late + 60);
+    assert_eq!(t.fake.calls(), ["start", "drush Freeze"]);
+    assert!(t.fake.up.load(Ordering::SeqCst), "still awake");
+
+    t.fake.drush_fails.store(false, Ordering::SeqCst);
+    t.e.idle_check(late + 31 * 60);
+    t.job_done(&owner);
+    assert_eq!(
+        t.fake.calls(),
+        ["start", "drush Freeze", "drush Freeze", "stop"]
+    );
+    assert_eq!(t.edge(), (true, false));
+    assert!(t.audit_text().contains("idle timer"));
+}
+
+/// A resting site started by hand is awake: edge stops the resting copy and
+/// the idle timer runs for it.
+#[test]
+fn a_resting_site_started_by_hand_counts_as_woken() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    t.call("POST", "/v1/rest", Some(&owner), "");
+    t.job_done(&owner);
+    assert_eq!(t.edge(), (true, false));
+    t.e.tick(0);
+    assert!(t.flags().resting, "still stopped: still resting");
+    t.fake.up.store(true, Ordering::SeqCst);
+    t.e.tick(0);
+    let f = t.flags();
+    assert!(!f.resting && f.woken_at.is_some());
+    assert_eq!(t.edge(), (false, false));
+}
+
+/// m5-4: the public progress endpoint says one of three words, no more.
+#[test]
+fn wake_status_says_waking_ready_or_failed_and_nothing_else() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    let word = |t: &T| {
+        let (s, v) = t.call("GET", "/v1/wake/status", None, "");
+        assert_eq!(s, 200);
+        assert_eq!(v.as_object().unwrap().len(), 1, "{v}");
+        s_(&v["state"])
+    };
+    assert_eq!(word(&t), "ready");
+    t.call("POST", "/v1/rest", Some(&owner), "");
+    t.job_done(&owner);
+    assert_eq!(word(&t), "failed", "resting is not ready");
+    t.call("POST", "/v1/wake/paired", Some(&owner), "");
+    t.job_done(&owner);
+    assert_eq!(word(&t), "ready");
+    t.call("POST", "/v1/lockdown", Some(&owner), "");
+    t.job_done(&owner);
+    assert_eq!(word(&t), "failed");
+}
+
+/// m5-3: the wake form answers with the progress page; its one script runs
+/// by its hash alone.
+#[test]
+fn a_right_code_in_the_form_shows_the_progress_page() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    t.call("POST", "/v1/rest", Some(&owner), "");
+    t.job_done(&owner);
+    let code = t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: false,
+        },
+        "",
+    );
+    let r = t.e.handle(Request {
+        method: "POST".into(),
+        url: "/v1/wake".into(),
+        headers: vec![
+            (
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            ),
+            ("X-Real-IP".into(), OWNER_IP.into()),
+        ],
+        body: format!("code={}", code.replace('-', "%2D")).into_bytes(),
+        peer: "172.20.0.3:5000".parse().unwrap(),
+    });
+    assert_eq!(r.status, 202, "{}", r.body);
+    assert!(r.body.contains("Waking the site") && r.body.contains("/atelier"));
+    assert!(!r.body.contains(&code), "the code is never echoed");
+    let csp = r
+        .headers
+        .iter()
+        .find(|(k, _)| *k == "Content-Security-Policy")
+        .unwrap()
+        .1;
+    let hash = codes::base64(&codes::sha256(PROGRESS_SCRIPT.as_bytes()));
+    assert!(
+        csp.contains(&format!("script-src 'sha256-{hash}'")),
+        "{csp}"
+    );
+    let script_src = csp.split(';').find(|d| d.contains("script-src")).unwrap();
+    assert!(!script_src.contains("unsafe"), "{csp}");
+    assert!(csp.contains("connect-src 'self'"));
+    assert!(r
+        .body
+        .contains(&format!("<script>{PROGRESS_SCRIPT}</script>")));
+    t.job_done(&owner);
+    assert!(t.fake.up.load(Ordering::SeqCst));
+}
+
+/// m5-3, D-10: a paired Manager rotates the wake code (shown once, kept as
+/// a hash) or revokes it; a revoked code wakes nothing.
+#[test]
+fn a_paired_manager_rotates_and_revokes_the_wake_code() {
+    let t = engine();
+    let (_, owner) = t.primary();
+    let (_, junior) = t.junior(&owner, "192.0.2.20");
+    let (s, v) = t.call("POST", "/v1/wake/code", Some(&junior), "");
+    assert_eq!(s, 201);
+    let first = s_(&v["code"]);
+    let (s, v) = t.call("POST", "/v1/wake/code", Some(&owner), "");
+    assert_eq!(s, 201);
+    let code = s_(&v["code"]);
+    assert_ne!(first, code);
+    let on_disk = std::fs::read_to_string(t.d.0.join("state/engine.json")).unwrap();
+    assert!(!on_disk.contains(&codes::normalize_code(&code)));
+    let wake = |c: &str| {
+        t.call_from(
+            "198.51.100.4",
+            "POST",
+            "/v1/wake",
+            None,
+            &json!({ "code": c }).to_string(),
+        )
+        .0
+    };
+    assert_eq!(wake(&first), 401, "rotated out");
+    assert_eq!(wake(&code), 202);
+    t.job_done(&owner);
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["wake_code_set"], true);
+    assert_eq!(t.call("DELETE", "/v1/wake/code", Some(&owner), "").0, 200);
+    assert_eq!(wake(&code), 401, "revoked");
+    let (_, st) = t.call("GET", "/v1/status", Some(&owner), "");
+    assert_eq!(st["wake_code_set"], false);
+    let a = t.audit_text();
+    assert!(a.contains("rotated") && a.contains("revoked"));
+}
+
+/// The same transitions over `docker exec` (m3-7): rest, wake, wake-code
+/// --revoke, unlock back to resting.
+#[test]
+fn admin_rest_wake_and_unlock_keep_edge_in_step() {
+    let t = engine();
+    let out = t.admin(AdminCommand::Rest, "");
+    assert!(out.contains("Resting"), "{out}");
+    assert_eq!(t.fake.calls(), ["drush Freeze", "stop"]);
+    assert_eq!(t.edge(), (true, false));
+    let st: Value = serde_json::from_str(&t.admin(AdminCommand::Status, "")).unwrap();
+    assert_eq!(st["state"], "resting");
+    t.admin(AdminCommand::Wake, "");
+    assert_eq!(t.edge(), (false, false));
+    assert!(t.flags().woken_at.is_some());
+    t.admin(AdminCommand::Lockdown, "");
+    assert_eq!(t.edge(), (true, true));
+    let mut out = Vec::new();
+    let e = admin::run(
+        AdminCommand::Rest,
+        &t.e.store,
+        &t.e.inbox,
+        &Shared(t.fake.clone()),
+        &mut "".as_bytes(),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("locked down"));
+    t.admin(AdminCommand::Unlock, "");
+    assert_eq!(t.edge(), (true, false));
+    t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: false,
+        },
+        "",
+    );
+    assert!(t.flags().wake_hash.is_some());
+    t.admin(
+        AdminCommand::WakeCode {
+            set: false,
+            revoke: true,
+        },
+        "",
+    );
+    assert!(t.flags().wake_hash.is_none());
 }

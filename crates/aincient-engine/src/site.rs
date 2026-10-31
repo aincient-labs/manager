@@ -52,6 +52,10 @@ pub trait Site: Send + Sync {
     /// Whether Drupal answers through edge: any status but edge's own
     /// 502–504 (an untrusted Host's 4xx counts).
     fn answers(&self) -> bool;
+    /// The idle timer's minutes (D-11, m5-5); `0` is off.
+    fn idle_rest_minutes(&self) -> u64 {
+        aincient_core::engine::IDLE_REST_DEFAULT_MINUTES
+    }
 }
 
 /// The real site: `docker compose` over the mounted socket.
@@ -123,6 +127,15 @@ impl Site for ComposeSite {
 
     fn answers(&self) -> bool {
         http_status(&self.edge, "/user/login").is_some_and(|c| !matches!(c, 502..=504))
+    }
+
+    /// From the stack's `.env`, which the engine mounts read-only.
+    fn idle_rest_minutes(&self) -> u64 {
+        let env = self.stack.read_env();
+        aincient_core::engine::idle_rest_minutes(
+            env.get(aincient_core::engine::IDLE_REST_ENV)
+                .map(String::as_str),
+        )
     }
 }
 

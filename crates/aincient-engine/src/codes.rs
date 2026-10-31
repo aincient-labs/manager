@@ -56,6 +56,29 @@ pub fn sha256_hex(s: &str) -> String {
     hex(&Sha256::digest(s.as_bytes()))
 }
 
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// Standard base64 with padding (a CSP script hash).
+pub fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 /// Compare without an early exit, so the time taken says nothing about where
 /// two secrets differ.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -236,6 +259,21 @@ mod tests {
         assert!(!valid_name("a\nb"));
         assert!(!valid_name(""));
         assert!(!valid_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (i, o) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(i.as_bytes()), o);
+        }
     }
 
     #[test]
