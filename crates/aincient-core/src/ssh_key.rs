@@ -277,7 +277,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct Broken;
+    pub(crate) struct Broken;
     impl SecretStore for Broken {
         fn get(&self, account: &str) -> Result<Option<String>> {
             Err(no_keychain(

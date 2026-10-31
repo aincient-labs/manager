@@ -101,6 +101,7 @@ pub fn sites_add(
     let base = pairing::engine_url(&site)?;
     println!("Pairing with {} as \"{name}\"…", base.base());
     let added = sites::add_remote_site(uh, site, |site| {
+        pairing::check_store(&ssh_key::Keychain, &site.slug)?;
         let client = EngineClient::new(base.clone(), Https::new());
         let paired = pairing::pair(&client, &code, &name).map_err(|e| match e {
             EngineError::Unauthorized(m) | EngineError::Forbidden(m) => anyhow!(
@@ -110,8 +111,7 @@ pub fn sites_add(
             ),
             other => anyhow!(other),
         })?;
-        pairing::keep(&ssh_key::Keychain, &site.slug, &paired)
-            .context("paired, but the token couldn't be kept in the keychain")?;
+        pairing::keep_or_release(&ssh_key::Keychain, client, &site.slug, &paired, true)?;
         println!(
             "{} as the site's primary Manager (pairing {}). Its token is in your OS keychain.",
             style::success("Paired"),
@@ -192,6 +192,7 @@ pub fn sites_join(
     let name = manager_name(name)?;
     let base = pairing::engine_url(&site)?;
     let added = sites::add_remote_site(uh, site, |site| {
+        pairing::check_store(&ssh_key::Keychain, &site.slug)?;
         let client = EngineClient::new(base.clone(), Https::new());
         let req = pairing::request_join(&client, &name).map_err(|e| match e {
             EngineError::Forbidden(m) => anyhow!("the site isn't taking new Managers: {m}"),
@@ -207,8 +208,7 @@ pub fn sites_join(
         let mut clock = Clock { started, told: 0 };
         match pairing::wait_for_approval(&client, &req, &mut clock)? {
             Waited::Paired(p) => {
-                pairing::keep(&ssh_key::Keychain, &site.slug, &p)
-                    .context("approved, but the token couldn't be kept in the keychain")?;
+                pairing::keep_or_release(&ssh_key::Keychain, client, &site.slug, &p, false)?;
                 println!(
                     "{} (pairing {}). Its token is in your OS keychain.",
                     style::success("Approved"),

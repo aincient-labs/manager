@@ -217,11 +217,18 @@ fn checked_name(name: &str) -> Result<String, String> {
         .ok_or_else(|| "The Manager's name: 1 to 64 visible characters.".to_string())
 }
 
-fn register(site: Site, paired: &pairing::Paired) -> Result<(), String> {
+/// Add the new site and keep its token — or take the pairing back when the
+/// keychain refuses it ([`pairing::keep_or_release`]).
+fn register(
+    site: Site,
+    c: EngineClient<Https>,
+    paired: &pairing::Paired,
+    primary: bool,
+) -> Result<(), String> {
     let uh = sites::user_home().map_err(|e| format!("{e:#}"))?;
     let slug = site.slug.clone();
     sites::add_remote_site(&uh, site, |s| {
-        pairing::keep(&ssh_key::Keychain, &s.slug, paired)
+        pairing::keep_or_release(&ssh_key::Keychain, c, &s.slug, paired, primary)
     })
     .map_err(|e| format!("{e:#}"))?;
     sites::use_site(&uh, &slug)
@@ -242,6 +249,7 @@ pub fn add_with_install_code(
     if code.trim().is_empty() {
         return Err("Type the install code the site's installer printed.".into());
     }
+    pairing::check_store(&ssh_key::Keychain, slug).map_err(|e| capitalise(&format!("{e:#}")))?;
     let c = EngineClient::new(
         pairing::engine_url(&site).map_err(|e| format!("{e:#}"))?,
         Https::new(),
@@ -253,7 +261,7 @@ pub fn add_with_install_code(
         ),
         other => capitalise(&other.to_string()),
     })?;
-    register(site, &paired)
+    register(site, c, &paired, true)
 }
 
 /// The one join this window waits on.
@@ -287,6 +295,7 @@ pub fn join_start(
     let site = entry(slug, label, url)?;
     let name = checked_name(name)?;
     let base = pairing::engine_url(&site).map_err(|e| format!("{e:#}"))?;
+    pairing::check_store(&ssh_key::Keychain, slug).map_err(|e| capitalise(&format!("{e:#}")))?;
     let c = EngineClient::new(base.clone(), Https::new());
     let req = pairing::request_join(&c, &name).map_err(|e| match e {
         EngineError::Forbidden(m) => format!("The site isn't taking new Managers: {m}"),
@@ -337,7 +346,7 @@ pub fn join_poll(joining: &Joining) -> Result<Polled, String> {
         Ok(Collected::Paired(p)) => {
             let j = slot.take().expect("checked above");
             let slug = j.site.slug.clone();
-            register(j.site, &p)?;
+            register(j.site, c, &p, false)?;
             Ok(Polled::Paired { slug })
         }
         Err(EngineError::NotFound(_)) => {

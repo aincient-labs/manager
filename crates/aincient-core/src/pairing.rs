@@ -22,7 +22,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -424,6 +424,51 @@ pub fn keep(store: &dyn SecretStore, slug: &str, paired: &Paired) -> Result<()> 
     save_token(store, slug, &paired.token)
 }
 
+/// Check `store` can keep a token for `slug` (a probe entry, written and
+/// deleted) before anything is asked of an engine: a pairing made for a
+/// Manager that can't hold its token stays on the engine until revoked by
+/// hand.
+pub fn check_store(store: &dyn SecretStore, slug: &str) -> Result<()> {
+    let probe = format!("engine-token-probe:{slug}");
+    store
+        .set(&probe, "probe")
+        .and_then(|()| store.delete(&probe))
+        .context(
+            "this Manager can't keep a pairing token in the keychain, so it asked the site nothing",
+        )
+}
+
+/// [`keep`], or — when the keychain refuses the token after all — revoke the
+/// new pairing with that same token (`DELETE pairings/self`), so no pairing
+/// stays on the engine that nobody holds. Either way the error says what
+/// became of it; when the revoke failed too, where to revoke it by hand.
+pub fn keep_or_release<T: HttpTransport>(
+    store: &dyn SecretStore,
+    client: EngineClient<T>,
+    slug: &str,
+    paired: &Paired,
+    primary: bool,
+) -> Result<()> {
+    let Err(kept) = keep(store, slug, paired) else {
+        return Ok(());
+    };
+    let id = &paired.id;
+    let what = match forget_self(&client.with_token(paired.token.clone())) {
+        Ok(()) => format!("the site's pairing {id} was taken back, so nothing is left behind"),
+        Err(e) if primary => format!(
+            "taking back the site's pairing {id} failed too ({e}); revoke it over SSH: docker \
+             exec <project>-engine-1 atelier engine admin revoke {id}"
+        ),
+        Err(e) => format!(
+            "taking back the site's pairing {id} failed too ({e}); revoke it from the primary \
+             Manager's Managers panel"
+        ),
+    };
+    Err(anyhow!("{kept:#}").context(format!(
+        "paired, but the token couldn't be kept in the keychain; {what}"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +560,62 @@ mod tests {
         assert_eq!(f.sent.borrow()[1].bearer, None, "no token to pair");
         let store = crate::ssh_key::tests::Memory::default();
         keep(&store, "vps", &p).unwrap();
+        assert_eq!(
+            load_token(&store, "vps").unwrap().as_deref(),
+            Some("aet_new")
+        );
+    }
+
+    #[test]
+    fn a_keychain_that_cannot_keep_a_token_is_found_before_asking() {
+        let store = crate::ssh_key::tests::Memory::default();
+        check_store(&store, "vps").unwrap();
+        assert_eq!(
+            store.get("engine-token-probe:vps").unwrap(),
+            None,
+            "probe gone"
+        );
+        let e = check_store(&crate::ssh_key::tests::Broken, "vps").unwrap_err();
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("asked the site nothing") && text.contains("no OS keychain"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_token_the_keychain_refuses_takes_its_pairing_back() {
+        let p = Paired {
+            id: "abc123def456".into(),
+            token: "aet_new".into(),
+        };
+        let f = Fake::with(&[V1, (200, "{}")]);
+        let e = keep_or_release(&crate::ssh_key::tests::Broken, anon(&f), "vps", &p, false)
+            .unwrap_err();
+        assert_eq!(f.sent(), ["GET version", "DELETE pairings/self"]);
+        assert_eq!(f.sent.borrow()[1].bearer.as_deref(), Some("aet_new"));
+        let text = format!("{e:#}");
+        assert!(text.contains("abc123def456 was taken back"), "{text}");
+        assert!(
+            !text.contains("aet_new"),
+            "the token is never shown: {text}"
+        );
+
+        // The revoke failed too: say where to do it by hand.
+        let f = Fake::with(&[V1, (503, r#"{"error":"busy"}"#)]);
+        let joined = keep_or_release(&crate::ssh_key::tests::Broken, anon(&f), "vps", &p, false);
+        let text = format!("{:#}", joined.unwrap_err());
+        assert!(text.contains("primary Manager's Managers panel"), "{text}");
+        let f = Fake::with(&[V1, (503, r#"{"error":"busy"}"#)]);
+        let primary = keep_or_release(&crate::ssh_key::tests::Broken, anon(&f), "vps", &p, true);
+        let text = format!("{:#}", primary.unwrap_err());
+        assert!(text.contains("engine admin revoke abc123def456"), "{text}");
+
+        // A keychain that keeps it: nothing is sent.
+        let f = Fake::default();
+        let store = crate::ssh_key::tests::Memory::default();
+        keep_or_release(&store, anon(&f), "vps", &p, false).unwrap();
+        assert!(f.sent().is_empty());
         assert_eq!(
             load_token(&store, "vps").unwrap().as_deref(),
             Some("aet_new")
