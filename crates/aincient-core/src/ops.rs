@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::docker::{
     self, compose, preflight, run_capture, run_inherited, run_streaming, try_capture,
 };
+use crate::engine_admin::AdminVerb;
 use crate::stack::{Channel, InstallOptions, Stack, LEGACY_DEFAULT_IMAGE};
 
 /// drush, as invoked inside the `app` container.
@@ -1327,13 +1328,52 @@ fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     run_step(c, "start the appliance", r)
 }
 
-/// `docker compose stop` — stop containers, keep data.
-pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+/// Stop the site. With the engine up, Stop is its Rest (DECISIONS 0488):
+/// freeze, then stop `app` and `db`, edge serving the snapshot; returns the
+/// engine's answer. Without it, [`stop_containers`].
+pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
+    ensure_installed(stack)?;
+    if let Some(info) = ready_engine(stack) {
+        r.stage(Stage::Working, "Putting the site to rest…", None);
+        let said = engine_verb(&info, AdminVerb::Rest, "rest")?;
+        say(r, &said);
+        return Ok(Some(said));
+    }
+    stop_containers(stack, r)?;
+    Ok(None)
+}
+
+/// `docker compose stop` — stop every container, the engine and edge too, and
+/// keep data. For freeing the port (a site leaving the list), not the owner's
+/// Stop ([`stop`]).
+pub fn stop_containers(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     ensure_installed(stack)?;
     r.stage(Stage::Working, "Stopping the appliance…", None);
     let mut c = compose(stack);
     c.arg("stop");
     run_step(c, "stop the appliance", r)
+}
+
+/// The engine's info when its container answers `docker exec`: the sign that
+/// Start and Stop go through it (DECISIONS 0488).
+fn ready_engine(stack: &Stack) -> Option<crate::engine_admin::EngineInfo> {
+    crate::engine_admin::probe(stack).filter(|i| i.ready().is_some())
+}
+
+fn engine_verb(
+    info: &crate::engine_admin::EngineInfo,
+    verb: AdminVerb,
+    what: &str,
+) -> Result<String> {
+    use crate::engine_admin::{EngineAdmin, LocalDocker};
+    EngineAdmin::new(&LocalDocker, Some(info), what)?.run(verb)
+}
+
+/// The engine's answer, line by line, into the reporter's feed.
+fn say(r: &mut dyn Reporter, said: &str) {
+    for line in said.lines().filter(|l| !l.trim().is_empty()) {
+        r.log(line);
+    }
 }
 
 /// What was observed of the stack's `app` container before starting it.
@@ -1395,6 +1435,23 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
+    // DECISIONS 0488: with the engine up, Start is its Wake (refused while
+    // locked down), so the engine's state stays the site's state.
+    if let Some(info) = ready_engine(stack) {
+        r.stage(Stage::Starting, "Waking the site…", Some(0.4));
+        let said = engine_verb(&info, AdminVerb::Wake, "wake").map_err(|e| {
+            if format!("{e:#}").contains("locked down") {
+                anyhow::anyhow!(
+                    "the site is locked down, so it can't be started. Unlock it first \
+                     (System → Experimental features, or `atelier site unlock --experimental`)."
+                )
+            } else {
+                e
+            }
+        })?;
+        say(r, &said);
+        return Ok(wait_until_ready(stack, START_READY_TIMEOUT, r));
+    }
     r.stage(Stage::Starting, "Starting the appliance…", Some(0.4));
     match start_action(observe_container(stack)) {
         StartAction::Start => {

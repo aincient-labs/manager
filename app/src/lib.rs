@@ -730,7 +730,9 @@ async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String
         }
         Target::Remote(site) if is_paired(&site) => {
             require_experimental()?;
-            blocking(move || paired::act(&site, Verb::Wake).map(|_| ())).await
+            let said = blocking(move || paired::act(&site, Verb::Wake)).await?;
+            say_lines(&app, &said);
+            Ok(())
         }
         Target::Remote(site) => run_remote(app, site, remote::Action::Start).await,
     }
@@ -740,7 +742,20 @@ async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String
 async fn do_stop(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || ops::stop(&s, &mut EventReporter { app }).map_err(err)).await
+            blocking(move || {
+                ops::stop(&s, &mut EventReporter { app })
+                    .map(|_| ())
+                    .map_err(err)
+            })
+            .await
+        }
+        // DECISIONS 0488: a paired site's Stop is the engine's Rest, as its
+        // Start is Wake.
+        Target::Remote(site) if is_paired(&site) => {
+            require_experimental()?;
+            let said = blocking(move || paired::act(&site, Verb::Rest)).await?;
+            say_lines(&app, &said);
+            Ok(())
         }
         Target::Remote(site) => run_remote(app, site, remote::Action::Stop).await,
     }

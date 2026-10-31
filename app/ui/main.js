@@ -972,7 +972,7 @@ function renderStatus(status) {
     // from here — "Edit my site" opens its console through a tunnel.
     view.classList.toggle("hidden", !url);
     toggle.classList.remove("hidden");
-    $("startstop-label").textContent = "Stop";
+    $("startstop-label").textContent = engineWord(status) ? "Rest" : "Stop";
   } else if (status.running) {
     // Nothing else re-reads status here (a Start from this window waits for the
     // site itself), so a window opened while the site boots would stay on
@@ -992,7 +992,7 @@ function renderStatus(status) {
     primaryLabel.textContent = "Starting…";
     view.classList.add("hidden");
     toggle.classList.remove("hidden");
-    $("startstop-label").textContent = "Stop";
+    $("startstop-label").textContent = engineWord(status) ? "Rest" : "Stop";
   } else if (engineWord(status) === "resting" || engineWord(status) === "locked") {
     // Resting mode (M5): visitors still read the snapshot.
     const locked = engineWord(status) === "locked";
@@ -1767,15 +1767,30 @@ const actions = {
   // Start or stop, decided by the live status rather than a label.
   startstop: async () => {
     const running = !!(lastStatus && lastStatus.running);
+    // With the engine, Stop is its Rest and Start its Wake (DECISIONS 0488).
+    const engine = !!engineWord(lastStatus);
     // Stopping a live site on a server takes its slug (D-07); locally it never asked.
     if (
       running &&
-      !(await confirmChange("Stop {site}?", "Visitors can't reach it until it's started again."))
+      !(await (engine
+        ? confirmChange(
+            "Put {site} to rest?",
+            "A fresh snapshot is saved first, then the site's app and database stop. Visitors " +
+              "keep reading the snapshot; sign-in and forms are paused until it is woken. If the " +
+              "snapshot fails, the site stays awake."
+          )
+        : confirmChange("Stop {site}?", "Visitors can't reach it until it's started again.")))
     )
       return;
-    return runProgressOp(running ? "Stopping your website" : "Starting your website", () =>
-      invoke(running ? "do_stop" : "do_start")
-    );
+    const label = running
+      ? engine
+        ? "Putting the site to rest"
+        : "Stopping your website"
+      : engine
+        ? "Waking the site"
+        : "Starting your website";
+    await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"));
+    if (engine) refreshEngine();
   },
 
   "startstop-from-publish": () =>

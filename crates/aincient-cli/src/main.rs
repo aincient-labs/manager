@@ -957,7 +957,7 @@ fn run_sites(command: SitesCommand, experimental: bool) -> Result<()> {
             // the port so it can't collide with a site added later. Only a
             // running site is stopped, so a host without Docker stays quiet.
             if stack.exists() && ops::status(&stack).running {
-                if let Err(e) = ops::stop(&stack, &mut ops::Silent) {
+                if let Err(e) = ops::stop_containers(&stack, &mut ops::Silent) {
                     println!(
                         "{} {e:#}",
                         style::warn("Removed from the list, but couldn't stop it:")
@@ -1315,8 +1315,11 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             Ok(())
         }
         AppCommand::Stop { .. } => {
-            ops::stop(stack, &mut ops::Silent)?;
-            println!("{}", style::success("Stopped."));
+            match ops::stop(stack, &mut ops::Silent)? {
+                // The engine rested it (DECISIONS 0488): say what it did.
+                Some(said) => println!("{}", style::success(said.trim())),
+                None => println!("{}", style::success("Stopped.")),
+            }
             Ok(())
         }
         AppCommand::Down { wipe, yes } => {
