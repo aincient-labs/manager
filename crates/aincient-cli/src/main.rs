@@ -1037,12 +1037,22 @@ fn sites_list(uh: &std::path::Path, json: bool) -> Result<()> {
             );
             continue;
         }
+        // A stopped site with the engine says why (DECISIONS 0488): resting,
+        // locked down or waking, as the window's switcher does.
+        let held = (r.site.installed && !r.running)
+            .then(|| ops::engine_state_of(&r.site.stack()))
+            .flatten();
         let state = if !r.site.installed {
             "not installed"
         } else if r.running {
             "running"
         } else {
-            "stopped"
+            match held.as_deref() {
+                Some("resting") => "resting",
+                Some("waking") => "waking",
+                Some("locked") => "locked down",
+                _ => "stopped",
+            }
         };
         println!(
             "{} {:<14} {:<22} {:<6} {:<14} {}",
