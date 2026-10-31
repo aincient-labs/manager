@@ -13,7 +13,7 @@
 //! | file | what it does |
 //! |---|---|
 //! | [`ENGINE_COMPOSE_FILE`] | adds the `engine` service (Docker socket, no published port, internal `engine` network), puts `edge` on that network, gives `app` the inbox (rw) and outbox (ro) volumes, and mounts [`ENGINE_EDGE_FILE`] over edge's `default.conf`; with trusted proxies, also publishes edge on loopback only ([`engine_compose`], m7-10) |
-//! | [`ENGINE_EDGE_FILE`] | [`EDGE_CONF_TEMPLATE`] plus the engine's rate-limit zones and its `/_atelier/engine/` locations |
+//! | [`ENGINE_EDGE_FILE`] | [`EDGE_CONF_TEMPLATE`] plus the engine's rate-limit zones, its `/_atelier/engine/` locations and resting mode ([`edge_conf`]) |
 //!
 //! Without the opt-in, edge has no `/_atelier/engine/` location at all: such a
 //! path falls to edge's `location /` like any other (the snapshot's 404 when
@@ -25,7 +25,10 @@
 //! Network layout (E-05): only `edge` and `engine` are on `engine`; `app` and
 //! `db` never join it, and the engine also refuses any TCP peer that isn't edge.
 //! Volumes: `engine-inbox` (app writes, the engine reads), `engine-outbox` (the
-//! engine writes, app mounts read-only), `engine-state` (the engine only).
+//! engine writes, app mounts read-only), `engine-state` (the engine only),
+//! and for resting mode (M5) `engine-signal` (the engine writes its resting
+//! markers, edge mounts it read-only) and `engine-activity` (edge logs console
+//! requests, the engine reads the log's time). `app` mounts neither.
 
 use crate::stack::{Stack, EDGE_CONF_TEMPLATE};
 use anyhow::{bail, Context, Result};
@@ -68,6 +71,22 @@ pub const TRUSTED_PROXIES_ENV: &str = "ATELIER_TRUSTED_PROXIES";
 /// [`ENGINE_COMPOSE_TEMPLATE`] sets it, so a copied compose file that drops the
 /// line can't start an engine by accident.
 pub const EXPERIMENTAL_ENV: &str = "ATELIER_ENGINE_EXPERIMENTAL";
+/// The `.env` key for the idle timer (D-11, m5-5): minutes without a console
+/// request before a woken site goes back to rest; `0` turns it off. Read by
+/// the engine on each check, so a change needs no restart.
+pub const IDLE_REST_ENV: &str = "ATELIER_IDLE_REST_MINUTES";
+/// The idle timer when `.env` doesn't set it (the design's 30 minutes).
+pub const IDLE_REST_DEFAULT_MINUTES: u64 = 30;
+
+/// [`IDLE_REST_ENV`]'s value as minutes: unset or unreadable is the default
+/// (a typo must not silently turn the timer off), capped at a week.
+pub fn idle_rest_minutes(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(IDLE_REST_DEFAULT_MINUTES, |m| m.min(7 * 24 * 60))
+}
+
 /// The `.env` value of `COMPOSE_FILE` while the engine is on.
 pub const COMPOSE_FILE_VALUE: &str = "compose.yaml:compose.engine.yaml";
 /// The `.env` keys [`enable`] writes and [`disable`] removes.
@@ -101,6 +120,8 @@ pub const EDGE_ROUTES: &[&str] = &[
     "audit",
     "wake/paired",
     "wake/resume",
+    "wake/status",
+    "wake/code",
 ];
 
 /// The opt-in compose file, merged over [`COMPOSE_TEMPLATE`].
@@ -125,6 +146,10 @@ services:
       - engine
     volumes:
       - ./edge.engine.conf:/etc/nginx/conf.d/default.conf:ro
+      # Resting mode: the engine's markers (read-only here) and the console
+      # requests edge logs for the idle timer.
+      - engine-signal:/run/atelier-engine:ro
+      - engine-activity:/var/log/atelier-activity
   engine:
     # The image ID `atelier engine enable` resolved from atelier-engine:dev:
     # immutable, so a rebuild or retag changes nothing until enable runs again.
@@ -143,6 +168,8 @@ services:
       - engine-inbox:/inbox
       - engine-outbox:/outbox
       - engine-state:/state
+      - engine-signal:/signal
+      - engine-activity:/activity
     networks:
       - engine
     # Bounded, so a flood can't exhaust the host's processes or memory.
@@ -158,6 +185,8 @@ volumes:
   engine-inbox:
   engine-outbox:
   engine-state:
+  engine-signal:
+  engine-activity:
 networks:
   default:
   engine:
@@ -293,6 +322,21 @@ limit_req_zone $engine_try zone=engine_wake:1m rate=5r/m;
 # engine's paths with an internal redirect.
 proxy_ignore_headers X-Accel-Redirect;
 
+# Resting mode (M5). The idle timer's signal (D-11): a console request Drupal
+# answered 2xx, which only a signed-in user gets (anonymous ones get 403 or a
+# redirect). The engine reads only the log's modification time.
+log_format engine_activity "$msec";
+map "$upstream_status $uri" $engine_activity {
+    default 0;
+    "~^2[0-9][0-9] /atelier(/|\z)" 1;
+}
+# The resting copy (C-07). Only /atelier offers the wake form, and not while
+# locked down ($engine_wake is 0 then).
+map "$engine_wake$uri" $engine_rest_page {
+    default "RESTING_PAGE";
+    "~^1/atelier(/|\z)" "WAKE_PAGE";
+}
+
 "#;
 
 /// One proxied engine location's body (after its own `limit_req` lines).
@@ -359,6 +403,108 @@ fn edge_locations() -> String {
     )
 }
 
+/// The shipped rule's snapshot switch: a session cookie, a Drupal-owned path
+/// or a non-GET method bypasses the snapshot.
+const FRZ_ROOT_SHIPPED: &str = r#"map "$frz_cookie$frz_path$frz_method" $frz_root {
+    default /srv/private/frozen/current;
+    "~1" /nonexistent/frozen-bypass;
+}
+"#;
+
+/// The same switch with resting mode in front (m5-2): while resting, a
+/// session cookie alone no longer bypasses, so a signed-in reader still gets
+/// the snapshot's pages; Drupal-owned paths and non-GET methods still do, and
+/// then meet the resting copy. Awake, it is the shipped rule.
+const FRZ_ROOT_ENGINE: &str = r#"map "$engine_resting$frz_cookie$frz_path$frz_method" $frz_root {
+    default /srv/private/frozen/current;
+    # Resting: a Drupal path or method bypasses (to the resting copy).
+    "~^1.(1|.1)" /nonexistent/frozen-bypass;
+    # Resting: a cookie alone reads the snapshot.
+    "~^1" /srv/private/frozen/current;
+    # Awake: the shipped rule.
+    "~1" /nonexistent/frozen-bypass;
+}
+"#;
+
+/// Server-wide, before every location: whether the site rests, from the
+/// engine's markers in `engine-signal`, which edge mounts read-only and `app`
+/// not at all. Two `stat`s per request; no request header, cookie or path
+/// can set either variable. Then the access logs: the image's own, and the
+/// idle timer's.
+const EDGE_RESTING_SERVER: &str = r#"
+    # Resting mode (Atelier engine, M5): the engine's markers decide, never a
+    # request. `locked` (lockdown, D-09) is resting with the wake form off.
+    set $engine_resting 0;
+    set $engine_wake 0;
+    if (-f /run/atelier-engine/resting) {
+        set $engine_resting 1;
+        set $engine_wake 1;
+    }
+    if (-f /run/atelier-engine/locked) {
+        set $engine_resting 1;
+        set $engine_wake 0;
+    }
+    access_log /var/log/nginx/access.log main;
+    access_log /var/log/atelier-activity/console.log engine_activity if=$engine_activity;
+"#;
+
+/// In `@miss`, before Drupal is asked: a resting site has no Drupal, so the
+/// request gets the resting copy instead of the "starting" page.
+const EDGE_MISS_RESTING: &str = r#"        # Resting (Atelier engine): no Drupal to ask; the resting copy (C-07).
+        error_page 418 = @engine_resting;
+        if ($engine_resting) {
+            return 418;
+        }
+"#;
+
+/// The resting copy itself (C-07): a calm page, 503 so nothing caches or
+/// indexes it as the page; the wake form only on `/atelier`.
+const EDGE_RESTING_LOCATION: &str = r#"
+    location @engine_resting {
+        default_type text/html;
+        charset utf-8;
+        add_header Cache-Control "no-store" always;
+        add_header Retry-After 3600 always;
+        add_header X-Frame-Options DENY always;
+        add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'" always;
+        return 503 $engine_rest_page;
+    }
+"#;
+
+const RESTING_STYLE: &str = "body{font:16px/1.5 system-ui,sans-serif;margin:15vh auto;max-width:32rem;padding:0 1.5rem;color:#222;background:#fff}h1{font-size:1.4rem}input,button{font:inherit;padding:.4rem .6rem}@media (prefers-color-scheme:dark){body{color:#eee;background:#161616}a{color:#9cf}}";
+
+/// The resting page anyone gets for what needs Drupal. Single-quoted
+/// attributes and no `$`: it sits inside a double-quoted nginx string whose
+/// `$` would read as a variable.
+pub fn resting_page() -> String {
+    resting_html(
+        "<p>Sign-in and forms are paused while it rests. Its pages are still here to \
+         read.</p>",
+    )
+}
+
+/// The resting page on `/atelier` (C-07): the same words, and the wake form,
+/// which posts to the engine's `wake` (m5-3).
+pub fn wake_page() -> String {
+    resting_html(
+        "<p>Sign-in and forms are paused while it rests. If you work on this site, wake \
+         it with its wake code. Waking starts the site; it doesn't sign you in.</p>\
+         <form method='post' action='/_atelier/engine/v1/wake'><label for='code'>Wake \
+         code</label> <input id='code' name='code' autocomplete='off' required> \
+         <button>Wake</button></form><p>A Manager paired with this site can wake it \
+         too.</p>",
+    )
+}
+
+fn resting_html(words: &str) -> String {
+    format!(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' \
+         content='width=device-width,initial-scale=1'><title>This site is resting</title>\
+         <style>{RESTING_STYLE}</style></head><body><main><h1>This site is resting</h1>\
+         {words}<p><a href='/'>Go to the home page</a></p></main></body></html>"
+    )
+}
+
 fn insert_at(base: &str, anchor: &str, text: &str, before: bool) -> String {
     assert_eq!(
         base.matches(anchor).count(),
@@ -399,9 +545,36 @@ fn edge_real_ip(trusted: &[String]) -> String {
 /// `trusted` proxies ([`trusted_proxies`]): derived, so it can't drift from
 /// the shipped rule silently (each insertion asserts its anchor).
 pub fn edge_conf(trusted: &[String]) -> String {
-    let s = insert_at(EDGE_CONF_TEMPLATE, "server {\n", EDGE_ZONES, true);
-    let tail = format!("{}{}", edge_real_ip(trusted), edge_locations());
+    let s = insert_at(EDGE_CONF_TEMPLATE, "server {\n", &edge_zones(), true);
+    let s = replace_once(&s, FRZ_ROOT_SHIPPED, FRZ_ROOT_ENGINE);
+    let s = insert_at(
+        &s,
+        "        # Live or bypassed: Drupal. A variable target is resolved per request.\n",
+        EDGE_MISS_RESTING,
+        true,
+    );
+    let tail = format!(
+        "{}{EDGE_RESTING_SERVER}{}{EDGE_RESTING_LOCATION}",
+        edge_real_ip(trusted),
+        edge_locations()
+    );
     insert_at(&s, "    absolute_redirect off;\n", &tail, false)
+}
+
+/// [`EDGE_ZONES`] with the two resting pages in place.
+fn edge_zones() -> String {
+    EDGE_ZONES
+        .replace("RESTING_PAGE", &resting_page())
+        .replace("WAKE_PAGE", &wake_page())
+}
+
+fn replace_once(base: &str, from: &str, to: &str) -> String {
+    assert_eq!(
+        base.matches(from).count(),
+        1,
+        "edge template text gone or repeated: {from:?}"
+    );
+    base.replacen(from, to, 1)
 }
 
 /// Parse [`TRUSTED_PROXIES_ENV`]: IPs or CIDRs, separated by commas or
@@ -933,11 +1106,117 @@ mod tests {
         assert_eq!(e.matches('{').count(), e.matches('}').count());
         // Removing the engine's additions gives back the shipped rule.
         assert_eq!(
-            e.replace(EDGE_ZONES, "")
+            e.replace(&edge_zones(), "")
+                .replace(FRZ_ROOT_ENGINE, FRZ_ROOT_SHIPPED)
+                .replace(EDGE_MISS_RESTING, "")
+                .replace(EDGE_RESTING_SERVER, "")
+                .replace(EDGE_RESTING_LOCATION, "")
                 .replace(&edge_real_ip(&[]), "")
                 .replace(&edge_locations(), ""),
             EDGE_CONF_TEMPLATE
         );
+    }
+
+    /// m5-2: edge decides "resting" from the engine's marker files only; no
+    /// request field feeds the variables, and every Drupal-bound request
+    /// meets the resting copy, with the wake form on `/atelier` alone.
+    #[test]
+    fn resting_mode_is_the_engines_markers_and_never_a_request() {
+        let e = edge_conf(&[]);
+        let server = e.split("server {\n").nth(1).unwrap();
+        // Set only from the markers, server-wide, before any location.
+        assert_eq!(e.matches("set $engine_resting ").count(), 3);
+        assert_eq!(e.matches("set $engine_wake ").count(), 3);
+        assert!(server.contains("if (-f /run/atelier-engine/resting) {"));
+        assert!(server.contains("if (-f /run/atelier-engine/locked) {\n        set $engine_resting 1;\n        set $engine_wake 0;"));
+        assert!(server.find("set $engine_resting 0;").unwrap() < server.find("location ").unwrap());
+        for v in ["$engine_resting", "$engine_wake"] {
+            for line in e
+                .lines()
+                .filter(|l| l.starts_with("map ") && l.contains(v))
+            {
+                assert!(
+                    !line.contains("$http_")
+                        && !line.contains("$cookie_")
+                        && !line.contains("$arg_"),
+                    "{line}"
+                );
+            }
+        }
+        // @miss: the resting copy before Drupal is asked.
+        let miss = e.split("location @miss {").nth(1).unwrap();
+        assert!(miss.find("return 418;").unwrap() < miss.find("set $app http://app:80;").unwrap());
+        assert!(miss.contains("error_page 418 = @engine_resting;"));
+        assert!(e.contains("location @engine_resting {"));
+        assert!(e.contains("return 503 $engine_rest_page;"));
+        // The snapshot switch: resting lets a cookie read the snapshot, a
+        // Drupal path or method bypasses (to the resting copy), awake is the
+        // shipped rule; the shipped map itself is gone.
+        assert!(!e.contains(FRZ_ROOT_SHIPPED));
+        assert!(e.contains("map \"$engine_resting$frz_cookie$frz_path$frz_method\" $frz_root {"));
+        // The pages: plain, no external asset, nothing nginx would read as
+        // a variable or a quote end; the form only in the wake page.
+        for page in [resting_page(), wake_page()] {
+            assert!(!page.contains('$') && !page.contains('"'), "{page}");
+            assert!(!page.contains("http") && !page.contains("<script"));
+            assert!(
+                page.contains("This site is resting")
+                    && page.contains("Sign-in and forms are paused")
+            );
+        }
+        assert!(!resting_page().contains("<form"));
+        assert!(wake_page().contains("<form method='post' action='/_atelier/engine/v1/wake'>"));
+        assert!(
+            e.contains("\"~^1/atelier(/|\\z)\" \"<!doctype"),
+            "wake form only on /atelier, only when wake is on"
+        );
+        // The idle timer's log: console requests Drupal answered 2xx only,
+        // beside the image's own access log.
+        assert!(server.contains("access_log /var/log/nginx/access.log main;"));
+        assert!(server.contains(
+            "access_log /var/log/atelier-activity/console.log engine_activity if=$engine_activity;"
+        ));
+        assert!(e.contains("\"~^2[0-9][0-9] /atelier(/|\\z)\" 1;"));
+        // The shipped template knows none of it.
+        assert!(!EDGE_CONF_TEMPLATE.contains("resting"));
+    }
+
+    #[test]
+    fn the_resting_volumes_reach_edge_read_only_and_never_app() {
+        let c = ENGINE_COMPOSE_TEMPLATE;
+        let services = c.split("\nvolumes:\n").next().unwrap();
+        let app = services
+            .split("  app:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n  edge:\n")
+            .next()
+            .unwrap();
+        assert!(!app.contains("engine-signal") && !app.contains("engine-activity"));
+        let edge = services
+            .split("\n  edge:\n")
+            .nth(1)
+            .unwrap()
+            .split("\n  engine:\n")
+            .next()
+            .unwrap();
+        let edge = format!("{edge}\n");
+        assert!(edge.contains("      - engine-signal:/run/atelier-engine:ro\n"));
+        assert!(edge.contains("      - engine-activity:/var/log/atelier-activity\n"));
+        let engine = services.split("\n  engine:\n").nth(1).unwrap();
+        assert!(engine.contains("      - engine-signal:/signal\n"));
+        assert!(engine.contains("      - engine-activity:/activity\n"));
+        assert!(c.contains("\n  engine-signal:\n  engine-activity:\n"));
+    }
+
+    #[test]
+    fn the_idle_timer_reads_minutes_and_falls_back_to_the_default() {
+        assert_eq!(idle_rest_minutes(None), IDLE_REST_DEFAULT_MINUTES);
+        assert_eq!(idle_rest_minutes(Some("0")), 0);
+        assert_eq!(idle_rest_minutes(Some(" 45 ")), 45);
+        assert_eq!(idle_rest_minutes(Some("thirty")), IDLE_REST_DEFAULT_MINUTES);
+        assert_eq!(idle_rest_minutes(Some("-5")), IDLE_REST_DEFAULT_MINUTES);
+        assert_eq!(idle_rest_minutes(Some("999999")), 7 * 24 * 60);
     }
 
     #[test]
