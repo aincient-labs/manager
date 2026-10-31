@@ -1131,10 +1131,7 @@ mod tests {
         assert!(server.contains("if (-f /run/atelier-engine/locked) {\n        set $engine_resting 1;\n        set $engine_wake 0;"));
         assert!(server.find("set $engine_resting 0;").unwrap() < server.find("location ").unwrap());
         for v in ["$engine_resting", "$engine_wake"] {
-            for line in e
-                .lines()
-                .filter(|l| l.starts_with("map ") && l.contains(v))
-            {
+            for line in e.lines().filter(|l| l.starts_with("map ") && l.contains(v)) {
                 assert!(
                     !line.contains("$http_")
                         && !line.contains("$cookie_")
