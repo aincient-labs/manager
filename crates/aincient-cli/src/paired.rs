@@ -7,9 +7,10 @@
 //!   to type into the primary, then waits for the approval.
 //! - `--site <SLUG> engine requests|approve|managers|revoke|forget`: the
 //!   pairing list, the primary's approvals, and leaving.
-//! - On an engine-paired site, `app status`, `app start` (wake), `site
-//!   freeze`, `site live`, `site lockdown` and `site unlock` go to the
-//!   engine's API; everything else is refused (no SSH, no host CLI).
+//! - On an engine-paired site, `app status`, `app start` and `site wake`
+//!   (`wake/paired`), `site freeze`, `site live`, `site rest`, `site
+//!   lockdown`, `site unlock` and `engine wake-code` go to the engine's API;
+//!   everything else is refused (no SSH, no host CLI).
 //!
 //! The logic is [`aincient_core::pairing`]; this prints and asks.
 
@@ -231,14 +232,30 @@ pub fn sites_join(
 /// tested.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
-    Status { json: bool },
+    Status {
+        json: bool,
+    },
     Open,
-    Verb { verb: Verb, yes: bool },
+    Verb {
+        verb: Verb,
+        yes: bool,
+    },
+    /// `engine wake-code`: `None` shows, `Some(true)` rotates, `Some(false)` revokes.
+    WakeCode {
+        change: Option<bool>,
+    },
     Requests,
-    Approve { yes: bool },
+    Approve {
+        yes: bool,
+    },
     Managers,
-    Revoke { id: String, yes: bool },
-    Forget { yes: bool },
+    Revoke {
+        id: String,
+        yes: bool,
+    },
+    Forget {
+        yes: bool,
+    },
 }
 
 /// Map a command to its engine route, or refuse it: no SSH means no host
@@ -302,6 +319,14 @@ pub fn route(command: Command, site: &Site) -> Result<Route> {
                 verb: Verb::Unlock,
                 yes,
             },
+            SiteCommand::Rest { yes } => Route::Verb {
+                verb: Verb::Rest,
+                yes,
+            },
+            SiteCommand::Wake => Route::Verb {
+                verb: Verb::Wake,
+                yes: true,
+            },
             SiteCommand::Export { .. } => return Err(refuse("site export")),
             SiteCommand::Snapshots { .. } => return Err(refuse("site snapshots")),
             SiteCommand::Use { .. } => return Err(refuse("site use")),
@@ -318,6 +343,9 @@ pub fn route(command: Command, site: &Site) -> Result<Route> {
             use crate::engine::EngineCommand as E;
             match command {
                 E::Requests => Route::Requests,
+                E::WakeCode { rotate, revoke } => Route::WakeCode {
+                    change: crate::engine::wake_code_change(rotate, revoke),
+                },
                 E::Approve { yes } => Route::Approve { yes },
                 E::Managers => Route::Managers,
                 E::Revoke { id, yes } => Route::Revoke { id, yes },
@@ -353,12 +381,9 @@ fn verb_words(verb: Verb) -> (&'static str, &'static str) {
              pending request is dropped and every Manager junior to this one is revoked. Only \
              this Manager, a senior one, or SSH can unlock it.",
         ),
-        Verb::Unlock => (
-            "Unlock {site}?",
-            "Wake and pairing open again. The site stays stopped until it is started.",
-        ),
-        Verb::Wake => ("Start {site}?", ""),
-        Verb::Rest => ("Put {site} to rest?", ""),
+        Verb::Unlock => ("Unlock {site}?", crate::UNLOCK_DETAIL),
+        Verb::Wake => ("Wake {site}?", ""),
+        Verb::Rest => (crate::REST_QUESTION, crate::REST_DETAIL),
     }
 }
 
@@ -374,6 +399,12 @@ fn print_status(site: &Site, st: &EngineStatus) {
         site.slug,
         site.engine_url().unwrap_or_default()
     );
+    if !st.state.is_empty() {
+        println!(
+            "  State:    {}",
+            aincient_core::engine_admin::state_words(&st.state)
+        );
+    }
     println!("  App:      {}", st.app);
     println!("  Database: {}", st.db);
     println!(
@@ -492,9 +523,18 @@ pub fn run(command: Command, site: &Site, experimental: bool) -> Result<()> {
                 println!("{} isn't locked down; nothing to do.", site.label);
                 return Ok(());
             }
+            if matches!(verb, Verb::Rest | Verb::Wake) && st.lockdown {
+                bail!("{} is locked down: unlock it first", site.label);
+            }
+            if verb == Verb::Rest && st.resting {
+                println!("{} is already resting; nothing to do.", site.label);
+                return Ok(());
+            }
             let g = guard(site, &st);
             let (question, detail) = verb_words(verb);
-            if !confirm_change(&g, detail, question, yes)? {
+            // A wake loses visitors nothing: not asked (the old `app start`
+            // wasn't either).
+            if verb != Verb::Wake && !confirm_change(&g, detail, question, yes)? {
                 println!("{}", style::warn("Aborted — nothing was changed."));
                 return Ok(());
             }
@@ -540,6 +580,28 @@ pub fn run(command: Command, site: &Site, experimental: bool) -> Result<()> {
             Ok(())
         }
         Route::Approve { yes } => approve(&c, site, yes),
+        Route::WakeCode { change } => {
+            match change {
+                None => {
+                    let st = c.status().map_err(ex)?;
+                    println!(
+                        "{}",
+                        crate::engine::wake_code_state(st.wake_code_set, st.lockdown)
+                    );
+                }
+                Some(true) => {
+                    let code = c.rotate_wake_code().map_err(ex)?;
+                    println!("{}", aincient_core::engine_admin::wake_code_notice(&code));
+                }
+                Some(false) => {
+                    c.revoke_wake_code().map_err(ex)?;
+                    println!(
+                        "Wake code revoked: waking by code is refused until you make a new one."
+                    );
+                }
+            }
+            Ok(())
+        }
         Route::Managers => {
             let m = pairing::managers(&c).map_err(ex)?;
             println!(
@@ -761,6 +823,39 @@ mod tests {
             }
         );
         assert_eq!(r(&["app", "open"]).unwrap(), Route::Open);
+        // Resting mode (M5).
+        assert_eq!(
+            r(&["site", "rest"]).unwrap(),
+            Route::Verb {
+                verb: Verb::Rest,
+                yes: false
+            }
+        );
+        assert_eq!(
+            r(&["site", "wake"]).unwrap(),
+            Route::Verb {
+                verb: Verb::Wake,
+                yes: true
+            }
+        );
+        assert_eq!(
+            r(&["engine", "wake-code"]).unwrap(),
+            Route::WakeCode { change: None }
+        );
+        assert_eq!(
+            r(&["engine", "wake-code", "--rotate"]).unwrap(),
+            Route::WakeCode { change: Some(true) }
+        );
+        assert_eq!(
+            r(&["engine", "wake-code", "--revoke"]).unwrap(),
+            Route::WakeCode {
+                change: Some(false)
+            }
+        );
+        assert!(
+            Cli::try_parse_from(["atelier", "engine", "wake-code", "--rotate", "--revoke"])
+                .is_err()
+        );
     }
 
     #[test]

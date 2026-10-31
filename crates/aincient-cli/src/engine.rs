@@ -69,6 +69,16 @@ pub enum EngineCommand {
     /// Make a new one-time install code (over SSH, or on this computer): it
     /// pairs a site's first Manager as its primary. Replaces an unused one.
     InstallCode,
+    /// The site's wake code (m5-3, D-10): whether one is set; with --rotate
+    /// a new one, shown once; with --revoke none, so waking by code is
+    /// refused. It wakes the site from /atelier while it rests, and signs
+    /// nobody in.
+    WakeCode {
+        #[arg(long, conflicts_with = "revoke")]
+        rotate: bool,
+        #[arg(long)]
+        revoke: bool,
+    },
     /// On the site's PRIMARY Manager: Managers waiting to join (name,
     /// address, age). Their codes are on their own screens, never here.
     Requests,
@@ -116,6 +126,7 @@ pub fn check_experimental(cmd: &EngineCommand, experimental: bool) -> Result<()>
         EngineCommand::Disable => "disable",
         EngineCommand::Remove { .. } => "remove",
         EngineCommand::InstallCode => "install-code",
+        EngineCommand::WakeCode { .. } => "wake-code",
         EngineCommand::Requests => "requests",
         EngineCommand::Approve { .. } => "approve",
         EngineCommand::Managers => "managers",
@@ -188,6 +199,11 @@ pub fn run_on_host(
             println!("{}", engine_admin::install_code_notice(&code));
             Ok(())
         }
+        EngineCommand::WakeCode { rotate, revoke } => wake_code_admin(
+            &engine_admin::LocalDocker,
+            engine_admin::probe(stack).as_ref(),
+            wake_code_change(rotate, revoke),
+        ),
         EngineCommand::Requests => Err(not_token_paired("requests", "on this computer")),
         EngineCommand::Approve { .. } => Err(not_token_paired("approve", "on this computer")),
         EngineCommand::Managers => Err(not_token_paired("managers", "on this computer")),
@@ -211,6 +227,54 @@ pub fn run_on_host(
         EngineCommand::Serve { .. } | EngineCommand::Admin { .. } | EngineCommand::Probe { .. } => {
             unreachable!("these go through run_without_site")
         }
+    }
+}
+
+/// `--rotate` is `Some(true)`, `--revoke` `Some(false)`, neither `None`
+/// (show whether one is set).
+pub fn wake_code_change(rotate: bool, revoke: bool) -> Option<bool> {
+    match (rotate, revoke) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// `engine wake-code` through `docker exec` (this computer or SSH).
+pub fn wake_code_admin<D: engine_admin::DockerExec + ?Sized>(
+    docker: &D,
+    info: Option<&engine_admin::EngineInfo>,
+    change: Option<bool>,
+) -> Result<()> {
+    match change {
+        None => {
+            let st = engine_admin::EngineAdmin::new(docker, info, "wake-code")?.status()?;
+            println!("{}", wake_code_state(st.wake_code_set, st.lockdown));
+        }
+        Some(true) => {
+            let code =
+                engine_admin::wake_code(docker, info, false)?.expect("a rotate returns its code");
+            println!("{}", engine_admin::wake_code_notice(&code));
+        }
+        Some(false) => {
+            engine_admin::wake_code(docker, info, true)?;
+            println!("Wake code revoked: waking by code is refused until you make a new one.");
+        }
+    }
+    Ok(())
+}
+
+/// Whether a wake code is set, in words (never the code: only its hash is kept).
+pub fn wake_code_state(set: bool, locked: bool) -> String {
+    let state = if set {
+        "A wake code is set (only its hash is kept; `--rotate` makes a new one)."
+    } else {
+        "No wake code: waking by code is refused. `--rotate` makes one."
+    };
+    if locked {
+        format!("{state} The site is locked down, so waking by code is off until unlock.")
+    } else {
+        state.to_string()
     }
 }
 
@@ -337,6 +401,7 @@ mod tests {
             &["disable"],
             &["remove", "--yes"],
             &["install-code"],
+            &["wake-code", "--rotate"],
             &["requests"],
             &["approve"],
             &["managers"],
