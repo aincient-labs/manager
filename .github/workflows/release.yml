@@ -87,13 +87,191 @@ jobs:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
 
+  # The experimental engine image (DECISIONS 0487), built from this tag and
+  # pushed to GHCR as ghcr.io/aincient-labs/atelier-engine:<version> (never
+  # `latest`), BEFORE the binaries: every Manager build compiles in the
+  # image's digest (ATELIER_ENGINE_DIGEST) and `atelier engine enable` pins
+  # <repo>@sha256:<digest>, never the tag. Not on pull requests (no push).
+  #
+  # One native runner per architecture (no QEMU: a Rust release build under
+  # emulation takes far longer), each pushing its image by digest only; then
+  # engine-image joins them into one multi-arch index under the version tag.
+  # A version's image is immutable: when the tag already exists (a re-run),
+  # both steps reuse its digest instead of pushing a new one, so the CLI and
+  # the GUI (release-gui.yml reads the same tag) agree.
+  engine-image-build:
+    name: engine-image-build (${{ matrix.platform }})
+    if: ${{ !github.event.pull_request }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ENGINE_IMAGE_REPO: ghcr.io/aincient-labs/atelier-engine
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: version
+        name: Engine image version
+        shell: bash
+        run: |
+          # v0.13.0 → 0.13.0 (a docker tag has no '+', so build metadata is refused)
+          version="${GITHUB_REF_NAME##*/}"
+          version="${version#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $GITHUB_REF_NAME gives no engine image version ($version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - id: existing
+        name: Reuse an image already pushed for this version
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "$ENGINE_IMAGE_REPO:$VERSION" >/dev/null 2>&1; then
+            echo "$ENGINE_IMAGE_REPO:$VERSION exists: not rebuilding it"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - id: build
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: engine/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=atelier-engine
+            org.opencontainers.image.description=Atelier engine sidecar (EXPERIMENTAL, opt-in)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=GPL-2.0-or-later
+          outputs: type=image,name=${{ env.ENGINE_IMAGE_REPO }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export the digest
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine-digests"
+          touch "$RUNNER_TEMP/engine-digests/${DIGEST#sha256:}"
+      - name: Upload the digest
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: engine-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/engine-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  engine-image:
+    needs:
+      - engine-image-build
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ENGINE_IMAGE_REPO: ghcr.io/aincient-labs/atelier-engine
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - id: version
+        name: Engine image version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME##*/}"
+          version="${version#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - id: existing
+        name: Keep an image already pushed for this version
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "$ENGINE_IMAGE_REPO:$VERSION" >/dev/null 2>&1; then
+            echo "$ENGINE_IMAGE_REPO:$VERSION exists: keeping it"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download the per-arch digests
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: engine-digests-*
+          path: ${{ runner.temp }}/engine-digests
+          merge-multiple: true
+      - name: Push the multi-arch index under the version tag
+        if: ${{ steps.existing.outputs.exists != 'true' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for f in "$RUNNER_TEMP"/engine-digests/*; do
+            sources+=("$ENGINE_IMAGE_REPO@sha256:$(basename "$f")")
+          done
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "::error::expected 2 per-arch digests (amd64, arm64), got ${#sources[@]}"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.revision=$REVISION" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$ENGINE_IMAGE_REPO:$VERSION" \
+            "${sources[@]}"
+      - id: digest
+        name: The index digest the Manager builds pin
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "$ENGINE_IMAGE_REPO:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no sha256 digest for $ENGINE_IMAGE_REPO:$VERSION (got '$digest')"
+            exit 1
+          fi
+          docker buildx imagetools inspect "$ENGINE_IMAGE_REPO@$digest"
+          echo "Pinned by this release: $ENGINE_IMAGE_REPO@$digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
   # Build and packages all the platform-specific things
   build-local-artifacts:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+      - engine-image
+    # The engine image must have been pushed for a release (0487); it is
+    # skipped only on pull requests, which never publish.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.engine-image.result == 'success' || (needs.engine-image.result == 'skipped' && needs.plan.outputs.publishing != 'true')) && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -112,6 +290,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # Compiled into the CLI (option_env!, 0487): what `atelier engine
+      # enable` pins. Empty on pull requests: a developer build.
+      ATELIER_ENGINE_DIGEST: ${{ needs.engine-image.outputs.digest }}
     steps:
       - name: enable windows longpaths
         run: |

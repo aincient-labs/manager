@@ -27,6 +27,8 @@ on:
 
 permissions:
   contents: write
+  # Read the engine image's digest from GHCR (DECISIONS 0487).
+  packages: read
 
 jobs:
   build:
@@ -91,6 +93,42 @@ jobs:
           mkdir -p "$keydir"
           printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$keydir/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$keydir/AuthKey.p8" >> "$GITHUB_ENV"
+
+      # DECISIONS 0487: the GUI, like the CLI, compiles in the digest of the
+      # engine image release.yml pushes from this tag
+      # (ghcr.io/aincient-labs/atelier-engine:<version>), so adding the engine
+      # to a site on this computer pins <repo>@sha256:<digest>. Read straight
+      # from the registry API (curl: no docker on the macOS/Windows runners),
+      # waiting for release.yml's engine-image job; no digest, no GUI release.
+      - name: Engine image digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          repo=aincient-labs/atelier-engine
+          version="${GITHUB_REF_NAME##*/}"
+          version="${version#v}"
+          digest=''
+          for i in $(seq 1 60); do
+            # A fresh registry token each try: they are short-lived.
+            token=$(curl -fsS -u "x:$GH_TOKEN" \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:$repo:pull" \
+              2>/dev/null | jq -r '.token // empty') || true
+            digest=$(curl -fsSI -H "Authorization: Bearer $token" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/$repo/manifests/$version" 2>/dev/null \
+              | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}') || true
+            [ -n "$digest" ] && break
+            echo "waiting for ghcr.io/$repo:$version from release.yml… ($i/60)"
+            sleep 30
+          done
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no engine image ghcr.io/$repo:$version (got '$digest')"
+            exit 1
+          fi
+          echo "Engine image pinned by this GUI: ghcr.io/$repo@$digest"
+          echo "ATELIER_ENGINE_DIGEST=$digest" >> "$GITHUB_ENV"
 
       # Build the native bundles ONLY — no `tagName`/`releaseName`, so tauri-action
       # does not create or upload a Release. It exposes the built bundle paths as
