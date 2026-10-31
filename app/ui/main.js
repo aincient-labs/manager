@@ -443,9 +443,11 @@ async function refresh() {
   if (remote) {
     const before = remoteStates[row.slug];
     if (!(before && before.state === "frozen" && status.running)) {
-      const rested = engineWord(status) === "resting";
+      // The engine's word for a site that isn't up, where it has one.
+      const word = engineWord(status);
+      const held = ["resting", "waking", "locked"].includes(word) ? word : "stopped";
       remoteStates[row.slug] = {
-        state: status.running ? "running" : rested ? "resting" : "stopped",
+        state: status.running ? "running" : held,
         version: status.version,
       };
       renderSites();
@@ -497,6 +499,8 @@ const REMOTE_STATE_WORDS = {
   frozen: "Frozen",
   stopped: "Stopped",
   resting: "Resting",
+  waking: "Waking",
+  locked: "Locked down",
 };
 
 function siteState(row) {
@@ -523,7 +527,7 @@ function siteDot(row) {
   const st = remoteStates[row.slug];
   if (!st) return "";
   return (
-    { running: "up", frozen: "warn", resting: "warn", stopped: "down", unreachable: "warn" }[
+    { running: "up", frozen: "warn", resting: "warn", waking: "warn", locked: "down", stopped: "down", unreachable: "warn" }[
       st.state
     ] || ""
   );

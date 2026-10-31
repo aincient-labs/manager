@@ -1900,6 +1900,10 @@ pub enum SiteState {
     /// Rested by its engine (M5): the app is down and visitors get the
     /// snapshot until it is woken. Only a paired site reports it.
     Resting,
+    /// Its engine is starting it from rest; not up yet.
+    Waking,
+    /// Locked down by its engine (D-09): resting, with waking off.
+    Locked,
     /// The server didn't answer in time, or answered with an error.
     Unreachable { reason: String },
 }
@@ -1908,7 +1912,10 @@ impl SiteState {
     /// Whether changing it needs the typed slug (D-07) — see
     /// [`crate::guard::is_live`]: frozen and unreachable count as live.
     pub fn is_live(&self) -> bool {
-        !matches!(self, SiteState::Stopped | SiteState::Resting)
+        !matches!(
+            self,
+            SiteState::Stopped | SiteState::Resting | SiteState::Waking | SiteState::Locked
+        )
     }
 }
 
@@ -2858,6 +2865,10 @@ mod tests {
             !SiteState::Resting.is_live(),
             "its app is down, as the paired guard says"
         );
+        for (state, word) in [(SiteState::Waking, "waking"), (SiteState::Locked, "locked")] {
+            assert_eq!(serde_json::to_value(&state).unwrap()["state"], word);
+            assert!(!state.is_live(), "{word}: its app isn't up");
+        }
     }
 
     #[test]

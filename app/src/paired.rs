@@ -91,7 +91,9 @@ pub fn guard(site: &Site) -> ChangeGuard {
 pub fn probe(site: &Site) -> remote::SiteState {
     match client(site).and_then(|c| c.status().map_err(|e| explain(site, e))) {
         Ok(st) if st.app == "running" => remote::SiteState::Running { version: None },
+        Ok(st) if st.lockdown || st.state == "locked" => remote::SiteState::Locked,
         Ok(st) if st.state == "resting" => remote::SiteState::Resting,
+        Ok(st) if st.state == "waking" => remote::SiteState::Waking,
         Ok(_) => remote::SiteState::Stopped,
         Err(reason) => remote::SiteState::Unreachable { reason },
     }
