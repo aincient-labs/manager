@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Server backups come home.** A backup made on a server is copied to
   `~/.atelier/remote/<slug>/backups` and checked against the server's size and SHA-256
   (`--no-copy` keeps it on the server). A backup on this computer restores onto the server by
-  upload; `--on-server` takes a path on the server.
+  upload; `--on-server` takes a path on the server. Both show each step as it happens: the server's own steps
+  (dumping, packing, loading, rebuilding caches) and the Manager's (uploading or copying with
+  the size, the SHA-256 check), so a minute-long backup is never a blank progress box.
 - **Backups know their site.** Every new backup records the site it came from, and restore
   refuses another site's backup unless you pass `--other-site` (the window asks). Older backups
   restore with a warning. `data backup --json` prints the archive's path, size and checksum.
