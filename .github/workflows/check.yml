@@ -1,0 +1,51 @@
+# Compiles the workspace on every OS a release builds for, on every push and
+# pull request — so a platform-specific break (a `cfg(unix)` module used from
+# cross-platform code, say) fails HERE, on a branch, and never on a public tag.
+# `bin/release-manager publish` (umbrella repo) waits for this workflow to pass
+# on the release commit before it tags.
+#
+# The Tauri GUI (`atelier-manager`) is excluded: on Linux it needs GTK/WebKit
+# system packages, and release-gui.yml builds it on every tag anyway. Tests run
+# once, on ubuntu-22.04; the other runners only compile.
+name: Check
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-22.04-arm
+          - macos-15
+          - windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --exclude atelier-manager --locked
+
+      - name: cargo test
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo test --workspace --exclude atelier-manager --locked
