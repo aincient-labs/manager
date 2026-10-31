@@ -589,7 +589,7 @@ pub fn run(command: Command, site: &Site, experimental: bool) -> Result<()> {
                     let st = c.status().map_err(ex)?;
                     println!(
                         "{}",
-                        crate::engine::wake_code_state(st.wake_code_set, st.lockdown)
+                        crate::wake_code::wake_code_state(st.wake_code_set, st.lockdown)
                     );
                 }
                 Some(true) => {

@@ -155,8 +155,9 @@ jobs:
         with:
           # The Tauri app crate lives in app/ (holds tauri.conf.json + src).
           projectPath: app
-          # `--target ''` is invalid, so only pass the flag on macOS.
-          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+          # `--target ''` is invalid, so only pass the flag on macOS. A prerelease
+          # (`vX.Y.Z-N`) skips the .rpm: rpm refuses a `-` in the version.
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || (matrix.platform == 'ubuntu-22.04' && contains(github.ref_name, '-') && '--bundles deb,appimage' || '') }}
 
       # cargo-dist (release.yml) owns creating the GitHub Release for this tag.
       # Wait for it to appear, then upload the GUI bundles onto it so CLI + GUI

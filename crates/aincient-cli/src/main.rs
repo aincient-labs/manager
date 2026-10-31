@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 mod engine;
 mod paired;
 mod style;
+mod wake_code;
 
 #[derive(Parser)]
 #[command(
@@ -2632,7 +2633,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
         }
         Route::WakeCode { change } => {
             let info = session.engine_info()?;
-            engine::wake_code_admin(&session, info.as_ref(), change)
+            wake_code::wake_code_admin(&session, info.as_ref(), change)
         }
         Route::InstallCode => {
             let info = session.engine_info()?;
