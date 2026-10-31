@@ -1412,6 +1412,11 @@ struct SiteView {
     #[serde(flatten)]
     row: SiteRow,
     running: bool,
+    /// For a site on this computer that isn't running: the engine's word
+    /// (resting, locked, …) when it has one, so the switcher doesn't say
+    /// "Stopped" for a site the engine put to rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine_state: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1440,8 +1445,16 @@ async fn list_sites(sel: State<'_, Selected>) -> Result<SitesView, String> {
         let sites = rows
             .into_iter()
             .map(|row| {
-                let running = docker_up && row.installed && ops::is_running(&row.stack());
-                SiteView { row, running }
+                let stack = row.stack();
+                let running = docker_up && row.installed && ops::is_running(&stack);
+                let engine_state = (docker_up && row.installed && !running)
+                    .then(|| ops::engine_state_of(&stack))
+                    .flatten();
+                SiteView {
+                    row,
+                    running,
+                    engine_state,
+                }
             })
             .collect();
         Ok(SitesView { selected, sites })

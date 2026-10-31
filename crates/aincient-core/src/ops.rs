@@ -401,6 +401,15 @@ fn with_engine_state(mut info: crate::engine_admin::EngineInfo) -> crate::engine
     info
 }
 
+/// The engine's word for a site that isn't running (resting, locked, …), so a
+/// list of sites can say why it is down. `None` without an engine or an answer.
+/// Costs a `compose ps` and one `docker exec`, so ask only for stopped sites.
+pub fn engine_state_of(stack: &Stack) -> Option<String> {
+    crate::engine_admin::probe(stack)
+        .map(with_engine_state)
+        .and_then(|e| e.state)
+}
+
 /// Is the stack's `app` container running? One `compose ps`, no HTTP probe —
 /// cheap enough to ask for every site in a list. Assumes Docker is up; a failed
 /// probe reads as not running.

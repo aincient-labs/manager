@@ -512,7 +512,15 @@ function siteState(row) {
     return REMOTE_STATE_WORDS[st.state] || "—";
   }
   if (!row.installed) return "Not set up yet";
-  return row.running ? "Running" : "Stopped";
+  if (row.running) return "Running";
+  return REMOTE_STATE_WORDS[localHeld(row)] || "Stopped";
+}
+
+// A site on this computer that isn't running: the engine's word for it
+// (resting, waking, locked) when it has one, else plain "stopped".
+function localHeld(row) {
+  const word = row.engine_state;
+  return ["resting", "waking", "locked"].includes(word) ? word : "stopped";
 }
 
 // The switcher line under a site's name. A server that didn't answer is
@@ -524,7 +532,10 @@ function siteMeta(row) {
 }
 
 function siteDot(row) {
-  if (!row.host) return row.running ? "up" : "down";
+  if (!row.host) {
+    if (row.running) return "up";
+    return { resting: "warn", waking: "warn", locked: "down" }[localHeld(row)] || "down";
+  }
   const st = remoteStates[row.slug];
   if (!st) return "";
   return (
