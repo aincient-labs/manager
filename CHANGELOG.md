@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Backups know their site.** Every new backup records the site it came from, and restore
   refuses another site's backup unless you pass `--other-site` (the window asks). Older backups
   restore with a warning. `data backup --json` prints the archive's path, size and checksum.
+- **The experimental engine ships as a published image.** Each release builds
+  `ghcr.io/aincient-labs/atelier-engine:<version>` (linux/amd64 and linux/arm64) from the same tag,
+  and the CLI and the desktop app carry its digest: `atelier engine enable --experimental` pulls
+  the image and pins it by that digest, never by a tag. Building the image on the server
+  (`engine/build.sh`) remains for developer builds of the Manager, which say so when they enable.
 
 ### Changed
 

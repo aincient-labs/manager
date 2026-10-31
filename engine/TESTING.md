@@ -4,7 +4,8 @@ Thank you for testing this. This kit says what the engine is, what we would like
 the rules, how to set up a server for it, the checklist, what we already know, and how to tell us
 what you find.
 
-Version under test: **manager commit `<COMMIT>`** <!-- owner: fill in when the channel is chosen (plan m7-6) -->.
+Version under test: **Manager `<VERSION>`** (tag `v<VERSION>`, commit `<COMMIT>`) and the engine image
+published with it, `ghcr.io/aincient-labs/atelier-engine:<VERSION>` <!-- owner: fill in when the channel is chosen (plan m7-6); the GHCR package must be public before testers pull it -->.
 How you get it: **`<CHANNEL>`** <!-- owner: a build shared with testers only, or a public experimental tag that is never `latest` or `edge` (m7-6) -->.
 You also receive the design, `manager-sidecar-security.md`. Its threats table, floors and tester
 checklist are the reference for everything below.
@@ -102,23 +103,35 @@ ip6tables -I INPUT       -i eth0 -p tcp --dport 41221:41299 -j DROP
 curl -fsSL https://aincient-labs.com/atelier/install.sh | bash
 ```
 
-**4. Build the engine image and the Linux CLI from `<COMMIT>`.** The engine image is built on the
-server and never pulled; the CLI binary inside it is the same build, so you can copy it out.
+**4. Install the Manager CLI `<VERSION>` on the server.** Each Manager release carries the digest of
+the engine image built and published from the same tag, `ghcr.io/aincient-labs/atelier-engine:<VERSION>`
+(linux/amd64 and linux/arm64); step 6 pulls that image **by digest** and pins it. Nothing is built
+on the server, and the tag is never what runs. The source checkout is only for `engine/attack.sh`
+and `engine/console-standin.sh`.
 
 <!-- owner: replace <SOURCE> with how testers get the source (m7-6) -->
 
 ```sh
 # atelier
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/aincient-labs/manager/releases/download/v<VERSION>/atelier-installer.sh | sh
+atelier --version                     # <VERSION>; open a new shell if it isn't on PATH yet
+git clone <SOURCE> manager && cd manager && git checkout v<VERSION>
+```
+<!-- verify: this published-image path is new (DECISIONS 0487); our VPS runs used the developer path below. -->
+
+**Developer path: build the image on the server.** A Manager you build yourself carries no
+released image; `enable` then says it is a developer build and pins a local `atelier-engine:dev`
+by its image ID instead. Use this only to test a commit that has no release:
+
+```sh
+# atelier
 git clone <SOURCE> manager && cd manager && git checkout <COMMIT>
 engine/build.sh                       # docker build → atelier-engine:dev (local only)
-mkdir -p ~/.local/bin
-docker create --name atelier-cli atelier-engine:dev
-docker cp atelier-cli:/usr/local/bin/atelier ~/.local/bin/atelier && docker rm atelier-cli
+docker run --rm -v "$PWD":/src -w /src rust:1-bookworm cargo build --release --locked -p atelier
+mkdir -p ~/.local/bin && cp target/release/atelier ~/.local/bin/atelier
 atelier --version
 ```
-<!-- verify: copying the CLI out of the engine image (static musl build) was not what our VPS run did;
-we built it with `docker run --rm -v "$PWD":/src -w /src rust:1-bookworm cargo build --release --locked -p atelier`.
-Either should work; the second is the one we ran. -->
 
 **5. A TLS proxy.** The Manager talks to the engine over HTTPS only, so put a proxy in front. Ours
 was Caddy (official image, host network), with this `Caddyfile`:
@@ -148,8 +161,9 @@ echo 'ATELIER_TRUSTED_PROXIES=172.18.0.1' >> ~/.atelier/.env
 IPs or CIDRs, comma or space separated; `0.0.0.0/0` and the like are refused. Never list an address
 an untrusted client can arrive as.
 
-**6. Enable the engine.** It pins the image you built by its ID, writes `compose.engine.yaml` and
-`edge.engine.conf`, restarts the stack and prints the **install code** (`XXXX-XXXX-XXXX-XXXX`,
+**6. Enable the engine.** It pulls the engine image this Manager release carries and pins it by
+digest (`ATELIER_ENGINE_IMAGE=ghcr.io/aincient-labs/atelier-engine@sha256:…` in `.env`; on the
+developer path, the local image's ID), writes `compose.engine.yaml` and `edge.engine.conf`, restarts the stack and prints the **install code** (`XXXX-XXXX-XXXX-XXXX`,
 shown once) that pairs your first Manager. Keep it private. The released installer wrote the
 stack files from the released templates, and `enable` refuses while they differ from this build's;
 `doctor --fix` rewrites them (your `.env` values, such as `ATELIER_TRUSTED_PROXIES`, are kept).
@@ -158,6 +172,7 @@ stack files from the released templates, and `enable` refuses while they differ 
 # atelier
 atelier doctor --fix
 atelier engine enable --experimental
+grep ATELIER_ENGINE_IMAGE ~/.atelier/.env   # …/atelier-engine@sha256:<64 hex>, never a tag
 ss -ltn | grep 41221            # expect 127.0.0.1:41221 only, no 0.0.0.0 or [::]
 atelier doctor                  # the "(EXPERIMENTAL)" lines should all be [x]
 curl -s https://test.example.org/_atelier/engine/v1/version
@@ -168,8 +183,9 @@ Compose would publish it anywhere else; the proxy is then the only way in. Witho
 on all addresses and every client is its own TCP peer. A new install code, any time:
 `docker exec atelier-engine-1 atelier engine admin install-code`.
 
-**7. Pair a Manager.** On your own computer, build the CLI from `<COMMIT>` (`cargo build --release
---locked -p atelier`; the binary is `target/release/atelier`) and pair it as the primary. It asks
+**7. Pair a Manager.** On your own computer, install the same Manager release `<VERSION>` (the
+installer from step 4, or the desktop app from the same GitHub release; on the developer path, build
+it from `<COMMIT>` with `cargo build --release --locked -p atelier`) and pair it as the primary. It asks
 for the install code; the token goes to the OS keychain.
 
 ```sh
@@ -318,8 +334,10 @@ is a new finding.
 5. **A killed `compose exec` may leave drush running** inside `app` until `app` stops.
 6. **The console (Drupal) can revoke every non-primary Manager** through the inbox. It can't revoke
    the primary or add one.
-7. **The engine image is pinned by its local image ID**, not a registry digest, and is not signed.
-   It is built on your server from source; publishing and signing come later.
+7. **The engine image is pinned by its registry digest, but not signed.** The Manager release
+   carries the digest of the image built from the same tag (DECISIONS 0487), so a retag or a
+   compromised registry tag can't change what runs; nothing yet proves who built that image
+   beyond the release workflow. Signing comes later.
 8. **Wake is slower than the 20 s budget on the released Atelier** (about 27 s on 2 vCPU / 4 GB).
    A faster restart exists in an unreleased cms build. Not a security issue.
 9. **Many addresses can keep an owner without a Manager from waking by code** until the pause ends
@@ -342,7 +360,8 @@ without GitHub need another path, add the contact here -->
 
 Include:
 
-- the commit (`<COMMIT>`) and `atelier --version`, on the server and the Manager;
+- the commit (`<COMMIT>`) and `atelier --version`, on the server and the Manager, and the engine pin
+  (`grep ATELIER_ENGINE_IMAGE ~/.atelier/.env`);
 - how your setup differs from section 4 (OS, Docker and Compose versions, proxy, firewall);
 - the steps, as commands, from a fresh setup;
 - what an attacker gets, and from where they start (internet, `app`, a paired Manager, the host);
@@ -363,7 +382,7 @@ What happens next:
 
 ```
 Title:
-Commit / versions:       <COMMIT>, atelier --version (server, Manager)
+Commit / versions:       <COMMIT>, atelier --version (server, Manager), ATELIER_ENGINE_IMAGE
 Setup deltas:            OS, Docker/Compose, proxy, ATELIER_TRUSTED_PROXIES, firewall
 Starting position:       internet | app container (www-data/root) | paired Manager (primary/junior) | host
 Checklist line(s):

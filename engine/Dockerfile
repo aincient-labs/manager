@@ -1,8 +1,12 @@
 # The Atelier engine sidecar: EXPERIMENTAL, opt-in only (DECISIONS 0483).
-# Built locally by engine/build.sh as atelier-engine:dev and never pushed;
-# `atelier engine enable` pins the stack to this build's image ID, never the
-# tag (ATELIER_ENGINE_IMAGE in .env, plan m7-4). Context: the manager repo
-# root. Base images are pinned by digest (tag kept for the reader).
+# Published by the release workflow from each Manager tag as
+# ghcr.io/aincient-labs/atelier-engine:<version> (linux/amd64 + linux/arm64),
+# and every Manager build carries that image's digest: `atelier engine enable`
+# pins <repo>@sha256:<digest>, never the tag (ATELIER_ENGINE_IMAGE in .env,
+# DECISIONS 0487). Developer path: engine/build.sh builds it locally as
+# atelier-engine:dev, which only a developer build of the Manager pins, by
+# image ID (m7-4). Context: the manager repo root. Base images are pinned by
+# digest (tag kept for the reader).
 FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
