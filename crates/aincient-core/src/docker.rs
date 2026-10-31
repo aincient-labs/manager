@@ -732,16 +732,21 @@ fn probe_result(out: Output) -> std::result::Result<String, String> {
 /// For best-effort probes (image digests, container labels); bounded by
 /// [`LOCAL_PROBE_TIMEOUT`], and a timeout is just another `None`.
 pub fn try_capture(mut cmd: Command) -> Option<String> {
-    let out = output_within(&mut cmd, LOCAL_PROBE_TIMEOUT).ok()?;
+    capture_ok(&mut cmd).filter(|s| !s.is_empty())
+}
+
+/// Like [`try_capture`], but an empty answer is an answer (`Some("")`):
+/// `compose ps` saying "no containers" is not the same as it failing.
+pub fn try_capture_empty_ok(mut cmd: Command) -> Option<String> {
+    capture_ok(&mut cmd)
+}
+
+fn capture_ok(cmd: &mut Command) -> Option<String> {
+    let out = output_within(cmd, LOCAL_PROBE_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]
@@ -752,6 +757,18 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener};
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// "No containers" (success, empty) is an answer; a failure isn't.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_answer_is_not_a_failure() {
+        assert_eq!(
+            super::try_capture_empty_ok(Command::new("true")).as_deref(),
+            Some("")
+        );
+        assert_eq!(super::try_capture(Command::new("true")), None);
+        assert_eq!(super::try_capture_empty_ok(Command::new("false")), None);
+    }
 
     /// Is a process with this pid still there (a zombie counts as there)?
     #[cfg(unix)]

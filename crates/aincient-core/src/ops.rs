@@ -1372,7 +1372,9 @@ fn container_state_from_ps(out: &str) -> ContainerState {
 fn observe_container(stack: &Stack) -> ContainerState {
     let mut c = compose(stack);
     c.args(["ps", "-a", "--format", "json"]);
-    match try_capture(c) {
+    // An empty list means no containers (Missing → `up`), not a failed ask:
+    // a site whose containers are gone must not get `compose start`.
+    match docker::try_capture_empty_ok(c) {
         Some(out) => container_state_from_ps(&out),
         None => ContainerState::Unknown,
     }
