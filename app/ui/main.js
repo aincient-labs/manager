@@ -24,6 +24,7 @@ let lastExportHadBaseUrl = false; // did that export get a real website address?
 let managerVersion = ""; // this app's own version, shown in the chrome
 let siteRows = []; // list_sites rows, for the header switcher
 let selectedSlug = null; // the site this window operates on (registry slug)
+let startingRecheck = null; // timer that re-reads status while "Starting up…"
 // Sites on a server (M2): what each one's server last said (probe_site /
 // get_status), by slug — {state: running|frozen|stopped|unreachable, …}.
 const remoteStates = {};
@@ -962,6 +963,15 @@ function renderStatus(status) {
     toggle.classList.remove("hidden");
     $("startstop-label").textContent = "Stop";
   } else if (status.running) {
+    // Nothing else re-reads status here (a Start from this window waits for the
+    // site itself), so a window opened while the site boots would stay on
+    // "Starting up…" until something was clicked.
+    if (!startingRecheck) {
+      startingRecheck = setTimeout(() => {
+        startingRecheck = null;
+        refresh().catch((e) => showError(String(e)));
+      }, 3000);
+    }
     dot.className = "dot up";
     headline.textContent = "Starting up…";
     sub.textContent = "Almost there — this usually takes a few seconds.";
