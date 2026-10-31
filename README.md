@@ -51,7 +51,9 @@ so it's always qualified by its namespace). The stack directory defaults to `~/.
 ### Several sites
 
 One machine can run several independent sites — each its own appliance with its own containers,
-Postgres, files, port and backups. `~/.atelier/sites.toml` lists them and says which one is active:
+Postgres, files, port and backups. `~/.atelier/sites.toml` lists them and says which one is active
+(sites on a server are kept in `~/.atelier/sites.remote.toml`, so an older Manager still reads
+`sites.toml`):
 
 ```
 atelier sites add blog --label "Blog"   # ~/.atelier/sites/blog, first free port, installed

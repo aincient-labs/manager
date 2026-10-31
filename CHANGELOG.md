@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server site that is running, frozen or not, you type the site's short name; `--yes` alone doesn't skip it, so
   scripts pass `--yes --confirm-slug <slug>`. `app stop` and `site freeze|use|live|prune` take
   `--yes`.
+- Sites on a server are kept in `~/.atelier/sites.remote.toml`; `sites.toml` holds only the sites on
+  this computer, in the shape Manager 0.12.1 reads, so going back to 0.12.1 keeps every local site.
+  A `sites.toml` with server sites in it (from a pre-release build) is split the first time it is read.
 
 - The GUI's set-up screen installs a newly added site on the port it was registered with, the
   same rule as `atelier app install`, instead of always offering 41221.
