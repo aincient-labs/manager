@@ -405,6 +405,9 @@ fn print_status(site: &Site, st: &EngineStatus) {
             aincient_core::engine_admin::state_words(&st.state)
         );
     }
+    if let Some(v) = &st.version {
+        println!("  Version:  {v}");
+    }
     println!("  App:      {}", st.app);
     println!("  Database: {}", st.db);
     println!(
