@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The Manager window wears the new brand**, matching aincient-labs.com and the Atelier
+  console: paper and ink, 1px rules instead of cards and shadows, square corners, IBM Plex Sans
+  (bundled, still fully offline), and the new Atelier CMS mark in the window and as the app icon.
+  Highlights are ink; red only means something is wrong. A site that is starting up now shows
+  the amber "waiting" square instead of the green "running" one.
+
 ## [0.13.1] - 2026-11-01
 
 ### Fixed

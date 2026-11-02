@@ -1,103 +1,82 @@
-/* Atelier Manager — app-tier chrome on the Atelier kit (brand.md §3/§10).
-   Tokens mirror the console's canonical :root (aincient_chat/chat-ui/src/
-   styles.css): gesso-paper grounds, bistre ink, ONE cinnabar pigment, soft
-   diffuse shadows ("light falls, nothing glows"), the 4/7/10/14 radius
-   family. Light = gesso (default); dark = studio night via the OS scheme.
-   The arcade cut (Press Start 2P, 2px corners, hard offset shadows,
-   steps() motion, spectrum stripe) is retired — DECISIONS 0174. */
+/* Atelier Manager — the Monograph app tier (umbrella docs/brand.md §1–3, §10;
+   DECISIONS 0500, 0501). The same palette as the website and the console:
+   paper and ink, 1px rules instead of boxes, square corners, IBM Plex Sans.
+   Highlight (selected, active, focus, the primary) is INK; red only means
+   something is wrong; cinnabar lives in the mark only. Shadows only on what
+   sits above the page (menus, dialogs). Dark follows the OS scheme. */
 
-/* Fraunces (OFL) — the display serif, bundled locally, never CDN'd (Tauri
-   runs offline; operator surfaces leak no IP — DECISIONS 0058 posture).
-   Body/UI runs the study-02 system stack, same as the console. */
+/* IBM Plex Sans (OFL) — the one face, bundled locally, never CDN'd (Tauri runs
+   offline; operator surfaces leak no IP — DECISIONS 0058 posture). Variable,
+   latin subset, the same file the website ships. */
 @font-face {
-  font-family: "Fraunces";
+  font-family: "IBM Plex Sans";
   font-style: normal;
-  font-weight: 400 600;
+  font-weight: 100 700;
   font-display: swap;
-  src: url("fonts/fraunces.woff2") format("woff2");
-}
-
-/* Schibsted Grotesk (OFL) — the body/UI sans, same face the marketing site and
-   the console run (apps/website · Schibsted Grotesk, latin subset). Bundled
-   locally so the manager reads as the same shop as the homepage while staying
-   offline-first. Replaces the bare system-ui stack that made the app feel flat. */
-@font-face {
-  font-family: "Schibsted Grotesk";
-  font-style: normal;
-  font-weight: 400 700;
-  font-display: swap;
-  src: url("fonts/schibsted-grotesk.woff2") format("woff2");
+  src: url("fonts/plex-sans-latin.woff2") format("woff2");
 }
 
 :root {
-  /* Gesso paper (Atelier light — default): the tokens are taken VERBATIM from the
-     marketing homepage (apps/website/site/assets/css/styles.css) so the manager
-     reads as the same warm-paper shop as aincient-labs.com — a bright #FDFCFA
-     ground with pure-white raised cards, not the grey ground it used to wear. */
-  --bg: #fdfcfa; /* warm off-white ground — the window canvas (site --paper) */
-  --surface: #ffffff; /* raised cards — the brightest paper (site --card) */
-  --surface-2: #f4f1ec; /* chrome / recessed fills (site --paper-2) */
-  --border: #e8e3da; /* hairline (site --line) */
-  --border-strong: rgba(25, 23, 20, 0.16); /* soft stone (site --line-strong) */
-  --text: #191714; /* bistre ink (site --ink) */
-  --text-dim: #6b655b; /* muted (site --muted) */
-  --text-faint: #948e83; /* a lighter muted — the app's own faint step */
-  --accent: #b94430; /* CINNABAR — the one pigment (site --cinnabar) */
-  --accent-deep: #a83825; /* pressed / hover cinnabar (site --cinnabar-deep) */
-  --accent-2: #b87400; /* warm ochre — quiet secondary (site --amber) */
-  --jade: #0e8a5f; /* verdigris — links & positive (site --mint) */
-  --danger: #c4432f; /* held apart from accent (site --coral) */
-  --on-accent: #fbf9f5; /* paper ink on a cinnabar/brick fill */
-  --shadow: #191714; /* warm ink base for inset + tinted shadows */
-  /* Diffuse "light falls, nothing glows" shadows (Law 04) — the same two-layer
-     recipe the homepage uses, so cards lift off the bright paper instead of
-     sitting flat on it. */
-  --shadow-1: 0 1px 1px rgba(25, 23, 20, 0.04),
-    0 10px 28px -16px rgba(25, 23, 20, 0.28);
-  --shadow-lift: 0 2px 3px rgba(25, 23, 20, 0.06),
-    0 16px 40px -18px rgba(25, 23, 20, 0.32);
-  /* One radius family (Law 06): chips / controls / cards / panels. */
-  --r-chip: 4px;
-  --r-control: 7px;
-  --r-card: 10px;
-  --r-panel: 14px;
+  /* Light — the website's Monograph palette (apps/website/DESIGN.md). */
+  --bg: #ffffff; /* paper — the window canvas */
+  --surface: #ffffff; /* panels share the paper; rules separate them */
+  --surface-2: #f3f1ec; /* the well — inputs, hover + selected rows, command strips */
+  --border: #e0ded9; /* hairline */
+  --border-strong: #0d0d0d; /* the ink rule that opens a block */
+  --text: #0d0d0d; /* ink */
+  --text-dim: #636363; /* caption grey (AA on paper and well) */
+  --text-faint: #8e8a84; /* placeholders only */
+  --accent: #0d0d0d; /* highlight is INK (0501): primary fill, active, selected */
+  --accent-deep: #2b2b2b; /* soft ink — the primary's hover / press */
+  --accent-2: #9a6a12; /* ochre — waiting / attention (state only) */
+  --jade: #3f7a52; /* moss — running / passing (state only) */
+  --danger: #a93a2a; /* brick — errors and destructive only */
+  --on-accent: #ffffff; /* paper text on an ink fill */
+  --mark: #c2452a; /* cinnabar — the mark's stripe, nowhere else */
+  --mark-ring: #0d0d0d; /* the mark's corners */
+  --shadow: #140e06; /* shadow ink for overlays */
+  /* Overlays only (menus, dialogs): the website's laid-object shadow. */
+  --shadow-1: 0 26px 46px -22px rgba(20, 14, 6, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.06);
+  --shadow-lift: 0 34px 60px -30px rgba(20, 14, 6, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.08);
+  /* Square (0500): the names stay so nothing else has to change. */
+  --r-chip: 0;
+  --r-control: 0;
+  --r-card: 0;
+  --r-panel: 0;
   --maxw: 720px; /* centred column — content never stretches edge-to-edge */
-  --font: "Schibsted Grotesk", ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", Helvetica, Arial, sans-serif;
-  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Palatino,
-    Georgia, serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --font: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-display: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-family: var(--font);
   /* Native control faces (select, scrollbars) follow the theme. */
   color-scheme: light;
 }
 
-/* Studio night — the atelier after hours: warm charcoal grounds, paper ink, the
-   pigment lifted a half-step for the dark ground. Mirrors the homepage's dark
-   tokens verbatim so both surfaces read as one warm-charcoal room. */
+/* Night — the website's dark Monograph palette. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #191714; /* site --paper (dark) */
-    --surface: #211e19; /* site --card (dark) */
-    --surface-2: #26221c; /* site --paper-2 (dark) */
-    --border: rgba(234, 231, 226, 0.13); /* site --line (dark) */
-    --border-strong: rgba(234, 231, 226, 0.22); /* site --line-strong (dark) */
-    --text: #eae7e2; /* site --ink (dark) */
-    --text-dim: #a29b91; /* site --muted (dark) */
-    --text-faint: #7d7669; /* the app's own faint step */
-    --accent: #e0694e; /* site --cinnabar (dark) */
-    --accent-deep: #e0694e; /* site --cinnabar-deep (dark) */
-    --accent-2: #e0a23c; /* site --amber (dark) */
-    --jade: #3fcf9b; /* site --mint (dark) */
-    --danger: #f0715c; /* site --coral (dark) */
-    --shadow: #000000; /* pure ink base for inset + tinted shadows */
-    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35),
-      0 12px 32px -16px rgba(0, 0, 0, 0.65);
-    --shadow-lift: 0 2px 4px rgba(0, 0, 0, 0.4),
-      0 18px 46px -18px rgba(0, 0, 0, 0.72);
+    --bg: #121110;
+    --surface: #121110;
+    --surface-2: #1b1a18;
+    --border: #2c2a27;
+    --border-strong: #f2f0ec;
+    --text: #f2f0ec;
+    --text-dim: #a39e96;
+    --text-faint: #6f6a63;
+    --accent: #f2f0ec;
+    --accent-deep: #d4d0c9;
+    --accent-2: #d2a24c;
+    --jade: #7fb08e;
+    --danger: #e0806c;
+    --on-accent: #121110;
+    --mark-ring: #ffffff;
+    --shadow: #000000;
+    --shadow-1: 0 26px 46px -22px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.12);
+    --shadow-lift: 0 34px 60px -30px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.16);
     color-scheme: dark;
   }
 }
+
 
 * {
   box-sizing: border-box;
@@ -117,8 +96,9 @@ body {
   overflow: hidden;
   overscroll-behavior: none;
 }
+/* Selection is an ink wash — highlight is ink (0501), moss stays a state. */
 ::selection {
-  background: color-mix(in oklch, var(--jade) 45%, transparent);
+  background: color-mix(in oklch, var(--accent) 18%, transparent);
 }
 ::-webkit-scrollbar {
   width: 8px;
@@ -128,26 +108,27 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: 999px;
+  background: var(--border);
+  border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
 }
 
-/* Mono whisper — UPPERCASE micro-labels + machine-flavoured text (Law 13
-   grammar; replaces the arcade Press Start 2P micro-type). */
+/* Whisper — a quiet sentence-case caption (the mono UPPERCASE micro-label is
+   retired; mono is for machine text only). */
 .whisper {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
-  line-height: 1.6;
-  font-weight: 500;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--text-dim);
 }
 
-/* Top bar — quiet chrome on the recessed panel ground; the mark carries the
-   brand (the viewport-edge spectrum stripe is retired — study 02, Plate 3). */
+/* Top bar — paper chrome closed by a hairline; the mark carries the brand. */
 .topbar {
   flex: none;
-  background: var(--surface-2);
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 .sprite {
@@ -172,38 +153,26 @@ body {
   gap: 12px;
   padding: 13px 20px;
 }
-/* The Atelier lockup — handcrafted monogram + outlined wordmark (masters in
-   the umbrella's brand/app-look/). Both are currentColor, so the
-   lockup themes from `color` (ink); at chrome size the wordmark stays solid
-   ink — the monogram carries the pigment (Law 03: one gesture per size). */
+/* The Atelier CMS lockup (0497; masters in the umbrella's brand/masters/):
+   mark and name at the SAME height so the name's cap height and baseline sit
+   on the A in the mark; gap = 0.11 × that height. The name is currentColor. */
 .wordmark {
+  --wordmark-height: 22px;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: calc(var(--wordmark-height) * 0.11);
   color: var(--text);
 }
-.wordmark-mark {
-  width: 22px;
-  height: 22px;
-  flex: none;
-}
+.wordmark-mark,
 .wordmark-text {
-  height: 14px;
+  height: var(--wordmark-height);
   width: auto;
+  flex: none;
   display: block;
-}
-/* The maker line — hairline-separated small-caps "by AIncient Labs", set on the
-   same line to the right of the lockup, exactly as the marketing site's header
-   does it. */
-.maker {
-  padding-left: 10px;
-  margin-left: 2px;
-  border-left: 1px solid var(--border-strong);
-  color: var(--text-faint);
 }
 /* The app's role, held quietly at the far right of the bar. */
 .app-role {
-  color: var(--text-faint);
+  color: var(--text-dim);
 }
 /* The right end of the bar: the site switcher, then the app's role. */
 .topbar-end {
@@ -228,7 +197,7 @@ body {
   padding: 5px 10px 5px 11px;
   border: 1px solid var(--border);
   border-radius: var(--r-control);
-  background: var(--surface);
+  background: transparent;
   color: var(--text);
   font-family: inherit;
   text-align: left;
@@ -237,12 +206,11 @@ body {
 }
 .site-current:hover,
 .site-current[aria-expanded="true"] {
-  background: var(--surface-2);
-  border-color: var(--border-strong);
+  border-color: var(--text);
 }
 .site-current:focus-visible {
-  outline: 3px solid color-mix(in oklch, var(--accent) 30%, transparent);
-  outline-offset: 1px;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .site-current-text {
   display: flex;
@@ -274,6 +242,7 @@ body {
 .site-current[aria-expanded="true"] .chev-down {
   transform: rotate(-90deg);
 }
+/* The menu sits above the page — one of the few things that keeps a shadow. */
 .site-menu {
   position: absolute;
   top: calc(100% + 6px);
@@ -284,7 +253,7 @@ body {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-lift);
+  box-shadow: var(--shadow-1);
   padding: 6px;
 }
 .site-menu-head {
@@ -316,11 +285,19 @@ body {
   cursor: pointer;
 }
 .site-option:hover,
-.site-menu-action:hover,
+.site-menu-action:hover {
+  background: var(--surface-2);
+}
 .site-option:focus-visible,
 .site-menu-action:focus-visible {
   background: var(--surface-2);
-  outline: none;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* The current site = the well + the ink bar (the selected-row grammar). */
+.site-option[aria-checked="true"] {
+  background: var(--surface-2);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .site-option-text {
   display: flex;
@@ -365,13 +342,6 @@ body {
   color: var(--text);
 }
 
-/* On the narrowest windows, drop the maker line before the role — the lockup
-   plus "Manager" is enough to place you. */
-@media (max-width: 452px) {
-  .maker {
-    display: none;
-  }
-}
 /* With a switcher in the bar, the role label is the first thing to give up its
    room — the site name matters more than the app's own name. */
 @media (max-width: 560px) {
@@ -417,21 +387,21 @@ main {
   text-align: left;
 }
 
-/* Action groups — a mono whisper label over a set of related actions. */
+/* Action groups — a sentence-case heading on an ink rule over related actions. */
 .group {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 .group-label {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
-  line-height: 1.6;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
   font-weight: 500;
   color: var(--text-dim);
   margin: 4px 0 0;
+  border-top: 1px solid var(--border-strong);
+  padding-top: 10px;
 }
 .action-grid {
   display: grid;
@@ -457,15 +427,17 @@ main {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
+  font-family: var(--font);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-dim);
   cursor: pointer;
   list-style: none;
   user-select: none;
+}
+.advanced > summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .advanced > summary::-webkit-details-marker {
   display: none;
@@ -491,35 +463,31 @@ main {
   display: none !important;
 }
 
-/* Cards lift on a soft diffuse shadow — light falling in a room (Law 04). */
+/* Cards belong to the page — a hairline, no shadow, square (0500). */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-1);
   padding: 18px;
 }
 .card h2 {
   font-family: var(--font-display);
-  font-weight: 550;
+  font-weight: 500;
   font-size: 20px;
   letter-spacing: -0.01em;
   margin: 0 0 8px;
 }
 .card h3 {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
+  font-family: var(--font);
+  font-size: 13px;
   font-weight: 500;
   margin: 0 0 14px;
-  line-height: 1.6;
+  line-height: 1.5;
   color: var(--text-dim);
 }
-/* Warn card — an ochre whisper tint, never a saturated fill (Law 02). */
+/* Warn card — an ochre bar at the left edge, never a tinted fill. */
 .card.warn {
-  border-color: color-mix(in oklch, var(--accent-2) 45%, var(--border));
-  background: color-mix(in oklch, var(--accent-2) 8%, var(--surface));
+  box-shadow: inset 2px 0 0 var(--accent-2);
 }
 
 .muted {
@@ -528,16 +496,24 @@ main {
   line-height: 1.5;
   margin: 0;
 }
+/* Links are ink, underlined — moss is a state, not a link colour. */
 .link {
   display: inline-block;
   margin-top: 10px;
-  color: var(--jade);
+  color: var(--text);
   font-size: 13px;
   font-weight: 600;
-  text-decoration: none;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
 }
 .link:hover {
-  text-decoration: underline;
+  text-decoration-color: currentColor;
+}
+.link:focus-visible,
+.console-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* Status */
@@ -546,40 +522,44 @@ main {
   align-items: center;
   gap: 10px;
 }
+/* The state square — 8px, square, in the state colour (0500). No class = not
+   yet known (a hairline square); `.down` = stopped (a caption-grey outline). */
 .dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--text-faint);
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border);
   flex: none;
 }
 .dot.up {
   background: var(--jade);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--jade) 22%, transparent);
+  box-shadow: none;
 }
 .dot.down {
-  background: var(--border-strong);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--text-dim);
 }
 .status-text {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 11px;
+  font-family: var(--font);
+  font-size: 13px;
   font-weight: 500;
   line-height: 1.4;
 }
-/* The console URL is a machine string — it wears the mono (Law 13). */
+/* The console URL is a machine string — it wears the mono. */
 .console-link {
   display: inline-block;
   margin-top: 10px;
   font-family: var(--font-mono);
-  color: var(--jade);
+  color: var(--text);
   font-size: 12px;
   font-weight: 600;
-  text-decoration: none;
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 3px;
 }
 .console-link:hover {
-  text-decoration: underline;
+  text-decoration-color: currentColor;
 }
 .login {
   margin-top: 10px;
@@ -587,34 +567,35 @@ main {
   font-size: 12px;
 }
 
-/* Update banner — an ochre whisper on the paper, not a violet shout. */
+/* Update banner — a ruled block with an ochre bar at the left: attention, not
+   alarm. No fill, no box, no shadow. */
 .banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  background: color-mix(in oklch, var(--accent-2) 12%, var(--surface));
-  border: 1px solid color-mix(in oklch, var(--accent-2) 45%, var(--border));
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border-strong);
+  box-shadow: inset 2px 0 0 var(--accent-2);
   color: var(--text);
-  border-radius: var(--r-card);
-  box-shadow: var(--shadow-1);
+  border-radius: 0;
   padding: 12px 14px;
   font-size: 13px;
   font-weight: 600;
 }
 
 /* The manager's own nudge sits below the appliance banner and must read as the
-   lesser of the two — plain paper, no accent wash. */
+   lesser of the two — a hairline rule, no bar. */
 .banner.quiet {
-  background: var(--surface);
-  border-color: var(--border);
+  border-top-color: var(--border);
+  box-shadow: none;
   font-weight: 500;
 }
 
-/* Buttons — the kit voices (Laws 07/08): a raised paper secondary is the
-   default; `.primary` is the ONE cinnabar fill per view; destructive actions
-   stay quiet until the modal's brick-filled CONFIRM step. Buttons lift off
-   the paper and settle 1px into it on press — the 2px arcade stamp retired. */
+/* Buttons (0500/0501): the primary is the ink fill; the default is a hairline
+   outline on paper; ghost is text only; destructive is brick ink + a brick
+   hairline, never a red fill. Flat — no shadow, no press motion. */
 .btn {
   appearance: none;
   display: inline-flex;
@@ -622,39 +603,23 @@ main {
   justify-content: center;
   gap: 8px;
   border: 1px solid var(--border);
-  background: var(--surface);
+  background: transparent;
   color: var(--text);
   border-radius: var(--r-control);
-  box-shadow: 0 1px 1px color-mix(in oklch, var(--shadow) 8%, transparent),
-    0 6px 16px -10px color-mix(in oklch, var(--shadow) 26%, transparent);
+  box-shadow: none;
   padding: 10px 14px;
   font-family: inherit;
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  transition: border-color 0.12s, background 0.12s, box-shadow 0.08s,
-    transform 0.08s;
+  transition: border-color 0.12s, background 0.12s, color 0.12s;
 }
-/* Hover stays achromatic — the pigment belongs to the primary and active
-   states, not to every button the pointer crosses (Law 01). */
 .btn:not(:disabled):hover {
-  background: var(--surface-2);
+  border-color: var(--text);
 }
-.btn:not(:disabled):active {
-  transform: translateY(1px);
-  box-shadow: 0 1px 3px -1px color-mix(in oklch, var(--shadow) 30%, transparent);
-}
-/* Focus = the accent TINT ring — never a glow, never the browser blue. */
 .btn:focus-visible {
-  outline: 3px solid color-mix(in oklch, var(--accent) 30%, transparent);
-  outline-offset: 1px;
-}
-/* Disabled = dimmed in place (Law 12): same shape, shadow removed. */
-.btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-  box-shadow: none;
-  transform: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .btn.primary {
   background: var(--accent);
@@ -673,26 +638,36 @@ main {
 .btn.full {
   width: 100%;
 }
-/* Destructive voice, pre-confirm: brick ink on paper, tint ground on hover. */
+/* Destructive — brick ink and a brick hairline, before and at confirm. */
 .btn.danger {
   color: var(--danger);
+  border-color: var(--danger);
 }
 .btn.danger:not(:disabled):hover {
-  background: color-mix(in oklch, var(--danger) 9%, var(--surface));
-}
-/* The modal's CONFIRM step is the brick fill — the promise made explicit. */
-.modal-actions .btn.danger {
-  background: var(--danger);
   border-color: var(--danger);
-  color: var(--on-accent);
-}
-.modal-actions .btn.danger:not(:disabled):hover {
-  background: color-mix(in oklch, var(--danger) 88%, var(--text));
+  box-shadow: inset 0 0 0 1px var(--danger);
 }
 .btn.ghost {
   background: transparent;
   border-color: transparent;
+}
+.btn.ghost:not(:disabled):hover {
+  border-color: transparent;
+  color: var(--text);
+}
+/* Disabled = the well, faint ink, a hairline (never an opacity dim). */
+.btn:disabled,
+.btn.primary:disabled,
+.btn.danger:disabled {
+  background: var(--surface-2);
+  color: var(--text-faint);
+  border-color: var(--border);
   box-shadow: none;
+  cursor: default;
+}
+.btn.ghost:disabled {
+  background: transparent;
+  border-color: transparent;
 }
 
 .actions {
@@ -701,34 +676,32 @@ main {
   gap: 12px;
 }
 
-/* Form fields — inputs recede into the paper (Law 08): hairline + inset
-   shade on the recessed fill, while buttons lift off it. */
+/* Form fields — the well, a hairline, square; focus = an ink border + ring. */
 .field {
   display: block;
   margin-top: 14px;
 }
 .field span {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  font-family: var(--font);
   display: block;
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.6;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
   color: var(--text-dim);
   margin-bottom: 8px;
 }
 .field em {
   font-family: var(--font);
-  text-transform: none;
-  letter-spacing: 0;
   color: var(--text-dim);
   font-size: 12px;
   font-weight: 400;
   font-style: normal;
 }
 .field input,
-select {
+select,
+textarea,
+.modal-input,
+.confirm-type input {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -737,13 +710,31 @@ select {
   font-family: inherit;
   background: var(--surface-2);
   color: var(--text);
-  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
+  box-shadow: none;
+}
+.field input::placeholder,
+textarea::placeholder,
+.modal-input::placeholder,
+.confirm-type input::placeholder {
+  color: var(--text-faint);
 }
 .field input:focus,
-select:focus {
-  outline: 3px solid color-mix(in oklch, var(--accent) 25%, transparent);
-  outline-offset: 0;
-  border-color: var(--accent);
+select:focus,
+textarea:focus,
+.modal-input:focus,
+.confirm-type input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--text);
+}
+/* Error = a 2px brick border (the box keeps its size via the padding). */
+.field input[aria-invalid="true"],
+select[aria-invalid="true"],
+textarea[aria-invalid="true"],
+.modal-input[aria-invalid="true"],
+.confirm-type input[aria-invalid="true"] {
+  border: 2px solid var(--danger);
+  padding: 9px 11px;
 }
 
 /* Restore panel — a saved backup gets a full-width select (names stay legible)
@@ -757,12 +748,10 @@ select:focus {
   border-radius: var(--r-card);
 }
 .panel-label {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.6;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
   color: var(--text-dim);
 }
 .restore-actions {
@@ -771,17 +760,18 @@ select:focus {
   gap: 10px;
 }
 
-/* Error banner — a brick whisper tint, never a saturated fill (Law 02). */
+/* Error toast — sits above the page (so it keeps the lift), on paper, with a
+   brick bar at the left. Never a tinted fill. */
 .error {
   position: fixed;
   left: 16px;
   right: 16px;
   bottom: 16px;
-  background: color-mix(in oklch, var(--danger) 10%, var(--surface));
-  border: 1px solid color-mix(in oklch, var(--danger) 45%, var(--border));
+  background: var(--surface);
+  border: 1px solid var(--border);
   color: var(--danger);
   border-radius: var(--r-card);
-  box-shadow: var(--shadow-lift);
+  box-shadow: inset 2px 0 0 var(--danger), var(--shadow-lift);
   padding: 12px 14px;
   font-size: 13px;
   display: flex;
@@ -797,8 +787,12 @@ select:focus {
   cursor: pointer;
   color: inherit;
 }
+.error .x:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 
-/* Overlays — one scrim tint for every door (Law 10): warm ink, no blur. */
+/* Overlays — one scrim tint for every door: warm ink, no blur. */
 .overlay {
   position: fixed;
   inset: 0;
@@ -827,29 +821,11 @@ select:focus {
 }
 .modal-title {
   font-family: var(--font-display);
-  font-weight: 550;
+  font-weight: 500;
   font-size: 17px;
   letter-spacing: -0.01em;
   line-height: 1.3;
   margin: 0 0 12px;
-}
-.modal-input,
-.confirm-type input {
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  font-size: 14px;
-  font-family: inherit;
-  background: var(--surface-2);
-  color: var(--text);
-  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
-}
-.modal-input:focus,
-.confirm-type input:focus {
-  outline: 3px solid color-mix(in oklch, var(--accent) 25%, transparent);
-  outline-offset: 0;
-  border-color: var(--accent);
 }
 .modal-input {
   margin-bottom: 18px;
@@ -864,23 +840,23 @@ select:focus {
   color: var(--text-dim);
   margin-bottom: 8px;
 }
-/* The typed word is machine text — it wears the mono chip (Law 13). */
+/* The typed word is machine text — mono, in brick ink on the well (no tint). */
 .confirm-type b {
   font-family: var(--font-mono);
   font-weight: 600;
   color: var(--danger);
-  background: color-mix(in oklch, var(--danger) 10%, transparent);
+  background: var(--surface-2);
   border-radius: var(--r-chip);
   padding: 1px 5px;
 }
-/* Which site a confirm or a running op is about — whispered above the title. */
+/* Which site a confirm or a running op is about — a caption above the title. */
 .modal-site {
   margin: 0 0 8px;
   color: var(--text-dim);
 }
 .modal .modal-site {
   margin: 0 0 8px;
-  font-size: 10px;
+  font-size: 13px;
 }
 .modal-field {
   margin: 0 0 14px;
@@ -904,7 +880,7 @@ select:focus {
   justify-content: flex-end;
 }
 
-/* Spinner — a smooth, eased turn (the arcade steps() rotation is retired). */
+/* Spinner — a smooth, eased turn. The one 50% radius left in the sheet. */
 .spinner {
   width: 28px;
   height: 28px;
@@ -920,9 +896,9 @@ select:focus {
   }
 }
 
-/* Progress panel — a raised paper panel holding the bar over a live log
-   feed. Shown for the long lifecycle ops so the user watches each phase
-   instead of staring at a single line of overlay text. */
+/* Progress panel — a dialog holding the bar over a live log feed. Shown for
+   the long lifecycle ops so the user watches each phase instead of staring at
+   a single line of overlay text. */
 .progress-panel {
   background: var(--surface);
   color: var(--text);
@@ -939,21 +915,20 @@ select:focus {
   margin: 0 0 14px;
 }
 
-/* The bar — the cinnabar fill IS the active state (Law 01's second element),
-   on a recessed track; it settles jade the moment the console is ready. */
+/* The bar — an ink fill on the well; it settles moss the moment the console
+   is ready. Square ends. */
 .progressbar {
   height: 12px;
   background: var(--surface-2);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: 0;
   overflow: hidden;
-  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
 }
 .progressbar-fill {
   height: 100%;
   width: 0%;
   background: var(--accent);
-  border-radius: 999px;
+  border-radius: 0;
   transition: width 0.3s ease, background 0.2s;
   /* A slow breath (eased, not a blink) so a long phase still reads as
      "working" even while the bar's width is parked — e.g. the image pull. */
@@ -970,8 +945,8 @@ select:focus {
 }
 
 /* Indeterminate mode — for ops with no measurable progress (backup, restore,
-   stop, password): a cinnabar segment sweeps the track until the op settles
-   to a full jade bar. */
+   stop, password): an ink segment sweeps the track until the op settles to a
+   full moss bar. */
 .progressbar.indeterminate .progressbar-fill {
   width: 40%;
   animation: indeterminate 1.4s ease-in-out infinite;
@@ -985,20 +960,18 @@ select:focus {
   }
 }
 
-/* Live sub-status (e.g. "Booting… (12s)") as a mono whisper. */
+/* Live sub-status (e.g. "Booting… (12s)") — a sentence-case caption. */
 .progress-stage {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.6;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.5;
   color: var(--text-dim);
   margin: 12px 0;
   min-height: 16px;
 }
 
-/* The log feed — mono, recessed into the paper, pinned to the latest line. */
+/* The log feed — mono, in the well, pinned to the latest line. */
 .progress-log {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1007,7 +980,6 @@ select:focus {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--r-control);
-  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
   padding: 10px 12px;
   margin: 0;
   height: 152px;
@@ -1017,15 +989,13 @@ select:focus {
 }
 
 /* Structured pull progress — one compact row per image layer (id · bar ·
-   phase/bytes), fed by compose's JSON progress events. Working rows fill
-   cinnabar, finished rows settle jade, warnings ochre, failures coral —
-   the same vocabulary as the main bar, so "is this going fine?" is a
-   colour-read, not a log-read. */
+   phase/bytes), fed by compose's JSON progress events. Working rows fill ink,
+   finished rows settle moss, warnings ochre, failures brick — the same
+   vocabulary as the main bar, so "is this going fine?" is a colour-read, not
+   a log-read. */
 .pull-summary {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-family: var(--font);
+  font-size: 13px;
   color: var(--text-dim);
   margin: 0 0 8px;
 }
@@ -1053,7 +1023,7 @@ select:focus {
 }
 .pull-bar {
   height: 6px;
-  border-radius: 999px;
+  border-radius: 0;
   background: var(--surface-2);
   border: 1px solid var(--border);
   overflow: hidden;
@@ -1062,7 +1032,7 @@ select:focus {
   height: 100%;
   width: 0%;
   background: var(--accent);
-  border-radius: 999px;
+  border-radius: 0;
   transition: width 0.2s ease, background 0.2s;
 }
 .pull-row.pull-done .pull-bar-fill {
@@ -1083,7 +1053,7 @@ select:focus {
   overflow: hidden;
 }
 
-/* Log severity — errors coral, warnings ochre; routine chatter stays dim. */
+/* Log severity — errors brick, warnings ochre; routine chatter stays dim. */
 .progress-log .log-error {
   color: var(--danger);
 }
@@ -1104,9 +1074,9 @@ select:focus {
   display: flex;
 }
 
-/* Sidebar — calm, vertical navigation on the recessed panel. Scales cleanly as
-   destinations are added (and leaves room to seat a server switcher on top for
-   multi-server later). Shown only once the appliance is installed. */
+/* Sidebar — calm, vertical navigation on paper, closed by a hairline. Scales
+   cleanly as destinations are added. Shown only once the appliance is
+   installed. */
 .sidebar {
   flex: none;
   width: 176px;
@@ -1114,7 +1084,7 @@ select:focus {
   flex-direction: column;
   gap: 3px;
   padding: 14px 10px;
-  background: var(--surface-2);
+  background: var(--surface);
   border-right: 1px solid var(--border);
   overflow-y: auto;
 }
@@ -1142,16 +1112,16 @@ select:focus {
 }
 .nav-item:hover {
   color: var(--text);
-  background: var(--surface);
+  background: var(--surface-2);
 }
-/* Active = a soft pigment tint pill — the one place the cinnabar marks "you are
-   here" (Law 01). */
+/* Active = ink text on the well with a 2px ink bar at the left (0501). */
 .nav-item.active {
-  color: var(--accent);
-  background: color-mix(in oklch, var(--accent) 12%, transparent);
+  color: var(--text);
+  background: var(--surface-2);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .nav-item:focus-visible {
-  outline: 3px solid color-mix(in oklch, var(--accent) 30%, transparent);
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 /* On a cramped width, collapse the sidebar to icons so content keeps room. */
@@ -1169,12 +1139,12 @@ select:focus {
   }
 }
 
-/* An intro block that opens a panel — a display-serif heading + a plain-language
-   lede, no card frame (it's orientation, not a control). */
+/* An intro block that opens a panel — a heading + a plain-language lede, no
+   card frame (it's orientation, not a control). */
 .intro h2,
 .card.welcome h2 {
   font-family: var(--font-display);
-  font-weight: 550;
+  font-weight: 500;
   font-size: 21px;
   letter-spacing: -0.01em;
   margin: 0 0 10px;
@@ -1191,7 +1161,7 @@ select:focus {
 
 /* A hint line — small, dim, often paired with a leading check/○ icon. */
 .hint {
-  color: var(--text-faint);
+  color: var(--text-dim);
   font-size: 12.5px;
   line-height: 1.5;
   margin: 10px 0 0;
@@ -1215,10 +1185,9 @@ select:focus {
   padding: 22px;
 }
 
-/* A soft informational card (e.g. "start your site first"). */
+/* A soft informational card (e.g. "start your site first") — an ochre bar. */
 .card.note {
-  background: color-mix(in oklch, var(--accent-2) 7%, var(--surface));
-  border-color: color-mix(in oklch, var(--accent-2) 40%, var(--border));
+  box-shadow: inset 2px 0 0 var(--accent-2);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1247,15 +1216,15 @@ select:focus {
   align-self: center;
 }
 
-/* The status hero on Home — the emotional centre of the app; it floats a half
-   step higher than the plain cards around it. */
+/* The status hero on Home — the emotional centre of the app; it belongs to
+   the page, so it carries an ink rule at the top instead of a lift. */
 .card.hero {
   padding: 20px;
-  box-shadow: var(--shadow-lift);
+  border-top-color: var(--border-strong);
 }
 .status-headline {
   font-family: var(--font-display);
-  font-weight: 550;
+  font-weight: 500;
   font-size: 19px;
   letter-spacing: -0.01em;
 }
@@ -1289,9 +1258,8 @@ select:focus {
 .btn.ghost.small {
   color: var(--text-dim);
 }
-.btn.ghost.small:hover {
+.btn.ghost.small:not(:disabled):hover {
   color: var(--text);
-  background: var(--surface-2);
 }
 
 /* A gentle help line closing a panel. */
@@ -1345,6 +1313,10 @@ select:focus {
   accent-color: var(--accent);
   cursor: pointer;
 }
+.check input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .check code {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -1353,21 +1325,22 @@ select:focus {
   padding: 1px 5px;
 }
 
-/* Export success card. */
+/* Export success card — a moss bar: passing, stated once. */
 .card.done-card {
-  border-color: color-mix(in oklch, var(--jade) 45%, var(--border));
-  background: color-mix(in oklch, var(--jade) 7%, var(--surface));
+  box-shadow: inset 2px 0 0 var(--jade);
 }
+/* `.card .done-head` so it outranks `.card h3` (it is an h3 inside a card). */
+.card .done-head,
 .done-head {
   display: flex;
   align-items: center;
   gap: 8px;
   font-family: var(--font-display);
-  font-weight: 550;
+  font-weight: 500;
   font-size: 16px;
   letter-spacing: -0.01em;
+  line-height: 1.3;
   margin: 0 0 8px;
-  text-transform: none;
   color: var(--text);
 }
 .done-head .ic {
@@ -1395,7 +1368,7 @@ select:focus {
 }
 
 /* Host hand-off list — one row per host: what it is on the left, the way in on
-   the right. Rules between rows, never boxes; the card is the box (Law 02). */
+   the right. Rules between rows, never boxes; the card is the box. */
 .host-list {
   list-style: none;
   margin: 14px 0 0;
@@ -1460,7 +1433,6 @@ select:focus {
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: var(--r-control);
-  box-shadow: inset 0 1px 2px color-mix(in oklch, var(--shadow) 8%, transparent);
   padding: 10px 12px;
   margin: 0;
   height: 200px;
@@ -1478,13 +1450,12 @@ select:focus {
   margin-bottom: 12px;
 }
 .kv-label {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
-  font-weight: 500;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 400;
   color: var(--text-dim);
 }
+/* Values are versions / ids — machine text, mono. */
 .kv-value {
   font-family: var(--font-mono);
   font-size: 12px;
@@ -1512,18 +1483,16 @@ select:focus {
    Troubleshoot (doctor) report.
 
    Severity is carried by a mark + a colour, never by colour alone (the marks
-   read the same to a colour-blind eye, and survive a screenshot). Semantic
-   colours only — jade/ochre/coral — so the cinnabar accent stays the one
-   pigment and never lands on status (brand.md §3.4/§10.1).
+   read the same to a colour-blind eye, and survive a screenshot). State
+   colours only — moss/ochre/brick — so highlight ink never stands in for a
+   verdict and cinnabar never lands on status (brand.md §3.4/§10.1).
 --------------------------------------------------------------------------- */
 .doctor {
   margin-top: 14px;
 }
 .doctor-tier {
-  font-family: var(--font-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 10px;
+  font-family: var(--font);
+  font-size: 13px;
   font-weight: 500;
   color: var(--text-dim);
   margin: 16px 0 6px;
@@ -1591,19 +1560,17 @@ select:focus {
   color: var(--text-dim);
 }
 .sev-skipped .doctor-mark {
-  color: var(--border);
+  color: var(--text-dim);
 }
 
 /* The manager's version, held beside the role label in the chrome. Tabular
-   figures so it doesn't jitter between builds, and a notch fainter than the
-   role — it's provenance for a bug report, not a thing to read. */
+   figures so it doesn't jitter between builds; machine text, so mono. */
 .version-tag {
   margin-left: 6px;
-  color: var(--text-faint);
-  opacity: 0.75;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
   font-variant-numeric: tabular-nums;
-  text-transform: none;
-  letter-spacing: 0.06em;
 }
 .version-tag:empty {
   display: none;
@@ -1611,11 +1578,11 @@ select:focus {
 
 /* --- Sites on a server (M2) -------------------------------------------------- */
 
-/* Ochre: a state worth a look, not a verdict — frozen, or a server that
-   didn't answer. Same grammar as up/down. */
+/* Ochre: a state worth a look, not a verdict — starting, resting, frozen, or a
+   server that didn't answer. Same grammar as up/down. */
 .dot.warn {
   background: var(--accent-2);
-  box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent-2) 22%, transparent);
+  box-shadow: none;
 }
 
 /* What only makes sense for one kind of site. `body.remote` is set while the
@@ -1625,7 +1592,8 @@ body:not(.remote) .remote-only {
   display: none !important;
 }
 
-/* Two-way choice in a modal: "On this computer" / "On a server". */
+/* Two-way choice in a modal: "On this computer" / "On a server". The chosen
+   side is an ink outline on paper — no shadow. */
 .seg {
   display: flex;
   gap: 4px;
@@ -1644,21 +1612,24 @@ body:not(.remote) .remote-only {
   gap: 7px;
   padding: 7px 8px;
   border: 1px solid transparent;
-  border-radius: calc(var(--r-control) - 2px);
+  border-radius: var(--r-control);
   background: none;
   color: var(--text-dim);
   font-family: inherit;
   font-size: 13px;
   cursor: pointer;
 }
+.seg-opt:hover {
+  color: var(--text);
+}
 .seg-opt[aria-checked="true"] {
   background: var(--surface);
-  border-color: var(--border);
+  border-color: var(--text);
   color: var(--text);
-  box-shadow: var(--shadow-1);
 }
 .seg-opt:focus-visible {
-  outline: 3px solid color-mix(in oklch, var(--accent) 25%, transparent);
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* The add-site form grows with the server fields; it scrolls inside the
@@ -1707,7 +1678,8 @@ body.busy, body.busy * {
   cursor: progress !important;
 }
 
-/* Pairing without SSH (M4, E-02): the code a Manager shows or keeps. */
+/* Pairing without SSH (M4, E-02): the code a Manager shows or keeps — a ruled
+   block (ink rule on top, hairline round the rest), mono because it's typed. */
 .big-code,
 .modal .big-code {
   font-family: var(--font-mono);
@@ -1717,7 +1689,8 @@ body.busy, body.busy * {
   text-align: center;
   padding: 14px 8px;
   margin: 12px 0;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
+  border-top-color: var(--border-strong);
   border-radius: var(--r-card);
   background: var(--surface);
   color: var(--text);
@@ -1731,8 +1704,8 @@ body.busy, body.busy * {
   margin-top: 12px;
 }
 .sub-label {
-  font-size: 0.82rem;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text-dim);
   margin: 12px 0 6px;
 }

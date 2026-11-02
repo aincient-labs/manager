@@ -983,7 +983,7 @@ function renderStatus(status) {
         refresh().catch((e) => showError(String(e)));
       }, 3000);
     }
-    dot.className = "dot up";
+    dot.className = "dot warn"; // waiting = ochre (0501), not yet running
     headline.textContent = "Starting up…";
     sub.textContent = "Almost there — this usually takes a few seconds.";
     primary.disabled = true;
