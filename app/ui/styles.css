@@ -1,13 +1,15 @@
 /* Atelier Manager — the Monograph app tier (umbrella docs/brand.md §1–3, §10;
-   DECISIONS 0500, 0501). The same palette as the website and the console:
-   paper and ink, 1px rules instead of boxes, square corners, IBM Plex Sans.
-   Highlight (selected, active, focus, the primary) is INK; red only means
-   something is wrong; cinnabar lives in the mark only. Shadows only on what
-   sits above the page (menus, dialogs). Dark follows the OS scheme. */
+   DECISIONS 0500, 0501; the website's apps/website/DESIGN.md is the source).
 
-/* IBM Plex Sans (OFL) — the one face, bundled locally, never CDN'd (Tauri runs
-   offline; operator surfaces leak no IP — DECISIONS 0058 posture). Variable,
-   latin subset, the same file the website ships. */
+   ONE system, a handful of parts, used everywhere:
+     type    IBM Plex Sans only; mono only for machine text (logs, paths, codes)
+     colour  paper, ink, soft ink, grey, hairline, well. Highlight = ink.
+             Moss/ochre/brick are states, never decoration; cinnabar = the mark.
+     rules   1px ink to open a section, 1px hairline between rows. No boxes,
+             no tinted panels, no side bars, no rounded corners.
+     depth   shadows only on what floats above the page (menu, dialog, toast).
+   Control sizes: 36px (default), 32px (.small), 44px (.big). */
+
 @font-face {
   font-family: "IBM Plex Sans";
   font-style: normal;
@@ -17,42 +19,35 @@
 }
 
 :root {
-  /* Light — the website's Monograph palette (apps/website/DESIGN.md). */
-  --bg: #ffffff; /* paper — the window canvas */
-  --surface: #ffffff; /* panels share the paper; rules separate them */
-  --surface-2: #f3f1ec; /* the well — inputs, hover + selected rows, command strips */
+  --bg: #ffffff; /* paper */
+  --surface: #ffffff;
+  --surface-2: #f3f1ec; /* the well: inputs, hover rows, machine text */
   --border: #e0ded9; /* hairline */
-  --border-strong: #0d0d0d; /* the ink rule that opens a block */
+  --border-strong: #0d0d0d; /* the ink rule that opens a section */
   --text: #0d0d0d; /* ink */
-  --text-dim: #636363; /* caption grey (AA on paper and well) */
-  --text-faint: #8e8a84; /* placeholders only */
-  --accent: #0d0d0d; /* highlight is INK (0501): primary fill, active, selected */
-  --accent-deep: #2b2b2b; /* soft ink — the primary's hover / press */
-  --accent-2: #9a6a12; /* ochre — waiting / attention (state only) */
-  --jade: #3f7a52; /* moss — running / passing (state only) */
-  --danger: #a93a2a; /* brick — errors and destructive only */
-  --on-accent: #ffffff; /* paper text on an ink fill */
-  --mark: #c2452a; /* cinnabar — the mark's stripe, nowhere else */
-  --mark-ring: #0d0d0d; /* the mark's corners */
-  --shadow: #140e06; /* shadow ink for overlays */
-  /* Overlays only (menus, dialogs): the website's laid-object shadow. */
-  --shadow-1: 0 26px 46px -22px rgba(20, 14, 6, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.06);
-  --shadow-lift: 0 34px 60px -30px rgba(20, 14, 6, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.08);
-  /* Square (0500): the names stay so nothing else has to change. */
-  --r-chip: 0;
-  --r-control: 0;
-  --r-card: 0;
-  --r-panel: 0;
-  --maxw: 720px; /* centred column — content never stretches edge-to-edge */
+  --text-2: #2b2b2b; /* soft ink: body copy */
+  --text-dim: #636363; /* caption grey */
+  --text-faint: #8e8a84; /* placeholders, disabled */
+  --accent: #0d0d0d; /* highlight is ink (0501) */
+  --accent-deep: #2b2b2b;
+  --on-accent: #ffffff;
+  --accent-2: #9a6a12; /* ochre: waiting, attention */
+  --jade: #3f7a52; /* moss: running, done */
+  --danger: #a93a2a; /* brick: errors and destructive only */
+  --mark: #c2452a; /* cinnabar: the mark's stripe, nowhere else */
+  --mark-ring: #0d0d0d;
+  --scrim: rgba(13, 12, 10, 0.42);
+  --shadow-float: 0 26px 46px -22px rgba(20, 14, 6, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.06);
+  /* Drawn glyphs for native controls (data URIs cannot read a var). */
+  --glyph-chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23636363' stroke-width='1.4' stroke-linecap='square'/%3E%3C/svg%3E");
+  --glyph-tick: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.8 8.4 6.6 11.2 12.2 5' fill='none' stroke='%23ffffff' stroke-width='1.8' stroke-linecap='square'/%3E%3C/svg%3E");
   --font: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
-  --font-display: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-family: var(--font);
-  /* Native control faces (select, scrollbars) follow the theme. */
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --col: 640px; /* the content column */
   color-scheme: light;
 }
 
-/* Night — the website's dark Monograph palette. */
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #121110;
@@ -61,44 +56,61 @@
     --border: #2c2a27;
     --border-strong: #f2f0ec;
     --text: #f2f0ec;
+    --text-2: #d4d0c9;
     --text-dim: #a39e96;
     --text-faint: #6f6a63;
     --accent: #f2f0ec;
     --accent-deep: #d4d0c9;
+    --on-accent: #121110;
     --accent-2: #d2a24c;
     --jade: #7fb08e;
     --danger: #e0806c;
-    --on-accent: #121110;
     --mark-ring: #ffffff;
-    --shadow: #000000;
-    --shadow-1: 0 26px 46px -22px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.12);
-    --shadow-lift: 0 34px 60px -30px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.16);
+    --scrim: rgba(0, 0, 0, 0.6);
+    --shadow-float: 0 26px 46px -22px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.12);
+    --glyph-chev: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%23a39e96' stroke-width='1.4' stroke-linecap='square'/%3E%3C/svg%3E");
+    --glyph-tick: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.8 8.4 6.6 11.2 12.2 5' fill='none' stroke='%23121110' stroke-width='1.8' stroke-linecap='square'/%3E%3C/svg%3E");
     color-scheme: dark;
   }
 }
 
+/* ---------------------------------------------------------------- base ---- */
 
 * {
   box-sizing: border-box;
 }
-
+html {
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  /* A fixed-chrome desktop window: the page itself never scrolls (so the
-     webview never paints whole-page scrollbars or rubber-bands on flush
-     content). Only the content region below the topbar scrolls, and only when
-     it genuinely overflows. */
   height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.5;
 }
-/* Selection is an ink wash — highlight is ink (0501), moss stays a state. */
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+p {
+  margin: 0;
+}
 ::selection {
-  background: color-mix(in oklch, var(--accent) 18%, transparent);
+  background: color-mix(in oklch, var(--accent) 16%, transparent);
 }
 ::-webkit-scrollbar {
   width: 8px;
@@ -109,156 +121,294 @@ body {
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 0;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--text-dim);
+  background: var(--text-faint);
 }
-
-/* Whisper — a quiet sentence-case caption (the mono UPPERCASE micro-label is
-   retired; mono is for machine text only). */
-.whisper {
-  font-family: var(--font);
-  font-size: 13px;
-  line-height: 1.5;
-  font-weight: 400;
-  color: var(--text-dim);
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
-
-/* Top bar — paper chrome closed by a hairline; the mark carries the brand. */
-.topbar {
-  flex: none;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+.hidden {
+  display: none !important;
 }
 .sprite {
   position: absolute;
 }
-/* Icon — Lucide geometry, monochrome via currentColor (brand.md §2.5). */
+body.busy,
+body.busy * {
+  cursor: progress !important;
+}
+body.remote .local-only,
+body:not(.remote) .remote-only {
+  display: none !important;
+}
+
+/* Icons — line drawings, square caps (website DESIGN.md §Shapes). */
 .ic {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   flex: none;
   fill: none;
   stroke: currentColor;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  stroke-width: 1.6;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 13px 20px;
-}
-/* The Atelier CMS lockup (0497; masters in the umbrella's brand/masters/):
-   mark and name at the SAME height so the name's cap height and baseline sit
-   on the A in the mark; gap = 0.11 × that height. The name is currentColor. */
-.wordmark {
-  --wordmark-height: 22px;
-  display: inline-flex;
-  align-items: center;
-  gap: calc(var(--wordmark-height) * 0.11);
+/* ---------------------------------------------------------- type roles ---- */
+
+/* Page title — one per screen. */
+.intro h2,
+.card.welcome h2,
+.status-headline {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
   color: var(--text);
 }
-.wordmark-mark,
-.wordmark-text {
-  height: var(--wordmark-height);
-  width: auto;
-  flex: none;
-  display: block;
+/* Lede under a page title. */
+.intro .muted,
+.card.welcome .muted,
+.hero-sub {
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text-2);
+  max-width: 34em;
 }
-/* The app's role, held quietly at the far right of the bar. */
-.app-role {
+/* Body copy. */
+.muted {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+/* Notes and captions. */
+.hint,
+.whisper,
+.help-line,
+.banner-sub,
+.field em {
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 400;
+  font-style: normal;
   color: var(--text-dim);
 }
-/* The right end of the bar: the site switcher, then the app's role. */
-.topbar-end {
+.hint:has(> .ic) {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.hint .ic {
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  color: var(--jade);
+}
+/* Links — inherit their colour, a 1px underline at 40%. */
+a,
+.link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+a:hover,
+.link:hover {
+  text-decoration-color: currentColor;
+}
+.link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--text);
+}
+.link .ic {
+  width: 14px;
+  height: 14px;
+}
+
+/* --------------------------------------------------------------- chrome ---- */
+
+/* One row: the lockup, the app's name, its version. Nothing else lives here. */
+.topbar {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+}
+.brand {
+  height: 52px;
   display: flex;
   align-items: center;
   gap: 14px;
-  min-width: 0;
+  padding: 0 20px;
+}
+/* The Atelier CMS lockup, verbatim from brand/masters (0495–0497). Its height
+   puts the name's cap height at ~10px, level with 15px text. */
+.wordmark {
+  display: block;
+  height: 26px;
+  width: auto;
+  color: var(--text);
+}
+.app-role {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1;
+  font-size: 15px;
+  color: var(--text-dim);
+}
+.app-role::before {
+  content: "";
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+}
+.version-tag {
+  margin-left: auto;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.version-tag:empty {
+  display: none;
 }
 
-/* Site switcher — a quiet paper control in the chrome. The menu below it is
-   the one place sites are listed, switched, added and renamed. */
-.site-switcher {
-  position: relative;
-  min-width: 0;
+.shell {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
 }
-.site-current {
+
+/* Sidebar — the site you're working on, then the sections. */
+.sidebar {
+  flex: none;
+  width: 240px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+.sidebar-label {
+  margin: 0;
+  padding: 20px 20px 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.nav {
+  display: flex;
+  flex-direction: column;
+  margin-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.nav-item {
   appearance: none;
   display: flex;
   align-items: center;
-  gap: 9px;
-  max-width: 260px;
-  padding: 5px 10px 5px 11px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  background: transparent;
-  color: var(--text);
-  font-family: inherit;
+  width: 100%;
+  height: 40px;
+  padding: 0 20px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  font-size: 15px;
+  color: var(--text-dim);
   text-align: left;
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s;
+  transition: color 0.2s var(--ease);
 }
-.site-current:hover,
-.site-current[aria-expanded="true"] {
-  border-color: var(--text);
+.nav-item .ic {
+  display: none;
+}
+.nav-item:hover {
+  color: var(--text);
+}
+/* Active = ink, a step heavier. No bar, no fill. */
+.nav-item.active {
+  color: var(--text);
+  font-weight: 500;
+}
+.nav-item:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Site switcher — a row in the sidebar; its menu floats. */
+.site-switcher {
+  position: relative;
+}
+.site-current {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) 12px;
+  align-items: center;
+  column-gap: 10px;
+  width: 100%;
+  padding: 8px 20px 10px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.site-current:hover .site-current-label,
+.site-current[aria-expanded="true"] .site-current-label {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
 }
 .site-current:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline-offset: -2px;
+}
+.site-current .dot {
+  align-self: start;
+  margin-top: 8px;
 }
 .site-current-text {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  line-height: 1.25;
 }
 .site-current-label {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .site-current-host {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .chev-down {
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
+  align-self: start;
+  margin-top: 6px;
   color: var(--text-dim);
   transform: rotate(90deg);
-  transition: transform 0.12s;
+  transition: transform 0.2s var(--ease);
 }
 .site-current[aria-expanded="true"] .chev-down {
   transform: rotate(-90deg);
 }
-/* The menu sits above the page — one of the few things that keeps a shadow. */
 .site-menu {
   position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  top: 100%;
+  left: 12px;
   z-index: 20;
-  width: 280px;
-  max-width: calc(100vw - 32px);
+  width: 288px;
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  box-shadow: var(--shadow-1);
-  padding: 6px;
+  border-top: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-float);
 }
 .site-menu-head {
-  margin: 4px 8px 6px;
-  color: var(--text-dim);
+  padding: 10px 14px 6px;
 }
 .site-list {
   list-style: none;
@@ -274,13 +424,12 @@ body {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 8px;
-  border: none;
-  border-radius: var(--r-control);
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 0;
+  border-top: 1px solid var(--border);
   background: none;
-  color: var(--text);
-  font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
   text-align: left;
   cursor: pointer;
 }
@@ -290,36 +439,29 @@ body {
 }
 .site-option:focus-visible,
 .site-menu-action:focus-visible {
-  background: var(--surface-2);
-  outline: 2px solid var(--accent);
   outline-offset: -2px;
-}
-/* The current site = the well + the ink bar (the selected-row grammar). */
-.site-option[aria-checked="true"] {
-  background: var(--surface-2);
-  box-shadow: inset 2px 0 0 var(--accent);
 }
 .site-option-text {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
-  line-height: 1.3;
+  line-height: 1.35;
 }
 .site-option-label {
-  font-weight: 600;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.site-option[aria-checked="true"] .site-option-label {
+  font-weight: 500;
+}
 .site-option-meta {
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--text-dim);
 }
 .site-option .tick {
-  width: 16px;
-  height: 16px;
-  color: var(--accent);
   visibility: hidden;
 }
 .site-option[aria-checked="true"] .tick {
@@ -327,45 +469,24 @@ body {
 }
 .site-menu-foot {
   border-top: 1px solid var(--border);
-  margin-top: 6px;
-  padding-top: 6px;
 }
 .site-menu-action {
   color: var(--text-dim);
-  font-weight: 600;
-}
-.site-menu-action .ic {
-  width: 16px;
-  height: 16px;
 }
 .site-menu-action:hover {
   color: var(--text);
 }
 
-/* With a switcher in the bar, the role label is the first thing to give up its
-   room — the site name matters more than the app's own name. */
-@media (max-width: 560px) {
-  .topbar-end .app-role {
-    display: none;
-  }
-  .site-current {
-    max-width: 170px;
-  }
-}
+/* ------------------------------------------------------------- content ---- */
 
 main {
   flex: 1 1 auto;
-  min-height: 0; /* let the flex child shrink so its own scroll engages */
-  min-width: 0; /* and shrink horizontally beside the sidebar */
-  overflow-y: auto; /* scroll the content region only when it overflows */
-  overflow-x: hidden; /* never horizontally */
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
   overscroll-behavior: contain;
-  width: 100%;
-  padding: 20px;
-  max-width: var(--maxw);
-  margin: 0 auto;
-  /* A flex column so the visible screen can own the full height — centred
-     welcome screens breathe; tab panels sit calmly at the top. */
+  padding: 40px 48px 40px;
   display: flex;
   flex-direction: column;
 }
@@ -373,329 +494,326 @@ main {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  align-items: flex-start;
+  gap: 24px;
+  width: 100%;
+  max-width: var(--col);
 }
-/* Welcome/status screens (loading, Docker, first-run) sit centred in the window
-   so a first-time owner meets one calm message, not a top-anchored form. */
+.screen > * {
+  max-width: 100%;
+}
+.screen > .card,
+.screen > .group,
+.screen > .banner,
+.screen > #publish-result,
+.screen > #publish-form {
+  align-self: stretch;
+}
+/* Welcome screens (loading, Docker, first run): one column, centred in the
+   window, text still set from the left. */
 .screen.center {
   justify-content: center;
-  align-items: stretch;
-  text-align: center;
+  align-self: center;
+  max-width: 480px;
 }
-.screen.center .field,
-.screen.center .advanced {
-  text-align: left;
-}
-
-/* Action groups — a sentence-case heading on an ink rule over related actions. */
-.group {
+.intro,
+.card.welcome {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
-.group-label {
-  font-family: var(--font);
-  font-size: 13px;
-  line-height: 1.5;
-  font-weight: 500;
-  color: var(--text-dim);
-  margin: 4px 0 0;
+
+/* A section: an ink rule, a title, then its rows. */
+.group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+  padding-top: 14px;
   border-top: 1px solid var(--border-strong);
-  padding-top: 10px;
 }
-.action-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 10px;
+.group > * {
+  max-width: 100%;
 }
-
-/* Status card head — state on the left, lifecycle toggle on the right. */
-.status-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+.group > .card {
+  align-self: stretch;
 }
-
-/* Advanced disclosure — destructive actions stay folded away. */
-.advanced {
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
-  margin-top: 4px;
-}
-.advanced > summary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font);
-  font-size: 13px;
+.group-label,
+.card h3,
+.sub-label {
+  margin: 0;
+  font-size: 15px;
   font-weight: 500;
-  color: var(--text-dim);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
+  line-height: 1.4;
+  color: var(--text);
 }
-.advanced > summary:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.advanced > summary::-webkit-details-marker {
+.group-label .ic {
   display: none;
 }
-.advanced > summary .chev {
-  width: 14px;
-  height: 14px;
-  transition: transform 0.15s ease;
+.sub-label {
+  font-size: 14px;
+  margin-top: 8px;
 }
-.advanced[open] > summary .chev {
-  transform: rotate(90deg);
-}
-.advanced > summary:hover {
-  color: var(--text);
-}
-.advanced p {
-  margin: 12px 0;
-}
-.advanced .btn {
-  width: 100%;
-}
-.hidden {
-  display: none !important;
+.group + .group {
+  margin-top: 8px;
 }
 
-/* Cards belong to the page — a hairline, no shadow, square (0500). */
+/* A .card is no longer a box: it is a plain block that stacks its children. */
 .card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
-  padding: 18px;
-}
-.card h2 {
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 20px;
-  letter-spacing: -0.01em;
-  margin: 0 0 8px;
-}
-.card h3 {
-  font-family: var(--font);
-  font-size: 13px;
-  font-weight: 500;
-  margin: 0 0 14px;
-  line-height: 1.5;
-  color: var(--text-dim);
-}
-/* Warn card — an ochre bar at the left edge, never a tinted fill. */
-.card.warn {
-  box-shadow: inset 2px 0 0 var(--accent-2);
-}
-
-.muted {
-  color: var(--text-dim);
-  font-size: 13px;
-  line-height: 1.5;
-  margin: 0;
-}
-/* Links are ink, underlined — moss is a state, not a link colour. */
-.link {
-  display: inline-block;
-  margin-top: 10px;
-  color: var(--text);
-  font-size: 13px;
-  font-weight: 600;
-  text-decoration: underline;
-  text-decoration-color: var(--border);
-  text-underline-offset: 3px;
-}
-.link:hover {
-  text-decoration-color: currentColor;
-}
-.link:focus-visible,
-.console-link:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* Status */
-.status-row {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
 }
-/* The state square — 8px, square, in the state colour (0500). No class = not
-   yet known (a hairline square); `.down` = stopped (a caption-grey outline). */
+.card > * {
+  max-width: 100%;
+}
+.card > .kv,
+.card > .field,
+.card > .host-list,
+.card > .doctor,
+.card > .logs-view,
+.card > .advanced,
+.card > .restore-panel {
+  align-self: stretch;
+}
+/* A notice: a state square beside the words, between hairlines. */
+.card.warn,
+.card.note {
+  flex-direction: row;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  align-self: stretch;
+}
+.card.warn::before,
+.card.note::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 8px;
+  background: var(--accent-2);
+}
+.card.warn > p,
+.card.note > p {
+  flex: 1 1 0;
+  min-width: 60%;
+}
+.card.note > .btn {
+  margin-left: 20px;
+}
+
+/* State square — 8px, square. No class = unknown (hairline). */
 .dot {
   width: 8px;
   height: 8px;
-  border-radius: 0;
+  flex: none;
   background: transparent;
   box-shadow: inset 0 0 0 1px var(--border);
-  flex: none;
 }
 .dot.up {
   background: var(--jade);
   box-shadow: none;
 }
+.dot.warn {
+  background: var(--accent-2);
+  box-shadow: none;
+}
 .dot.down {
-  background: transparent;
   box-shadow: inset 0 0 0 1px var(--text-dim);
 }
-.status-text {
-  font-family: var(--font);
-  font-size: 13px;
-  font-weight: 500;
-  line-height: 1.4;
+
+/* --------------------------------------------------------------- Home ---- */
+
+.card.hero {
+  gap: 12px;
 }
-/* The console URL is a machine string — it wears the mono. */
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.status-row .dot {
+  width: 10px;
+  height: 10px;
+}
 .console-link {
-  display: inline-block;
-  margin-top: 10px;
   font-family: var(--font-mono);
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 600;
-  text-decoration: underline;
-  text-decoration-color: var(--border);
-  text-underline-offset: 3px;
+  font-size: 13px;
+  color: var(--text-dim);
 }
-.console-link:hover {
-  text-decoration-color: currentColor;
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  align-self: stretch;
 }
-.login {
-  margin-top: 10px;
-  font-family: var(--font-mono);
-  font-size: 12px;
+/* Stop/Rest is the rarer action, so it sits apart at the right, but on the
+   same 44px line as the buttons beside it. */
+.hero-actions #home-toggle {
+  margin-left: auto;
+  height: 44px;
+  padding: 0 18px;
+  font-size: 15px;
 }
 
-/* Update banner — a ruled block with an ochre bar at the left: attention, not
-   alarm. No fill, no box, no shadow. */
+/* Update notices — ledger rows. */
 .banner {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  background: transparent;
-  border: none;
-  border-top: 1px solid var(--border-strong);
-  box-shadow: inset 2px 0 0 var(--accent-2);
-  color: var(--text);
-  border-radius: 0;
-  padding: 12px 14px;
-  font-size: 13px;
-  font-weight: 600;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 15px;
 }
-
-/* The manager's own nudge sits below the appliance banner and must read as the
-   lesser of the two — a hairline rule, no bar. */
-.banner.quiet {
-  border-top-color: var(--border);
-  box-shadow: none;
+#update-banner {
+  border-top: 1px solid var(--border-strong);
+}
+#update-banner:not(.hidden) + #manager-update-banner {
+  margin-top: -24px;
+}
+#update-banner.hidden + #manager-update-banner {
+  border-top: 1px solid var(--border-strong);
+}
+.banner > div {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+.banner b {
   font-weight: 500;
 }
+.banner.quiet b {
+  font-weight: 400;
+  color: var(--text-2);
+}
 
-/* Buttons (0500/0501): the primary is the ink fill; the default is a hairline
-   outline on paper; ghost is text only; destructive is brick ink + a brick
-   hairline, never a red fill. Flat — no shadow, no press motion. */
+/* Occasional actions and the closing help line — quiet text, at the foot. */
+.quiet-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-top: auto;
+  padding-top: 16px;
+}
+.help-line {
+  font-size: 14px;
+}
+.quiet-row + .help-line {
+  margin-top: -12px;
+}
+
+/* ------------------------------------------------------------ buttons ---- */
+
+/* Secondary: a hairline outline, ink on hover. Primary: the one ink block.
+   Danger: brick words and a brick line. Ghost: words only. */
 .btn {
   appearance: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px solid var(--border);
+  height: 36px;
+  padding: 0 14px;
+  border: 0;
+  box-shadow: inset 0 0 0 1px var(--border);
   background: transparent;
   color: var(--text);
-  border-radius: var(--r-control);
-  box-shadow: none;
-  padding: 10px 14px;
-  font-family: inherit;
   font-size: 14px;
-  font-weight: 600;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
-  transition: border-color 0.12s, background 0.12s, color 0.12s;
+  transition: box-shadow 0.2s var(--ease), background 0.2s var(--ease), color 0.2s var(--ease);
 }
 .btn:not(:disabled):hover {
-  border-color: var(--text);
-}
-.btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  box-shadow: inset 0 0 0 1px var(--text);
 }
 .btn.primary {
   background: var(--accent);
-  border-color: var(--accent);
   color: var(--on-accent);
+  box-shadow: none;
+  font-weight: 600;
 }
 .btn.primary:not(:disabled):hover {
   background: var(--accent-deep);
-  border-color: var(--accent-deep);
+  box-shadow: none;
 }
-.btn.small {
-  padding: 7px 12px;
-  font-size: 13px;
-}
-/* A button that spans the full group width; the group's flex gap spaces it. */
-.btn.full {
-  width: 100%;
-}
-/* Destructive — brick ink and a brick hairline, before and at confirm. */
 .btn.danger {
   color: var(--danger);
-  border-color: var(--danger);
-}
-.btn.danger:not(:disabled):hover {
-  border-color: var(--danger);
   box-shadow: inset 0 0 0 1px var(--danger);
 }
+.btn.danger:not(:disabled):hover {
+  box-shadow: inset 0 0 0 2px var(--danger);
+}
+.btn.small {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 13px;
+}
+.btn.big {
+  height: 44px;
+  padding: 0 20px;
+  font-size: 15px;
+}
+/* Buttons size to their words; .full only asks for its own line. */
+.btn.full {
+  display: flex;
+  width: fit-content;
+}
 .btn.ghost {
-  background: transparent;
-  border-color: transparent;
+  height: auto;
+  padding: 0;
+  box-shadow: none;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-dim);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+.btn.ghost .ic {
+  display: none;
 }
 .btn.ghost:not(:disabled):hover {
-  border-color: transparent;
+  box-shadow: none;
   color: var(--text);
+  text-decoration-color: currentColor;
 }
-/* Disabled = the well, faint ink, a hairline (never an opacity dim). */
-.btn:disabled,
-.btn.primary:disabled,
-.btn.danger:disabled {
+.btn:disabled {
   background: var(--surface-2);
   color: var(--text-faint);
-  border-color: var(--border);
   box-shadow: none;
   cursor: default;
 }
 .btn.ghost:disabled {
-  background: transparent;
-  border-color: transparent;
+  background: none;
 }
 
-.actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
+/* -------------------------------------------------------------- fields ---- */
 
-/* Form fields — the well, a hairline, square; focus = an ink border + ring. */
 .field {
-  display: block;
-  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
-.field span {
-  font-family: var(--font);
-  display: block;
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.5;
-  color: var(--text-dim);
-  margin-bottom: 8px;
+.field > span {
+  font-size: 14px;
+  color: var(--text);
 }
 .field em {
-  font-family: var(--font);
-  color: var(--text-dim);
-  font-size: 12px;
-  font-weight: 400;
-  font-style: normal;
+  display: block;
+  margin-top: 2px;
+}
+.field em::first-letter {
+  text-transform: uppercase;
 }
 .field input,
 select,
@@ -703,586 +821,104 @@ textarea,
 .modal-input,
 .confirm-type input {
   width: 100%;
-  padding: 10px 12px;
+  height: 40px;
+  padding: 0 12px;
   border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  font-size: 14px;
-  font-family: inherit;
+  border-radius: 0;
   background: var(--surface-2);
   color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
   box-shadow: none;
+  transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.field input::placeholder,
-textarea::placeholder,
-.modal-input::placeholder,
-.confirm-type input::placeholder {
+textarea {
+  height: auto;
+  padding: 10px 12px;
+}
+::placeholder {
   color: var(--text-faint);
+}
+.field input:hover,
+select:hover,
+.modal-input:hover,
+.confirm-type input:hover {
+  border-color: var(--text-faint);
 }
 .field input:focus,
 select:focus,
 textarea:focus,
 .modal-input:focus,
 .confirm-type input:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: none;
+  border-color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--text);
+}
+.field input[readonly] {
+  cursor: default;
+}
+[aria-invalid="true"] {
+  border-color: var(--danger) !important;
+  box-shadow: inset 0 0 0 1px var(--danger) !important;
+}
+/* Select — the same field, with a drawn chevron. */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 36px;
+  background-image: var(--glyph-chev);
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px 12px;
+  cursor: pointer;
+}
+.kv-value select {
+  width: auto;
+  min-width: 200px;
+  text-align: left;
+}
+
+/* Checkbox and radio — 16px squares. Checked box = ink with a paper tick;
+   checked radio = an ink square inside the outline. */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--text);
+  cursor: pointer;
+}
+.check input {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  border: 1px solid var(--text-dim);
+  border-radius: 0;
+  background: var(--surface) center / 16px 16px no-repeat;
+  cursor: pointer;
+  transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+.check:hover input {
   border-color: var(--text);
 }
-/* Error = a 2px brick border (the box keeps its size via the padding). */
-.field input[aria-invalid="true"],
-select[aria-invalid="true"],
-textarea[aria-invalid="true"],
-.modal-input[aria-invalid="true"],
-.confirm-type input[aria-invalid="true"] {
-  border: 2px solid var(--danger);
-  padding: 9px 11px;
+.check input[type="checkbox"]:checked {
+  background-color: var(--accent);
+  background-image: var(--glyph-tick);
+  border-color: var(--accent);
 }
-
-/* Restore panel — a saved backup gets a full-width select (names stay legible)
-   with its actions stacked below, so nothing squeezes the dropdown. */
-.restore-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-card);
+.check input[type="radio"]:checked {
+  border-color: var(--text);
+  box-shadow: inset 0 0 0 3px var(--surface), inset 0 0 0 8px var(--text);
 }
-.panel-label {
-  font-family: var(--font);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.5;
-  color: var(--text-dim);
-}
-.restore-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-/* Error toast — sits above the page (so it keeps the lift), on paper, with a
-   brick bar at the left. Never a tinted fill. */
-.error {
-  position: fixed;
-  left: 16px;
-  right: 16px;
-  bottom: 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--danger);
-  border-radius: var(--r-card);
-  box-shadow: inset 2px 0 0 var(--danger), var(--shadow-lift);
-  padding: 12px 14px;
-  font-size: 13px;
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-}
-.error .x {
-  margin-left: auto;
-  background: none;
-  border: none;
-  font-size: 20px;
-  line-height: 1;
-  cursor: pointer;
-  color: inherit;
-}
-.error .x:focus-visible {
+.check input:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
-/* Overlays — one scrim tint for every door: warm ink, no blur. */
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: oklch(0.12 0.01 60 / 0.45);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  z-index: 10;
-}
-.modal {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--r-panel);
-  box-shadow: var(--shadow-lift);
-  padding: 22px;
-  width: min(360px, 86vw);
-}
-.modal p {
-  margin: 0 0 18px;
-  font-size: 14px;
-  line-height: 1.5;
-  font-weight: 400;
-}
-.modal-title {
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 17px;
-  letter-spacing: -0.01em;
-  line-height: 1.3;
-  margin: 0 0 12px;
-}
-.modal-input {
-  margin-bottom: 18px;
-}
-.confirm-type {
-  display: block;
-  margin: 0 0 18px;
-}
-.confirm-type span {
-  display: block;
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-bottom: 8px;
-}
-/* The typed word is machine text — mono, in brick ink on the well (no tint). */
-.confirm-type b {
-  font-family: var(--font-mono);
-  font-weight: 600;
-  color: var(--danger);
-  background: var(--surface-2);
-  border-radius: var(--r-chip);
-  padding: 1px 5px;
-}
-/* Which site a confirm or a running op is about — a caption above the title. */
-.modal-site {
-  margin: 0 0 8px;
-  color: var(--text-dim);
-}
-.modal .modal-site {
-  margin: 0 0 8px;
-  font-size: 13px;
-}
-.modal-field {
-  margin: 0 0 14px;
-}
-.modal-field input {
-  width: 100%;
-}
-.modal .muted {
-  color: var(--text-dim);
-}
-.modal-error {
-  color: var(--danger);
-}
-.modal p.modal-error {
-  font-size: 13px;
-  margin: -4px 0 14px;
-}
-.modal-actions {
-  display: flex;
-  gap: 10px;
-  justify-content: flex-end;
-}
-
-/* Spinner — a smooth, eased turn. The one 50% radius left in the sheet. */
-.spinner {
-  width: 28px;
-  height: 28px;
-  border: 3px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.9s linear infinite;
-  margin: 0 auto;
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* Progress panel — a dialog holding the bar over a live log feed. Shown for
-   the long lifecycle ops so the user watches each phase instead of staring at
-   a single line of overlay text. */
-.progress-panel {
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--r-panel);
-  box-shadow: var(--shadow-lift);
-  width: min(440px, 90vw);
-  overflow: hidden;
-}
-.progress-body {
-  padding: 20px;
-}
-.progress-panel .modal-title {
-  margin: 0 0 14px;
-}
-
-/* The bar — an ink fill on the well; it settles moss the moment the console
-   is ready. Square ends. */
-.progressbar {
-  height: 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 0;
-  overflow: hidden;
-}
-.progressbar-fill {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  border-radius: 0;
-  transition: width 0.3s ease, background 0.2s;
-  /* A slow breath (eased, not a blink) so a long phase still reads as
-     "working" even while the bar's width is parked — e.g. the image pull. */
-  animation: pulse 1.8s ease-in-out infinite;
-}
-.progressbar-fill.done {
-  background: var(--jade);
-  animation: none;
-}
-@keyframes pulse {
-  50% {
-    opacity: 0.55;
-  }
-}
-
-/* Indeterminate mode — for ops with no measurable progress (backup, restore,
-   stop, password): an ink segment sweeps the track until the op settles to a
-   full moss bar. */
-.progressbar.indeterminate .progressbar-fill {
-  width: 40%;
-  animation: indeterminate 1.4s ease-in-out infinite;
-}
-@keyframes indeterminate {
-  from {
-    transform: translateX(-120%);
-  }
-  to {
-    transform: translateX(280%);
-  }
-}
-
-/* Live sub-status (e.g. "Booting… (12s)") — a sentence-case caption. */
-.progress-stage {
-  font-family: var(--font);
-  font-size: 13px;
-  font-weight: 400;
-  line-height: 1.5;
-  color: var(--text-dim);
-  margin: 12px 0;
-  min-height: 16px;
-}
-
-/* The log feed — mono, in the well, pinned to the latest line. */
-.progress-log {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.55;
-  color: var(--text-dim);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  padding: 10px 12px;
-  margin: 0;
-  height: 152px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* Structured pull progress — one compact row per image layer (id · bar ·
-   phase/bytes), fed by compose's JSON progress events. Working rows fill ink,
-   finished rows settle moss, warnings ochre, failures brick — the same
-   vocabulary as the main bar, so "is this going fine?" is a colour-read, not
-   a log-read. */
-.pull-summary {
-  font-family: var(--font);
-  font-size: 13px;
-  color: var(--text-dim);
-  margin: 0 0 8px;
-}
-.pull-layers {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 132px;
-  overflow-y: auto;
-  margin: 0 0 10px;
-}
-.pull-row {
-  display: grid;
-  grid-template-columns: 82px 1fr 96px;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
-}
-.pull-id {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.pull-bar {
-  height: 6px;
-  border-radius: 0;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  overflow: hidden;
-}
-.pull-bar-fill {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  border-radius: 0;
-  transition: width 0.2s ease, background 0.2s;
-}
-.pull-row.pull-done .pull-bar-fill {
-  background: var(--jade);
-}
-.pull-row.pull-warn .pull-bar-fill {
-  background: var(--accent-2);
-}
-.pull-row.pull-fail .pull-bar-fill {
-  background: var(--danger);
-}
-.pull-row.pull-fail {
-  color: var(--danger);
-}
-.pull-meta {
-  text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-}
-
-/* Log severity — errors brick, warnings ochre; routine chatter stays dim. */
-.progress-log .log-error {
-  color: var(--danger);
-}
-.progress-log .log-warn {
-  color: var(--accent-2);
-}
-
-/* ============================================================================
-   Redesign additions — a welcoming, tabbed shell over the same Atelier kit.
-   Plain-language screens for people who've never run a website: one calm
-   message per view, one obvious next step, jargon folded away under disclosures.
-   ============================================================================ */
-
-/* Shell — the sidebar + content row that fills the window under the header. */
-.shell {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-}
-
-/* Sidebar — calm, vertical navigation on paper, closed by a hairline. Scales
-   cleanly as destinations are added. Shown only once the appliance is
-   installed. */
-.sidebar {
-  flex: none;
-  width: 176px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 14px 10px;
-  background: var(--surface);
-  border-right: 1px solid var(--border);
-  overflow-y: auto;
-}
-.nav-item {
-  appearance: none;
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  width: 100%;
-  padding: 9px 12px;
-  border: none;
-  border-radius: var(--r-control);
-  background: none;
-  color: var(--text-dim);
-  font-family: var(--font);
-  font-size: 13.5px;
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
-  transition: color 0.12s, background 0.12s;
-}
-.nav-item .ic {
-  width: 18px;
-  height: 18px;
-}
-.nav-item:hover {
-  color: var(--text);
-  background: var(--surface-2);
-}
-/* Active = ink text on the well with a 2px ink bar at the left (0501). */
-.nav-item.active {
-  color: var(--text);
-  background: var(--surface-2);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-.nav-item:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-/* On a cramped width, collapse the sidebar to icons so content keeps room. */
-@media (max-width: 620px) {
-  .sidebar {
-    width: 56px;
-    align-items: center;
-  }
-  .nav-item {
-    justify-content: center;
-    padding: 10px 0;
-  }
-  .nav-item span {
-    display: none;
-  }
-}
-
-/* An intro block that opens a panel — a heading + a plain-language lede, no
-   card frame (it's orientation, not a control). */
-.intro h2,
-.card.welcome h2 {
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 21px;
-  letter-spacing: -0.01em;
-  margin: 0 0 10px;
-}
-.intro {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.intro .muted,
-.card.welcome .muted {
-  font-size: 14px;
-}
-
-/* A hint line — small, dim, often paired with a leading check/○ icon. */
-.hint {
-  color: var(--text-dim);
-  font-size: 12.5px;
-  line-height: 1.5;
-  margin: 10px 0 0;
-  display: flex;
-  align-items: flex-start;
-  gap: 7px;
-}
-.hint .ic {
-  width: 15px;
-  height: 15px;
-  margin-top: 1px;
-  color: var(--jade);
-  flex: none;
-}
-.screen.center .hint {
-  justify-content: center;
-}
-
-/* Welcome cards (Docker, first-run) get a touch more inner air. */
-.card.welcome {
-  padding: 22px;
-}
-
-/* A soft informational card (e.g. "start your site first") — an ochre bar. */
-.card.note {
-  box-shadow: inset 2px 0 0 var(--accent-2);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-/* Inline link cluster — doc/action links laid on one wrapping row. */
-.inline-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
-  margin-top: 14px;
-}
-.screen.center .inline-links {
-  justify-content: center;
-}
-.link {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.link .ic {
-  width: 15px;
-  height: 15px;
-}
-.link.centered {
-  align-self: center;
-}
-
-/* The status hero on Home — the emotional centre of the app; it belongs to
-   the page, so it carries an ink rule at the top instead of a lift. */
-.card.hero {
-  padding: 20px;
-  border-top-color: var(--border-strong);
-}
-.status-headline {
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 19px;
-  letter-spacing: -0.01em;
-}
-.hero-sub {
-  margin-top: 6px;
-}
-.card.hero .console-link {
-  margin-top: 8px;
-}
-.hero-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 16px;
-}
-.hero-actions .btn.primary {
-  flex: 1 1 auto;
-}
-
-/* A larger primary — the one confident action on a welcome/hero view. */
-.btn.big {
-  padding: 13px 18px;
-  font-size: 15px;
-}
-
-/* Quiet secondary actions (Sign in · Reset password) — understated, spaced. */
-.quiet-row {
-  display: flex;
-  gap: 8px;
-  justify-content: center;
-}
-.btn.ghost.small {
-  color: var(--text-dim);
-}
-.btn.ghost.small:not(:disabled):hover {
-  color: var(--text);
-}
-
-/* A gentle help line closing a panel. */
-.help-line {
-  margin: 6px 0 0;
-  font-size: 13px;
-  color: var(--text-dim);
-  text-align: center;
-}
-
-/* Update banner gains a two-line body (headline + reassurance). */
-.banner > div {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.banner-sub {
-  font-weight: 400;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-/* Folder / value picker row — a read-only field beside a Choose button. */
 .picker {
   display: flex;
   gap: 8px;
@@ -1293,86 +929,85 @@ textarea[aria-invalid="true"],
 }
 .picker .btn {
   flex: none;
+  height: 40px;
 }
 
-/* Checkbox rows — a friendly opt-in, aligned and roomy. */
-.check {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-top: 12px;
-  font-size: 13.5px;
-  line-height: 1.45;
-  cursor: pointer;
+/* Disclosure — a quiet row with a turning chevron. */
+.advanced {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
 }
-.check input {
-  width: 16px;
-  height: 16px;
-  margin: 1px 0 0;
-  flex: none;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-.check input:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.check code {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--surface-2);
-  border-radius: var(--r-chip);
-  padding: 1px 5px;
-}
-
-/* Export success card — a moss bar: passing, stated once. */
-.card.done-card {
-  box-shadow: inset 2px 0 0 var(--jade);
-}
-/* `.card .done-head` so it outranks `.card h3` (it is an h3 inside a card). */
-.card .done-head,
-.done-head {
+.advanced > summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-family: var(--font-display);
-  font-weight: 500;
-  font-size: 16px;
-  letter-spacing: -0.01em;
-  line-height: 1.3;
-  margin: 0 0 8px;
+  width: fit-content;
+  font-size: 14px;
+  color: var(--text-2);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.advanced > summary::-webkit-details-marker {
+  display: none;
+}
+.advanced > summary:hover {
   color: var(--text);
 }
-.done-head .ic {
-  width: 18px;
-  height: 18px;
-  color: var(--jade);
+.advanced > summary .chev {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.2s var(--ease);
 }
-.path-line {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  padding: 8px 10px;
-  margin: 6px 0 0;
-  word-break: break-all;
+.advanced[open] > summary .chev {
+  transform: rotate(90deg);
 }
-
-/* The export result stacks its own cards, so it needs the panel's own rhythm. */
-#publish-result {
+.advanced > :not(summary) {
+  margin-top: 14px;
+}
+.advanced > .btn {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
+  width: fit-content;
+}
+.advanced > .check + .check {
+  margin-top: 10px;
 }
 
-/* Host hand-off list — one row per host: what it is on the left, the way in on
-   the right. Rules between rows, never boxes; the card is the box. */
+/* ------------------------------------------------------ ledger + lists ---- */
+
+/* A fact: grey term, ink value, a hairline under it. */
+.kv {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 44px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+.card > .kv:first-child {
+  border-top: 1px solid var(--border);
+}
+.kv + .kv {
+  margin-top: -14px;
+}
+.kv-label {
+  color: var(--text-dim);
+}
+.kv-value {
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* Host hand-off: one row per host, hairlines between. */
 .host-list {
   list-style: none;
-  margin: 14px 0 0;
+  margin: 0;
   padding: 0;
+  border-top: 1px solid var(--border);
 }
 .host {
   display: flex;
@@ -1380,147 +1015,147 @@ textarea[aria-invalid="true"],
   justify-content: space-between;
   gap: 16px;
   padding: 12px 0;
-}
-.host + .host {
-  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 .host-text {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 .host-text strong {
-  font-size: 13px;
-  font-weight: 550;
+  font-size: 15px;
+  font-weight: 500;
+}
+.host-text .muted {
+  font-size: 14px;
+  color: var(--text-dim);
 }
 .host .btn {
   flex: none;
 }
-#export-cli-cmd + .btn {
-  margin-top: 10px;
-  width: fit-content;
-}
-@media (max-width: 560px) {
-  .host {
-    flex-direction: column;
-    align-items: stretch;
-  }
-}
 
-/* Empty-state hint inside the backups panel. */
-#backups-empty {
-  margin: 0;
-}
-
-/* Activity (logs) view. */
-.logs-controls {
+/* Backups. */
+.restore-panel {
   display: flex;
-  gap: 8px;
-  margin: 14px 0 10px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+.restore-panel select {
+  width: 100%;
+}
+.restore-actions,
+.logs-controls,
+.inline-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.inline-links {
+  gap: 20px;
 }
 .logs-controls select {
-  flex: 1 1 auto;
-}
-.logs-controls .btn {
-  flex: none;
-}
-.logs-view {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.55;
-  color: var(--text-dim);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-  padding: 10px 12px;
-  margin: 0;
-  height: 200px;
-  overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
+  width: auto;
+  min-width: 180px;
 }
 
-/* A key/value line in Maintenance (version, etc.). */
-.kv {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.kv-label {
-  font-family: var(--font);
-  font-size: 13px;
-  font-weight: 400;
-  color: var(--text-dim);
-}
-/* Values are versions / ids — machine text, mono. */
-.kv-value {
+/* Machine text: mono, in the well. */
+.path-line,
+.logs-view,
+.progress-log {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
   font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--text);
-  text-align: right;
+  line-height: 1.55;
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+.path-line {
+  align-self: stretch;
   word-break: break-all;
 }
-
-/* The advanced/danger disclosure stacks its buttons with breathing room. */
-.danger-zone {
-  margin-top: 14px;
+.logs-view {
+  height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--text-dim);
 }
-.danger-zone .check,
-.danger-zone .btn {
-  margin-top: 10px;
+.progress-log {
+  height: 152px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: 11px;
+  color: var(--text-dim);
 }
-.group-label .ic {
-  width: 13px;
-  height: 13px;
-  vertical-align: -2px;
-  margin-right: 5px;
+.progress-log .log-error {
+  color: var(--danger);
+}
+.progress-log .log-warn {
+  color: var(--accent-2);
 }
 
-/* ---------------------------------------------------------------------------
-   Troubleshoot (doctor) report.
+/* Publish result. */
+#publish-result {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.done-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.card .done-head {
+  font-size: 20px;
+}
+.done-head .ic {
+  width: 18px;
+  height: 18px;
+  color: var(--jade);
+}
 
-   Severity is carried by a mark + a colour, never by colour alone (the marks
-   read the same to a colour-blind eye, and survive a screenshot). State
-   colours only — moss/ochre/brick — so highlight ink never stands in for a
-   verdict and cinnabar never lands on status (brand.md §3.4/§10.1).
---------------------------------------------------------------------------- */
+/* Troubleshoot report: a mark + a colour, never colour alone. */
 .doctor {
-  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 .doctor-tier {
-  font-family: var(--font);
-  font-size: 13px;
+  margin: 0 0 6px;
+  font-size: 14px;
   font-weight: 500;
-  color: var(--text-dim);
-  margin: 16px 0 6px;
-}
-.doctor-tier:first-child {
-  margin-top: 0;
+  color: var(--text);
 }
 .doctor-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
+  border-top: 1px solid var(--border);
 }
 .doctor-item {
   display: flex;
-  gap: 9px;
+  gap: 10px;
   align-items: baseline;
-  font-size: 13px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
   line-height: 1.45;
 }
 .doctor-mark {
+  flex: none;
+  width: 1em;
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 600;
-  flex: 0 0 auto;
-  width: 1em;
   text-align: center;
 }
 .doctor-body {
@@ -1531,18 +1166,12 @@ textarea[aria-invalid="true"],
 }
 .doctor-detail,
 .doctor-remedy {
-  font-size: 12px;
+  font-size: 13px;
   overflow-wrap: anywhere;
 }
 .doctor-detail {
   color: var(--text-dim);
 }
-/* The remedy is the actionable half — it earns a little more weight than the
-   observation above it, without shouting. */
-.doctor-remedy {
-  color: var(--text);
-}
-
 .sev-ok .doctor-mark {
   color: var(--jade);
 }
@@ -1553,173 +1182,30 @@ textarea[aria-invalid="true"],
   color: var(--danger);
 }
 .sev-fail .doctor-label {
-  font-weight: 600;
+  font-weight: 500;
 }
-/* A skipped check was never reached — it must recede, not read as a verdict. */
-.sev-skipped {
-  color: var(--text-dim);
-}
+.sev-skipped,
 .sev-skipped .doctor-mark {
   color: var(--text-dim);
 }
 
-/* The manager's version, held beside the role label in the chrome. Tabular
-   figures so it doesn't jitter between builds; machine text, so mono. */
-.version-tag {
-  margin-left: 6px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
-}
-.version-tag:empty {
-  display: none;
-}
-
-/* --- Sites on a server (M2) -------------------------------------------------- */
-
-/* Ochre: a state worth a look, not a verdict — starting, resting, frozen, or a
-   server that didn't answer. Same grammar as up/down. */
-.dot.warn {
-  background: var(--accent-2);
-  box-shadow: none;
-}
-
-/* What only makes sense for one kind of site. `body.remote` is set while the
-   window shows a site on a server. */
-body.remote .local-only,
-body:not(.remote) .remote-only {
-  display: none !important;
-}
-
-/* Two-way choice in a modal: "On this computer" / "On a server". The chosen
-   side is an ink outline on paper — no shadow. */
-.seg {
-  display: flex;
-  gap: 4px;
-  padding: 3px;
-  margin: 0 0 14px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-control);
-}
-.seg-opt {
-  appearance: none;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  padding: 7px 8px;
-  border: 1px solid transparent;
-  border-radius: var(--r-control);
-  background: none;
-  color: var(--text-dim);
-  font-family: inherit;
-  font-size: 13px;
-  cursor: pointer;
-}
-.seg-opt:hover {
-  color: var(--text);
-}
-.seg-opt[aria-checked="true"] {
-  background: var(--surface);
-  border-color: var(--text);
-  color: var(--text);
-}
-.seg-opt:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-/* The add-site form grows with the server fields; it scrolls inside the
-   window rather than past it. */
-#add-site .modal {
-  width: min(440px, 90vw);
-  max-height: 88vh;
-  overflow-y: auto;
-}
-#add-site .check {
-  margin-top: 8px;
-}
-.guided {
-  margin: 12px 0 14px;
-}
-.guided .hint {
-  margin: 10px 0 0;
-}
-.guided .btn {
-  margin-top: 10px;
-}
-
-/* The identity-mismatch dialog names two sites side by side. */
-#mismatch .modal {
-  width: min(420px, 90vw);
-}
-#mismatch .kv-label {
-  white-space: nowrap;
-}
-#mismatch .kv-value {
-  font-family: inherit;
-  font-size: 13px;
-  word-break: normal;
-  overflow-wrap: anywhere;
-}
-#mismatch .modal-actions {
-  margin-top: 18px;
-}
-#confirm-msg {
-  white-space: pre-line;
-}
-#confirm-msg:empty {
-  display: none;
-}
-body.busy, body.busy * {
-  cursor: progress !important;
-}
-
-/* Pairing without SSH (M4, E-02): the code a Manager shows or keeps — a ruled
-   block (ink rule on top, hairline round the rest), mono because it's typed. */
-.big-code,
-.modal .big-code {
-  font-family: var(--font-mono);
-  font-size: 1.9rem;
-  font-weight: 600;
-  letter-spacing: 0.18em;
-  text-align: center;
-  padding: 14px 8px;
-  margin: 12px 0;
-  border: 1px solid var(--border);
-  border-top-color: var(--border-strong);
-  border-radius: var(--r-card);
-  background: var(--surface);
-  color: var(--text);
-  user-select: all;
-  overflow-wrap: anywhere;
-}
-.add-how {
-  margin: 4px 0 10px;
-}
+/* Managers (engine pairing). */
 .managers {
-  margin-top: 12px;
-}
-.sub-label {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-dim);
-  margin: 12px 0 6px;
+  align-self: stretch;
 }
 .managers-list {
   list-style: none;
   margin: 0 0 8px;
   padding: 0;
+  border-top: 1px solid var(--border);
 }
 .managers-list li {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 0;
+  gap: 10px;
+  padding: 8px 0;
   border-bottom: 1px solid var(--border);
+  font-size: 14px;
 }
 .managers-list .m-text {
   flex: 1;
@@ -1727,11 +1213,334 @@ body.busy, body.busy * {
 }
 .managers-list .m-name {
   display: block;
-  color: var(--text);
   overflow-wrap: anywhere;
 }
 .managers-list .m-meta {
   display: block;
-  font-size: 0.8rem;
+  font-size: 13px;
   color: var(--text-dim);
+}
+#experimental-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+  align-self: stretch;
+}
+#experimental-body > .kv,
+#experimental-body > .card.warn {
+  align-self: stretch;
+}
+
+/* ----------------------------------------------------- floating layers ---- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--scrim);
+}
+.modal,
+.progress-panel {
+  width: min(420px, 88vw);
+  max-height: 88vh;
+  overflow-y: auto;
+  padding: 24px;
+  background: var(--surface);
+  color: var(--text);
+  border-top: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-float);
+}
+.progress-body {
+  display: block;
+}
+.modal > * + *,
+.progress-body > * + * {
+  margin-top: 14px;
+}
+.modal-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+.modal p {
+  font-size: 15px;
+  line-height: 1.5;
+}
+.modal .muted {
+  color: var(--text-2);
+}
+.modal-site {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.modal-site + .modal-title {
+  margin-top: 4px;
+}
+.modal .modal-error,
+.modal-error {
+  font-size: 13px;
+  color: var(--danger);
+}
+.modal .kv + .kv {
+  margin-top: 0;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 6px;
+}
+.modal .modal-actions {
+  margin-top: 22px;
+}
+.confirm-type {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 14px;
+}
+.confirm-type b {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+#confirm-msg {
+  white-space: pre-line;
+}
+#confirm-msg:empty {
+  display: none;
+}
+#add-site .modal {
+  width: min(460px, 90vw);
+}
+#add-site .check {
+  margin-top: 10px;
+}
+.add-how {
+  display: flex;
+  flex-direction: column;
+}
+.how-engine,
+.how-ssh {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.guided > * + * {
+  margin-top: 12px;
+}
+.big-code {
+  margin: 0;
+  padding: 16px 8px;
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-align: center;
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+/* Two-way choice: the chosen side is the ink block. */
+.seg {
+  display: flex;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.seg-opt {
+  appearance: none;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 36px;
+  border: 0;
+  background: none;
+  font-size: 14px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.seg-opt:hover {
+  color: var(--text);
+}
+.seg-opt[aria-checked="true"] {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+/* Progress — a 4px ink line on the well; moss when done. */
+.progressbar {
+  height: 4px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.progressbar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.3s var(--ease), background 0.2s;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+.progressbar-fill.done {
+  background: var(--jade);
+  animation: none;
+}
+.progressbar.indeterminate .progressbar-fill {
+  width: 40%;
+  animation: sweep 1.4s ease-in-out infinite;
+}
+.progress-stage {
+  min-height: 20px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.pull-summary {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.pull-layers {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+.pull-row {
+  display: grid;
+  grid-template-columns: 82px 1fr 96px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.pull-id,
+.pull-meta {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.pull-meta {
+  text-align: right;
+}
+.pull-bar {
+  height: 4px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.pull-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s var(--ease), background 0.2s;
+}
+.pull-row.pull-done .pull-bar-fill {
+  background: var(--jade);
+}
+.pull-row.pull-warn .pull-bar-fill {
+  background: var(--accent-2);
+}
+.pull-row.pull-fail,
+.pull-row.pull-fail .pull-bar-fill {
+  color: var(--danger);
+  background: var(--danger);
+}
+.pull-row.pull-fail {
+  background: none;
+}
+
+/* Loading — the same line, sweeping. */
+.spinner {
+  position: relative;
+  width: 160px;
+  height: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.spinner::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: var(--accent);
+  animation: sweep 1.4s ease-in-out infinite;
+}
+@keyframes sweep {
+  from {
+    transform: translateX(-120%);
+  }
+  to {
+    transform: translateX(280%);
+  }
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* Error toast — floats, so it keeps the shadow; brick words with a mark. */
+.error {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  z-index: 30;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border-top: 1px solid var(--danger);
+  box-shadow: var(--shadow-float);
+  font-size: 14px;
+  color: var(--danger);
+}
+.error::before {
+  content: "";
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 7px;
+  background: var(--danger);
+}
+.error .x {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  font-size: 20px;
+  line-height: 1;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.error .x:hover {
+  color: var(--text);
+}
+
+@media (max-width: 760px) {
+  main {
+    padding: 28px 24px;
+  }
+  .sidebar {
+    width: 208px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

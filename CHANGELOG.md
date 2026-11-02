@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bundled, still fully offline), and the new Atelier CMS mark in the window and as the app icon.
   Highlights are ink; red only means something is wrong. A site that is starting up now shows
   the amber "waiting" square instead of the green "running" one.
+- **A calmer, more consistent layout.** The site you're working on now sits at the top of the
+  sidebar instead of in the title bar, which holds only the Atelier CMS mark, "Manager" and the
+  version. Sections are separated by lines instead of boxes, every screen opens with the same
+  kind of title, and buttons, fields, dropdowns and checkboxes share one look and size.
+- **The Mac app icon is a proper macOS icon**: the Atelier CMS mark on Apple's rounded-square
+  tile with its soft shadow, so it sits right in the Dock and the app switcher.
 
 ## [0.13.1] - 2026-11-01
 
