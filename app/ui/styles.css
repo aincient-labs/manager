@@ -173,7 +173,7 @@ body {
   padding: 13px 20px;
 }
 /* The Atelier lockup — handcrafted monogram + outlined wordmark (masters in
-   the umbrella's docs/brand-assets/atelier/). Both are currentColor, so the
+   the umbrella's brand/app-look/). Both are currentColor, so the
    lockup themes from `color` (ink); at chrome size the wordmark stays solid
    ink — the monogram carries the pigment (Law 03: one gesture per size). */
 .wordmark {

@@ -1,4 +1,9 @@
-# Atelier manager
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/readme/hero-dark.png" />
+  <img src=".github/readme/hero-light.png" alt="Atelier CMS. Install and look after Atelier CMS. Atelier Manager: the desktop app and the atelier command line." width="1000" />
+</picture>
+
+# Atelier Manager
 
 The installer/manager for an Atelier CMS appliance. One shared Rust engine, two
 front-ends:
