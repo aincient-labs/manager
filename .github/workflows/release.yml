@@ -447,6 +447,15 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # CycloneDX SBOMs, one per binary and target (umbrella DECISIONS 0503 M1),
+      # attached with the release below. Resolved from Cargo.lock per target, so
+      # this one Linux runner covers every platform. cargo-cyclonedx pinned.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate SBOMs
+        run: |
+          set -euo pipefail
+          .github/scripts/sbom artifacts | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
