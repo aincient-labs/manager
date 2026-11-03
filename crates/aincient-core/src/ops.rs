@@ -841,7 +841,11 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
         retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
         up(stack, r)?;
-        return Ok(wait_until_ready(stack, READY_TIMEOUT, r));
+        let ready = wait_until_ready(stack, READY_TIMEOUT, r);
+        if ready {
+            return move_db_image(stack, r);
+        }
+        return Ok(false);
     }
 
     // A stepped route is the case where a snapshot is least optional: it is longer,
@@ -919,7 +923,59 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
             );
         }
     }
-    Ok(true)
+    move_db_image(stack, r)
+}
+
+/// Where the appliance image keeps its converge script.
+const CONVERGE_PATH: &str = "/usr/local/bin/converge.sh";
+/// The converge step that rebuilds indexes when the db's C library changed.
+const COLLATION_REFRESH_STEP: &str = "refresh_collation_versions";
+
+/// Move the `db` service onto [`crate::stack::DB_IMAGE`] once the site runs an app
+/// image whose converge rebuilds indexes on a collation change (cms #86). Runs
+/// after an update has come up, so it asks the container actually running rather
+/// than a version number — an `:edge` build has none worth comparing. Recreates
+/// `db` on the new image and `app` with it, so converge runs against the new
+/// glibc and reindexes before the site serves. Returns whether the console came
+/// back up. Nothing to do (or an app too old to reindex, or not running) is
+/// `Ok(true)`: the move waits for the next update.
+fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    if stack.pending_db_image_migration().is_none() || !app_rebuilds_indexes(stack) {
+        return Ok(true);
+    }
+    let Some((from, to)) = stack.migrate_db_image()? else {
+        return Ok(true);
+    };
+    r.stage(
+        Stage::Scaffold,
+        &format!(
+            "Moving your site's database server to {to}. It was on {from}, whose older \
+             system libraries carry security advisories. The data stays; its indexes are \
+             rebuilt once for the new libraries, which takes a moment longer than a \
+             restart."
+        ),
+        Some(0.9),
+    );
+    pull(stack, r)?;
+    let mut c = compose(stack);
+    c.args(["up", "-d", "--force-recreate", "db", "app"]);
+    run_step(c, "move the database server", r)?;
+    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+}
+
+/// Whether the running `app` container's converge carries the collation step.
+fn app_rebuilds_indexes(stack: &Stack) -> bool {
+    let mut c = compose(stack);
+    c.args([
+        "exec",
+        "-T",
+        "app",
+        "grep",
+        "-q",
+        COLLATION_REFRESH_STEP,
+        CONVERGE_PATH,
+    ]);
+    docker::try_capture_empty_ok(c).is_some()
 }
 
 /// Wraps a [`Reporter`] so a sub-run's 0.0–1.0 progress lands inside one slice of

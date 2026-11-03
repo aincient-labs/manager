@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its security advisories; the slim one is the same nginx without them. New installs start on it,
   and `atelier app update` moves existing ones (your `compose.yaml` edits are kept), even when
   there is no new Atelier release. `atelier doctor` warns until then.
+- **The database server moves to the Debian trixie build** (`pgvector/pgvector:pg16-trixie`): the
+  same PostgreSQL 16 and pgvector, on system libraries without the old image's Critical and High
+  advisories. New installs start on it. `atelier app update` moves an existing site once it runs
+  an Atelier version that rebuilds its database indexes for the new libraries (text sorts
+  slightly differently under them); the data stays, and the first start takes a moment longer.
+  `atelier doctor` warns until then.
 
 ## [0.14.0] - 2026-11-03
 
