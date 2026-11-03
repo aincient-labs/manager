@@ -935,13 +935,17 @@ mod tests {
 
     #[test]
     fn connectivity_check_fails_on_a_closed_port() {
-        // Bind then drop: the port is free, so nothing is listening on it.
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Bind but never listen, and hold the socket for the whole check: the
+        // port stays reserved, so a parallel test can't be handed it and start
+        // listening there (bind-then-drop raced exactly that way).
+        use socket2::{Domain, Socket, Type};
+        let reserved = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        reserved
+            .bind(&std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())
+            .unwrap();
+        let port = reserved.local_addr().unwrap().as_socket().unwrap().port();
         assert!(!can_reach("127.0.0.1", port, Duration::from_secs(2)));
+        drop(reserved);
     }
 
     /// A blackholed address never answers; the budget, not the OS connect

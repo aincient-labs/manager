@@ -41,3 +41,6 @@ keyring = { version = "3.6", features = ["async-secret-service", "async-io", "cr
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
+
+[dev-dependencies]
+socket2 = "0.6"
