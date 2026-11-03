@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# sbom — CycloneDX SBOMs for one Manager release (umbrella DECISIONS 0503 M1): one file per binary
+# and release target, listing every crate linked into it (build-script-only crates excluded), resolved from Cargo.lock for that
+# target (no build needed, so one Linux runner covers every target).
+#
+#   .github/scripts/sbom OUT_DIR
+#
+# Writes OUT_DIR/atelier-cli-<target>.cdx.json (the `atelier` CLI) and
+# OUT_DIR/atelier-manager-<target>.cdx.json (the desktop app). Needs cargo-cyclonedx on PATH;
+# the release workflow installs it pinned (--locked, exact version).
+set -euo pipefail
+out="${1:?usage: sbom OUT_DIR}"; mkdir -p "$out"; out="$(cd "$out" && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# What each binary ships for: the CLI's targets are dist-workspace.toml's; the desktop app's
+# are release-gui.yml's (the macOS universal app = both Apple targets).
+CLI_TARGETS="aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc"
+GUI_TARGETS="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc"
+one() { # file-prefix crate-dir target
+  local name="$1" dir="$root/$2" t="$3"
+  cargo cyclonedx -q --manifest-path "$dir/Cargo.toml" --format json --target "$t" --no-build-deps \
+    --override-filename "$name-$t.cdx"
+  mv "$dir/$name-$t.cdx.json" "$out/"
+  # In a workspace it writes the same file name into every member; only $dir's is ours.
+  find "$root/app" "$root/crates" -maxdepth 2 -name "$name-$t.cdx.json" -delete
+  jq -e '.bomFormat == "CycloneDX" and (.components | length) > 0' "$out/$name-$t.cdx.json" >/dev/null
+  printf '%s\t%s components\n' "$name-$t.cdx.json" "$(jq '.components | length' "$out/$name-$t.cdx.json")"
+}
+for t in $CLI_TARGETS; do one atelier-cli crates/aincient-cli "$t"; done
+for t in $GUI_TARGETS; do one atelier-manager app "$t"; done
