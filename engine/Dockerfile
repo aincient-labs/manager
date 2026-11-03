@@ -7,7 +7,7 @@
 # atelier-engine:dev, which only a developer build of the Manager pins, by
 # image ID (m7-4). Context: the manager repo root. Base images are pinned by
 # digest (tag kept for the reader).
-FROM rust:1.88-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS build
+FROM rust:1.99-alpine@sha256:7e9e2d068a107a2adafd19930011178d14a78326053cd4c3a9f7ad3fd049557d AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
