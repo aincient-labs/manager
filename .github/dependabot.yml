@@ -1,0 +1,28 @@
+# Dependabot for the Manager (umbrella decision 0503, D-07). Security updates arrive as advisories
+# do; version updates come as one grouped pull request a month per ecosystem. The weekly SBOM scan
+# in the private cms repo watches the latest two Manager releases.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      crates:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: "/engine"
+    schedule:
+      interval: monthly
