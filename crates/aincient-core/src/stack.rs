@@ -337,6 +337,19 @@ server {
 }
 "#;
 
+/// Every `edge.conf` an earlier manager (or `install.sh`) shipped, byte for byte.
+/// A stack still holding one of these was never hand-edited, so it is upgraded to
+/// [`EDGE_CONF_TEMPLATE`] silently ([`Stack::refresh_shipped_edge_conf`]) instead
+/// of earning doctor's "written by an older manager" warning. When the template
+/// changes, add the outgoing text here as `templates/edge-<first version>.conf`.
+pub const SUPERSEDED_EDGE_CONF_TEMPLATES: &[&str] =
+    &[include_str!("../templates/edge-0.10.0.conf")];
+
+/// True for the current edge template or any superseded shipped one.
+fn is_shipped_edge_conf(s: &str) -> bool {
+    s == EDGE_CONF_TEMPLATE || SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&s)
+}
+
 /// The file in a stack directory holding the site's identity (m2-6, D-04).
 pub const SITE_ID_FILE: &str = "site-id";
 
@@ -435,8 +448,23 @@ impl Stack {
         std::fs::read_to_string(self.compose_path()).ok().as_deref() == Some(COMPOSE_TEMPLATE)
             && std::fs::read_to_string(self.edge_conf_path())
                 .ok()
-                .as_deref()
-                == Some(EDGE_CONF_TEMPLATE)
+                .is_some_and(|s| is_shipped_edge_conf(&s))
+    }
+
+    /// Replace an `edge.conf` that is exactly a superseded shipped template with
+    /// the current one. Anything else (current, hand-edited, missing) is left
+    /// alone. Returns whether the file changed, so the caller can reload `edge`.
+    pub fn refresh_shipped_edge_conf(&self) -> Result<bool> {
+        let path = self.edge_conf_path();
+        let Ok(current) = std::fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        if !SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&current.as_str()) {
+            return Ok(false);
+        }
+        std::fs::write(&path, EDGE_CONF_TEMPLATE)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(true)
     }
 
     /// The Docker Compose **project name** for this stack — the namespace its
@@ -786,6 +814,7 @@ impl Stack {
             std::fs::write(&edge, EDGE_CONF_TEMPLATE)
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
+        self.refresh_shipped_edge_conf()?;
 
         let env_path = self.env_path();
 
@@ -1559,5 +1588,39 @@ mod tests {
         assert_eq!(ts.0.image(), DEFAULT_IMAGE);
         assert_eq!(ts.0.http_port(), DEFAULT_PORT);
         assert!(ts.0.read_env().is_empty());
+    }
+
+    #[test]
+    fn superseded_edge_conf_is_current_and_refreshed_silently() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        std::fs::write(stack.edge_conf_path(), SUPERSEDED_EDGE_CONF_TEMPLATES[0]).unwrap();
+
+        // An untouched older template is not a doctor warning…
+        assert!(stack.stack_files_current());
+        // …and is swapped for the current one on the next refresh.
+        assert!(stack.refresh_shipped_edge_conf().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.edge_conf_path()).unwrap(),
+            EDGE_CONF_TEMPLATE
+        );
+        assert!(!stack.refresh_shipped_edge_conf().unwrap());
+    }
+
+    #[test]
+    fn hand_edited_edge_conf_is_never_refreshed() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let edited = format!("{}# mine\n", SUPERSEDED_EDGE_CONF_TEMPLATES[0]);
+        std::fs::write(stack.edge_conf_path(), &edited).unwrap();
+
+        assert!(!stack.stack_files_current());
+        assert!(!stack.refresh_shipped_edge_conf().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.edge_conf_path()).unwrap(),
+            edited
+        );
     }
 }

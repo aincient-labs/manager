@@ -816,11 +816,26 @@ fn retarget_single_hop(stack: &Stack, plan: &UpgradePlan) -> Result<()> {
     Ok(())
 }
 
+/// Swap an untouched older shipped `edge.conf` for the current one before an
+/// upgrade, and have a running `edge` reload it, so the page visitors see while
+/// `app` restarts is this manager's. nginx reads its config only at start, so
+/// without the reload the old page would stay until `edge` next restarts.
+/// Best-effort: a failed write or reload never blocks the upgrade (the file is
+/// then picked up at the next restart, and doctor still sees it as shipped).
+fn refresh_edge_conf(stack: &Stack) {
+    if let Ok(true) = stack.refresh_shipped_edge_conf() {
+        let mut reload = compose(stack);
+        reload.args(["exec", "-T", "edge", "nginx", "-s", "reload"]);
+        let _ = reload.output();
+    }
+}
+
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
     announce_legacy_migrations(stack, r)?;
+    refresh_edge_conf(stack);
 
     if !plan.is_stepped() {
         retarget_single_hop(stack, plan)?;

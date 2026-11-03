@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind of title, and buttons, fields, dropdowns and checkboxes share one look and size.
 - **The "Atelier is starting" page wears the new brand**: what your browser shows while a site
   starts or upgrades now has the Atelier CMS mark and follows your light or dark setting.
+  Existing sites get it on their next update, with no doctor warning: the Manager recognises the
+  starting page it shipped before and swaps it in place. An `edge.conf` you edited by hand is
+  never touched.
 - **The Mac app icon is a proper macOS icon**: the Atelier CMS mark on Apple's rounded-square
   tile with its soft shadow, so it sits right in the Dock and the app switcher.
 
