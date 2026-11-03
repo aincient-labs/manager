@@ -15,7 +15,7 @@ RUN cargo build --release --locked -p atelier
 
 # The Docker CLI with the Compose plugin; the engine drives the host daemon
 # through the mounted socket.
-FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d
+FROM docker:29-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb
 COPY --from=build /src/target/release/atelier /usr/local/bin/atelier
 EXPOSE 8080
 # `serve` refuses to start unless ATELIER_ENGINE_EXPERIMENTAL=1, which only
