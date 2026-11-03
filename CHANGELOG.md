@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sidebar instead of in the title bar, which holds only the Atelier CMS mark, "Manager" and the
   version. Sections are separated by lines instead of boxes, every screen opens with the same
   kind of title, and buttons, fields, dropdowns and checkboxes share one look and size.
+- **The "Atelier is starting" page wears the new brand**: what your browser shows while a site
+  starts or upgrades now has the Atelier CMS mark and follows your light or dark setting.
 - **The Mac app icon is a proper macOS icon**: the Atelier CMS mark on Apple's rounded-square
   tile with its soft shadow, so it sits right in the Dock and the app switcher.
 
