@@ -781,6 +781,36 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         ));
     }
 
+    // The db image too (cms #86). Not repaired here: the new image's glibc sorts
+    // text differently and only an app whose converge reindexes may start on it,
+    // which `atelier app update` checks in the running container before it moves.
+    if scaffolded {
+        out.push(match stack.pending_db_image_migration() {
+            Some((from, to)) => Check::bad(
+                "stack.db_image",
+                Tier::Stack,
+                "Database server receives security fixes",
+                Severity::Warn,
+                "The database server runs an image we no longer ship. `atelier app \
+                 update` moves it once your site runs a version that rebuilds its \
+                 indexes for the new system libraries.",
+            )
+            .detail(format!("{from} → {to}")),
+            None => Check::ok(
+                "stack.db_image",
+                Tier::Stack,
+                "Database server receives security fixes",
+            ),
+        });
+    } else {
+        out.push(Check::skipped(
+            "stack.db_image",
+            Tier::Stack,
+            "Database server receives security fixes",
+            "No stack yet.",
+        ));
+    }
+
     // The edge's nginx tag was baked into compose.yaml at install time, so an old
     // install keeps pulling the last build of a line nginx no longer patches, or the
     // full image we stopped shipping. The site runs fine, which is why it's a

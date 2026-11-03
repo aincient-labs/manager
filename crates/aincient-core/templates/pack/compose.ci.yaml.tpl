@@ -4,7 +4,7 @@
 # the admission gate, kind-check and the gallery smoke before anything ships.
 services:
   db:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16-trixie
     environment:
       POSTGRES_DB: aincient
       POSTGRES_USER: aincient

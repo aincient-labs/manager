@@ -206,6 +206,25 @@ pub fn edge_nginx_upgrade_reason(from: &str) -> &'static str {
     }
 }
 
+/// The Postgres + pgvector image the `db` service runs — the tag in
+/// [`COMPOSE_TEMPLATE`]. Debian trixie: the bookworm build ([`LEGACY_DB_IMAGE`])
+/// carries a `gosu` built with an old Go and Debian libraries with Critical/High
+/// advisories that trixie fixes (cms #86, umbrella DECISIONS 0503).
+pub const DB_IMAGE: &str = "pgvector/pgvector:pg16-trixie";
+
+/// The bookworm db image every install before the trixie move was written with.
+/// Moving off it changes glibc under the data (2.36 → 2.41), so text indexes have
+/// to be rebuilt: the appliance's converge does that on start, which is why
+/// [`Stack::migrate_db_image`] only runs once the app image carries that step.
+pub const LEGACY_DB_IMAGE: &str = "pgvector/pgvector:pg16";
+
+/// The `db` image an install should move to, if any: exactly [`LEGACY_DB_IMAGE`],
+/// the tag a manager or `install.sh` wrote. A digest, another tag or another image
+/// is the operator's choice and stays.
+pub fn db_image_upgrade(image: &str) -> Option<String> {
+    (image == LEGACY_DB_IMAGE).then(|| DB_IMAGE.to_string())
+}
+
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
 /// step with the `cat > compose.yaml` heredoc in `docker/install.sh`: the slim
 /// runtime topology (edge + app + db, no build context, no updater sidecar).
@@ -216,7 +235,7 @@ pub fn edge_nginx_upgrade_reason(from: &str) -> &'static str {
 pub const COMPOSE_TEMPLATE: &str = r#"name: atelier
 services:
   db:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16-trixie
     environment:
       POSTGRES_DB: aincient
       POSTGRES_USER: aincient
@@ -753,19 +772,50 @@ impl Stack {
         let Some((from, to)) = self.pending_edge_image_migration() else {
             return Ok(None);
         };
+        self.rewrite_image_line(&from, &to)?;
+        Ok(Some((from, to)))
+    }
+
+    /// Rewrite every `image: <from>` line of `compose.yaml` to `<to>` in place, so a
+    /// hand-edited file keeps its edits.
+    fn rewrite_image_line(&self, from: &str, to: &str) -> Result<()> {
         let path = self.compose_path();
         let compose = std::fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
         let rewritten: String = compose
             .split_inclusive('\n')
             .map(|line| match line.trim_start().strip_prefix("image:") {
-                Some(value) if value.trim() == from => line.replacen(&from, &to, 1),
+                Some(value) if value.trim() == from => line.replacen(from, to, 1),
                 _ => line.to_string(),
             })
             .collect();
         std::fs::write(&path, rewritten)
-            .with_context(|| format!("could not write {}", path.display()))?;
+            .with_context(|| format!("could not write {}", path.display()))
+    }
+
+    /// Move the `db` service off the bookworm image onto [`DB_IMAGE`]. Returns
+    /// `Some((from, to))` if it rewrote anything; idempotent like the edge move.
+    ///
+    /// NOT called from the legacy repairs that run before every pull: the new
+    /// image's glibc sorts text differently, and only an app image whose converge
+    /// rebuilds indexes on a collation change may start against it. The caller
+    /// (`ops::move_db_image`) checks that in the running container first.
+    pub fn migrate_db_image(&self) -> Result<Option<(String, String)>> {
+        let Some((from, to)) = self.pending_db_image_migration() else {
+            return Ok(None);
+        };
+        self.rewrite_image_line(&from, &to)?;
         Ok(Some((from, to)))
+    }
+
+    /// Whether [`migrate_db_image`](Self::migrate_db_image) would rewrite this
+    /// install, and to what.
+    pub fn pending_db_image_migration(&self) -> Option<(String, String)> {
+        let compose = std::fs::read_to_string(self.compose_path()).ok()?;
+        compose.lines().find_map(|line| {
+            let from = line.trim_start().strip_prefix("image:")?.trim();
+            db_image_upgrade(from).map(|to| (from.to_string(), to))
+        })
     }
 
     /// Whether [`migrate_edge_image`](Self::migrate_edge_image) would rewrite this
@@ -1558,6 +1608,47 @@ mod tests {
         assert!(now.contains("    # mine\n"), "hand edits survive");
         // Once only.
         assert_eq!(stack.migrate_edge_image().unwrap(), None);
+    }
+
+    #[test]
+    fn the_template_runs_the_trixie_db_image() {
+        assert!(COMPOSE_TEMPLATE.contains(&format!("    image: {DB_IMAGE}\n")));
+        assert_eq!(db_image_upgrade(DB_IMAGE), None);
+        assert_eq!(db_image_upgrade(LEGACY_DB_IMAGE).as_deref(), Some(DB_IMAGE));
+        // A digest, another tag or another image is the operator's choice.
+        assert_eq!(db_image_upgrade("pgvector/pgvector:pg16-bookworm"), None);
+        assert_eq!(db_image_upgrade("pgvector/pgvector:pg17"), None);
+        assert_eq!(db_image_upgrade("postgres:16"), None);
+    }
+
+    #[test]
+    fn an_old_db_image_is_moved_and_hand_edits_survive() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let old = COMPOSE_TEMPLATE.replace(DB_IMAGE, LEGACY_DB_IMAGE).replace(
+            "    restart: unless-stopped\nvolumes:",
+            "    restart: unless-stopped\n    # mine\nvolumes:",
+        );
+        std::fs::write(stack.compose_path(), &old).unwrap();
+
+        assert_eq!(
+            stack.pending_db_image_migration(),
+            Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
+        );
+        // The edge move must not touch the db line, nor the db move the edge line.
+        assert_eq!(stack.pending_edge_image_migration(), None);
+        assert!(stack.migrate_db_image().unwrap().is_some());
+
+        let now = std::fs::read_to_string(stack.compose_path()).unwrap();
+        assert_eq!(
+            now,
+            COMPOSE_TEMPLATE.replace(
+                "    restart: unless-stopped\nvolumes:",
+                "    restart: unless-stopped\n    # mine\nvolumes:",
+            )
+        );
+        assert_eq!(stack.migrate_db_image().unwrap(), None);
     }
 
     #[test]
