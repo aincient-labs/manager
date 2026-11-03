@@ -958,7 +958,7 @@ impl Reporter for ScaledReporter<'_> {
 }
 
 /// Run the one-time repairs an install made under an older manager needs — the
-/// retired-repository rename, the move off an unmaintained nginx for `edge`, and the
+/// retired-repository rename, the move off an unmaintained or full nginx for `edge`, and the
 /// legacy-`:edge` → stable move — and say so out loud.
 ///
 /// None of them can be reached by changing a default: the image names were baked
@@ -994,14 +994,16 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             Some(0.07),
         );
     }
-    // Same kind of repair: a web server line nginx no longer fixes is nobody's
-    // choice, and it changes no Atelier version, so no snapshot and no question.
+    // Same kind of repair: a web server line nginx no longer fixes, or the full
+    // image we stopped shipping, is nobody's choice, and it changes no Atelier
+    // version, so no snapshot and no question.
     // The `pull` + `up` that follow fetch it and recreate `edge`.
     if let Some((from, to)) = stack.migrate_edge_image()? {
         r.stage(
             Stage::Scaffold,
             &format!(
-                "Moving the web server in front of your site to {to}. It was on {from},                  an nginx line that no longer receives security fixes (ATELIER-SA-2026-002).",
+                "Moving the web server in front of your site to {to}. It was on {from}, {}.",
+                crate::stack::edge_nginx_upgrade_reason(&from),
             ),
             Some(0.075),
         );

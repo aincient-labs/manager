@@ -163,26 +163,47 @@ pub fn rename_legacy_repo(image: &str) -> Option<String> {
 ///
 /// A *maintained* nginx line, not merely a recent one: nginx patches only its
 /// current stable and mainline branches, and the old stable stops receiving fixes
-/// the day the next one ships. Moving this means moving installs too — see
-/// [`edge_nginx_upgrade`].
-pub const EDGE_IMAGE: &str = "nginx:1.30-alpine";
+/// the day the next one ships. And the *slim* flavour: the full Alpine image adds
+/// curl, expat and brotli, which nginx never loads but which collect most of the
+/// image's security advisories (umbrella DECISIONS 0503, weekly scan, cms #87).
+/// Moving this means moving installs too — see [`edge_nginx_upgrade`].
+pub const EDGE_IMAGE: &str = "nginx:1.30-alpine-slim";
 
 /// The `nginx:1.N-alpine` minor below which an edge image is on an nginx line that
 /// no longer receives security fixes, and is moved onto [`EDGE_IMAGE`].
 const EDGE_NGINX_FLOOR_MINOR: u32 = 30;
 
-/// Move an edge image on an unmaintained nginx line onto [`EDGE_IMAGE`]. `None`
-/// for anything that isn't one of the `nginx:1.N-alpine` tags a manager or
-/// `install.sh` ever wrote below the floor — a newer line, a digest or another
-/// image is the operator's choice and stays.
+/// Move an edge image a manager or `install.sh` wrote onto [`EDGE_IMAGE`]: an
+/// `nginx:1.N-alpine` tag on an unmaintained line (below the floor), or the full
+/// `nginx:1.30-alpine` the floor line shipped as before the slim move. `None` for
+/// anything else — a newer line, a digest or another image is the operator's
+/// choice and stays.
 ///
 /// Like [`rename_legacy_repo`] this is a dead pointer rather than a preference: the
 /// tag was baked into `compose.yaml` at install time and `compose pull` on it only
-/// ever fetches the last build of a line nginx no longer fixes (ATELIER-SA-2026-002).
+/// ever fetches the last build of a line nginx no longer fixes (ATELIER-SA-2026-002),
+/// or the image with the packages we stopped shipping.
 pub fn edge_nginx_upgrade(image: &str) -> Option<String> {
     let (minor, suffix) = image.strip_prefix("nginx:1.")?.split_once('-')?;
     let minor: u32 = minor.parse().ok()?;
-    (suffix == "alpine" && minor < EDGE_NGINX_FLOOR_MINOR).then(|| EDGE_IMAGE.to_string())
+    (suffix == "alpine" && minor <= EDGE_NGINX_FLOOR_MINOR).then(|| EDGE_IMAGE.to_string())
+}
+
+/// Why [`edge_nginx_upgrade`] moves `from`, in words for the person running it.
+pub fn edge_nginx_upgrade_reason(from: &str) -> &'static str {
+    let minor = from
+        .strip_prefix("nginx:1.")
+        .and_then(|rest| rest.split_once('-'))
+        .and_then(|(minor, _)| minor.parse::<u32>().ok());
+    match minor {
+        Some(m) if m < EDGE_NGINX_FLOOR_MINOR => {
+            "an nginx line that no longer receives security fixes (ATELIER-SA-2026-002)"
+        }
+        _ => {
+            "the full nginx image, whose extra packages (curl, expat) collect security \
+              advisories nginx never uses"
+        }
+    }
 }
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
@@ -222,7 +243,7 @@ services:
       - private:/opt/drupal/private
     restart: unless-stopped
   edge:
-    image: nginx:1.30-alpine
+    image: nginx:1.30-alpine-slim
     depends_on:
       - app
     ports:
@@ -1493,7 +1514,15 @@ mod tests {
             edge_nginx_upgrade("nginx:1.27-alpine").as_deref(),
             Some(EDGE_IMAGE)
         );
+        // The floor line's full image moves to slim (cms #87).
+        assert_eq!(
+            edge_nginx_upgrade("nginx:1.30-alpine").as_deref(),
+            Some(EDGE_IMAGE)
+        );
+        assert!(edge_nginx_upgrade_reason("nginx:1.28-alpine").contains("no longer receives"));
+        assert!(edge_nginx_upgrade_reason("nginx:1.30-alpine").contains("full nginx image"));
         // A newer line, an unpinned tag, another flavour or another image is a choice.
+        assert_eq!(edge_nginx_upgrade("nginx:1.30-alpine-slim"), None);
         assert_eq!(edge_nginx_upgrade("nginx:1.31-alpine"), None);
         assert_eq!(edge_nginx_upgrade("nginx:alpine"), None);
         assert_eq!(edge_nginx_upgrade("nginx:1.28"), None);

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The web server in front of your site moves to nginx's slim image** (`nginx:1.30-alpine-slim`).
+  The full image carries curl, expat and brotli, which nginx never uses but which collect most of
+  its security advisories; the slim one is the same nginx without them. New installs start on it,
+  and `atelier app update` moves existing ones (your `compose.yaml` edits are kept), even when
+  there is no new Atelier release. `atelier doctor` warns until then.
+
 ## [0.14.0] - 2026-11-03
 
 ### Changed
