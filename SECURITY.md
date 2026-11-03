@@ -40,6 +40,17 @@ The manager follows **[Semantic Versioning](https://semver.org/)** and is releas
 [GitHub Releases](https://github.com/aincient-labs/manager/releases) and the
 `aincient-labs/homebrew-tap`. Security fixes ship in a new release; the **latest release** is
 the supported version. Update with `brew upgrade atelier` or by downloading the newest release.
+Each advisory says whether the release before the latest was affected.
+
+## What's inside: SBOMs
+
+Every release from 0.14.0 attaches a **CycloneDX SBOM** (software bill of materials) per
+binary and target to its [GitHub Release](https://github.com/aincient-labs/manager/releases):
+`atelier-cli-<target>.cdx.json` for the CLI and `atelier-manager-<target>.cdx.json` for the
+desktop app, listing every Rust crate compiled in. We scan the latest two releases against new
+advisories every week; an advisory that cannot affect the Manager is recorded in a
+`vex.openvex.json` ([OpenVEX](https://openvex.dev)) in this repository. How to read the files:
+[aincient-labs.com/docs/sbom](https://aincient-labs.com/docs/sbom).
 
 ## Verifying what you run
 
