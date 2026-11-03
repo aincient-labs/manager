@@ -313,7 +313,6 @@ dependencies = [
  "aincient-core",
  "anyhow",
  "serde",
- "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
