@@ -383,7 +383,7 @@ mod tests {
         let l = store.lock().unwrap();
         assert!(l.flags().unwrap().lockdown);
         let ids: Vec<String> = l.pairings().unwrap().into_iter().map(|p| p.id).collect();
-        assert_eq!(ids, [owner.id.clone()]);
+        assert_eq!(ids, std::slice::from_ref(&owner.id));
         assert!(!ids.contains(&other.id));
         drop(l);
         // Wake is refused while locked down; unlock lifts it, wake starts.

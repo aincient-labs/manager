@@ -1,0 +1,18 @@
+# cargo-deny (umbrella DECISIONS 0503/0504, CRA m2-8): `cargo deny check advisories` runs in CI
+# (check.yml) and in `bin/release-manager prepare`. Only the advisories check is configured for
+# now; licenses, bans and sources stay unconfigured and are not run.
+#
+# A RustSec advisory against a crate in Cargo.lock fails the check. Fix it by upgrading the crate;
+# an advisory that cannot affect the Manager goes in vex.openvex.json AND in `ignore` below with
+# the same reason, never in `ignore` alone.
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerabilities and unsound advisories fail (cargo-deny 0.20 defaults); yanked crates warn.
+# Unmaintained crates fail only when the workspace depends on them DIRECTLY: transitive ones
+# (tauri's GTK/urlpattern stack, keyring's zbus) still print, but don't block a release
+# (umbrella DECISIONS 0505).
+unmaintained = "workspace"
+ignore = []

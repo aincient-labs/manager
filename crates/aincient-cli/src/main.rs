@@ -827,6 +827,9 @@ fn run_sites(command: SitesCommand, experimental: bool) -> Result<()> {
                     stack.home.display()
                 );
             }
+            if let Some(notice) = &added.notice {
+                println!("{} {notice}", style::warn("Note"));
+            }
             println!(
                 "{} {} ({}) — port {}, folder {}",
                 style::success("Added site"),

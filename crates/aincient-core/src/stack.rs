@@ -320,6 +320,15 @@ map $http_x_forwarded_proto $edge_proto {
     default $http_x_forwarded_proto;
     "" $scheme;
 }
+# HSTS only for a request that arrived over TLS (an outer terminator, or a
+# direct https listener). Keyed on $edge_proto, the scheme already forwarded to
+# Drupal, so the two never disagree. An empty value is not sent; a browser
+# ignores HSTS received over plain http, so a client spoofing the header gains
+# nothing.
+map $edge_proto $hsts {
+    default "";
+    https "max-age=31536000";
+}
 
 proxy_http_version 1.1;
 proxy_set_header Host $http_host;
@@ -340,6 +349,16 @@ server {
     server_name _;
     absolute_redirect off;
 
+    # Baseline security headers, on every response (`always`: error pages too).
+    # nginx drops server-level add_header in any location that has one of its
+    # own, so `location /` and `@updating` repeat this block verbatim; keep the
+    # three copies in step. @miss has none of its own and inherits it.
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    add_header Strict-Transport-Security $hsts always;
+
     gzip on;
     gzip_vary on;
     gzip_types text/css text/plain text/xml application/xml application/javascript application/json image/svg+xml;
@@ -348,6 +367,11 @@ server {
         root $frz_root;
         add_header X-Atelier-Served frozen;
         add_header Cache-Control "public, max-age=300, stale-while-revalidate=86400";
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+        add_header X-Frame-Options SAMEORIGIN always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+        add_header Strict-Transport-Security $hsts always;
         try_files $uri/index.html $uri @miss;
     }
 
@@ -363,6 +387,10 @@ server {
         # Live or bypassed: Drupal. A variable target is resolved per request.
         set $app http://app:80;
         proxy_pass $app;
+        # Drupal sends the same two (core FinishResponseSubscriber); the edge's
+        # copies are the only ones, so drop the upstream's.
+        proxy_hide_header X-Content-Type-Options;
+        proxy_hide_header X-Frame-Options;
         # `=`: answer with @updating's own 503, not the upstream's 502.
         error_page 502 503 504 = @updating;
     }
@@ -372,6 +400,11 @@ server {
         default_type text/html;
         add_header Retry-After 5 always;
         add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
+        add_header X-Frame-Options SAMEORIGIN always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+        add_header Strict-Transport-Security $hsts always;
         return 503 "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='5'><title>Atelier is starting</title><style>:root{color-scheme:light dark;--paper:#FFFFFF;--ink:#0D0D0D;--grey:#636363}@media (prefers-color-scheme:dark){:root{--paper:#121110;--ink:#F2F0EC;--grey:#A39E96}}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:0 16px;background:var(--paper);color:var(--ink);font:400 16px/1.55 'IBM Plex Sans','Helvetica Neue',Arial,sans-serif}main{width:100%;max-width:30rem;border-top:1px solid var(--ink);padding-top:1.5rem}svg{display:block;width:40px;height:40px;margin-bottom:1.25rem}h1{margin:0 0 .75rem;font-size:1.75rem;font-weight:500;line-height:1.1;letter-spacing:-0.02em}p{margin:0;color:var(--grey)}</style></head><body><main><svg viewBox='-9 -9 128.72 128.72' aria-hidden='true'><path d='M65.328 5.665 L5.562 105.298 L45.635 105.358 L105.299 5.562 Z' fill='#C2452A'/><path d='M56.151 30.981 L52.559 30.981 L34.183 77.371 L28.978 79.098 L28.978 80.143 L43.042 80.143 L43.042 79.098 L36.711 77.474 L42.648 62.220 L59.988 62.220 L64.826 73.258 L70.629 63.552 Z M43.539 59.929 L50.803 41.264 L58.984 59.929 Z' fill='#FFFFFF' fill-rule='evenodd'/><path d='M-0.44 19.56 V-0.44 H19.56 M111.30 91.30 V111.30 H91.30' fill='none' stroke='currentColor' stroke-width='4' stroke-linecap='square'/></svg><h1>Atelier is starting</h1><p>The site is updating or has just been started. This page reloads by itself every few seconds.</p></main></body></html>";
     }
 }
@@ -382,8 +415,10 @@ server {
 /// [`EDGE_CONF_TEMPLATE`] silently ([`Stack::refresh_shipped_edge_conf`]) instead
 /// of earning doctor's "written by an older manager" warning. When the template
 /// changes, add the outgoing text here as `templates/edge-<first version>.conf`.
-pub const SUPERSEDED_EDGE_CONF_TEMPLATES: &[&str] =
-    &[include_str!("../templates/edge-0.10.0.conf")];
+pub const SUPERSEDED_EDGE_CONF_TEMPLATES: &[&str] = &[
+    include_str!("../templates/edge-0.10.0.conf"),
+    include_str!("../templates/edge-0.14.0.conf"),
+];
 
 /// True for the current edge template or any superseded shipped one.
 fn is_shipped_edge_conf(s: &str) -> bool {
@@ -437,6 +472,37 @@ pub struct Stack {
     /// relabel must not move the site off its volumes.
     pub project: Option<String>,
 }
+
+/// What [`Stack::ensure_scaffold`] did that its caller may need to act on.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Scaffolded {
+    /// An untouched older shipped `edge.conf` was replaced with the current one.
+    pub edge_conf_refreshed: bool,
+    /// A fresh `.env` was written while Docker reported this stack's database
+    /// volume already exists, so no `DB_PASSWORD` was generated.
+    pub existing_db_without_env: bool,
+}
+
+impl Scaffolded {
+    /// The line to show the user, if any: a database found without its `.env`
+    /// may need its old `DB_PASSWORD` back.
+    pub fn notice(&self, stack: &Stack) -> Option<String> {
+        self.existing_db_without_env.then(|| {
+            format!(
+                "Found an existing database for this site but no .env, so a new one was \
+                 written. If the database was created with a generated database password, \
+                 restore DB_PASSWORD in {} from your backup, or reset it \
+                 ({DB_PASSWORD_RECOVERY_URL}). Databases from older versions keep working.",
+                stack.env_path().display()
+            )
+        })
+    }
+}
+
+/// How to get a site back to its database when `.env` (and with it the
+/// generated `DB_PASSWORD`) is lost.
+pub const DB_PASSWORD_RECOVERY_URL: &str =
+    "https://aincient-labs.com/docs/hardening#if-you-lose-env";
 
 /// Options for scaffolding a fresh stack.
 #[derive(Debug, Default, Clone)]
@@ -870,7 +936,45 @@ impl Stack {
     /// Lay down `compose.yaml` + `.env` if absent. Never clobbers an existing
     /// `.env` (preserves `HASH_SALT`); reconciles the image and port tunables on
     /// a re-run, mirroring `install.sh`.
-    pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<()> {
+    ///
+    /// A fresh `.env` also gets a random `DB_PASSWORD`, but only when Docker
+    /// confirms this stack has no database volume yet — see
+    /// [`ensure_scaffold_with`](Self::ensure_scaffold_with).
+    ///
+    /// When an untouched older `edge.conf` was replaced, a running `edge` is
+    /// told to reload it here, so every caller (install, `sites add`, a pack's
+    /// dev stack) serves the new rule without waiting for edge's next restart.
+    pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<Scaffolded> {
+        let done = self.ensure_scaffold_with(opts, || db_volume_probe(self))?;
+        if done.edge_conf_refreshed {
+            edge_reload(self);
+        }
+        Ok(done)
+    }
+
+    /// [`ensure_scaffold`](Self::ensure_scaffold) with the database-volume probe
+    /// passed in: `Some(true)` = this stack's `<project>_db-data` exists,
+    /// `Some(false)` = Docker answered and it doesn't, `None` = Docker couldn't
+    /// answer. Asked only when the `.env` is being created.
+    ///
+    /// Postgres applies `POSTGRES_PASSWORD` once, when `db-data` is first
+    /// initialised, and never again — so a new password over an existing volume
+    /// locks the site out of its own database. `DB_PASSWORD` is therefore
+    /// written only on `Some(false)`; otherwise compose's `aincient` fallback
+    /// applies, exactly as before. An existing `.env` is never given one (no
+    /// rotation). A `DB_PASSWORD` exported in the shell is ignored: `.env` is
+    /// the only source of it, and [`crate::docker::docker`] keeps an exported
+    /// one away from compose.
+    ///
+    /// A fresh `.env` over an existing volume is reported back
+    /// ([`Scaffolded::existing_db_without_env`]): that database may have been
+    /// made with a generated password the new `.env` no longer holds.
+    pub fn ensure_scaffold_with(
+        &self,
+        opts: &InstallOptions,
+        db_volume_exists: impl FnOnce() -> Option<bool>,
+    ) -> Result<Scaffolded> {
+        let mut done = Scaffolded::default();
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
 
@@ -885,7 +989,7 @@ impl Stack {
             std::fs::write(&edge, EDGE_CONF_TEMPLATE)
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
-        self.refresh_shipped_edge_conf()?;
+        done.edge_conf_refreshed = self.refresh_shipped_edge_conf()?;
 
         let env_path = self.env_path();
 
@@ -898,7 +1002,7 @@ impl Stack {
             // A fresh install has chosen its channel by definition — whatever the
             // image it was pointed at implies. Recording it here is what keeps the
             // legacy-edge migration from ever looking at this install again.
-            let contents = format!(
+            let mut contents = format!(
                 "HASH_SALT={salt}\n\
                  AINCIENT_IMAGE={image}\n\
                  AINCIENT_CHANNEL={channel}\n\
@@ -907,6 +1011,13 @@ impl Stack {
                 salt = hash_salt(),
                 channel = Channel::of_image(&image).name(),
             );
+            match db_volume_exists() {
+                Some(false) => {
+                    contents.push_str(&format!("DB_PASSWORD={}\n", random_hex(24)));
+                }
+                Some(true) => done.existing_db_without_env = true,
+                None => {}
+            }
             write_private(&env_path, &contents)?;
         } else {
             // Reconcile only the tunables the caller explicitly chose this run;
@@ -944,7 +1055,7 @@ impl Stack {
             }
             self.write_env(&env)?;
         }
-        Ok(())
+        Ok(done)
     }
 
     /// Repair the stack's own files — what `doctor --fix` calls when
@@ -1049,10 +1160,38 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 
 /// 32 random bytes, hex-encoded — a Drupal `HASH_SALT` (matches `openssl rand -hex 32`).
 fn hash_salt() -> String {
-    let mut buf = [0u8; 32];
+    random_hex(32)
+}
+
+/// `n` random bytes, lowercase-hex-encoded (matches `openssl rand -hex n`).
+fn random_hex(n: usize) -> String {
+    let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Whether this stack's database volume exists, asked of Docker. Unit tests
+/// never reach Docker: they get "couldn't answer", which writes no password, and
+/// exercise the decision through [`Stack::ensure_scaffold_with`] instead.
+#[cfg(not(test))]
+fn db_volume_probe(stack: &Stack) -> Option<bool> {
+    crate::docker::db_volume_exists(stack)
+}
+
+#[cfg(test)]
+fn db_volume_probe(_stack: &Stack) -> Option<bool> {
+    None
+}
+
+/// Reload a running `edge` after its `edge.conf` was refreshed. Unit tests
+/// never reach Docker.
+#[cfg(not(test))]
+fn edge_reload(stack: &Stack) {
+    crate::docker::reload_edge(stack);
+}
+
+#[cfg(test)]
+fn edge_reload(_stack: &Stack) {}
 
 #[cfg(test)]
 mod tests {
@@ -1149,6 +1288,114 @@ mod tests {
         );
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v2");
         assert_eq!(stack.http_port(), 9000);
+    }
+
+    fn assert_db_password(stack: &Stack) -> String {
+        let pw = stack.env_get("DB_PASSWORD").expect("DB_PASSWORD written");
+        assert_eq!(pw.len(), 48, "24 random bytes, hex");
+        assert!(
+            pw.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "lowercase hex: {pw}"
+        );
+        pw
+    }
+
+    #[test]
+    fn a_new_site_gets_a_random_db_password_when_no_volume_exists() {
+        let (a, b) = (TempStack::new(), TempStack::new());
+        a.0.ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        b.0.ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        assert_ne!(assert_db_password(&a.0), assert_db_password(&b.0));
+        // The compose fallback stays for every .env without one.
+        assert!(COMPOSE_TEMPLATE.contains("POSTGRES_PASSWORD: ${DB_PASSWORD:-aincient}"));
+        assert!(COMPOSE_TEMPLATE.contains("pgsql://aincient:${DB_PASSWORD:-aincient}@db/"));
+    }
+
+    #[test]
+    fn no_db_password_over_an_existing_volume_or_when_docker_cannot_answer() {
+        // Postgres keeps the password the volume was initialised with; a new
+        // one in .env would lock the site out of its database.
+        for probe in [Some(true), None] {
+            let ts = TempStack::new();
+            let done =
+                ts.0.ensure_scaffold_with(&InstallOptions::default(), || probe)
+                    .unwrap();
+            assert_eq!(ts.0.env_get("DB_PASSWORD"), None, "probe {probe:?}");
+            assert_eq!(ts.0.env_get("HASH_SALT").unwrap().len(), 64);
+            // Only a volume Docker confirmed earns the "restore your password" note.
+            assert_eq!(done.existing_db_without_env, probe == Some(true));
+            assert_eq!(done.notice(&ts.0).is_some(), probe == Some(true));
+        }
+    }
+
+    #[test]
+    fn a_fresh_env_over_an_existing_database_says_how_to_recover() {
+        let ts = TempStack::new();
+        let notice =
+            ts.0.ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+                .unwrap()
+                .notice(&ts.0)
+                .expect("a notice");
+        assert!(notice.contains(&ts.0.env_path().display().to_string()));
+        assert!(notice.contains("restore DB_PASSWORD"));
+        assert!(notice.contains(DB_PASSWORD_RECOVERY_URL));
+        assert!(notice.contains("Databases from older versions keep working."));
+        // A re-run over the now-existing .env doesn't repeat it.
+        let again =
+            ts.0.ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+                .unwrap();
+        assert_eq!(again, Scaffolded::default());
+        // Nor does a brand-new site.
+        let fresh = TempStack::new();
+        let done = fresh
+            .0
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        assert_eq!(done, Scaffolded::default());
+    }
+
+    #[test]
+    fn an_existing_env_never_gains_or_changes_a_db_password() {
+        // Without one: re-scaffold (the probe is not even asked) and repair
+        // both leave it absent — no rotation onto an initialised volume.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+            .unwrap();
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || {
+                panic!("an existing .env must not ask about the volume")
+            })
+            .unwrap();
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+        let mut env = stack.read_env();
+        env.remove("HASH_SALT");
+        stack.write_env(&env).unwrap();
+        let changes = stack.repair_scaffold().unwrap();
+        assert_eq!(changes, vec!["generated a new HASH_SALT".to_string()]);
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+
+        // With one: kept byte-for-byte across re-scaffold and repair.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        let pw = assert_db_password(stack);
+        stack
+            .ensure_scaffold_with(
+                &InstallOptions {
+                    image: None,
+                    http_port: Some(9001),
+                },
+                || Some(false),
+            )
+            .unwrap();
+        stack.repair_scaffold().unwrap();
+        assert_eq!(stack.env_get("DB_PASSWORD"), Some(pw));
     }
 
     #[test]
@@ -1726,6 +1973,22 @@ mod tests {
             EDGE_CONF_TEMPLATE
         );
         assert!(!stack.refresh_shipped_edge_conf().unwrap());
+
+        // Scaffolding reports a refresh (so a running edge is reloaded), and
+        // only when the file actually changed.
+        std::fs::write(stack.edge_conf_path(), SUPERSEDED_EDGE_CONF_TEMPLATES[1]).unwrap();
+        assert!(
+            stack
+                .ensure_scaffold(&InstallOptions::default())
+                .unwrap()
+                .edge_conf_refreshed
+        );
+        assert!(
+            !stack
+                .ensure_scaffold(&InstallOptions::default())
+                .unwrap()
+                .edge_conf_refreshed
+        );
     }
 
     #[test]

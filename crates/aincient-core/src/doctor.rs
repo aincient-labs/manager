@@ -697,6 +697,29 @@ fn parse_df_available_kb(out: &str) -> Option<u64> {
 
 // --- tier 2: the stack -------------------------------------------------------
 
+/// An install made before per-site database passwords has no `DB_PASSWORD` and
+/// runs on compose's shared default. Advisory only: the database isn't published
+/// outside the stack, and rotation doesn't exist yet — so there is deliberately
+/// no `.fixable(..)` and no command in the remedy.
+fn db_password_verdict(password: Option<&str>) -> Check {
+    match password {
+        None | Some("") | Some("aincient") => Check::bad(
+            "stack.db_password",
+            Tier::Stack,
+            "Database password",
+            Severity::Warn,
+            format!(
+                "It isn't reachable from outside the stack, but a future update will rotate \
+                 it. If the site can't reach its database after a reinstall, \
+                 {} explains how to recover.",
+                crate::stack::DB_PASSWORD_RECOVERY_URL
+            ),
+        )
+        .detail("This site's database uses the shared default password."),
+        Some(_) => Check::ok("stack.db_password", Tier::Stack, "Database password"),
+    }
+}
+
 /// Returns whether the `app` container is running — the gate for the site tier.
 fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     // The stack files are on disk, so this one is answerable even without Docker.
@@ -740,6 +763,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             )
             .fixable(Repair::Scaffold),
         });
+        out.push(db_password_verdict(stack.env_get("DB_PASSWORD").as_deref()));
     } else {
         out.push(Check::skipped(
             "stack.env",
@@ -1477,6 +1501,40 @@ fn health_detail(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_db_password_warns_without_a_fix() {
+        for pw in [None, Some(""), Some("aincient")] {
+            let c = db_password_verdict(pw);
+            assert_eq!(c.severity, Severity::Warn, "{pw:?}");
+            assert!(c.fix.is_none(), "{pw:?}");
+            assert_eq!(
+                c.detail.as_deref(),
+                Some("This site's database uses the shared default password.")
+            );
+            let remedy = c.remedy.unwrap();
+            assert!(remedy.contains("a future update will rotate it"));
+            assert!(remedy.contains(crate::stack::DB_PASSWORD_RECOVERY_URL));
+        }
+    }
+
+    #[test]
+    fn random_db_password_is_ok() {
+        let c = db_password_verdict(Some("3f9a1c0b7d2e4a68b5c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7"));
+        assert_eq!(c.severity, Severity::Ok);
+        assert!(c.fix.is_none() && c.remedy.is_none());
+    }
+
+    #[test]
+    fn default_db_password_warning_keeps_doctor_healthy_and_unfixed() {
+        let report = Report {
+            checks: vec![db_password_verdict(None)],
+            actions: vec![],
+        };
+        assert!(report.healthy());
+        assert_eq!(report.count(Severity::Warn), 1);
+        assert!(report.checks.iter().all(|c| c.fix.is_none()));
+    }
 
     #[test]
     fn port_check_free_or_held_by_this_site_is_ok() {

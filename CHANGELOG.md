@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **New sites get their own random database password** instead of the shared default. It is
+  written to the new site's `.env` (`DB_PASSWORD`) only when Docker confirms the site has no
+  database yet; if Docker can't be asked, the site keeps the default, as before. Existing sites
+  keep the password their database was created with: nothing is rotated or added to an existing
+  `.env`. The site's `.env` is the only source of the password: the manager ignores a
+  `DB_PASSWORD` exported in your shell (for another project, say), so it can no longer override
+  the site's own. If a new `.env` is written for a site whose database already exists, the
+  manager says so and points at how to restore or reset the password
+  (<https://aincient-labs.com/docs/hardening#if-you-lose-env>); databases from older versions
+  keep working.
+- **`atelier doctor` flags the shared default database password.** Sites made before per-site
+  passwords (no `DB_PASSWORD` in `.env`, or the default `aincient`) now show a warning: the database
+  isn't reachable from outside the stack, but a future update will rotate it. Advisory only: it
+  never fails `doctor`, and `--fix` does nothing for it.
+- **The edge sends baseline security headers** (`X-Content-Type-Options`, `Referrer-Policy`,
+  `X-Frame-Options: SAMEORIGIN`, `Permissions-Policy`, and HSTS when the request arrived over TLS),
+  including on the engine's resting page (which keeps `X-Frame-Options: DENY`) and its "engine
+  unavailable" answer. A site's untouched `edge.conf` is upgraded to the new rule silently, and a
+  running edge reloads it on `atelier app install` as well as on update; a hand-edited one keeps
+  doctor's existing "written by an older manager" note.
+- **Releases are gated on RustSec advisories** (`cargo deny check advisories`, in CI and before
+  every release), and an OpenVEX file, `vex.openvex.json`, is published at the repository root.
+- **quick-xml 0.42** (from 0.39.4, via plist 1.10.3): fixes RUSTSEC-2026-0194 and -0195, a
+  quadratic attribute check and an unbounded namespace allocation in the XML reader the desktop app
+  uses for property lists. **anyhow 1.0.103** fixes RUSTSEC-2026-0190.
+
 ## [0.14.1] - 2026-11-03
 
 ### Security

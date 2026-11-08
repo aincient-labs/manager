@@ -1239,6 +1239,9 @@ pub struct AddedSite {
     pub reregistered: bool,
     /// It became the active site (there was none).
     pub activated: bool,
+    /// Something to tell the user about the stack files just laid down
+    /// ([`crate::stack::Scaffolded::notice`]).
+    pub notice: Option<String>,
 }
 
 /// Register a new site `slug` at `~/.atelier/sites/<slug>`, pinned to project
@@ -1342,10 +1345,12 @@ pub fn add_site(
     // Creates the directory and writes compose.yaml / edge.conf / .env where
     // absent; on a re-registered stack only an explicit --port is written.
     let explicit = port.is_some() || !stack.env_path().is_file();
-    stack.ensure_scaffold(&crate::stack::InstallOptions {
-        image: None,
-        http_port: explicit.then_some(chosen),
-    })?;
+    let notice = stack
+        .ensure_scaffold(&crate::stack::InstallOptions {
+            image: None,
+            http_port: explicit.then_some(chosen),
+        })?
+        .notice(&stack);
 
     registry.sites.push(site.clone());
     let activated = registry.active.is_none();
@@ -1358,6 +1363,7 @@ pub fn add_site(
         port: chosen,
         reregistered,
         activated,
+        notice,
     })
 }
 
@@ -2229,6 +2235,30 @@ project = "atelier-blog"
         assert_eq!(again.port, 41290);
         assert_eq!(again.site, first.site);
         assert_eq!(again.site.stack().env_get("HASH_SALT").unwrap(), salt);
+    }
+
+    #[test]
+    fn a_re_added_site_keeps_its_db_password() {
+        // Re-adding keeps the .env on disk, so the password its db-data volume
+        // was initialised with survives; nothing re-generates it.
+        let th = TempHome::new();
+        let uh = th.path();
+        let first = add_site(uh, "blog", None, Some(41291), all_free).unwrap();
+        let stack = first.site.stack();
+        // Unit tests never reach Docker, so add_site writes no password here.
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+        let env_path = stack.env_path();
+        let mut env = std::fs::read_to_string(&env_path).unwrap();
+        env.push_str("DB_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef\n");
+        std::fs::write(&env_path, env).unwrap();
+        remove_site(uh, "blog").unwrap();
+
+        let again = add_site(uh, "blog", None, None, all_free).unwrap();
+        assert!(again.reregistered);
+        assert_eq!(
+            again.site.stack().env_get("DB_PASSWORD").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
     }
 
     #[test]

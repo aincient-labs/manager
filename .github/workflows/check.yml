@@ -5,8 +5,9 @@
 # on the release commit before it tags.
 #
 # The Tauri GUI (`atelier-manager`) is excluded: on Linux it needs GTK/WebKit
-# system packages, and release-gui.yml builds it on every tag anyway. Tests run
-# once, on ubuntu-22.04; the other runners only compile.
+# system packages, and release-gui.yml builds it on every tag anyway. Tests,
+# clippy and the RustSec advisories check run once, on ubuntu-22.04; the other
+# runners only compile.
 name: Check
 
 on:
@@ -39,6 +40,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
@@ -49,3 +52,19 @@ jobs:
       - name: cargo test
         if: matrix.os == 'ubuntu-22.04'
         run: cargo test --workspace --exclude atelier-manager --locked
+
+      - name: cargo clippy
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo clippy --workspace --exclude atelier-manager --all-targets --locked -- -D warnings
+
+      # RustSec advisories against Cargo.lock (deny.toml; umbrella DECISIONS 0503/0504). The
+      # whole lockfile is checked, the GUI's crates included.
+      - name: Install cargo-deny
+        if: matrix.os == 'ubuntu-22.04'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny check advisories
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo deny --locked check advisories

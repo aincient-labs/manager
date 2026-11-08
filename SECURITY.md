@@ -16,6 +16,8 @@ Report privately through **GitHub's private vulnerability reporting**:
 2. Click **Report a vulnerability**.
 3. Fill in the advisory form.
 
+If you can't use GitHub, email **[security@aincient-labs.com](mailto:security@aincient-labs.com)**.
+
 This opens a private channel visible only to you and the maintainers. A good report includes:
 
 - The version (`atelier --version`) and how you installed it (Homebrew, direct download).
@@ -41,6 +43,12 @@ The manager follows **[Semantic Versioning](https://semver.org/)** and is releas
 `aincient-labs/homebrew-tap`. Security fixes ship in a new release; the **latest release** is
 the supported version. Update with `brew upgrade atelier` or by downloading the newest release.
 Each advisory says whether the release before the latest was affected.
+
+## Security releases
+
+Security fixes ship as patch releases as soon as they are ready, without waiting for feature work. The changelog and the GitHub release mark them.
+
+Security fixes are provided for the latest release; upgrading to it is how you receive them.
 
 ## What's inside: SBOMs
 
