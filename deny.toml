@@ -10,6 +10,9 @@
 all-features = true
 
 [advisories]
-# Defaults (cargo-deny 0.20): vulnerabilities and unsound advisories fail; unmaintained crates
-# fail when they are direct or transitive dependencies of the workspace; yanked crates warn.
+# Vulnerabilities and unsound advisories fail (cargo-deny 0.20 defaults); yanked crates warn.
+# Unmaintained crates fail only when the workspace depends on them DIRECTLY: transitive ones
+# (tauri's GTK/urlpattern stack, keyring's zbus) still print, but don't block a release
+# (umbrella DECISIONS 0505).
+unmaintained = "workspace"
 ignore = []

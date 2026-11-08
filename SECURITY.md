@@ -46,7 +46,7 @@ Each advisory says whether the release before the latest was affected.
 
 Security fixes ship as patch releases as soon as they are ready, without waiting for feature work. The changelog and the GitHub release mark them.
 
-<!-- OWNER: approve wording — Security fixes are provided for the latest release; upgrading to it is how you receive them. -->
+Security fixes are provided for the latest release; upgrading to it is how you receive them.
 
 ## What's inside: SBOMs
 

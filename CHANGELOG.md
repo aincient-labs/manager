@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   doctor's existing "written by an older manager" note.
 - **Releases are gated on RustSec advisories** (`cargo deny check advisories`, in CI and before
   every release), and an OpenVEX file, `vex.openvex.json`, is published at the repository root.
+- **quick-xml 0.42** (from 0.39.4, via plist 1.10.3): fixes RUSTSEC-2026-0194 and -0195, a
+  quadratic attribute check and an unbounded namespace allocation in the XML reader the desktop app
+  uses for property lists. **anyhow 1.0.103** fixes RUSTSEC-2026-0190.
 
 ## [0.14.1] - 2026-11-03
 
