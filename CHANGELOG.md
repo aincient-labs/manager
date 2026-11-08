@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passwords (no `DB_PASSWORD` in `.env`, or the default `aincient`) now show a warning: the database
   isn't reachable from outside the stack, but a future update will rotate it. Advisory only: it
   never fails `doctor`, and `--fix` does nothing for it.
+- **The edge sends baseline security headers** (`X-Content-Type-Options`, `Referrer-Policy`,
+  `X-Frame-Options: SAMEORIGIN`, `Permissions-Policy`, and HSTS when the request arrived over TLS).
+  A site's untouched `edge.conf` is upgraded to the new rule silently; a hand-edited one keeps
+  doctor's existing "written by an older manager" note.
 
 ## [0.14.1] - 2026-11-03
 
