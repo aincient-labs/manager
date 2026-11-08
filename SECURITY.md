@@ -42,6 +42,12 @@ The manager follows **[Semantic Versioning](https://semver.org/)** and is releas
 the supported version. Update with `brew upgrade atelier` or by downloading the newest release.
 Each advisory says whether the release before the latest was affected.
 
+## Security releases
+
+Security fixes ship as patch releases as soon as they are ready, without waiting for feature work. The changelog and the GitHub release mark them.
+
+<!-- OWNER: approve wording — Security fixes are provided for the latest release; upgrading to it is how you receive them. -->
+
 ## What's inside: SBOMs
 
 Every release from 0.14.0 attaches a **CycloneDX SBOM** (software bill of materials) per
