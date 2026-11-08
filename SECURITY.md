@@ -16,6 +16,8 @@ Report privately through **GitHub's private vulnerability reporting**:
 2. Click **Report a vulnerability**.
 3. Fill in the advisory form.
 
+If you can't use GitHub, email **[security@aincient-labs.com](mailto:security@aincient-labs.com)**.
+
 This opens a private channel visible only to you and the maintainers. A good report includes:
 
 - The version (`atelier --version`) and how you installed it (Homebrew, direct download).
