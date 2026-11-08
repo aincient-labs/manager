@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **New sites get their own random database password** instead of the shared default. It is
+  written to the new site's `.env` (`DB_PASSWORD`) only when Docker confirms the site has no
+  database yet; if Docker can't be asked, the site keeps the default, as before. Existing sites
+  keep the password their database was created with: nothing is rotated or added to an existing
+  `.env`.
+
 ## [0.14.1] - 2026-11-03
 
 ### Security

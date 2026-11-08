@@ -2232,6 +2232,30 @@ project = "atelier-blog"
     }
 
     #[test]
+    fn a_re_added_site_keeps_its_db_password() {
+        // Re-adding keeps the .env on disk, so the password its db-data volume
+        // was initialised with survives; nothing re-generates it.
+        let th = TempHome::new();
+        let uh = th.path();
+        let first = add_site(uh, "blog", None, Some(41291), all_free).unwrap();
+        let stack = first.site.stack();
+        // Unit tests never reach Docker, so add_site writes no password here.
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+        let env_path = stack.env_path();
+        let mut env = std::fs::read_to_string(&env_path).unwrap();
+        env.push_str("DB_PASSWORD=0123456789abcdef0123456789abcdef0123456789abcdef\n");
+        std::fs::write(&env_path, env).unwrap();
+        remove_site(uh, "blog").unwrap();
+
+        let again = add_site(uh, "blog", None, None, all_free).unwrap();
+        assert!(again.reregistered);
+        assert_eq!(
+            again.site.stack().env_get("DB_PASSWORD").as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
     fn list_shows_sites_with_ports_and_the_unadopted_legacy() {
         let th = TempHome::new();
         let uh = th.path();

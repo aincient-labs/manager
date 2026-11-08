@@ -91,6 +91,17 @@ pub fn compose(stack: &Stack) -> Command {
     c
 }
 
+/// Whether `stack`'s Postgres volume exists: `Some(true)`/`Some(false)` when
+/// Docker answered, `None` when it couldn't (not installed, not running, timed
+/// out). The volume is `<project>_db-data`: compose prefixes the template's
+/// `db-data` key (which sets no `name:`) with the project [`compose`] pins.
+pub fn db_volume_exists(stack: &Stack) -> Option<bool> {
+    let name = format!("{}_db-data", stack.project_name());
+    let mut cmd = docker();
+    cmd.args(["volume", "ls", "-q"]);
+    try_capture_empty_ok(cmd).map(|out| out.lines().any(|l| l.trim() == name))
+}
+
 /// A bare `docker` invocation with a `PATH` that includes the common Docker
 /// install locations.
 ///

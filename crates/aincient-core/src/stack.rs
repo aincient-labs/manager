@@ -870,7 +870,31 @@ impl Stack {
     /// Lay down `compose.yaml` + `.env` if absent. Never clobbers an existing
     /// `.env` (preserves `HASH_SALT`); reconciles the image and port tunables on
     /// a re-run, mirroring `install.sh`.
+    ///
+    /// A fresh `.env` also gets a random `DB_PASSWORD`, but only when Docker
+    /// confirms this stack has no database volume yet — see
+    /// [`ensure_scaffold_with`](Self::ensure_scaffold_with).
     pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<()> {
+        self.ensure_scaffold_with(opts, || db_volume_probe(self))
+    }
+
+    /// [`ensure_scaffold`](Self::ensure_scaffold) with the database-volume probe
+    /// passed in: `Some(true)` = this stack's `<project>_db-data` exists,
+    /// `Some(false)` = Docker answered and it doesn't, `None` = Docker couldn't
+    /// answer. Asked only when the `.env` is being created.
+    ///
+    /// Postgres applies `POSTGRES_PASSWORD` once, when `db-data` is first
+    /// initialised, and never again — so a new password over an existing volume
+    /// locks the site out of its own database. `DB_PASSWORD` is therefore
+    /// written only on `Some(false)`; otherwise compose's `aincient` fallback
+    /// applies, exactly as before. An existing `.env` is never given one (no
+    /// rotation). A `DB_PASSWORD` exported for this run wins over a generated
+    /// one, as in `install.sh` — compose would use it for the first init anyway.
+    pub fn ensure_scaffold_with(
+        &self,
+        opts: &InstallOptions,
+        db_volume_exists: impl FnOnce() -> Option<bool>,
+    ) -> Result<()> {
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
 
@@ -898,7 +922,7 @@ impl Stack {
             // A fresh install has chosen its channel by definition — whatever the
             // image it was pointed at implies. Recording it here is what keeps the
             // legacy-edge migration from ever looking at this install again.
-            let contents = format!(
+            let mut contents = format!(
                 "HASH_SALT={salt}\n\
                  AINCIENT_IMAGE={image}\n\
                  AINCIENT_CHANNEL={channel}\n\
@@ -907,6 +931,27 @@ impl Stack {
                 salt = hash_salt(),
                 channel = Channel::of_image(&image).name(),
             );
+            if db_volume_exists() == Some(false) {
+                let password = match std::env::var("DB_PASSWORD") {
+                    Ok(exported) if !exported.is_empty() => {
+                        // Written unquoted into .env, read back by compose and
+                        // spliced into DATABASE_URL (parse_url): anything compose
+                        // would interpolate, or a URL would split, differently
+                        // than the shell did is a later lockout. URL-unreserved only.
+                        if !exported.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
+                        }) {
+                            anyhow::bail!(
+                                "the exported DB_PASSWORD has characters a .env or a database \
+                                 URL can't hold safely; use letters, digits and - _ . ~ only"
+                            );
+                        }
+                        exported
+                    }
+                    _ => random_hex(24),
+                };
+                contents.push_str(&format!("DB_PASSWORD={password}\n"));
+            }
             write_private(&env_path, &contents)?;
         } else {
             // Reconcile only the tunables the caller explicitly chose this run;
@@ -1049,9 +1094,27 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 
 /// 32 random bytes, hex-encoded — a Drupal `HASH_SALT` (matches `openssl rand -hex 32`).
 fn hash_salt() -> String {
-    let mut buf = [0u8; 32];
+    random_hex(32)
+}
+
+/// `n` random bytes, lowercase-hex-encoded (matches `openssl rand -hex n`).
+fn random_hex(n: usize) -> String {
+    let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether this stack's database volume exists, asked of Docker. Unit tests
+/// never reach Docker: they get "couldn't answer", which writes no password, and
+/// exercise the decision through [`Stack::ensure_scaffold_with`] instead.
+#[cfg(not(test))]
+fn db_volume_probe(stack: &Stack) -> Option<bool> {
+    crate::docker::db_volume_exists(stack)
+}
+
+#[cfg(test)]
+fn db_volume_probe(_stack: &Stack) -> Option<bool> {
+    None
 }
 
 #[cfg(test)]
@@ -1149,6 +1212,84 @@ mod tests {
         );
         assert_eq!(stack.image(), "ghcr.io/aincient-labs/atelier-cms:v2");
         assert_eq!(stack.http_port(), 9000);
+    }
+
+    fn assert_db_password(stack: &Stack) -> String {
+        let pw = stack.env_get("DB_PASSWORD").expect("DB_PASSWORD written");
+        assert_eq!(pw.len(), 48, "24 random bytes, hex");
+        assert!(
+            pw.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "lowercase hex: {pw}"
+        );
+        pw
+    }
+
+    #[test]
+    fn a_new_site_gets_a_random_db_password_when_no_volume_exists() {
+        let (a, b) = (TempStack::new(), TempStack::new());
+        a.0.ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        b.0.ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        assert_ne!(assert_db_password(&a.0), assert_db_password(&b.0));
+        // The compose fallback stays for every .env without one.
+        assert!(COMPOSE_TEMPLATE.contains("POSTGRES_PASSWORD: ${DB_PASSWORD:-aincient}"));
+        assert!(COMPOSE_TEMPLATE.contains("pgsql://aincient:${DB_PASSWORD:-aincient}@db/"));
+    }
+
+    #[test]
+    fn no_db_password_over_an_existing_volume_or_when_docker_cannot_answer() {
+        // Postgres keeps the password the volume was initialised with; a new
+        // one in .env would lock the site out of its database.
+        for probe in [Some(true), None] {
+            let ts = TempStack::new();
+            ts.0.ensure_scaffold_with(&InstallOptions::default(), || probe)
+                .unwrap();
+            assert_eq!(ts.0.env_get("DB_PASSWORD"), None, "probe {probe:?}");
+            assert_eq!(ts.0.env_get("HASH_SALT").unwrap().len(), 64);
+        }
+    }
+
+    #[test]
+    fn an_existing_env_never_gains_or_changes_a_db_password() {
+        // Without one: re-scaffold (the probe is not even asked) and repair
+        // both leave it absent — no rotation onto an initialised volume.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+            .unwrap();
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || {
+                panic!("an existing .env must not ask about the volume")
+            })
+            .unwrap();
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+        let mut env = stack.read_env();
+        env.remove("HASH_SALT");
+        stack.write_env(&env).unwrap();
+        let changes = stack.repair_scaffold().unwrap();
+        assert_eq!(changes, vec!["generated a new HASH_SALT".to_string()]);
+        assert_eq!(stack.env_get("DB_PASSWORD"), None);
+
+        // With one: kept byte-for-byte across re-scaffold and repair.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        let pw = assert_db_password(stack);
+        stack
+            .ensure_scaffold_with(
+                &InstallOptions {
+                    image: None,
+                    http_port: Some(9001),
+                },
+                || Some(false),
+            )
+            .unwrap();
+        stack.repair_scaffold().unwrap();
+        assert_eq!(stack.env_get("DB_PASSWORD"), Some(pw));
     }
 
     #[test]
