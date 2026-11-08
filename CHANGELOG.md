@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database yet; if Docker can't be asked, the site keeps the default, as before. Existing sites
   keep the password their database was created with: nothing is rotated or added to an existing
   `.env`.
+- **`atelier doctor` flags the shared default database password.** Sites made before per-site
+  passwords (no `DB_PASSWORD` in `.env`, or the default `aincient`) now show a warning: the database
+  isn't reachable from outside the stack, but a future update will rotate it. Advisory only: it
+  never fails `doctor`, and `--fix` does nothing for it.
 
 ## [0.14.1] - 2026-11-03
 
