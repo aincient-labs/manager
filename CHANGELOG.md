@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `X-Frame-Options: SAMEORIGIN`, `Permissions-Policy`, and HSTS when the request arrived over TLS).
   A site's untouched `edge.conf` is upgraded to the new rule silently; a hand-edited one keeps
   doctor's existing "written by an older manager" note.
+- **Releases are gated on RustSec advisories** (`cargo deny check advisories`, in CI and before
+  every release), and an OpenVEX file, `vex.openvex.json`, is published at the repository root.
 
 ## [0.14.1] - 2026-11-03
 

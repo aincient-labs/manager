@@ -1,0 +1,10 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/aincient-labs/manager/blob/main/vex.openvex.json",
+  "author": "AIncient Labs",
+  "role": "Document Creator",
+  "timestamp": "2026-11-08T04:18:44Z",
+  "version": 1,
+  "tooling": "Hand-written; read by the weekly dependency scan (grype --vex). Products are package URLs, the form grype matches when it scans an SBOM; the scope is the atelier CLI and the Atelier Manager desktop app.",
+  "statements": []
+}
