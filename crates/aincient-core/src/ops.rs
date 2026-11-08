@@ -2530,7 +2530,7 @@ pub fn list_backups(stack: &Stack) -> Vec<Backup> {
             modified_unix,
         });
     }
-    out.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
+    out.sort_by_key(|a| std::cmp::Reverse(a.modified_unix));
     out
 }
 
