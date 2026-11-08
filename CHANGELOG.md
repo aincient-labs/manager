@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-08
+
 ### Security
 
 - **New sites get their own random database password** instead of the shared default. It is
@@ -707,7 +709,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed via `cargo-dist` → GitHub Releases and the
   `aincient-labs/homebrew-tap` (`brew install aincient-labs/tap/atelier`).
 
-[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/aincient-labs/manager/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/aincient-labs/manager/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/aincient-labs/manager/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/aincient-labs/manager/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/aincient-labs/manager/compare/v0.13.0...v0.13.1
