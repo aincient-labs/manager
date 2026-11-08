@@ -708,7 +708,12 @@ fn db_password_verdict(password: Option<&str>) -> Check {
             Tier::Stack,
             "Database password",
             Severity::Warn,
-            "It isn't reachable from outside the stack, but a future update will rotate it.",
+            format!(
+                "It isn't reachable from outside the stack, but a future update will rotate \
+                 it. If the site can't reach its database after a reinstall, \
+                 {} explains how to recover.",
+                crate::stack::DB_PASSWORD_RECOVERY_URL
+            ),
         )
         .detail("This site's database uses the shared default password."),
         Some(_) => Check::ok("stack.db_password", Tier::Stack, "Database password"),
@@ -1507,7 +1512,9 @@ mod tests {
                 c.detail.as_deref(),
                 Some("This site's database uses the shared default password.")
             );
-            assert!(c.remedy.unwrap().contains("a future update will rotate it"));
+            let remedy = c.remedy.unwrap();
+            assert!(remedy.contains("a future update will rotate it"));
+            assert!(remedy.contains(crate::stack::DB_PASSWORD_RECOVERY_URL));
         }
     }
 

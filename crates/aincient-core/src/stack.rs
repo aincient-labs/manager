@@ -473,6 +473,37 @@ pub struct Stack {
     pub project: Option<String>,
 }
 
+/// What [`Stack::ensure_scaffold`] did that its caller may need to act on.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Scaffolded {
+    /// An untouched older shipped `edge.conf` was replaced with the current one.
+    pub edge_conf_refreshed: bool,
+    /// A fresh `.env` was written while Docker reported this stack's database
+    /// volume already exists, so no `DB_PASSWORD` was generated.
+    pub existing_db_without_env: bool,
+}
+
+impl Scaffolded {
+    /// The line to show the user, if any: a database found without its `.env`
+    /// may need its old `DB_PASSWORD` back.
+    pub fn notice(&self, stack: &Stack) -> Option<String> {
+        self.existing_db_without_env.then(|| {
+            format!(
+                "Found an existing database for this site but no .env, so a new one was \
+                 written. If the database was created with a generated database password, \
+                 restore DB_PASSWORD in {} from your backup, or reset it \
+                 ({DB_PASSWORD_RECOVERY_URL}). Databases from older versions keep working.",
+                stack.env_path().display()
+            )
+        })
+    }
+}
+
+/// How to get a site back to its database when `.env` (and with it the
+/// generated `DB_PASSWORD`) is lost.
+pub const DB_PASSWORD_RECOVERY_URL: &str =
+    "https://aincient-labs.com/docs/hardening#if-you-lose-env";
+
 /// Options for scaffolding a fresh stack.
 #[derive(Debug, Default, Clone)]
 pub struct InstallOptions {
@@ -909,8 +940,16 @@ impl Stack {
     /// A fresh `.env` also gets a random `DB_PASSWORD`, but only when Docker
     /// confirms this stack has no database volume yet — see
     /// [`ensure_scaffold_with`](Self::ensure_scaffold_with).
-    pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<()> {
-        self.ensure_scaffold_with(opts, || db_volume_probe(self))
+    ///
+    /// When an untouched older `edge.conf` was replaced, a running `edge` is
+    /// told to reload it here, so every caller (install, `sites add`, a pack's
+    /// dev stack) serves the new rule without waiting for edge's next restart.
+    pub fn ensure_scaffold(&self, opts: &InstallOptions) -> Result<Scaffolded> {
+        let done = self.ensure_scaffold_with(opts, || db_volume_probe(self))?;
+        if done.edge_conf_refreshed {
+            edge_reload(self);
+        }
+        Ok(done)
     }
 
     /// [`ensure_scaffold`](Self::ensure_scaffold) with the database-volume probe
@@ -923,13 +962,19 @@ impl Stack {
     /// locks the site out of its own database. `DB_PASSWORD` is therefore
     /// written only on `Some(false)`; otherwise compose's `aincient` fallback
     /// applies, exactly as before. An existing `.env` is never given one (no
-    /// rotation). A `DB_PASSWORD` exported for this run wins over a generated
-    /// one, as in `install.sh` — compose would use it for the first init anyway.
+    /// rotation). A `DB_PASSWORD` exported in the shell is ignored: `.env` is
+    /// the only source of it, and [`crate::docker::docker`] keeps an exported
+    /// one away from compose.
+    ///
+    /// A fresh `.env` over an existing volume is reported back
+    /// ([`Scaffolded::existing_db_without_env`]): that database may have been
+    /// made with a generated password the new `.env` no longer holds.
     pub fn ensure_scaffold_with(
         &self,
         opts: &InstallOptions,
         db_volume_exists: impl FnOnce() -> Option<bool>,
-    ) -> Result<()> {
+    ) -> Result<Scaffolded> {
+        let mut done = Scaffolded::default();
         std::fs::create_dir_all(&self.home)
             .with_context(|| format!("could not create stack directory {}", self.home.display()))?;
 
@@ -944,7 +989,7 @@ impl Stack {
             std::fs::write(&edge, EDGE_CONF_TEMPLATE)
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
-        self.refresh_shipped_edge_conf()?;
+        done.edge_conf_refreshed = self.refresh_shipped_edge_conf()?;
 
         let env_path = self.env_path();
 
@@ -966,26 +1011,12 @@ impl Stack {
                 salt = hash_salt(),
                 channel = Channel::of_image(&image).name(),
             );
-            if db_volume_exists() == Some(false) {
-                let password = match std::env::var("DB_PASSWORD") {
-                    Ok(exported) if !exported.is_empty() => {
-                        // Written unquoted into .env, read back by compose and
-                        // spliced into DATABASE_URL (parse_url): anything compose
-                        // would interpolate, or a URL would split, differently
-                        // than the shell did is a later lockout. URL-unreserved only.
-                        if !exported.chars().all(|c| {
-                            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
-                        }) {
-                            anyhow::bail!(
-                                "the exported DB_PASSWORD has characters a .env or a database \
-                                 URL can't hold safely; use letters, digits and - _ . ~ only"
-                            );
-                        }
-                        exported
-                    }
-                    _ => random_hex(24),
-                };
-                contents.push_str(&format!("DB_PASSWORD={password}\n"));
+            match db_volume_exists() {
+                Some(false) => {
+                    contents.push_str(&format!("DB_PASSWORD={}\n", random_hex(24)));
+                }
+                Some(true) => done.existing_db_without_env = true,
+                None => {}
             }
             write_private(&env_path, &contents)?;
         } else {
@@ -1024,7 +1055,7 @@ impl Stack {
             }
             self.write_env(&env)?;
         }
-        Ok(())
+        Ok(done)
     }
 
     /// Repair the stack's own files — what `doctor --fix` calls when
@@ -1152,6 +1183,16 @@ fn db_volume_probe(_stack: &Stack) -> Option<bool> {
     None
 }
 
+/// Reload a running `edge` after its `edge.conf` was refreshed. Unit tests
+/// never reach Docker.
+#[cfg(not(test))]
+fn edge_reload(stack: &Stack) {
+    crate::docker::reload_edge(stack);
+}
+
+#[cfg(test)]
+fn edge_reload(_stack: &Stack) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,11 +1319,41 @@ mod tests {
         // one in .env would lock the site out of its database.
         for probe in [Some(true), None] {
             let ts = TempStack::new();
-            ts.0.ensure_scaffold_with(&InstallOptions::default(), || probe)
-                .unwrap();
+            let done =
+                ts.0.ensure_scaffold_with(&InstallOptions::default(), || probe)
+                    .unwrap();
             assert_eq!(ts.0.env_get("DB_PASSWORD"), None, "probe {probe:?}");
             assert_eq!(ts.0.env_get("HASH_SALT").unwrap().len(), 64);
+            // Only a volume Docker confirmed earns the "restore your password" note.
+            assert_eq!(done.existing_db_without_env, probe == Some(true));
+            assert_eq!(done.notice(&ts.0).is_some(), probe == Some(true));
         }
+    }
+
+    #[test]
+    fn a_fresh_env_over_an_existing_database_says_how_to_recover() {
+        let ts = TempStack::new();
+        let notice =
+            ts.0.ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+                .unwrap()
+                .notice(&ts.0)
+                .expect("a notice");
+        assert!(notice.contains(&ts.0.env_path().display().to_string()));
+        assert!(notice.contains("restore DB_PASSWORD"));
+        assert!(notice.contains(DB_PASSWORD_RECOVERY_URL));
+        assert!(notice.contains("Databases from older versions keep working."));
+        // A re-run over the now-existing .env doesn't repeat it.
+        let again =
+            ts.0.ensure_scaffold_with(&InstallOptions::default(), || Some(true))
+                .unwrap();
+        assert_eq!(again, Scaffolded::default());
+        // Nor does a brand-new site.
+        let fresh = TempStack::new();
+        let done = fresh
+            .0
+            .ensure_scaffold_with(&InstallOptions::default(), || Some(false))
+            .unwrap();
+        assert_eq!(done, Scaffolded::default());
     }
 
     #[test]
@@ -1902,6 +1973,22 @@ mod tests {
             EDGE_CONF_TEMPLATE
         );
         assert!(!stack.refresh_shipped_edge_conf().unwrap());
+
+        // Scaffolding reports a refresh (so a running edge is reloaded), and
+        // only when the file actually changed.
+        std::fs::write(stack.edge_conf_path(), SUPERSEDED_EDGE_CONF_TEMPLATES[1]).unwrap();
+        assert!(
+            stack
+                .ensure_scaffold(&InstallOptions::default())
+                .unwrap()
+                .edge_conf_refreshed
+        );
+        assert!(
+            !stack
+                .ensure_scaffold(&InstallOptions::default())
+                .unwrap()
+                .edge_conf_refreshed
+        );
     }
 
     #[test]

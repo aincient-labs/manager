@@ -91,6 +91,17 @@ pub fn compose(stack: &Stack) -> Command {
     c
 }
 
+/// Have a running `edge` re-read its config after the manager rewrote the
+/// file it mounts. nginx reads its config only at start, and a changed
+/// bind-mounted file is not a compose change, so `up` alone leaves the old rule
+/// in place. Best-effort: when `edge` isn't running the exec just fails, and the
+/// next start reads the new file anyway.
+pub fn reload_edge(stack: &Stack) {
+    let mut reload = compose(stack);
+    reload.args(["exec", "-T", "edge", "nginx", "-s", "reload"]);
+    let _ = output_within(&mut reload, Duration::from_secs(30));
+}
+
 /// Whether `stack`'s Postgres volume exists: `Some(true)`/`Some(false)` when
 /// Docker answered, `None` when it couldn't (not installed, not running, timed
 /// out). The volume is `<project>_db-data`: compose prefixes the template's
@@ -114,9 +125,16 @@ pub fn db_volume_exists(stack: &Stack) -> Option<bool> {
 /// though the same binary resolves fine from a terminal. Appending those dirs to
 /// the inherited `PATH` fixes GUI launches while leaving CLI/terminal launches —
 /// which already have a full `PATH` — to keep resolving `docker` exactly as before.
+///
+/// `DB_PASSWORD` is removed from the child's environment: compose prefers a
+/// variable from its own environment over the stack's `.env`, so one exported in
+/// the user's shell (say, for another project) would replace the site's password
+/// whenever the manager runs compose, and the app could no longer reach its
+/// database. The site's `.env` is the only source of it.
 pub fn docker() -> Command {
     let mut c = Command::new("docker");
     c.env("PATH", augmented_path());
+    c.env_remove("DB_PASSWORD");
     c
 }
 
@@ -918,6 +936,19 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with("couldn't run aincient-no-such-program:"));
+    }
+
+    #[test]
+    fn docker_never_passes_an_exported_db_password_on() {
+        // Checked on the built Command, not by exporting one: tests run in
+        // parallel and the process environment is shared.
+        let c = super::docker();
+        assert!(c.get_envs().any(|(k, v)| k == "DB_PASSWORD" && v.is_none()));
+        let mut stack = crate::stack::Stack::at("/nonexistent/atelier-env-scrub");
+        stack.project = Some("atelier-x".into());
+        assert!(super::compose(&stack)
+            .get_envs()
+            .any(|(k, v)| k == "DB_PASSWORD" && v.is_none()));
     }
 
     #[test]

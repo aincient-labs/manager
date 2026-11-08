@@ -775,7 +775,9 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
     preflight().require()?;
     r.stage(Stage::Scaffold, "Preparing the stack…", Some(0.08));
-    stack.ensure_scaffold(opts)?;
+    if let Some(notice) = stack.ensure_scaffold(opts)?.notice(stack) {
+        r.stage(Stage::Scaffold, &notice, Some(0.08));
+    }
     if opts.image.is_none() {
         announce_legacy_migrations(stack, r)?;
     }
@@ -824,9 +826,7 @@ fn retarget_single_hop(stack: &Stack, plan: &UpgradePlan) -> Result<()> {
 /// then picked up at the next restart, and doctor still sees it as shipped).
 fn refresh_edge_conf(stack: &Stack) {
     if let Ok(true) = stack.refresh_shipped_edge_conf() {
-        let mut reload = compose(stack);
-        reload.args(["exec", "-T", "edge", "nginx", "-s", "reload"]);
-        let _ = reload.output();
+        crate::docker::reload_edge(stack);
     }
 }
 

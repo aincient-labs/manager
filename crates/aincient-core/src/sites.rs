@@ -1239,6 +1239,9 @@ pub struct AddedSite {
     pub reregistered: bool,
     /// It became the active site (there was none).
     pub activated: bool,
+    /// Something to tell the user about the stack files just laid down
+    /// ([`crate::stack::Scaffolded::notice`]).
+    pub notice: Option<String>,
 }
 
 /// Register a new site `slug` at `~/.atelier/sites/<slug>`, pinned to project
@@ -1342,10 +1345,12 @@ pub fn add_site(
     // Creates the directory and writes compose.yaml / edge.conf / .env where
     // absent; on a re-registered stack only an explicit --port is written.
     let explicit = port.is_some() || !stack.env_path().is_file();
-    stack.ensure_scaffold(&crate::stack::InstallOptions {
-        image: None,
-        http_port: explicit.then_some(chosen),
-    })?;
+    let notice = stack
+        .ensure_scaffold(&crate::stack::InstallOptions {
+            image: None,
+            http_port: explicit.then_some(chosen),
+        })?
+        .notice(&stack);
 
     registry.sites.push(site.clone());
     let activated = registry.active.is_none();
@@ -1358,6 +1363,7 @@ pub fn add_site(
         port: chosen,
         reregistered,
         activated,
+        notice,
     })
 }
 

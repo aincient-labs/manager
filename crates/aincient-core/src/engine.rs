@@ -382,7 +382,9 @@ const EDGE_PROXY: &str = r#"            client_max_body_size 4k;
 /// at `\z`, never `$`: `$uri` is decoded, and `$` also matches before a final
 /// newline (`/pair%0A` once slipped past the exact location and its limit).
 /// `proxy_set_header` in a location drops every inherited one, so the list is
-/// the whole set the engine gets: no Cookie, no X-Forwarded-*.
+/// the whole set the engine gets: no Cookie, no X-Forwarded-*. Likewise
+/// `add_header`: `@engine_down` has one, so it repeats the shipped edge's
+/// security headers (the proxied locations have none and inherit them).
 fn edge_locations() -> String {
     let proxied = |rewrite: &str| {
         EDGE_PROXY
@@ -416,6 +418,11 @@ fn edge_locations() -> String {
          \x20   location @engine_down {{\n\
          \x20       default_type application/json;\n\
          \x20       add_header Cache-Control \"no-store\" always;\n\
+         \x20       add_header X-Content-Type-Options nosniff always;\n\
+         \x20       add_header Referrer-Policy strict-origin-when-cross-origin always;\n\
+         \x20       add_header X-Frame-Options SAMEORIGIN always;\n\
+         \x20       add_header Permissions-Policy \"camera=(), microphone=(), geolocation=(), payment=()\" always;\n\
+         \x20       add_header Strict-Transport-Security $hsts always;\n\
          \x20       return 503 '{{\"error\":\"engine unavailable\"}}';\n\
          \x20   }}\n",
         routes = EDGE_ROUTES.join("|"),
@@ -480,14 +487,21 @@ const EDGE_MISS_RESTING: &str = r#"        # Resting (Atelier engine): no Drupal
 "#;
 
 /// The resting copy itself (C-07): a calm page, 503 so nothing caches or
-/// indexes it as the page; the wake form only on `/atelier`.
+/// indexes it as the page; the wake form only on `/atelier`. Its own
+/// `add_header`s drop the server-level security headers, so it repeats them,
+/// with the stricter `X-Frame-Options DENY` in place of `SAMEORIGIN` (two
+/// different values would cancel each other out in a browser).
 const EDGE_RESTING_LOCATION: &str = r#"
     location @engine_resting {
         default_type text/html;
         charset utf-8;
         add_header Cache-Control "no-store" always;
         add_header Retry-After 3600 always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy strict-origin-when-cross-origin always;
         add_header X-Frame-Options DENY always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+        add_header Strict-Transport-Security $hsts always;
         add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'" always;
         return 503 $engine_rest_page;
     }
@@ -1164,6 +1178,34 @@ mod tests {
         assert!(c.contains(&format!(
             "./{ENGINE_EDGE_FILE}:/etc/nginx/conf.d/default.conf:ro"
         )));
+    }
+
+    #[test]
+    fn the_engine_edge_locations_keep_the_security_headers() {
+        // A location with its own add_header drops the server-level ones: the
+        // shipped rule repeats them in `/` and `@updating`, the engine's
+        // `@engine_down` and `@engine_resting` must too.
+        let e = edge_conf(&[]);
+        for header in [
+            "add_header X-Content-Type-Options nosniff always;",
+            "add_header Referrer-Policy strict-origin-when-cross-origin always;",
+            "add_header Permissions-Policy \"camera=(), microphone=(), geolocation=(), payment=()\" always;",
+            "add_header Strict-Transport-Security $hsts always;",
+        ] {
+            assert_eq!(e.matches(header).count(), 5, "{header}");
+        }
+        assert_eq!(
+            e.matches("add_header X-Frame-Options SAMEORIGIN always;")
+                .count(),
+            4
+        );
+        let resting = &e[e.find("location @engine_resting").unwrap()..];
+        let resting = &resting[..resting.find('}').unwrap()];
+        assert!(resting.contains("add_header X-Frame-Options DENY always;"));
+        assert!(!resting.contains("SAMEORIGIN"));
+        let down = &e[e.find("location @engine_down").unwrap()..];
+        let down = &down[..down.find('}').unwrap()];
+        assert!(down.contains("add_header Strict-Transport-Security $hsts always;"));
     }
 
     #[test]
