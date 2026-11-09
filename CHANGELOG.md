@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Dependency refresh within current versions: clap 4.6.7, anyhow 1.0.104, serde_json 1.0.154,
+  owo-colors 4.4.0, socket2 0.6.5, libc 0.2.191. No behaviour change.
+
 ## [0.15.0] - 2026-11-08
 
 ### Security
