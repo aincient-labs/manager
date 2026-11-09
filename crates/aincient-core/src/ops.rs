@@ -931,6 +931,40 @@ const CONVERGE_PATH: &str = "/usr/local/bin/converge.sh";
 /// The converge step that rebuilds indexes when the db's C library changed.
 const COLLATION_REFRESH_STEP: &str = "refresh_collation_versions";
 
+/// Whether the running `app` image ships the converge self-heal script.
+fn has_converge(stack: &Stack) -> bool {
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app", "test", "-x", CONVERGE_PATH]);
+    docker::try_capture_empty_ok(c).is_some()
+}
+
+/// Run after a restore reloads a database. A snapshot dumped from an *older*
+/// image carries a stale schema, stale config and a stale library-parse cache,
+/// so a bare `cache:rebuild` leaves the console blank — a broken `.libraries.yml`
+/// parse drops `type: module` (found reshooting the docs, 2026-11-03). Re-run the
+/// appliance's own `converge.sh`: it snapshots, runs `updatedb`, imports config
+/// and truncates `cache_file_parsing` behind a health gate — exactly as a boot or
+/// an update does, and the same script `doctor` shells to repair a site. Restoring
+/// an older snapshot onto a newer image is the forward direction, which converge
+/// migrates; its own per-run snapshot is the rollback. Streamed because it is slow
+/// and chatty. Images too old to ship the script skip it: their restore target
+/// matches their dump, so the cache rebuild the restore already did is enough.
+fn converge_restored(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    if !has_converge(stack) {
+        return Ok(());
+    }
+    r.stage(Stage::Scaffold, "Migrating the restored site…", Some(0.9));
+    run_step(converge_cmd(stack), "migrate the restored site", r)
+}
+
+/// `compose exec -T app /usr/local/bin/converge.sh` — the appliance's own
+/// self-heal, the same script `doctor` runs to repair a site.
+fn converge_cmd(stack: &Stack) -> Command {
+    let mut c = compose(stack);
+    c.args(["exec", "-T", "app", CONVERGE_PATH]);
+    c
+}
+
 /// Move the `db` service onto [`crate::stack::DB_IMAGE`] once the site runs an app
 /// image whose converge rebuilds indexes on a collation change (cms #86). Runs
 /// after an update has come up, so it asks the container actually running rather
@@ -2048,7 +2082,8 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     if is_snapshot_bundle(name) {
-        return restore_bundle(stack, file, r);
+        restore_bundle(stack, file, r)?;
+        return converge_restored(stack, r);
     }
 
     r.stage(Stage::Working, "Restoring the database…", None);
@@ -2100,7 +2135,7 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
     rm.args(["exec", "-T", "app", "rm", "-f", container_tmp]);
     let _ = rm.output();
 
-    Ok(())
+    converge_restored(stack, r)
 }
 
 /// Restore a full snapshot bundle (`.tar.gz` from [`backup`]): database + files.
@@ -3593,6 +3628,26 @@ mod tests {
         assert!(
             script.contains("chown -R www-data:www-data"),
             "re-asserts files ownership"
+        );
+    }
+
+    #[test]
+    fn restore_converges_in_the_app_container() {
+        // A restore reloads a database that may predate the running image, so it
+        // must end by re-running the appliance's converge (updatedb + cim +
+        // cache_file_parsing) — not just a cache rebuild — or an older snapshot
+        // comes up blank.
+        let dir = Scratch::new("restore-converge");
+        let stack = install_on(&dir.0, "ghcr.io/aincient-labs/cms:0.24.0");
+        let cmd = super::converge_cmd(&stack);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("exec -T app /usr/local/bin/converge.sh"),
+            "converge runs in the app container: {joined}"
         );
     }
 
