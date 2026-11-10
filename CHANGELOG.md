@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Restoring a snapshot made on an older Atelier version no longer leaves the console blank. `atelier data
+  restore` now finishes, for both a `.tar.gz` snapshot and a legacy `.sql` dump, by running the
+  appliance's own update step (database updates, config import, cache rebuild behind the health
+  check), the same one `atelier doctor` runs, instead of only clearing caches.
+
 ### Changed
 
 - Dependency refresh within current versions: clap 4.6.7, anyhow 1.0.104, serde_json 1.0.154,
