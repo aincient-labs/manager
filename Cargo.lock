@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aincient-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "aincient-engine"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "aincient-core",
  "anyhow",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "atelier"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "aincient-core",
  "aincient-engine",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "atelier-manager"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "aincient-core",
  "anyhow",
