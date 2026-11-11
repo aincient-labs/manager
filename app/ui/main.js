@@ -361,6 +361,18 @@ function setFraction(f) {
   }
 }
 
+// Per-frame DOM writes only when the value changed: the comet moves every 110 ms
+// and the clock once a second, but this runs ~60×/s — rewriting ARIA and text
+// each frame is main-thread work and mutation noise for assistive tech.
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+function setAttr(el, name, value) {
+  if (value === null) {
+    if (el.hasAttribute(name)) el.removeAttribute(name);
+  } else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+}
+
 // Which state each block is in; called every frame while the panel is open.
 function renderMatrix(now) {
   if (pm.mode === "busy") {
@@ -377,14 +389,15 @@ function renderMatrix(now) {
       pm.busyCells.forEach((c, k) => {
         const d = (head - k) * dir;
         const cls = reduceMotion.matches ? "t2" : d === 0 ? "on" : d === 1 ? "t1" : d === 2 || d === 3 ? "t2" : "";
-        c.className = cls ? `pm-cell ${cls}` : "pm-cell";
+        const want = cls ? `pm-cell ${cls}` : "pm-cell";
+        if (c.className !== want) c.className = want;
       });
     }
-    $("progressbar").removeAttribute("aria-valuenow");
+    setAttr($("progressbar"), "aria-valuenow", null);
     if (!pm.done && !pm.failed) {
       const secs = Math.floor((Date.now() - pm.started) / 1000);
       const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
-      $("progress-stage").textContent = `${pm.stageText} · ${clock}`;
+      setText($("progress-stage"), `${pm.stageText} · ${clock}`);
     }
     return;
   }
@@ -413,9 +426,9 @@ function renderMatrix(now) {
   });
   const pct = Math.round((pm.done ? 1 : f) * 100);
   const bar = $("progressbar");
-  bar.setAttribute("aria-valuenow", String(pct));
+  setAttr(bar, "aria-valuenow", String(pct));
   const step = pm.steps && pm.steps[pm.current];
-  bar.setAttribute("aria-valuetext", step ? `${step.label}, ${pct}%` : `${pct}%`);
+  setAttr(bar, "aria-valuetext", step ? `${step.label}, ${pct}%` : `${pct}%`);
 }
 
 function startMatrixLoop() {
@@ -666,7 +679,13 @@ $("progress-copy").addEventListener("click", () => copyText(progressReport(), $(
 
 // Wrap any long op in the progress panel: stream its steps via op-progress
 // events, then refresh. Returns whether the op completed without error.
+// Which runProgressOp owns the panel. A failure panel superseded by a new op is
+// released (progressReset), and its runProgressOp then resumes while the new one
+// is running: it must not hide the panel or stop the new op's render loop.
+let progressOwner = 0;
+
 async function runProgressOp(title, fn) {
+  const me = ++progressOwner;
   // A new attempt supersedes the previous failure — leaving the old banner up
   // makes a retry that succeeds look like it failed.
   hideError();
@@ -683,6 +702,9 @@ async function runProgressOp(title, fn) {
   try {
     if (failure !== null) {
       await progressFail(failure);
+      // Closing the panel must not erase the failure: the banner stays until the
+      // next action (unless a newer op already took over the screen).
+      if (progressOwner === me) showError(failure);
       return false;
     }
     progressFinish();
@@ -694,8 +716,10 @@ async function runProgressOp(title, fn) {
     return true;
   } finally {
     unlisten();
-    cancelAnimationFrame(pm.raf);
-    $("progress").classList.add("hidden");
+    if (progressOwner === me) {
+      cancelAnimationFrame(pm.raf);
+      $("progress").classList.add("hidden");
+    }
   }
 }
 
