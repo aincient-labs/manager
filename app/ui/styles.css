@@ -1393,14 +1393,15 @@ select {
 .pm-cell {
   aspect-ratio: 1;
   background: var(--surface-2);
-  transition: background-color 0.12s linear;
+  transition: background-color 0.18s ease-out;
 }
 .pm-cell.on {
   background: var(--accent);
 }
+/* The block being worked on breathes, it doesn't blink. */
 .pm-cell.head {
   background: var(--accent);
-  animation: pm-blink 0.9s steps(2, jump-none) infinite;
+  animation: pm-breathe 1.6s ease-in-out infinite;
 }
 .pm-cell.done {
   background: var(--jade);
@@ -1414,9 +1415,9 @@ select {
 .pm-cell.t2 {
   background: var(--border);
 }
-@keyframes pm-blink {
+@keyframes pm-breathe {
   50% {
-    opacity: 0.2;
+    opacity: 0.45;
   }
 }
 .pm-labels {

@@ -210,6 +210,15 @@ const LOG_KEEP = 400; // lines kept for the report
 
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
+// Pacing of the block matrix: the blocks shown never jump to where the op is.
+// They run through every block in order — one per PM_STEP_MS at rest, faster
+// when behind, so any gap closes within PM_CATCHUP_MS — and on success a moss
+// wave sweeps the grid in PM_WAVE_MS before the panel closes. Calmer than a
+// group snapping on when a quick step finishes.
+const PM_STEP_MS = 45;
+const PM_CATCHUP_MS = 600;
+const PM_WAVE_MS = 450;
+
 const pm = {
   title: "",
   mode: "busy",
@@ -244,6 +253,8 @@ function progressReset(title) {
   pm.busyCells = [];
   pm.fraction = 0;
   pm.pullFrac = null;
+  pm.cells = [];
+  pm.onSettled = null;
   pm.failed = false;
   pm.done = false;
   pm.error = "";
@@ -324,6 +335,12 @@ function buildGroups(steps) {
   grid.replaceChildren(...cells);
   labels.replaceChildren(...spans);
   labels.classList.toggle("hidden", steps.length < 2);
+  pm.cells = cells; // in fill order: column by column, group by group
+  pm.shown = 0;
+  pm.waved = 0;
+  pm.target = 0;
+  pm.rate = 1 / PM_STEP_MS;
+  pm.lastFrame = 0;
 }
 
 function setPlan(steps) {
@@ -379,6 +396,10 @@ function renderMatrix(now) {
     const n = pm.busyCells.length;
     if (pm.done) {
       pm.busyCells.forEach((c) => (c.className = "pm-cell done"));
+      if (pm.onSettled) {
+        pm.onSettled();
+        pm.onSettled = null;
+      }
     } else if (pm.failed) {
       pm.busyCells.forEach((c, k) => (c.className = k === 0 ? "pm-cell err" : "pm-cell"));
     } else {
@@ -402,27 +423,59 @@ function renderMatrix(now) {
     return;
   }
   const f = pm.fraction;
+  // How many blocks the op has really reached, in fill order: past groups full,
+  // the current one by its own fraction (or pull bytes), later ones empty.
+  let target = 0;
   pm.groups.forEach((g, gi) => {
     const s = g.step;
+    const n = g.cells.length;
     let local = Math.max(0, Math.min(1, (f - s.from) / Math.max(1e-6, s.to - s.from)));
     const isCurrent = pm.mode === "fill" || gi === pm.current;
     if (s.id === "pull" && isCurrent && pm.pullFrac != null) local = Math.max(local, pm.pullFrac);
-    const n = g.cells.length;
-    const lit = Math.min(n, Math.floor(local * n));
-    g.cells.forEach((c, k) => {
-      let cls = "";
-      if (pm.done) cls = "done";
-      else if (pm.mode === "plan" && gi < pm.current) cls = "on";
-      else if (pm.mode === "plan" && gi > pm.current) cls = "";
-      else if (k < lit) cls = "on";
-      else if (k === lit) cls = pm.failed ? "err" : "head";
-      const want = cls ? `pm-cell ${cls}` : "pm-cell";
-      if (c.className !== want) c.className = want;
-    });
-    if (g.label) {
-      const state = pm.done || gi < pm.current ? "past" : gi === pm.current ? (pm.failed ? "failed" : "now") : "";
-      if (g.label.className !== state) g.label.className = state;
+    if (pm.done || (pm.mode === "plan" && gi < pm.current)) target += n;
+    else if (isCurrent) target += Math.min(n, Math.floor(local * n));
+  });
+  const total = pm.cells.length;
+  // Advance what's shown toward it — every block in turn, never a jump.
+  const dt = pm.lastFrame ? Math.min(100, now - pm.lastFrame) : 0;
+  pm.lastFrame = now;
+  if (reduceMotion.matches || pm.snap) {
+    pm.shown = target;
+    if (pm.done) pm.waved = total;
+  } else {
+    // The speed is set when the target moves, then held: closing a gap at a
+    // speed proportional to what's left would only ever approach it.
+    if (target > pm.target) {
+      pm.target = target;
+      pm.rate = Math.max(1 / PM_STEP_MS, (target - pm.shown) / PM_CATCHUP_MS);
     }
+    if (pm.shown < target) pm.shown = Math.min(target, pm.shown + dt * pm.rate);
+    if (pm.done && pm.shown >= total) pm.waved = Math.min(total, pm.waved + (dt * total) / PM_WAVE_MS);
+  }
+  const lit = Math.floor(pm.shown);
+  const waved = Math.floor(pm.waved);
+  pm.cells.forEach((c, k) => {
+    let cls = "";
+    if (k < waved) cls = "done";
+    else if (k < lit) cls = "on";
+    else if (k === lit && !pm.done) cls = pm.failed ? "err" : "head";
+    const want = cls ? `pm-cell ${cls}` : "pm-cell";
+    if (c.className !== want) c.className = want;
+  });
+  if (pm.done && waved >= total && pm.onSettled) {
+    pm.onSettled();
+    pm.onSettled = null;
+  }
+  // Labels follow the blocks shown, so a heading never runs ahead of its group.
+  let start = 0;
+  pm.groups.forEach((g, gi) => {
+    const end = start + g.cells.length;
+    let state = "";
+    if (pm.failed && gi === pm.current) state = "failed";
+    else if (lit >= end) state = "past";
+    else if (lit >= start) state = pm.done ? "past" : "now";
+    if (g.label && g.label.className !== state) g.label.className = state;
+    start = end;
   });
   const pct = Math.round((pm.done ? 1 : f) * 100);
   const bar = $("progressbar");
@@ -441,11 +494,18 @@ function startMatrixLoop() {
 }
 
 // Settle to a full moss "done".
+// Resolves once the blocks have run through to the end and the moss wave has
+// swept the grid (at once with reduced motion, or for the busy strip).
 function progressFinish() {
   pm.done = true;
   pm.fraction = 1;
   $("progress-stage").textContent = pm.stageText && pm.mode !== "busy" ? pm.stageText : "Done.";
+  const settled = new Promise((resolve) => {
+    pm.onSettled = resolve;
+  });
   renderMatrix(performance.now());
+  // Never hold the panel longer than a full catch-up plus the wave.
+  return Promise.race([settled, new Promise((r) => setTimeout(r, PM_CATCHUP_MS + PM_WAVE_MS + 400))]);
 }
 
 function appendLog(line, cls) {
@@ -618,7 +678,9 @@ function progressFail(message) {
   $("progress-stage").classList.add("failed");
   appendLog(`✗ ${message}`, "log-error");
   setDetails(true);
+  pm.snap = true; // show where it stopped, not where the run-through had got to
   renderMatrix(performance.now());
+  pm.snap = false;
   cancelAnimationFrame(pm.raf); // a failed panel holds still
   $("progress-copy").classList.remove("hidden");
   $("progress-close").classList.remove("hidden");
@@ -707,12 +769,13 @@ async function runProgressOp(title, fn) {
       if (progressOwner === me) showError(failure);
       return false;
     }
-    progressFinish();
+    const settled = progressFinish();
     try {
       await refresh();
     } catch (e) {
       showError(String(e));
     }
+    await settled; // let the blocks finish their run before the panel closes
     return true;
   } finally {
     unlisten();
