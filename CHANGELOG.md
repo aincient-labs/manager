@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opens the log, and offers **Copy report**: what ran, on which site and Atelier version, how
   long each step took, the error and the end of the log.
 
+### Fixed
+
+- Two backups started at the same moment (from the app and the terminal, say) no longer write
+  the same file: each gets its own name, and neither packs the other's half-finished files. The
+  same holds for two restores or two static exports running at once.
+- A backup is only reported as saved once the archive has been read back and holds the database
+  and the manifest. A truncated or empty one fails the backup instead.
+- A restore checks the backup's database dump before it touches anything: a damaged file now stops
+  the restore with your current database untouched.
+- A backup, restore or export that fails no longer leaves its temporary files inside the
+  container.
+
 ## [0.15.1] - 2026-11-10
 
 ### Fixed

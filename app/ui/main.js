@@ -230,6 +230,12 @@ const pm = {
 };
 
 function progressReset(title) {
+  // A failure panel still waiting for Close is superseded: let its op finish
+  // rather than leave it awaiting forever.
+  if (pm.release) pm.release();
+  pm.release = null;
+  pm.lastStage = pm.lastStep = pm.lastMsg = undefined;
+  pm.failedAt = undefined;
   showSiteLine($("progress-site"));
   pm.title = title;
   pm.mode = "busy";
@@ -328,6 +334,9 @@ function setPlan(steps) {
   pm.mode = "plan";
   pm.entered = [];
   pm.current = -1;
+  // A new plan is a new run of blocks: progress from before it doesn't carry over.
+  pm.fraction = 0;
+  pm.pullFrac = null;
   buildGroups(steps);
 }
 
@@ -608,8 +617,10 @@ function progressFail(message) {
     const done = () => {
       document.removeEventListener("keydown", onKey);
       $("progress-close").onclick = null;
+      pm.release = null;
       resolve();
     };
+    pm.release = done;
     $("progress-close").onclick = done;
     document.addEventListener("keydown", onKey);
   });

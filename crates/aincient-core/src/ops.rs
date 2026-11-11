@@ -1788,7 +1788,16 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
         Some(l) if !l.is_empty() => format!("{}-{ts}", sanitize(l)),
         _ => ts.clone(),
     };
-    let host_path = stack.backups_dir().join(format!("aincient-{stem}.tar.gz"));
+    // Per-run paths: two backups at once (the GUI and the CLI, or a stepped
+    // upgrade's own snapshot) must never pack each other's staging or write the
+    // same file. The copy lands in a hidden `.part` the backup list ignores; the
+    // final name is only claimed once the archive is complete (see [`claim_name`]).
+    let run = run_id();
+    let stage = format!("/tmp/aincient-snapshot-{run}");
+    let part = stack
+        .backups_dir()
+        .join(format!(".aincient-{stem}-{run}.part"));
+    let archive = format!("{stage}.tar.gz");
 
     let drush = DRUSH.join(" ");
     // A manifest identifying the archive as an AIncient snapshot and pinning the
@@ -1833,51 +1842,101 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
             "app",
             "sh",
             "-c",
-            &backup_dump_script(&drush, &manifest),
+            &backup_dump_script(&drush, &manifest, &stage),
         ]);
         run_capture(c, "dump the database")
-    })?;
+    })
+    .inspect_err(|_| remove_in_container(stack, &[&stage, &archive]))?;
     plan.run(r, "pack", "Packing the uploaded files…", |_| {
         let mut c = compose(stack);
-        c.args(["exec", "-T", "app", "sh", "-c", &backup_pack_script()]);
+        c.args(["exec", "-T", "app", "sh", "-c", &backup_pack_script(&stage)]);
         run_capture(c, "pack the uploaded files")
-    })?;
-    plan.run(
-        r,
-        "copy",
-        "Copying the backup out of the container…",
-        |_| {
-            let mut cp = compose(stack);
-            cp.args([
-                "cp",
-                "app:/tmp/aincient-snapshot.tar.gz",
-                &host_path.to_string_lossy(),
-            ]);
-            run_capture(cp, "copy the snapshot out of the container")
-        },
-    )?;
+    })
+    .inspect_err(|_| remove_in_container(stack, &[&stage, &archive]))?;
+    let host_path = plan
+        .run(
+            r,
+            "copy",
+            "Copying the backup out of the container…",
+            |_| {
+                let mut cp = compose(stack);
+                cp.args(["cp", &format!("app:{archive}"), &part.to_string_lossy()]);
+                run_capture(cp, "copy the snapshot out of the container")?;
+                // A backup that isn't on disk in full is no backup: never report one.
+                let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                if size == 0 {
+                    bail!("the backup copied out of the container came out empty");
+                }
+                claim_name(
+                    &part,
+                    &stack.backups_dir(),
+                    &format!("aincient-{stem}"),
+                    ".tar.gz",
+                )
+            },
+        )
+        .inspect_err(|_| {
+            remove_in_container(stack, &[&stage, &archive]);
+            // Never leave a partial archive behind.
+            let _ = std::fs::remove_file(&part);
+        })?;
 
     // Best-effort cleanup of the in-container temp files.
-    let mut rm = compose(stack);
-    rm.args([
-        "exec",
-        "-T",
-        "app",
-        "rm",
-        "-rf",
-        "/tmp/aincient-snapshot",
-        "/tmp/aincient-snapshot.tar.gz",
-    ]);
-    let _ = rm.output();
+    remove_in_container(stack, &[&stage, &archive]);
 
     r.log(&format!("Snapshot written to {}", host_path.display()));
     plan.finish(r, "Backup saved.");
     Ok(host_path)
 }
 
-/// Where the static export is staged inside the `app` container before it's
-/// copied out to the host.
-const EXPORT_CONTAINER_DIR: &str = "/tmp/aincient-site-export";
+/// Best-effort removal of an op's temp paths inside the `app` container. Every
+/// failure path calls it: per-run names never overwrite each other, so a
+/// leftover would otherwise stay (a multi-GB archive, once per failed attempt).
+fn remove_in_container(stack: &Stack, paths: &[&str]) {
+    let mut rm = compose(stack);
+    rm.args(["exec", "-T", "app", "rm", "-rf"]).args(paths);
+    let _ = rm.output();
+}
+
+/// A token unique to one run of an op, for its temp paths inside the container.
+fn run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Move the finished `part` to `dir/stem.ext`, or `dir/stem-2.ext`, `-3`, … —
+/// the first name nobody holds. The claim is atomic (a hard link fails when the
+/// name exists), so two backups finishing in the same second never overwrite
+/// each other: checking `exists()` first and writing later raced (both picked
+/// the same name, the second archive replaced the first). A filesystem without
+/// hard links falls back to check-then-rename.
+fn claim_name(part: &Path, dir: &Path, stem: &str, ext: &str) -> Result<PathBuf> {
+    let candidates = std::iter::once(dir.join(format!("{stem}{ext}")))
+        .chain((2u32..1000).map(|n| dir.join(format!("{stem}-{n}{ext}"))));
+    for name in candidates {
+        match std::fs::hard_link(part, &name) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(part);
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) if !name.exists() => {
+                std::fs::rename(part, &name)
+                    .with_context(|| format!("failed to save the backup as {}", name.display()))?;
+                return Ok(name);
+            }
+            Err(_) => continue,
+        }
+    }
+    bail!("no free backup name for {stem}{ext} in {}", dir.display())
+}
+
+/// Prefix of the per-run directory a static export is staged in inside the `app`
+/// container before it's copied out to the host (see [`export_static`]).
+const EXPORT_CONTAINER_PREFIX: &str = "/tmp/aincient-site-export";
 
 /// Folder name the GUI exports into, under the folder the user picks. Exposed so
 /// the manager's picker can promise the same name the engine writes.
@@ -2020,12 +2079,47 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
             host_zip.display()
         );
     }
-    let container_zip = format!("{EXPORT_CONTAINER_DIR}.zip");
+    // Per-run staging inside the container: two exports at once (the GUI and the
+    // CLI) must never clear or copy out each other's pages.
+    let stage = format!("{EXPORT_CONTAINER_PREFIX}-{}", run_id());
+    let container_zip = format!("{stage}.zip");
+    let result = export_static_in(
+        stack,
+        opts,
+        &plan,
+        r,
+        &stage,
+        &container_zip,
+        &host_out,
+        &host_zip,
+    );
+    // Success or failure, the staging never stays behind (a large site's render,
+    // once per attempt).
+    remove_in_container(stack, &[&stage, &container_zip]);
+    result?;
 
+    r.log(&format!("Static site exported to {}", host_out.display()));
+    plan.finish(r, "Exported.");
+    Ok(host_out)
+}
+
+/// The in-container half of [`export_static`]: render into `stage`, copy it (and
+/// the zip) out. The caller removes `stage` + `container_zip` afterwards.
+#[allow(clippy::too_many_arguments)]
+fn export_static_in(
+    stack: &Stack,
+    opts: &ExportOptions,
+    plan: &Plan,
+    r: &mut dyn Reporter,
+    stage: &str,
+    container_zip: &str,
+    host_out: &Path,
+    host_zip: &Path,
+) -> Result<()> {
     // Assemble the drush invocation, rendering into a clean container staging dir.
     let mut export_args: Vec<String> = DRUSH.iter().map(|s| (*s).to_string()).collect();
     export_args.push("aincient:export".into());
-    export_args.push(format!("--out={EXPORT_CONTAINER_DIR}"));
+    export_args.push(format!("--out={stage}"));
     if let Some(base) = &opts.base_url {
         export_args.push(format!("--base-url={base}"));
     }
@@ -2041,19 +2135,6 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     if opts.skip_link_check {
         export_args.push("--skip-link-check".into());
     }
-
-    // Clear any stale staging dir so a re-export is clean.
-    let mut clean = compose(stack);
-    clean.args([
-        "exec",
-        "-T",
-        "app",
-        "rm",
-        "-rf",
-        EXPORT_CONTAINER_DIR,
-        container_zip.as_str(),
-    ]);
-    let _ = clean.output();
 
     plan.run(r, "render", "Rendering pages to static HTML…", |r| {
         let mut build = compose(stack);
@@ -2072,18 +2153,14 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     // destination doesn't exist, and *into* it when it does. Copy into a fresh
     // staging sibling, then swap it into place — the previous export is only
     // removed once the new one is verified on disk, and never anything else.
-    let staged = staging_sibling(&host_out);
+    let staged = staging_sibling(host_out);
     let mut cp = compose(stack);
-    cp.args([
-        "cp",
-        &format!("app:{EXPORT_CONTAINER_DIR}"),
-        &staged.to_string_lossy(),
-    ]);
+    cp.args(["cp", &format!("app:{stage}"), &staged.to_string_lossy()]);
     if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(e);
     }
-    if let Err(e) = install_export(&staged, &host_out) {
+    if let Err(e) = install_export(&staged, host_out) {
         let _ = std::fs::remove_dir_all(&staged);
         return Err(e);
     }
@@ -2098,22 +2175,7 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
         run_capture(cpz, "copy the export zip out of the container")?;
     }
 
-    // Best-effort cleanup of the in-container staging files.
-    let mut rm = compose(stack);
-    rm.args([
-        "exec",
-        "-T",
-        "app",
-        "rm",
-        "-rf",
-        EXPORT_CONTAINER_DIR,
-        container_zip.as_str(),
-    ]);
-    let _ = rm.output();
-
-    r.log(&format!("Static site exported to {}", host_out.display()));
-    plan.finish(r, "Exported.");
-    Ok(host_out)
+    Ok(())
 }
 
 /// Options for [`freeze`] — a passthrough onto `drush aincient:freeze`.
@@ -2321,11 +2383,12 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         .extension()
         .map(|e| e.eq_ignore_ascii_case("gz"))
         .unwrap_or(false);
-    let container_tmp = if gzipped {
-        "/tmp/aincient-restore.sql.gz"
-    } else {
-        "/tmp/aincient-restore.sql"
-    };
+    let container_tmp = format!(
+        "/tmp/aincient-restore-{}.{}",
+        run_id(),
+        if gzipped { "sql.gz" } else { "sql" }
+    );
+    let container_tmp = container_tmp.as_str();
 
     plan.run(
         r,
@@ -2340,9 +2403,21 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
             ]);
             run_capture(cp, "copy the backup into the container")
         },
-    )?;
+    )
+    .inspect_err(|_| remove_in_container(stack, &[container_tmp]))?;
 
     plan.run(r, "database", "Restoring the database…", |r| {
+        // Nothing is dropped until the dump is known to be readable: a truncated
+        // or empty file must fail here, with the current database untouched.
+        let check = if gzipped {
+            format!("test -s {container_tmp} && gzip -t {container_tmp}")
+        } else {
+            format!("test -s {container_tmp}")
+        };
+        let mut c = compose(stack);
+        c.args(["exec", "-T", "app", "sh", "-c", &check]);
+        run_capture(c, "check the backup file (your database was not touched)")?;
+
         r.log("Dropping the current database…");
         let mut drop = compose(stack);
         drop.args(["exec", "-T", "app"])
@@ -2360,7 +2435,8 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         let mut load = compose(stack);
         load.args(["exec", "-T", "app", "sh", "-c", &load_cmd]);
         run_capture(load, "load the backup")
-    })?;
+    })
+    .inspect_err(|_| remove_in_container(stack, &[container_tmp]))?;
 
     plan.run(r, "caches", "Rebuilding caches…", |_| {
         let mut cr = compose(stack);
@@ -2369,9 +2445,7 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
             .arg("cache:rebuild");
         let _ = cr.output();
 
-        let mut rm = compose(stack);
-        rm.args(["exec", "-T", "app", "rm", "-f", container_tmp]);
-        let _ = rm.output();
+        remove_in_container(stack, &[container_tmp]);
         Ok(())
     })?;
 
@@ -2390,23 +2464,34 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
 /// `www-data` ownership afterwards — exactly as `entrypoint.sh` does on boot —
 /// or restored uploads and their derivatives would be unwritable/unreadable.
 fn restore_bundle(stack: &Stack, file: &Path, plan: &Plan, r: &mut dyn Reporter) -> Result<()> {
+    let work = format!("/tmp/aincient-restore-{}", run_id());
+    let archive = format!("{work}.tar.gz");
+    // The files step removes both on success; any failure removes them here.
+    restore_bundle_in(stack, file, plan, r, &work, &archive)
+        .inspect_err(|_| remove_in_container(stack, &[&work, &archive]))
+}
+
+fn restore_bundle_in(
+    stack: &Stack,
+    file: &Path,
+    plan: &Plan,
+    r: &mut dyn Reporter,
+    work: &str,
+    archive: &str,
+) -> Result<()> {
     plan.run(
         r,
         "copy",
         "Copying the snapshot into the container…",
         |_| {
             let mut cp = compose(stack);
-            cp.args([
-                "cp",
-                &file.to_string_lossy(),
-                "app:/tmp/aincient-restore.tar.gz",
-            ]);
+            cp.args(["cp", &file.to_string_lossy(), &format!("app:{archive}")]);
             run_capture(cp, "copy the snapshot into the container")
         },
     )?;
 
     let drush = DRUSH.join(" ");
-    let [unpack, database, files] = restore_bundle_scripts(&drush);
+    let [unpack, database, files] = restore_bundle_scripts(&drush, work);
     let exec = |script: &str, action: &str| {
         let mut c = compose(stack);
         c.args(["exec", "-T", "app", "sh", "-c", script]);
@@ -2736,30 +2821,38 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
 ///
 /// Two scripts, run as two execs: [`backup_dump_script`] stages the dump and
 /// manifest, [`backup_pack_script`] tars them with the files tree.
-fn backup_dump_script(drush: &str, manifest: &str) -> String {
+fn backup_dump_script(drush: &str, manifest: &str, stage: &str) -> String {
     let manifest = crate::remote::sh_quote(manifest);
     format!(
         "set -e\n\
-         STAGE=/tmp/aincient-snapshot\n\
-         ARCHIVE=/tmp/aincient-snapshot.tar.gz\n\
+         STAGE={stage}\n\
+         ARCHIVE={stage}.tar.gz\n\
          rm -rf \"$STAGE\" \"$ARCHIVE\"\n\
          mkdir -p \"$STAGE\"\n\
          {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
+         test -s \"$STAGE/database.sql.gz\"\n\
+         gzip -t \"$STAGE/database.sql.gz\"\n\
          printf '%s\\n' {manifest} > \"$STAGE/manifest.json\"\n",
     )
 }
 
 /// The second half of the snapshot: pack the staged dump + manifest with the
 /// files tree and frozen snapshots (see [`backup_dump_script`]).
-fn backup_pack_script() -> String {
-    "set -e\n\
-     STAGE=/tmp/aincient-snapshot\n\
-     ARCHIVE=/tmp/aincient-snapshot.tar.gz\n\
-     mkdir -p /opt/drupal/private/frozen\n\
-     tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
-     -C /opt/drupal/web/sites/default files \
-     -C /opt/drupal/private frozen\n"
-        .to_string()
+fn backup_pack_script(stage: &str) -> String {
+    // The last two lines read the archive back: a truncated or unreadable archive,
+    // or one missing the dump or manifest, fails the backup instead of being
+    // reported as saved.
+    format!(
+        "set -e\n\
+         STAGE={stage}\n\
+         ARCHIVE={stage}.tar.gz\n\
+         mkdir -p /opt/drupal/private/frozen\n\
+         tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
+         -C /opt/drupal/web/sites/default files \
+         -C /opt/drupal/private frozen\n\
+         tar tzf \"$ARCHIVE\" > \"$STAGE/members\"\n\
+         grep -qx database.sql.gz \"$STAGE/members\" && grep -qx manifest.json \"$STAGE/members\"\n"
+    )
 }
 
 /// The in-container shell that restores a snapshot bundle: drop + reload the DB,
@@ -2771,18 +2864,23 @@ fn backup_pack_script() -> String {
 ///
 /// Three scripts, one exec each, so a failure names its step (DECISIONS 0515):
 /// unpack, database, files (files also rebuilds caches and cleans up).
-fn restore_bundle_scripts(drush: &str) -> [String; 3] {
-    let head = "set -e\n\
-                ARCHIVE=/tmp/aincient-restore.tar.gz\n\
-                WORK=/tmp/aincient-restore\n";
+fn restore_bundle_scripts(drush: &str, work: &str) -> [String; 3] {
+    let head = format!(
+        "set -e\n\
+         ARCHIVE={work}.tar.gz\n\
+         WORK={work}\n"
+    );
     let unpack = format!(
         "{head}\
          rm -rf \"$WORK\"\n\
          mkdir -p \"$WORK\"\n\
          tar xzf \"$ARCHIVE\" -C \"$WORK\"\n"
     );
+    // Nothing is dropped until the snapshot's dump is there and readable.
     let database = format!(
         "{head}\
+         test -s \"$WORK/database.sql.gz\"\n\
+         gzip -t \"$WORK/database.sql.gz\"\n\
          {drush} sql:drop -y\n\
          zcat \"$WORK/database.sql.gz\" | {drush} sql:cli\n"
     );
@@ -3655,13 +3753,17 @@ mod tests {
     fn backup_script_is_valid_shell_and_packs_db_and_files() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
         let manifest = r#"{"format":"aincient-snapshot","version":1,"created":"x","image":"y"}"#;
-        let dump = backup_dump_script(drush, manifest);
-        let pack = backup_pack_script();
+        let dump = backup_dump_script(drush, manifest, "/tmp/aincient-snapshot-1-2");
+        let pack = backup_pack_script("/tmp/aincient-snapshot-1-2");
         assert_valid_sh(&dump);
         assert_valid_sh(&pack);
         // The pack step reads what the dump step staged.
-        assert!(dump.contains("STAGE=/tmp/aincient-snapshot\n"));
-        assert!(pack.contains("STAGE=/tmp/aincient-snapshot\n"));
+        assert!(dump.contains("STAGE=/tmp/aincient-snapshot-1-2\n"));
+        assert!(pack.contains("STAGE=/tmp/aincient-snapshot-1-2\n"));
+        // A dump that isn't readable fails the backup before anything is packed,
+        // and the archive is read back before the backup counts as saved.
+        assert!(dump.contains("gzip -t \"$STAGE/database.sql.gz\""));
+        assert!(pack.contains("tar tzf \"$ARCHIVE\""));
         let script = format!("{dump}{pack}");
         assert!(script.contains("sql:dump --gzip"), "dumps the database");
         // Both members packed: the staged DB dump and the live files tree.
@@ -3889,11 +3991,40 @@ mod tests {
     }
 
     #[test]
+    fn a_second_backup_in_the_same_second_never_overwrites_the_first() {
+        let dir = Scratch::new("claim-name");
+        let part = |n: &str, body: &[u8]| {
+            let p = dir.0.join(format!(".{n}.part"));
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // Both runs finish before either claims: the claim, not the pick, decides.
+        let (a, b, c) = (part("a", b"one"), part("b", b"two"), part("c", b"three"));
+        let first = super::claim_name(&a, &dir.0, "aincient-x", ".tar.gz").unwrap();
+        let second = super::claim_name(&b, &dir.0, "aincient-x", ".tar.gz").unwrap();
+        let third = super::claim_name(&c, &dir.0, "aincient-x", ".tar.gz").unwrap();
+        assert_eq!(first, dir.0.join("aincient-x.tar.gz"));
+        assert_eq!(second, dir.0.join("aincient-x-2.tar.gz"));
+        assert_eq!(third, dir.0.join("aincient-x-3.tar.gz"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        assert!(
+            !a.exists() && !b.exists() && !c.exists(),
+            "parts are moved, not copied"
+        );
+    }
+
+    #[test]
+    fn run_ids_differ_between_runs() {
+        assert_ne!(super::run_id(), super::run_id());
+    }
+
+    #[test]
     fn a_label_with_quotes_keeps_the_backup_script_valid() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
         let manifest =
             serde_json::json!({ "site_label": "Bob's \"blog\" $(rm -rf /)" }).to_string();
-        let script = backup_dump_script(drush, &manifest);
+        let script = backup_dump_script(drush, &manifest, "/tmp/aincient-snapshot-1-2");
         assert_valid_sh(&script);
         // What the printf writes is the manifest, byte for byte.
         let printf = script
@@ -3992,12 +4123,17 @@ mod tests {
     #[test]
     fn restore_bundle_script_is_valid_shell_and_reasserts_ownership() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
-        let parts = restore_bundle_scripts(drush);
+        let parts = restore_bundle_scripts(drush, "/tmp/aincient-restore-1-2");
         for part in &parts {
             assert_valid_sh(part);
             // Each exec finds the archive and work dir the unpack step used.
-            assert!(part.contains("WORK=/tmp/aincient-restore\n"));
+            assert!(part.contains("WORK=/tmp/aincient-restore-1-2\n"));
         }
+        // The database is only dropped after its dump is proven readable.
+        let db = &parts[1];
+        let check = db.find("gzip -t").expect("checks the dump");
+        let drop = db.find("sql:drop").expect("drops");
+        assert!(check < drop, "check before drop");
         let script = parts.concat();
         assert!(script.contains("sql:drop -y"), "drops before load");
         assert!(
