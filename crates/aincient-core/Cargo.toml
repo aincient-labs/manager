@@ -12,7 +12,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-dirs = "5"
+dirs = "6"
 getrandom = "0.2"
 # Verifies a downloaded remote engine against its release `.sha256` (M2).
 sha2 = "0.10"
