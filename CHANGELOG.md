@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The progress window shows each step as a group of blocks that fills as the step runs: Prep,
+  Download, Start and Boot for an install, update or start; Check, Database, Files and Save for a
+  backup; Copy, Unpack, Database, Files and Migrate for a restore; Prepare, Render and Save for a
+  static export. Actions without steps (stop, freeze, password) show one slow-moving row and how
+  long they've been running. Image layers and the log are behind **Details**.
+- A backup now dumps the database and packs the files as two separate steps, and a snapshot
+  restore unpacks, restores the database and restores the files as three, so an error names the
+  part that failed.
+- The terminal numbers each step of these actions, for example `[2/4] Dumping the database…`.
+
+### Added
+
+- When an action fails, the progress window stays open on the step that stopped (marked red),
+  opens the log, and offers **Copy report**: what ran, on which site and Atelier version, how
+  long each step took, the error and the end of the log.
+
 ## [0.15.1] - 2026-11-10
 
 ### Fixed

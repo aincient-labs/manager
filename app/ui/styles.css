@@ -1377,85 +1377,99 @@ select {
   color: var(--on-accent);
 }
 
-/* Progress — a 4px ink line on the well; moss when done. */
-.progressbar {
-  height: 4px;
-  background: var(--surface-2);
-  overflow: hidden;
-}
-.progressbar-fill {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  transition: width 0.3s var(--ease), background 0.2s;
-  animation: pulse 1.8s ease-in-out infinite;
-}
-.progressbar-fill.done {
-  background: var(--jade);
-  animation: none;
-}
-.progressbar.indeterminate .progressbar-fill {
-  width: 40%;
-  animation: sweep 1.4s ease-in-out infinite;
-}
-.progress-stage {
-  min-height: 20px;
-  font-size: 13px;
-  color: var(--text-dim);
-}
-.pull-summary {
-  font-size: 13px;
-  color: var(--text-dim);
-}
-.pull-layers {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 132px;
-  overflow-y: auto;
-}
-.pull-row {
+/* Progress — a block matrix (DECISIONS 0515). One group of blocks per step the
+   op announced, filled column by column; ink while running, moss when done,
+   brick on the block where it failed. Ops with no percentage get one row with a
+   slow comet. Square blocks, no radius: the Monograph grammar. */
+.pmatrix {
   display: grid;
-  grid-template-columns: 82px 1fr 96px;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-dim);
+  gap: 6px;
 }
-.pull-id,
-.pull-meta {
+.pm-grid {
+  display: grid;
+  column-gap: 2px;
+  row-gap: 2px;
+}
+.pm-cell {
+  aspect-ratio: 1;
+  background: var(--surface-2);
+  transition: background-color 0.12s linear;
+}
+.pm-cell.on {
+  background: var(--accent);
+}
+.pm-cell.head {
+  background: var(--accent);
+  animation: pm-blink 0.9s steps(2, jump-none) infinite;
+}
+.pm-cell.done {
+  background: var(--jade);
+}
+.pm-cell.err {
+  background: var(--danger);
+}
+.pm-cell.t1 {
+  background: var(--text-dim);
+}
+.pm-cell.t2 {
+  background: var(--border);
+}
+@keyframes pm-blink {
+  50% {
+    opacity: 0.2;
+  }
+}
+.pm-labels {
+  display: grid;
+  column-gap: 2px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pm-labels span {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
 }
-.pull-meta {
-  text-align: right;
+.pm-labels span.past {
+  color: var(--text-dim);
 }
-.pull-bar {
-  height: 4px;
-  background: var(--surface-2);
-  overflow: hidden;
+.pm-labels span.now {
+  color: var(--text);
+  border-top-color: var(--border-strong);
 }
-.pull-bar-fill {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  transition: width 0.2s var(--ease), background 0.2s;
-}
-.pull-row.pull-done .pull-bar-fill {
-  background: var(--jade);
-}
-.pull-row.pull-warn .pull-bar-fill {
-  background: var(--accent-2);
-}
-.pull-row.pull-fail,
-.pull-row.pull-fail .pull-bar-fill {
+.pm-labels span.failed {
   color: var(--danger);
-  background: var(--danger);
+  border-top-color: var(--danger);
 }
-.pull-row.pull-fail {
-  background: none;
+.progress-stage.failed {
+  color: var(--danger);
+}
+.progress-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.progress-actions-gap {
+  flex: 1;
+}
+.progress-actions .btn.ghost {
+  font-size: 13px;
+}
+.progress-more {
+  display: grid;
+  gap: 8px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pm-cell.head {
+    animation: none;
+  }
+  .pm-cell {
+    transition: none;
+  }
 }
 
 /* Loading — the same line, sweeping. */

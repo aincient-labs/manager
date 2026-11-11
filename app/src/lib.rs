@@ -14,8 +14,8 @@ use aincient_core::engine_client::{EngineError, Verb};
 use aincient_core::settings::{self, Settings};
 use aincient_core::{
     doctor, ops, remote, sites, ssh_key, update_cache, Backup, CacheStatus, ChangeGuard, Channel,
-    InstallOptions, ModelRole, Preflight, PullEvent, Reporter, SingleFlight, Site, SiteRow, Stack,
-    Stage, Status, UpdateCheck,
+    InstallOptions, ModelRole, PlanStep, Preflight, PullEvent, Reporter, SingleFlight, Site,
+    SiteRow, Stack, Stage, Status, UpdateCheck,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -149,6 +149,7 @@ fn feed(app: &AppHandle) -> impl FnMut(Pipe, &str) + '_ {
                 message: remote::strip_ansi(line),
                 fraction: None,
                 pull: None,
+                steps: None,
             },
         );
     }
@@ -165,7 +166,7 @@ const REMOTE_STATUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 struct ProgressEvent {
     /// `"stage"` — a milestone that advances the bar; `"log"` — a passed-through
     /// docker line that only appends to the feed; `"pull"` — a structured
-    /// per-layer pull event carried in `pull`.
+    /// per-layer pull event carried in `pull`; `"plan"` — the steps in `steps`.
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     stage: Option<Stage>,
@@ -174,6 +175,9 @@ struct ProgressEvent {
     fraction: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pull: Option<PullEvent>,
+    /// `"plan"` — the op's steps, announced once up front (DECISIONS 0515).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<Vec<PlanStep>>,
 }
 
 /// Relays core lifecycle progress to the webview. Lives on the blocking worker
@@ -188,6 +192,20 @@ impl Reporter for EventReporter {
         true
     }
 
+    fn plan(&mut self, steps: &[PlanStep]) {
+        let _ = self.app.emit(
+            "op-progress",
+            ProgressEvent {
+                kind: "plan",
+                stage: None,
+                message: String::new(),
+                fraction: None,
+                pull: None,
+                steps: Some(steps.to_vec()),
+            },
+        );
+    }
+
     fn stage(&mut self, stage: Stage, message: &str, fraction: Option<f32>) {
         let _ = self.app.emit(
             "op-progress",
@@ -197,6 +215,7 @@ impl Reporter for EventReporter {
                 message: message.to_string(),
                 fraction,
                 pull: None,
+                steps: None,
             },
         );
     }
@@ -229,6 +248,7 @@ impl Reporter for EventReporter {
                 message: line.to_string(),
                 fraction: None,
                 pull: None,
+                steps: None,
             },
         );
     }
@@ -242,6 +262,7 @@ impl Reporter for EventReporter {
                 message: String::new(),
                 fraction: None,
                 pull: Some(ev.clone()),
+                steps: None,
             },
         );
     }
@@ -981,6 +1002,7 @@ async fn engine_remove(app: AppHandle, sel: State<'_, Selected>) -> Result<(), S
                             message: line.to_string(),
                             fraction: None,
                             pull: None,
+                            steps: None,
                         },
                     );
                 };

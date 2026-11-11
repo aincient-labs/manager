@@ -693,19 +693,29 @@
       <button class="x" data-action="dismiss-error" aria-label="Dismiss">×</button>
     </div>
 
-    <!-- Progress overlay -->
+    <!-- Progress overlay (DECISIONS 0515): one block group per announced step;
+         a single-row strip for ops with no percentage. Machine detail behind Details. -->
     <div id="progress" class="overlay hidden">
-      <div class="progress-panel">
+      <div class="progress-panel" role="dialog" aria-modal="true" aria-labelledby="progress-title">
         <div class="progress-body">
           <p id="progress-site" class="modal-site whisper hidden"></p>
           <h3 class="modal-title" id="progress-title">Working…</h3>
-          <div id="progressbar" class="progressbar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-            <div id="progress-fill" class="progressbar-fill"></div>
+          <div id="progressbar" class="pmatrix" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-labelledby="progress-title">
+            <div id="pm-grid" class="pm-grid"></div>
+            <div id="pm-labels" class="pm-labels" aria-hidden="true"></div>
           </div>
           <p id="progress-stage" class="progress-stage">Starting…</p>
-          <div id="pull-summary" class="pull-summary hidden"></div>
-          <div id="pull-layers" class="pull-layers hidden"></div>
-          <pre id="progress-log" class="progress-log" aria-live="polite"></pre>
+          <div class="progress-actions">
+            <button type="button" id="progress-details" class="btn ghost" aria-expanded="false" aria-controls="progress-more">Details</button>
+            <span class="progress-actions-gap"></span>
+            <button type="button" id="progress-copy" class="btn small hidden">Copy report</button>
+            <button type="button" id="progress-close" class="btn small primary hidden">Close</button>
+          </div>
+          <div id="progress-more" class="progress-more hidden">
+            <div id="pull-summary" class="pull-summary hidden"></div>
+            <div id="pull-layers" class="pull-layers hidden"></div>
+            <pre id="progress-log" class="progress-log" aria-live="polite"></pre>
+          </div>
         </div>
       </div>
     </div>

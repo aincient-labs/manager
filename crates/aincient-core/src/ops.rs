@@ -61,6 +61,12 @@ pub enum Stage {
 pub trait Reporter {
     /// A milestone: advance to `fraction` (0.0–1.0, when known) with a headline.
     fn stage(&mut self, _stage: Stage, _message: &str, _fraction: Option<f32>) {}
+    /// The steps this op will walk, announced once before the first of them
+    /// (DECISIONS 0515). Progress still arrives through [`stage`](Self::stage);
+    /// the plan only tells a front end how to group it — the GUI draws one block
+    /// per step, the CLI numbers its headings. Default: ignore it, so reporters
+    /// that only know `stage`/`log` keep working unchanged.
+    fn plan(&mut self, _steps: &[PlanStep]) {}
     /// A pass-through log line from the underlying tool (docker), no bar change.
     fn log(&mut self, _line: &str) {}
     /// A structured pull-progress event (per-layer phase + bytes), emitted in
@@ -93,6 +99,114 @@ pub trait Reporter {
 /// A [`Reporter`] that drops everything — for callers that don't show progress.
 pub struct Silent;
 impl Reporter for Silent {}
+
+/// One step of an op's [`Plan`]: what to call it and the slice of the overall
+/// 0.0–1.0 progress it covers.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanStep {
+    /// Stable machine id (`"dump"`, `"pull"`, …) — for reports and tests.
+    pub id: String,
+    /// Short label the GUI prints under the step's blocks ("Database").
+    pub label: String,
+    pub from: f32,
+    pub to: f32,
+}
+
+/// The steps an op walks, built from relative weights (DECISIONS 0515).
+///
+/// It doesn't hold the reporter, so an op keeps using `r` freely between
+/// steps: announce the plan, then wrap each step in [`run`](Plan::run).
+pub struct Plan {
+    steps: Vec<PlanStep>,
+}
+
+impl Plan {
+    /// `(id, label, weight)` triples, in order. Weights are relative.
+    pub fn weighted(steps: &[(&str, &str, f32)]) -> Self {
+        let total: f32 = steps.iter().map(|s| s.2).sum::<f32>().max(f32::EPSILON);
+        let mut at = 0.0;
+        let steps = steps
+            .iter()
+            .map(|(id, label, w)| {
+                let from = at;
+                at += w / total;
+                PlanStep {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    from,
+                    to: at.min(1.0),
+                }
+            })
+            .collect();
+        Plan { steps }
+    }
+
+    /// Steps with explicit fraction ranges — for the lifecycle ops, whose shared
+    /// helpers (`pull`, `up`, `wait_until_ready`) already report fixed fractions.
+    fn ranged(steps: &[(&str, &str, f32, f32)]) -> Self {
+        Plan {
+            steps: steps
+                .iter()
+                .map(|(id, label, from, to)| PlanStep {
+                    id: (*id).to_string(),
+                    label: (*label).to_string(),
+                    from: *from,
+                    to: *to,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn steps(&self) -> &[PlanStep] {
+        &self.steps
+    }
+
+    /// Tell the reporter which steps are coming.
+    pub fn announce(&self, r: &mut dyn Reporter) {
+        r.plan(&self.steps);
+    }
+
+    /// Run step `id`: report its headline at the step's start, then `f`. The
+    /// error, if any, propagates unchanged — the front end marks the step that
+    /// was running when the op failed.
+    pub fn run<T>(
+        &self,
+        r: &mut dyn Reporter,
+        id: &str,
+        message: &str,
+        f: impl FnOnce(&mut dyn Reporter) -> Result<T>,
+    ) -> Result<T> {
+        let from = self.steps.iter().find(|s| s.id == id).map(|s| s.from);
+        debug_assert!(from.is_some(), "step {id} is not in the plan");
+        r.stage(Stage::Working, message, from);
+        f(r)
+    }
+
+    /// The op finished: fill the bar.
+    pub fn finish(&self, r: &mut dyn Reporter, message: &str) {
+        r.stage(Stage::Working, message, Some(1.0));
+    }
+}
+
+/// Install, reinstall and a single-hop update: the fractions `pull`, `up` and
+/// `wait_until_ready` already report, named.
+fn lifecycle_plan() -> Plan {
+    Plan::ranged(&[
+        ("prepare", "Prep", 0.0, PULL_FROM),
+        ("pull", "Download", PULL_FROM, UP_FROM),
+        ("start", "Start", UP_FROM, BOOT_FROM),
+        ("boot", "Boot", BOOT_FROM, 1.0),
+    ])
+}
+
+/// Where `pull` starts the bar.
+const PULL_FROM: f32 = 0.12;
+/// Where `up` starts the bar.
+const UP_FROM: f32 = 0.6;
+/// Where `wait_until_ready` starts the bar.
+const BOOT_FROM: f32 = 0.72;
+/// Where `start` starts the bar (no download).
+const START_FROM: f32 = 0.4;
 
 /// A snapshot of the appliance's current state.
 ///
@@ -437,7 +551,7 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
     r.stage(
         Stage::Booting,
         "Waiting for the console to finish booting…",
-        Some(0.72),
+        Some(BOOT_FROM),
     );
     loop {
         if http_ready(port) {
@@ -454,7 +568,7 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
         }
         // Creep the bar across the boot window (0.72 → 0.95) and tick the timer.
         let elapsed = started.elapsed();
-        let frac = 0.72 + 0.23 * (elapsed.as_secs_f32() / timeout.as_secs_f32());
+        let frac = BOOT_FROM + (0.95 - BOOT_FROM) * (elapsed.as_secs_f32() / timeout.as_secs_f32());
         r.stage(
             Stage::Booting,
             &format!("Booting… ({}s)", elapsed.as_secs()),
@@ -772,6 +886,7 @@ fn registry_problem(image: &str, error: &str) -> String {
 /// and auto-rolls-back on failure. Returns whether the console came up before
 /// the readiness timeout (`false` = started but still booting).
 pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
+    lifecycle_plan().announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
     preflight().require()?;
     r.stage(Stage::Scaffold, "Preparing the stack…", Some(0.08));
@@ -830,8 +945,42 @@ fn refresh_edge_conf(stack: &Stack) {
     }
 }
 
+/// Where a stepped route's first hop starts the bar (the pre-route backup fills
+/// the slice before it).
+const ROUTE_START: f32 = 0.05;
+
+/// The steps [`apply_upgrade`] will report: the lifecycle phases for one hop, or
+/// one block per hop of a stepped route, labelled by the version it lands on.
+fn upgrade_plan(plan: &UpgradePlan) -> Plan {
+    if !plan.is_stepped() {
+        return lifecycle_plan();
+    }
+    let total = plan.steps.len();
+    let span = (1.0 - ROUTE_START) / total as f32;
+    let mut steps = vec![PlanStep {
+        id: "prepare".into(),
+        label: "Prep".into(),
+        from: 0.0,
+        to: ROUTE_START,
+    }];
+    for (i, hop) in plan.steps.iter().enumerate() {
+        let label = match hop.version {
+            Some(v) => v.to_string(),
+            None => format!("Step {}", i + 1),
+        };
+        steps.push(PlanStep {
+            id: format!("hop-{}", i + 1),
+            label,
+            from: ROUTE_START + span * i as f32,
+            to: ROUTE_START + span * (i + 1) as f32,
+        });
+    }
+    Plan { steps }
+}
+
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
+    upgrade_plan(plan).announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
     announce_legacy_migrations(stack, r)?;
@@ -860,7 +1009,14 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
             "Backing up before the first step…",
             Some(0.03),
         );
-        match backup(stack, Some("before-stepped-upgrade"), r) {
+        // The backup's own steps land inside this slice; its plan is dropped.
+        let mut snap = ScaledReporter {
+            inner: r,
+            base: 0.03,
+            span: ROUTE_START - 0.03,
+            prefix: String::new(),
+        };
+        match backup(stack, Some("before-stepped-upgrade"), &mut snap) {
             Ok(path) => r.stage(
                 Stage::Working,
                 &format!("Snapshot saved: {}", path.display()),
@@ -880,7 +1036,6 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     // Hops share the bar from 0.05 to 1.0, each rescaling the stage fractions the
     // shared pull/up/wait helpers report so a five-minute route doesn't look like
     // five separate runs that each finish at 100%.
-    const ROUTE_START: f32 = 0.05;
     let span = (1.0 - ROUTE_START) / total as f32;
 
     for (i, step) in plan.steps.iter().enumerate() {
@@ -949,11 +1104,10 @@ fn has_converge(stack: &Stack) -> bool {
 /// migrates; its own per-run snapshot is the rollback. Streamed because it is slow
 /// and chatty. Images too old to ship the script skip it: their restore target
 /// matches their dump, so the cache rebuild the restore already did is enough.
+///
+/// The caller checks [`has_converge`] and reports the step (it's a step of the
+/// restore's plan).
 fn converge_restored(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
-    if !has_converge(stack) {
-        return Ok(());
-    }
-    r.stage(Stage::Scaffold, "Migrating the restored site…", Some(0.9));
     run_step(converge_cmd(stack), "migrate the restored site", r)
 }
 
@@ -1022,6 +1176,10 @@ struct ScaledReporter<'a> {
 }
 
 impl Reporter for ScaledReporter<'_> {
+    /// A sub-run's plan never replaces the outer one: its progress is drawn
+    /// inside the outer step it runs in.
+    fn plan(&mut self, _steps: &[PlanStep]) {}
+
     fn stage(&mut self, stage: Stage, message: &str, fraction: Option<f32>) {
         self.inner.stage(
             stage,
@@ -1191,7 +1349,7 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(
         Stage::Pull,
         "Pulling the latest appliance image…",
-        Some(0.12),
+        Some(PULL_FROM),
     );
     // A capturing reporter (the GUI) gets structured per-layer progress via
     // compose's JSON progress stream; the CLI keeps inheriting docker's own TTY
@@ -1429,7 +1587,7 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
 
 /// `docker compose up -d`.
 fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
-    r.stage(Stage::Starting, "Starting the containers…", Some(0.6));
+    r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
     let mut c = compose(stack);
     c.args(["up", "-d"]);
     run_step(c, "start the appliance", r)
@@ -1542,10 +1700,15 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
+    Plan::ranged(&[
+        ("start", "Start", START_FROM, BOOT_FROM),
+        ("boot", "Boot", BOOT_FROM, 1.0),
+    ])
+    .announce(r);
     // DECISIONS 0488: with the engine up, Start is its Wake (refused while
     // locked down), so the engine's state stays the site's state.
     if let Some(info) = ready_engine(stack) {
-        r.stage(Stage::Starting, "Waking the site…", Some(0.4));
+        r.stage(Stage::Starting, "Waking the site…", Some(START_FROM));
         let said = engine_verb(&info, AdminVerb::Wake, "wake").map_err(|e| {
             if format!("{e:#}").contains("locked down") {
                 anyhow::anyhow!(
@@ -1559,7 +1722,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         say(r, &said);
         return Ok(wait_until_ready(stack, START_READY_TIMEOUT, r));
     }
-    r.stage(Stage::Starting, "Starting the appliance…", Some(0.4));
+    r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
     match start_action(observe_container(stack)) {
         StartAction::Start => {
             let mut c = compose(stack);
@@ -1589,6 +1752,7 @@ pub fn down(stack: &Stack, wipe_data: bool) -> Result<()> {
 pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
     preflight().require()?;
     if stack.exists() {
+        lifecycle_plan().announce(r);
         r.stage(Stage::Scaffold, "Removing the old appliance…", Some(0.02));
         down(stack, true)?;
     }
@@ -1605,11 +1769,19 @@ pub(crate) const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
 /// archive can be shared over the wire and [`restore`]d onto another host.
 /// Returns the path to the created archive.
 pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Result<PathBuf> {
-    r.stage(Stage::Working, "Backing up the database and files…", None);
-    ensure_running(stack)?;
-    std::fs::create_dir_all(stack.backups_dir())?;
-    // Which site this is (m2-6, D-04): restore refuses another site's archive.
-    let site_id = stack.ensure_site_id()?;
+    let plan = Plan::weighted(&[
+        ("check", "Check", 1.0),
+        ("dump", "Database", 4.0),
+        ("pack", "Files", 4.0),
+        ("copy", "Save", 1.0),
+    ]);
+    plan.announce(r);
+    let site_id = plan.run(r, "check", "Checking the site…", |_| {
+        ensure_running(stack)?;
+        std::fs::create_dir_all(stack.backups_dir())?;
+        // Which site this is (m2-6, D-04): restore refuses another site's archive.
+        stack.ensure_site_id()
+    })?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let stem = match label {
@@ -1651,21 +1823,39 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     .to_string();
 
     // Build the bundle inside the container, then copy it out (mirrors the
-    // dump→cp→rm pattern).
-    r.log("Dumping the database and packing uploaded files…");
-    let script = backup_script(&drush, &manifest);
-    let mut build = compose(stack);
-    build.args(["exec", "-T", "app", "sh", "-c", &script]);
-    run_capture(build, "build the snapshot archive")?;
-
-    r.log("Copying the snapshot out of the container…");
-    let mut cp = compose(stack);
-    cp.args([
-        "cp",
-        "app:/tmp/aincient-snapshot.tar.gz",
-        &host_path.to_string_lossy(),
-    ]);
-    run_capture(cp, "copy the snapshot out of the container")?;
+    // dump→cp→rm pattern). Dump and pack are separate execs so a failure names
+    // the half that broke (DECISIONS 0515).
+    plan.run(r, "dump", "Dumping the database…", |_| {
+        let mut c = compose(stack);
+        c.args([
+            "exec",
+            "-T",
+            "app",
+            "sh",
+            "-c",
+            &backup_dump_script(&drush, &manifest),
+        ]);
+        run_capture(c, "dump the database")
+    })?;
+    plan.run(r, "pack", "Packing the uploaded files…", |_| {
+        let mut c = compose(stack);
+        c.args(["exec", "-T", "app", "sh", "-c", &backup_pack_script()]);
+        run_capture(c, "pack the uploaded files")
+    })?;
+    plan.run(
+        r,
+        "copy",
+        "Copying the backup out of the container…",
+        |_| {
+            let mut cp = compose(stack);
+            cp.args([
+                "cp",
+                "app:/tmp/aincient-snapshot.tar.gz",
+                &host_path.to_string_lossy(),
+            ]);
+            run_capture(cp, "copy the snapshot out of the container")
+        },
+    )?;
 
     // Best-effort cleanup of the in-container temp files.
     let mut rm = compose(stack);
@@ -1681,6 +1871,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     let _ = rm.output();
 
     r.log(&format!("Snapshot written to {}", host_path.display()));
+    plan.finish(r, "Backup saved.");
     Ok(host_path)
 }
 
@@ -1801,7 +1992,13 @@ pub struct ExportOptions {
 /// `drush aincient:export` inside the `app` container (staging into a temp dir),
 /// then copies the result out. Returns the host output directory.
 pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) -> Result<PathBuf> {
-    r.stage(Stage::Working, "Exporting the site to static HTML…", None);
+    let plan = Plan::weighted(&[
+        ("prepare", "Prepare", 1.0),
+        ("render", "Render", 6.0),
+        ("copy", "Save", 2.0),
+    ]);
+    plan.announce(r);
+    r.stage(Stage::Working, "Checking the site…", Some(0.0));
     ensure_running(stack)?;
 
     let host_out = match &opts.out {
@@ -1858,14 +2055,19 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     ]);
     let _ = clean.output();
 
-    r.log("Rendering pages to static HTML…");
-    let mut build = compose(stack);
-    build.args(["exec", "-T", "app"]);
-    build.args(&export_args);
-    // The exporter reports page/asset counts and any broken links — surface them.
-    run_step(build, "export the static site", r)?;
+    plan.run(r, "render", "Rendering pages to static HTML…", |r| {
+        let mut build = compose(stack);
+        build.args(["exec", "-T", "app"]);
+        build.args(&export_args);
+        // The exporter reports page/asset counts and any broken links — surface them.
+        run_step(build, "export the static site", r)
+    })?;
 
-    r.log("Copying the exported site out of the container…");
+    r.stage(
+        Stage::Working,
+        "Copying the exported site out of the container…",
+        Some(plan.steps()[2].from),
+    );
     // `docker compose cp` copies the source dir *as* the destination when the
     // destination doesn't exist, and *into* it when it does. Copy into a fresh
     // staging sibling, then swap it into place — the previous export is only
@@ -1910,6 +2112,7 @@ pub fn export_static(stack: &Stack, opts: &ExportOptions, r: &mut dyn Reporter) 
     let _ = rm.output();
 
     r.log(&format!("Static site exported to {}", host_out.display()));
+    plan.finish(r, "Exported.");
     Ok(host_out)
 }
 
@@ -2081,12 +2284,39 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
+    let migrate = has_converge(stack);
     if is_snapshot_bundle(name) {
-        restore_bundle(stack, file, r)?;
-        return converge_restored(stack, r);
+        let mut steps = vec![
+            ("copy", "Copy", 1.0),
+            ("unpack", "Unpack", 1.0),
+            ("database", "Database", 4.0),
+            ("files", "Files", 3.0),
+        ];
+        if migrate {
+            steps.push(("migrate", "Migrate", 3.0));
+        }
+        let plan = Plan::weighted(&steps);
+        plan.announce(r);
+        restore_bundle(stack, file, &plan, r)?;
+        if migrate {
+            plan.run(r, "migrate", "Migrating the restored site…", |r| {
+                converge_restored(stack, r)
+            })?;
+        }
+        plan.finish(r, "Restored.");
+        return Ok(());
     }
 
-    r.stage(Stage::Working, "Restoring the database…", None);
+    let mut steps = vec![
+        ("copy", "Copy", 1.0),
+        ("database", "Database", 4.0),
+        ("caches", "Caches", 1.0),
+    ];
+    if migrate {
+        steps.push(("migrate", "Migrate", 3.0));
+    }
+    let plan = Plan::weighted(&steps);
+    plan.announce(r);
     let gzipped = file
         .extension()
         .map(|e| e.eq_ignore_ascii_case("gz"))
@@ -2097,45 +2327,61 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         "/tmp/aincient-restore.sql"
     };
 
-    r.log("Copying the backup into the container…");
-    let mut cp = compose(stack);
-    cp.args([
-        "cp",
-        &file.to_string_lossy(),
-        &format!("app:{container_tmp}"),
-    ]);
-    run_capture(cp, "copy the backup into the container")?;
+    plan.run(
+        r,
+        "copy",
+        "Copying the backup into the container…",
+        |_| {
+            let mut cp = compose(stack);
+            cp.args([
+                "cp",
+                &file.to_string_lossy(),
+                &format!("app:{container_tmp}"),
+            ]);
+            run_capture(cp, "copy the backup into the container")
+        },
+    )?;
 
-    r.log("Dropping the current database…");
-    let mut drop = compose(stack);
-    drop.args(["exec", "-T", "app"])
-        .args(DRUSH)
-        .args(["sql:drop", "-y"]);
-    run_capture(drop, "drop the existing database")?;
+    plan.run(r, "database", "Restoring the database…", |r| {
+        r.log("Dropping the current database…");
+        let mut drop = compose(stack);
+        drop.args(["exec", "-T", "app"])
+            .args(DRUSH)
+            .args(["sql:drop", "-y"]);
+        run_capture(drop, "drop the existing database")?;
 
-    r.log("Loading the backup…");
-    let drush = DRUSH.join(" ");
-    let load_cmd = if gzipped {
-        format!("zcat {container_tmp} | {drush} sql:cli")
-    } else {
-        format!("cat {container_tmp} | {drush} sql:cli")
-    };
-    let mut load = compose(stack);
-    load.args(["exec", "-T", "app", "sh", "-c", &load_cmd]);
-    run_capture(load, "load the backup")?;
+        r.log("Loading the backup…");
+        let drush = DRUSH.join(" ");
+        let load_cmd = if gzipped {
+            format!("zcat {container_tmp} | {drush} sql:cli")
+        } else {
+            format!("cat {container_tmp} | {drush} sql:cli")
+        };
+        let mut load = compose(stack);
+        load.args(["exec", "-T", "app", "sh", "-c", &load_cmd]);
+        run_capture(load, "load the backup")
+    })?;
 
-    r.log("Rebuilding caches…");
-    let mut cr = compose(stack);
-    cr.args(["exec", "-T", "app"])
-        .args(DRUSH)
-        .arg("cache:rebuild");
-    let _ = cr.output();
+    plan.run(r, "caches", "Rebuilding caches…", |_| {
+        let mut cr = compose(stack);
+        cr.args(["exec", "-T", "app"])
+            .args(DRUSH)
+            .arg("cache:rebuild");
+        let _ = cr.output();
 
-    let mut rm = compose(stack);
-    rm.args(["exec", "-T", "app", "rm", "-f", container_tmp]);
-    let _ = rm.output();
+        let mut rm = compose(stack);
+        rm.args(["exec", "-T", "app", "rm", "-f", container_tmp]);
+        let _ = rm.output();
+        Ok(())
+    })?;
 
-    converge_restored(stack, r)
+    if migrate {
+        plan.run(r, "migrate", "Migrating the restored site…", |r| {
+            converge_restored(stack, r)
+        })?;
+    }
+    plan.finish(r, "Restored.");
+    Ok(())
 }
 
 /// Restore a full snapshot bundle (`.tar.gz` from [`backup`]): database + files.
@@ -2143,24 +2389,38 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
 /// swap stay together. Files are rewritten as root, so we re-assert
 /// `www-data` ownership afterwards — exactly as `entrypoint.sh` does on boot —
 /// or restored uploads and their derivatives would be unwritable/unreadable.
-fn restore_bundle(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
-    r.stage(Stage::Working, "Restoring the database and files…", None);
+fn restore_bundle(stack: &Stack, file: &Path, plan: &Plan, r: &mut dyn Reporter) -> Result<()> {
+    plan.run(
+        r,
+        "copy",
+        "Copying the snapshot into the container…",
+        |_| {
+            let mut cp = compose(stack);
+            cp.args([
+                "cp",
+                &file.to_string_lossy(),
+                "app:/tmp/aincient-restore.tar.gz",
+            ]);
+            run_capture(cp, "copy the snapshot into the container")
+        },
+    )?;
 
-    r.log("Copying the snapshot into the container…");
-    let mut cp = compose(stack);
-    cp.args([
-        "cp",
-        &file.to_string_lossy(),
-        "app:/tmp/aincient-restore.tar.gz",
-    ]);
-    run_capture(cp, "copy the snapshot into the container")?;
-
-    r.log("Unpacking and restoring database + files…");
-    let script = restore_bundle_script(&DRUSH.join(" "));
-    let mut run = compose(stack);
-    run.args(["exec", "-T", "app", "sh", "-c", &script]);
-    run_capture(run, "restore the snapshot")?;
-
+    let drush = DRUSH.join(" ");
+    let [unpack, database, files] = restore_bundle_scripts(&drush);
+    let exec = |script: &str, action: &str| {
+        let mut c = compose(stack);
+        c.args(["exec", "-T", "app", "sh", "-c", script]);
+        run_capture(c, action)
+    };
+    plan.run(r, "unpack", "Unpacking the snapshot…", |_| {
+        exec(&unpack, "unpack the snapshot")
+    })?;
+    plan.run(r, "database", "Restoring the database…", |_| {
+        exec(&database, "restore the database")
+    })?;
+    plan.run(r, "files", "Restoring the uploaded files…", |_| {
+        exec(&files, "restore the uploaded files")
+    })?;
     Ok(())
 }
 
@@ -2473,7 +2733,10 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
 /// derivatives no page referenced. Frozen snapshots under `private/frozen/`
 /// carry their own derivatives and are NOT affected by the exclude (the pattern
 /// is anchored to the `files` member).
-fn backup_script(drush: &str, manifest: &str) -> String {
+///
+/// Two scripts, run as two execs: [`backup_dump_script`] stages the dump and
+/// manifest, [`backup_pack_script`] tars them with the files tree.
+fn backup_dump_script(drush: &str, manifest: &str) -> String {
     let manifest = crate::remote::sh_quote(manifest);
     format!(
         "set -e\n\
@@ -2482,12 +2745,21 @@ fn backup_script(drush: &str, manifest: &str) -> String {
          rm -rf \"$STAGE\" \"$ARCHIVE\"\n\
          mkdir -p \"$STAGE\"\n\
          {drush} sql:dump --gzip --result-file=\"$STAGE/database.sql\" >/dev/null\n\
-         printf '%s\\n' {manifest} > \"$STAGE/manifest.json\"\n\
-         mkdir -p /opt/drupal/private/frozen\n\
-         tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
-         -C /opt/drupal/web/sites/default files \
-         -C /opt/drupal/private frozen\n",
+         printf '%s\\n' {manifest} > \"$STAGE/manifest.json\"\n",
     )
+}
+
+/// The second half of the snapshot: pack the staged dump + manifest with the
+/// files tree and frozen snapshots (see [`backup_dump_script`]).
+fn backup_pack_script() -> String {
+    "set -e\n\
+     STAGE=/tmp/aincient-snapshot\n\
+     ARCHIVE=/tmp/aincient-snapshot.tar.gz\n\
+     mkdir -p /opt/drupal/private/frozen\n\
+     tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
+     -C /opt/drupal/web/sites/default files \
+     -C /opt/drupal/private frozen\n"
+        .to_string()
 }
 
 /// The in-container shell that restores a snapshot bundle: drop + reload the DB,
@@ -2496,17 +2768,27 @@ fn backup_script(drush: &str, manifest: &str) -> String {
 /// preserves the tree; the `chown` re-asserts `www-data` ownership (files are
 /// written as root) exactly as `entrypoint.sh` does. cache:rebuild and cleanup
 /// are best-effort so a hiccup there doesn't fail the restore.
-fn restore_bundle_script(drush: &str) -> String {
-    format!(
-        "set -e\n\
-         ARCHIVE=/tmp/aincient-restore.tar.gz\n\
-         WORK=/tmp/aincient-restore\n\
-         DEST={FILES_DIR}\n\
+///
+/// Three scripts, one exec each, so a failure names its step (DECISIONS 0515):
+/// unpack, database, files (files also rebuilds caches and cleans up).
+fn restore_bundle_scripts(drush: &str) -> [String; 3] {
+    let head = "set -e\n\
+                ARCHIVE=/tmp/aincient-restore.tar.gz\n\
+                WORK=/tmp/aincient-restore\n";
+    let unpack = format!(
+        "{head}\
          rm -rf \"$WORK\"\n\
          mkdir -p \"$WORK\"\n\
-         tar xzf \"$ARCHIVE\" -C \"$WORK\"\n\
+         tar xzf \"$ARCHIVE\" -C \"$WORK\"\n"
+    );
+    let database = format!(
+        "{head}\
          {drush} sql:drop -y\n\
-         zcat \"$WORK/database.sql.gz\" | {drush} sql:cli\n\
+         zcat \"$WORK/database.sql.gz\" | {drush} sql:cli\n"
+    );
+    let files = format!(
+        "{head}\
+         DEST={FILES_DIR}\n\
          if [ -d \"$WORK/files\" ]; then\n\
          \x20 find \"$DEST\" -mindepth 1 -delete 2>/dev/null || true\n\
          \x20 cp -a \"$WORK/files/.\" \"$DEST/\"\n\
@@ -2518,8 +2800,9 @@ fn restore_bundle_script(drush: &str) -> String {
          \x20 chown -R www-data:www-data /opt/drupal/private/frozen\n\
          fi\n\
          {drush} cache:rebuild || true\n\
-         rm -rf \"$WORK\" \"$ARCHIVE\" || true\n",
-    )
+         rm -rf \"$WORK\" \"$ARCHIVE\" || true\n"
+    );
+    [unpack, database, files]
 }
 
 /// True if `name` is a full snapshot bundle (database + files), vs. a legacy
@@ -2991,17 +3274,23 @@ mod tests {
     }
 
     use super::{
-        backup_script, container_state_from_ps, is_backup_file, is_snapshot_bundle, list_backups,
-        parse_extension_list, parse_http_status, parse_local_probe, parse_remote_probe,
-        parse_serialized_extensions, plan_route, plan_route_with, registry_problem,
-        remote_probe_with, restore_bundle_script, start_action, waypoint_image, ContainerState,
-        ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        backup_dump_script, backup_pack_script, container_state_from_ps, is_backup_file,
+        is_snapshot_bundle, list_backups, parse_extension_list, parse_http_status,
+        parse_local_probe, parse_remote_probe, parse_serialized_extensions, plan_route,
+        plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts, start_action,
+        waypoint_image, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
+        MAX_WAYPOINTS, REGISTRY_OFFLINE,
     };
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
         IdentityMismatch, RestoreOptions, Silent,
     };
+    use super::{
+        lifecycle_plan, Plan, PlanStep, Reporter, ScaledReporter, Stage, BOOT_FROM, PULL_FROM,
+        UP_FROM,
+    };
     use crate::stack::Stack;
+    use anyhow::{bail, Result};
     use std::path::{Path, PathBuf};
 
     /// A reporter that answers the migration question however the test wants, and
@@ -3366,8 +3655,14 @@ mod tests {
     fn backup_script_is_valid_shell_and_packs_db_and_files() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
         let manifest = r#"{"format":"aincient-snapshot","version":1,"created":"x","image":"y"}"#;
-        let script = backup_script(drush, manifest);
-        assert_valid_sh(&script);
+        let dump = backup_dump_script(drush, manifest);
+        let pack = backup_pack_script();
+        assert_valid_sh(&dump);
+        assert_valid_sh(&pack);
+        // The pack step reads what the dump step staged.
+        assert!(dump.contains("STAGE=/tmp/aincient-snapshot\n"));
+        assert!(pack.contains("STAGE=/tmp/aincient-snapshot\n"));
+        let script = format!("{dump}{pack}");
         assert!(script.contains("sql:dump --gzip"), "dumps the database");
         // Both members packed: the staged DB dump and the live files tree.
         assert!(script.contains("database.sql.gz"), "packs the db dump");
@@ -3513,12 +3808,92 @@ mod tests {
         assert_eq!(m.site_name(), "Bob's \"blog\" (blog)");
     }
 
+    /// Records what an op told its reporter, for the plan tests.
+    #[derive(Default)]
+    struct Recorder {
+        plans: Vec<Vec<PlanStep>>,
+        stages: Vec<(String, Option<f32>)>,
+    }
+    impl Reporter for Recorder {
+        fn plan(&mut self, steps: &[PlanStep]) {
+            self.plans.push(steps.to_vec());
+        }
+        fn stage(&mut self, _s: Stage, message: &str, fraction: Option<f32>) {
+            self.stages.push((message.to_string(), fraction));
+        }
+    }
+
+    #[test]
+    fn a_weighted_plan_tiles_zero_to_one_in_order() {
+        let plan = Plan::weighted(&[("a", "A", 1.0), ("b", "B", 3.0)]);
+        let s = plan.steps();
+        assert_eq!((s[0].from, s[0].to), (0.0, 0.25));
+        assert_eq!((s[1].from, s[1].to), (0.25, 1.0));
+    }
+
+    #[test]
+    fn a_plan_step_reports_its_start_and_passes_errors_through() {
+        let plan = Plan::weighted(&[("a", "A", 1.0), ("b", "B", 1.0)]);
+        let mut r = Recorder::default();
+        plan.announce(&mut r);
+        plan.run(&mut r, "a", "Doing A…", |_| Ok(())).unwrap();
+        let err = plan
+            .run(&mut r, "b", "Doing B…", |_| -> Result<()> {
+                bail!("boom")
+            })
+            .unwrap_err();
+        assert_eq!(err.to_string(), "boom");
+        assert_eq!(r.plans.len(), 1);
+        assert_eq!(
+            r.stages,
+            vec![
+                ("Doing A…".into(), Some(0.0)),
+                ("Doing B…".into(), Some(0.5))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_run_never_replaces_the_outer_plan() {
+        let mut outer = Recorder::default();
+        lifecycle_plan().announce(&mut outer);
+        let mut nested = ScaledReporter {
+            inner: &mut outer,
+            base: 0.03,
+            span: 0.02,
+            prefix: String::new(),
+        };
+        let inner = Plan::weighted(&[("x", "X", 1.0)]);
+        inner.announce(&mut nested);
+        inner.finish(&mut nested, "done");
+        assert_eq!(outer.plans.len(), 1, "only the lifecycle plan");
+        assert_eq!(outer.stages.len(), 1);
+        let f = outer.stages[0].1.unwrap();
+        assert!(
+            (f - 0.05).abs() < 1e-6,
+            "lands at the end of its slice: {f}"
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_plan_matches_the_fractions_its_helpers_report() {
+        let plan = lifecycle_plan();
+        let ids: Vec<&str> = plan.steps().iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["prepare", "pull", "start", "boot"]);
+        for pair in plan.steps().windows(2) {
+            assert_eq!(pair[0].to, pair[1].from, "contiguous");
+        }
+        assert_eq!(plan.steps()[1].from, PULL_FROM);
+        assert_eq!(plan.steps()[2].from, UP_FROM);
+        assert_eq!(plan.steps()[3].from, BOOT_FROM);
+    }
+
     #[test]
     fn a_label_with_quotes_keeps_the_backup_script_valid() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
         let manifest =
             serde_json::json!({ "site_label": "Bob's \"blog\" $(rm -rf /)" }).to_string();
-        let script = backup_script(drush, &manifest);
+        let script = backup_dump_script(drush, &manifest);
         assert_valid_sh(&script);
         // What the printf writes is the manifest, byte for byte.
         let printf = script
@@ -3617,8 +3992,13 @@ mod tests {
     #[test]
     fn restore_bundle_script_is_valid_shell_and_reasserts_ownership() {
         let drush = "/opt/drupal/vendor/bin/drush --root=/opt/drupal/web";
-        let script = restore_bundle_script(drush);
-        assert_valid_sh(&script);
+        let parts = restore_bundle_scripts(drush);
+        for part in &parts {
+            assert_valid_sh(part);
+            // Each exec finds the archive and work dir the unpack step used.
+            assert!(part.contains("WORK=/tmp/aincient-restore\n"));
+        }
+        let script = parts.concat();
         assert!(script.contains("sql:drop -y"), "drops before load");
         assert!(
             script.contains("| /opt/drupal/vendor/bin/drush"),

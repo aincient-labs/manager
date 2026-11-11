@@ -196,44 +196,239 @@ async function restoreFlow(path, what) {
   return runProgressOp("Restoring your backup", () => invoke("do_restore", { path, otherSite }));
 }
 
-// Whisper labels for each core Stage, shown in the progress sub-status / feed.
-const STAGE_LABELS = {
-  preflight: "Checking Docker",
-  scaffold: "Preparing",
-  pull: "Downloading",
-  starting: "Starting",
-  booting: "Booting the console",
-  ready: "Ready",
-  working: "Working",
-};
+// --- progress panel (DECISIONS 0515) ---------------------------------------
+// The core announces an op's steps up front (`plan` event: id, label, and the
+// slice of 0..1 each covers), then reports progress as `stage` fractions. The
+// panel draws one group of blocks per step and fills it column by column. Three
+// modes: "plan" (steps known), "fill" (a fraction but no plan — a plain matrix),
+// "busy" (no fraction at all — one row with a slow comet and an elapsed clock).
 
-let lastStage = null;
-// Whether this op reported a numeric fraction (a phased op like install/update),
-// so it owns the bar — vs. an indeterminate op (backup/stop/…) we finish green.
-let sawFraction = false;
+const PM_COLS = 30; // blocks across the whole grid
+const PM_ROWS = 3;
+const PM_MIN_COLS = 4; // a short step still gets a group its label fits under
+const LOG_KEEP = 400; // lines kept for the report
+
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+const pm = {
+  title: "",
+  mode: "busy",
+  steps: null, // [{id,label,from,to}]
+  groups: [], // [{step, cols, start, cells:[el]}]
+  busyCells: [],
+  fraction: 0,
+  pullFrac: null, // download bytes fraction, from the pull events
+  failed: false,
+  done: false,
+  error: "",
+  stageText: "",
+  started: 0,
+  entered: [], // ms timestamp each step was entered, by index
+  current: -1,
+  log: [],
+  raf: 0,
+};
 
 function progressReset(title) {
   showSiteLine($("progress-site"));
+  pm.title = title;
+  pm.mode = "busy";
+  pm.steps = null;
+  pm.groups = [];
+  pm.busyCells = [];
+  pm.fraction = 0;
+  pm.pullFrac = null;
+  pm.failed = false;
+  pm.done = false;
+  pm.error = "";
+  pm.stageText = "Working…";
+  pm.started = Date.now();
+  pm.entered = [];
+  pm.current = -1;
+  pm.log = [];
   $("progress-title").textContent = title;
-  $("progress-fill").style.width = "0%";
-  $("progress-fill").classList.remove("done");
-  $("progressbar").classList.add("indeterminate"); // until a fraction arrives
-  $("progress-stage").textContent = "Working…";
+  $("progress-stage").textContent = pm.stageText;
+  $("progress-stage").classList.remove("failed");
   $("progress-log").textContent = "";
+  setDetails(false);
+  $("progress-copy").classList.add("hidden");
+  $("progress-close").classList.add("hidden");
   resetPull();
-  lastStage = null;
-  sawFraction = false;
+  buildBusy();
 }
 
-// Settle the bar to a full mint "done" — for indeterminate ops that finished OK.
+function setDetails(open) {
+  $("progress-more").classList.toggle("hidden", !open);
+  $("progress-details").setAttribute("aria-expanded", String(open));
+  $("progress-details").textContent = open ? "Hide details" : "Details";
+}
+
+function pmCell() {
+  const c = document.createElement("div");
+  c.className = "pm-cell";
+  return c;
+}
+
+// The single strip for ops that report no fraction.
+function buildBusy() {
+  const grid = $("pm-grid");
+  grid.style.gridTemplateColumns = `repeat(${PM_COLS}, 1fr)`;
+  pm.busyCells = Array.from({ length: PM_COLS }, pmCell);
+  grid.replaceChildren(...pm.busyCells);
+  $("pm-labels").replaceChildren();
+  $("pm-labels").classList.add("hidden");
+}
+
+// Columns per step, proportional to its slice, never fewer than PM_MIN_COLS.
+function stepColumns(steps) {
+  const span = Math.max(1e-6, steps[steps.length - 1].to - steps[0].from);
+  const cols = steps.map((s) => Math.max(PM_MIN_COLS, Math.round(((s.to - s.from) / span) * PM_COLS)));
+  return cols;
+}
+
+// One group per step, a 3px gutter between groups; or one plain group ("fill").
+function buildGroups(steps) {
+  const grid = $("pm-grid");
+  const labels = $("pm-labels");
+  const cols = stepColumns(steps);
+  const template = cols.map((n) => `repeat(${n}, 1fr)`).join(" 3px ");
+  grid.style.gridTemplateColumns = template;
+  labels.style.gridTemplateColumns = template;
+  const cells = [];
+  const spans = [];
+  let col = 1;
+  pm.groups = steps.map((step, g) => {
+    const group = { step, cols: cols[g], start: col, cells: [] };
+    for (let k = 0; k < cols[g] * PM_ROWS; k++) {
+      const c = pmCell();
+      c.style.gridColumn = String(col + Math.floor(k / PM_ROWS));
+      c.style.gridRow = String((k % PM_ROWS) + 1);
+      group.cells.push(c);
+      cells.push(c);
+    }
+    const label = document.createElement("span");
+    label.textContent = step.label;
+    label.title = step.label;
+    label.style.gridColumn = `${col} / span ${cols[g]}`;
+    spans.push(label);
+    group.label = label;
+    col += cols[g] + 1;
+    return group;
+  });
+  grid.replaceChildren(...cells);
+  labels.replaceChildren(...spans);
+  labels.classList.toggle("hidden", steps.length < 2);
+}
+
+function setPlan(steps) {
+  if (!steps || !steps.length) return;
+  // The same plan announced twice (reinstall → install) changes nothing.
+  if (pm.steps && JSON.stringify(pm.steps) === JSON.stringify(steps)) return;
+  pm.steps = steps;
+  pm.mode = "plan";
+  pm.entered = [];
+  pm.current = -1;
+  buildGroups(steps);
+}
+
+function setFraction(f) {
+  // Never step backwards: a late helper (the db-image move) may re-report a
+  // lower fraction after "ready".
+  pm.fraction = Math.max(pm.fraction, Math.min(1, f));
+  if (pm.mode === "busy") {
+    pm.mode = pm.steps ? "plan" : "fill";
+    if (!pm.steps) buildGroups([{ id: "all", label: "", from: 0, to: 1 }]);
+  }
+  const steps = pm.steps;
+  if (!steps) return;
+  let i = -1;
+  steps.forEach((s, k) => {
+    if (pm.fraction + 1e-6 >= s.from) i = k;
+  });
+  if (i !== pm.current) {
+    const now = Date.now();
+    for (let k = pm.current + 1; k <= i; k++) pm.entered[k] = pm.entered[k] ?? now;
+    pm.current = i;
+  }
+}
+
+// Which state each block is in; called every frame while the panel is open.
+function renderMatrix(now) {
+  if (pm.mode === "busy") {
+    const n = pm.busyCells.length;
+    if (pm.done) {
+      pm.busyCells.forEach((c) => (c.className = "pm-cell done"));
+    } else if (pm.failed) {
+      pm.busyCells.forEach((c, k) => (c.className = k === 0 ? "pm-cell err" : "pm-cell"));
+    } else {
+      const span = n - 1;
+      const cyc = (now / 110) % (2 * span);
+      const dir = cyc < span ? 1 : -1;
+      const head = Math.round(cyc < span ? cyc : 2 * span - cyc);
+      pm.busyCells.forEach((c, k) => {
+        const d = (head - k) * dir;
+        const cls = reduceMotion.matches ? "t2" : d === 0 ? "on" : d === 1 ? "t1" : d === 2 || d === 3 ? "t2" : "";
+        c.className = cls ? `pm-cell ${cls}` : "pm-cell";
+      });
+    }
+    $("progressbar").removeAttribute("aria-valuenow");
+    if (!pm.done && !pm.failed) {
+      const secs = Math.floor((Date.now() - pm.started) / 1000);
+      const clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+      $("progress-stage").textContent = `${pm.stageText} · ${clock}`;
+    }
+    return;
+  }
+  const f = pm.fraction;
+  pm.groups.forEach((g, gi) => {
+    const s = g.step;
+    let local = Math.max(0, Math.min(1, (f - s.from) / Math.max(1e-6, s.to - s.from)));
+    const isCurrent = pm.mode === "fill" || gi === pm.current;
+    if (s.id === "pull" && isCurrent && pm.pullFrac != null) local = Math.max(local, pm.pullFrac);
+    const n = g.cells.length;
+    const lit = Math.min(n, Math.floor(local * n));
+    g.cells.forEach((c, k) => {
+      let cls = "";
+      if (pm.done) cls = "done";
+      else if (pm.mode === "plan" && gi < pm.current) cls = "on";
+      else if (pm.mode === "plan" && gi > pm.current) cls = "";
+      else if (k < lit) cls = "on";
+      else if (k === lit) cls = pm.failed ? "err" : "head";
+      const want = cls ? `pm-cell ${cls}` : "pm-cell";
+      if (c.className !== want) c.className = want;
+    });
+    if (g.label) {
+      const state = pm.done || gi < pm.current ? "past" : gi === pm.current ? (pm.failed ? "failed" : "now") : "";
+      if (g.label.className !== state) g.label.className = state;
+    }
+  });
+  const pct = Math.round((pm.done ? 1 : f) * 100);
+  const bar = $("progressbar");
+  bar.setAttribute("aria-valuenow", String(pct));
+  const step = pm.steps && pm.steps[pm.current];
+  bar.setAttribute("aria-valuetext", step ? `${step.label}, ${pct}%` : `${pct}%`);
+}
+
+function startMatrixLoop() {
+  cancelAnimationFrame(pm.raf);
+  const tick = (now) => {
+    renderMatrix(now);
+    pm.raf = requestAnimationFrame(tick);
+  };
+  pm.raf = requestAnimationFrame(tick);
+}
+
+// Settle to a full moss "done".
 function progressFinish() {
-  $("progressbar").classList.remove("indeterminate");
-  $("progress-fill").style.width = "100%";
-  $("progress-fill").classList.add("done");
-  $("progress-stage").textContent = "Done.";
+  pm.done = true;
+  pm.fraction = 1;
+  $("progress-stage").textContent = pm.stageText && pm.mode !== "busy" ? pm.stageText : "Done.";
+  renderMatrix(performance.now());
 }
 
 function appendLog(line, cls) {
+  pm.log.push(line);
+  if (pm.log.length > LOG_KEEP) pm.log.shift();
   const log = $("progress-log");
   const row = document.createElement("div");
   row.textContent = line;
@@ -249,7 +444,6 @@ function logClass(line) {
   if (/\b(warn|warning|deprecated|retrying)\b/i.test(line)) return "log-warn";
   return "";
 }
-
 // --- structured pull progress -------------------------------------------
 // One row per image layer, driven by compose's `--progress json` events (id ·
 // bar · phase/bytes). `dlCur`/`dlTot` remember download bytes separately from
@@ -359,15 +553,19 @@ function renderPull() {
   panel.replaceChildren(frag);
   const bytes = dlTot > 0 ? ` · ${fmtBytes(dlCur)} of ${fmtBytes(dlTot)}` : "";
   summary.textContent = `${done} of ${pullLayers.size} layers done${bytes}`;
+  // The Download group fills from bytes; the stage line says how far.
+  pm.pullFrac = dlTot > 0 ? dlCur / dlTot : null;
+  if (dlTot > 0 && !pm.failed) {
+    $("progress-stage").textContent = `Downloading · ${fmtBytes(dlCur)} of ${fmtBytes(dlTot)}`;
+  }
 }
 
 function progressUpdate(p) {
-  if (typeof p.fraction === "number") {
-    sawFraction = true;
-    $("progressbar").classList.remove("indeterminate");
-    $("progress-fill").style.width = `${Math.round(p.fraction * 100)}%`;
-    if (p.fraction >= 1) $("progress-fill").classList.add("done");
+  if (p.kind === "plan") {
+    setPlan(p.steps);
+    return;
   }
+  if (typeof p.fraction === "number") setFraction(p.fraction);
   if (p.kind === "pull") {
     pullUpdate(p.pull);
     return;
@@ -376,14 +574,86 @@ function progressUpdate(p) {
     if (p.message.trim()) appendLog(p.message, logClass(p.message));
     return;
   }
-  $("progress-stage").textContent = p.message;
-  if (p.stage !== lastStage) {
-    appendLog(`▸ ${STAGE_LABELS[p.stage] || p.message}`);
-    lastStage = p.stage;
+  pm.stageText = p.message;
+  if (pm.mode !== "busy") $("progress-stage").textContent = p.message;
+  // One feed line per step (and per distinct message of a no-percentage op),
+  // not one per boot-poll tick.
+  if (p.stage !== pm.lastStage || pm.current !== pm.lastStep || (p.stage === "working" && p.message !== pm.lastMsg)) {
+    appendLog(`▸ ${p.message}`);
   }
+  pm.lastStage = p.stage;
+  pm.lastStep = pm.current;
+  pm.lastMsg = p.message;
 }
 
-// Wrap any long op in the progress panel: stream its phases/steps via op-progress
+// Keep the panel open on the step that broke: brick block, the error in the
+// stage line, the log open, and a report to copy. Resolves on Close / Escape.
+function progressFail(message) {
+  pm.failed = true;
+  pm.error = message;
+  pm.failedAt = Date.now();
+  $("progress-stage").textContent = message;
+  $("progress-stage").classList.add("failed");
+  appendLog(`✗ ${message}`, "log-error");
+  setDetails(true);
+  renderMatrix(performance.now());
+  cancelAnimationFrame(pm.raf); // a failed panel holds still
+  $("progress-copy").classList.remove("hidden");
+  $("progress-close").classList.remove("hidden");
+  $("progress-close").focus();
+  return new Promise((resolve) => {
+    const onKey = (e) => {
+      if (e.key === "Escape") done();
+    };
+    const done = () => {
+      document.removeEventListener("keydown", onKey);
+      $("progress-close").onclick = null;
+      resolve();
+    };
+    $("progress-close").onclick = done;
+    document.addEventListener("keydown", onKey);
+  });
+}
+
+function fmtSecs(ms) {
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// Plain text for an issue or a support thread: what ran, on what, which step
+// broke after how long, and the tail of the log.
+function progressReport() {
+  const lines = [`Atelier Manager ${managerVersion || "(unknown version)"}: ${pm.title}`];
+  const row = currentSite();
+  if (row) lines.push(`Site: ${row.label} · ${siteHost(row)}`);
+  if (lastStatus) {
+    const digest = lastStatus.image_digest ? ` @ ${lastStatus.image_digest}` : "";
+    lines.push(`Atelier: ${lastStatus.version || "unknown"} · ${lastStatus.image}${digest}`);
+  }
+  lines.push(`Started: ${new Date(pm.started).toISOString()} · ${navigator.platform}`);
+  if (pm.steps) {
+    lines.push("", "Steps:");
+    pm.steps.forEach((s, i) => {
+      const state = i < pm.current ? "done" : i === pm.current ? (pm.failed ? "FAILED" : "running") : "not run";
+      const t0 = pm.entered[i];
+      const t1 = i < pm.current ? pm.entered[i + 1] : i === pm.current ? pm.failedAt ?? Date.now() : null;
+      const took = t0 != null && t1 != null ? fmtSecs(t1 - t0) : "";
+      lines.push(`  ${state.padEnd(8)} ${s.label.padEnd(12)} ${took}`.trimEnd());
+    });
+  } else {
+    lines.push(`Ran for ${fmtSecs((pm.failedAt ?? Date.now()) - pm.started)}`);
+  }
+  if (pm.error) lines.push("", `Error: ${pm.error}`);
+  const tail = pm.log.slice(-60);
+  lines.push("", `Log (last ${tail.length} of ${pm.log.length} lines):`, ...tail);
+  return lines.join("\n");
+}
+
+$("progress-details").addEventListener("click", () =>
+  setDetails($("progress-more").classList.contains("hidden"))
+);
+$("progress-copy").addEventListener("click", () => copyText(progressReport(), $("progress-copy")));
+
+// Wrap any long op in the progress panel: stream its steps via op-progress
 // events, then refresh. Returns whether the op completed without error.
 async function runProgressOp(title, fn) {
   // A new attempt supersedes the previous failure — leaving the old banner up
@@ -391,20 +661,31 @@ async function runProgressOp(title, fn) {
   hideError();
   progressReset(title);
   $("progress").classList.remove("hidden");
+  startMatrixLoop();
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
-  let ok = false;
+  let failure = null;
   try {
     await fn();
-    if (!sawFraction) progressFinish();
-    ok = true;
-    await refresh();
   } catch (e) {
-    showError(String(e));
+    failure = String(e);
+  }
+  try {
+    if (failure !== null) {
+      await progressFail(failure);
+      return false;
+    }
+    progressFinish();
+    try {
+      await refresh();
+    } catch (e) {
+      showError(String(e));
+    }
+    return true;
   } finally {
     unlisten();
+    cancelAnimationFrame(pm.raf);
     $("progress").classList.add("hidden");
   }
-  return ok;
 }
 
 // --- status -----------------------------------------------------------------

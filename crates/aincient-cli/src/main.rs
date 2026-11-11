@@ -644,10 +644,33 @@ struct CliReporter {
     last: Option<ops::Stage>,
     /// True when the current line was left open (no trailing newline) for dots.
     open_line: bool,
+    /// The op's announced steps, for `[i/n]` headings (DECISIONS 0515).
+    plan: Vec<ops::PlanStep>,
+}
+
+impl CliReporter {
+    /// `[2/4] message` when the fraction falls inside an announced step; the
+    /// final 100% headline stays bare.
+    fn numbered(&self, message: &str, fraction: Option<f32>) -> String {
+        match (step_index(&self.plan, fraction), fraction) {
+            (Some(i), Some(f)) if f < 1.0 => format!("[{}/{}] {message}", i + 1, self.plan.len()),
+            _ => message.to_string(),
+        }
+    }
+}
+
+/// Which announced step a fraction falls in: the last one it has reached.
+fn step_index(plan: &[ops::PlanStep], fraction: Option<f32>) -> Option<usize> {
+    let f = fraction?;
+    plan.iter().rposition(|s| f + 1e-6 >= s.from)
 }
 
 impl ops::Reporter for CliReporter {
-    fn stage(&mut self, stage: ops::Stage, message: &str, _fraction: Option<f32>) {
+    fn plan(&mut self, steps: &[ops::PlanStep]) {
+        self.plan = steps.to_vec();
+    }
+
+    fn stage(&mut self, stage: ops::Stage, message: &str, fraction: Option<f32>) {
         // A repeated Booting stage is a poll tick — show a heartbeat dot.
         if self.last == Some(stage) && stage == ops::Stage::Booting {
             print!(".");
@@ -659,6 +682,7 @@ impl ops::Reporter for CliReporter {
             self.open_line = false;
         }
         self.last = Some(stage);
+        let message = &self.numbered(message, fraction);
         match stage {
             ops::Stage::Ready => println!("{}", style::success(message)),
             ops::Stage::Booting => {
@@ -3071,6 +3095,24 @@ fn line(label: &str, ok: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cli_headings_number_the_announced_steps() {
+        let mut r = super::CliReporter::default();
+        assert_eq!(
+            r.numbered("Checking…", Some(0.0)),
+            "Checking…",
+            "no plan, no number"
+        );
+        ops::Reporter::plan(
+            &mut r,
+            aincient_core::Plan::weighted(&[("a", "A", 1.0), ("b", "B", 1.0)]).steps(),
+        );
+        assert_eq!(r.numbered("Doing A…", Some(0.0)), "[1/2] Doing A…");
+        assert_eq!(r.numbered("Doing B…", Some(0.5)), "[2/2] Doing B…");
+        assert_eq!(r.numbered("Done.", Some(1.0)), "Done.");
+        assert_eq!(r.numbered("Log-ish", None), "Log-ish");
+    }
     use super::*;
     use aincient_core::doctor::{HostTier, Tier};
 
