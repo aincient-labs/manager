@@ -2162,38 +2162,40 @@ fn export_static_in(
         run_step(build, "export the static site", r)
     })?;
 
-    r.stage(
-        Stage::Working,
+    plan.run(
+        r,
+        "copy",
         "Copying the exported site out of the container…",
-        Some(plan.steps()[2].from),
-    );
-    // `docker compose cp` copies the source dir *as* the destination when the
-    // destination doesn't exist, and *into* it when it does. Copy into a fresh
-    // staging sibling, then swap it into place — the previous export is only
-    // removed once the new one is verified on disk, and never anything else.
-    let staged = staging_sibling(host_out);
-    let mut cp = compose(stack);
-    cp.args(["cp", &format!("app:{stage}"), &staged.to_string_lossy()]);
-    if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
-        let _ = std::fs::remove_dir_all(&staged);
-        return Err(e);
-    }
-    if let Err(e) = install_export(&staged, host_out) {
-        let _ = std::fs::remove_dir_all(&staged);
-        return Err(e);
-    }
+        |_| {
+            // `docker compose cp` copies the source dir *as* the destination when
+            // the destination doesn't exist, and *into* it when it does. Copy into
+            // a fresh staging sibling, then swap it into place — the previous
+            // export is only removed once the new one is verified on disk, and
+            // never anything else.
+            let staged = staging_sibling(host_out);
+            let mut cp = compose(stack);
+            cp.args(["cp", &format!("app:{stage}"), &staged.to_string_lossy()]);
+            if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
+            if let Err(e) = install_export(&staged, host_out) {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(e);
+            }
 
-    if opts.zip {
-        let mut cpz = compose(stack);
-        cpz.args([
-            "cp",
-            &format!("app:{container_zip}"),
-            &host_zip.to_string_lossy(),
-        ]);
-        run_capture(cpz, "copy the export zip out of the container")?;
-    }
-
-    Ok(())
+            if opts.zip {
+                let mut cpz = compose(stack);
+                cpz.args([
+                    "cp",
+                    &format!("app:{container_zip}"),
+                    &host_zip.to_string_lossy(),
+                ]);
+                run_capture(cpz, "copy the export zip out of the container")?;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Options for [`freeze`] — a passthrough onto `drush aincient:freeze`.
