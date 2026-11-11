@@ -1797,6 +1797,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     let site_id = plan.run(r, "check", "Checking the site…", |_| {
         ensure_running(stack)?;
         std::fs::create_dir_all(stack.backups_dir())?;
+        sweep_stale_parts(&stack.backups_dir());
         // Which site this is (m2-6, D-04): restore refuses another site's archive.
         stack.ensure_site_id()
     })?;
@@ -1923,6 +1924,34 @@ fn run_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{}-{nanos}", std::process::id())
+}
+
+/// A `.part` nobody has written to for this long is an interrupted copy (the app
+/// quit or crashed mid-backup), never one in flight: `compose cp` keeps writing.
+const STALE_PART: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Remove interrupted backup copies: hidden `.aincient-*.part` files the backup
+/// list never shows, each as large as an archive. Best effort.
+fn sweep_stale_parts(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(".aincient-") && name.ends_with(".part")) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_PART);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Move the finished `part` to `dir/stem.ext`, or `dir/stem-2.ext`, `-3`, … —
@@ -4065,6 +4094,31 @@ mod tests {
             !a.exists() && !b.exists() && !c.exists(),
             "parts are moved, not copied"
         );
+    }
+
+    #[test]
+    fn only_stale_backup_parts_are_swept() {
+        let dir = Scratch::new("sweep-parts");
+        let old = dir.0.join(".aincient-x-1-2.part");
+        let fresh = dir.0.join(".aincient-x-3-4.part");
+        let backup = dir.0.join("aincient-x.tar.gz");
+        let other = dir.0.join(".something.part");
+        for p in [&old, &fresh, &backup, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - super::STALE_PART * 2;
+        for p in [&old, &backup, &other] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+        super::sweep_stale_parts(&dir.0);
+        assert!(!old.exists(), "an interrupted copy is removed");
+        assert!(fresh.exists(), "a copy in flight is kept");
+        assert!(backup.exists() && other.exists(), "nothing else is touched");
     }
 
     #[test]
