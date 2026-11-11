@@ -623,11 +623,19 @@ fn done_export_banner(path: &std::path::Path) {
 /// Prints each step of a data op as a plain line on stderr, so stdout stays
 /// free for `--json`. A Manager driving this CLI over SSH relays the lines as
 /// they arrive; without them a server backup or restore is a silent minute.
-struct StepLines;
+/// Headings are numbered `[i/n]` once the op announces its steps (0515).
+#[derive(Default)]
+struct StepLines {
+    plan: Vec<ops::PlanStep>,
+}
 
 impl ops::Reporter for StepLines {
-    fn stage(&mut self, _stage: ops::Stage, message: &str, _fraction: Option<f32>) {
-        eprintln!("{message}");
+    fn plan(&mut self, steps: &[ops::PlanStep]) {
+        self.plan = steps.to_vec();
+    }
+
+    fn stage(&mut self, _stage: ops::Stage, message: &str, fraction: Option<f32>) {
+        eprintln!("{}", numbered(&self.plan, message, fraction));
     }
 
     fn log(&mut self, line: &str) {
@@ -648,14 +656,12 @@ struct CliReporter {
     plan: Vec<ops::PlanStep>,
 }
 
-impl CliReporter {
-    /// `[2/4] message` when the fraction falls inside an announced step; the
-    /// final 100% headline stays bare.
-    fn numbered(&self, message: &str, fraction: Option<f32>) -> String {
-        match (step_index(&self.plan, fraction), fraction) {
-            (Some(i), Some(f)) if f < 1.0 => format!("[{}/{}] {message}", i + 1, self.plan.len()),
-            _ => message.to_string(),
-        }
+/// `[2/4] message` when the fraction falls inside an announced step; the final
+/// 100% headline stays bare.
+fn numbered(plan: &[ops::PlanStep], message: &str, fraction: Option<f32>) -> String {
+    match (step_index(plan, fraction), fraction) {
+        (Some(i), Some(f)) if f < 1.0 => format!("[{}/{}] {message}", i + 1, plan.len()),
+        _ => message.to_string(),
     }
 }
 
@@ -682,7 +688,7 @@ impl ops::Reporter for CliReporter {
             self.open_line = false;
         }
         self.last = Some(stage);
-        let message = &self.numbered(message, fraction);
+        let message = &numbered(&self.plan, message, fraction);
         match stage {
             ops::Stage::Ready => println!("{}", style::success(message)),
             ops::Stage::Booting => {
@@ -1550,7 +1556,7 @@ fn print_snapshots(list: &ops::SnapshotList) {
 fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
     match command {
         DataCommand::Backup { label, json, .. } => {
-            let path = ops::backup(stack, label.as_deref(), &mut StepLines)?;
+            let path = ops::backup(stack, label.as_deref(), &mut StepLines::default())?;
             if json {
                 // What a Manager driving this CLI over SSH reads (m2-5).
                 let info = ops::describe_backup(&path)?;
@@ -1593,7 +1599,7 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
                 stack,
                 &file,
                 &ops::RestoreOptions { other_site },
-                &mut StepLines,
+                &mut StepLines::default(),
             )?;
             println!("{}", style::success("Restore complete."));
             Ok(())
@@ -3100,7 +3106,7 @@ mod tests {
     fn cli_headings_number_the_announced_steps() {
         let mut r = super::CliReporter::default();
         assert_eq!(
-            r.numbered("Checking…", Some(0.0)),
+            numbered(&r.plan, "Checking…", Some(0.0)),
             "Checking…",
             "no plan, no number"
         );
@@ -3108,10 +3114,10 @@ mod tests {
             &mut r,
             aincient_core::Plan::weighted(&[("a", "A", 1.0), ("b", "B", 1.0)]).steps(),
         );
-        assert_eq!(r.numbered("Doing A…", Some(0.0)), "[1/2] Doing A…");
-        assert_eq!(r.numbered("Doing B…", Some(0.5)), "[2/2] Doing B…");
-        assert_eq!(r.numbered("Done.", Some(1.0)), "Done.");
-        assert_eq!(r.numbered("Log-ish", None), "Log-ish");
+        assert_eq!(numbered(&r.plan, "Doing A…", Some(0.0)), "[1/2] Doing A…");
+        assert_eq!(numbered(&r.plan, "Doing B…", Some(0.5)), "[2/2] Doing B…");
+        assert_eq!(numbered(&r.plan, "Done.", Some(1.0)), "Done.");
+        assert_eq!(numbered(&r.plan, "Log-ish", None), "Log-ish");
     }
     use super::*;
     use aincient_core::doctor::{HostTier, Tier};
