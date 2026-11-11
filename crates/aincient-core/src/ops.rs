@@ -986,7 +986,10 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
 
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
-    upgrade_plan(plan).announce(r);
+    // One source for the groups the front end draws and the slices the hops
+    // report into (review 2026-11-12: these were computed twice).
+    let route = upgrade_plan(plan);
+    route.announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
     announce_legacy_migrations(stack, r)?;
@@ -1039,21 +1042,22 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
         }
     }
 
-    // Hops share the bar from 0.05 to 1.0, each rescaling the stage fractions the
-    // shared pull/up/wait helpers report so a five-minute route doesn't look like
-    // five separate runs that each finish at 100%.
-    let span = (1.0 - ROUTE_START) / total as f32;
-
+    // Hops share the bar after the Prep slice, each rescaling the stage fractions
+    // the shared pull/up/wait helpers report so a five-minute route doesn't look
+    // like five separate runs that each finish at 100%. Slice and label come from
+    // the announced plan (step 0 is Prep); the prefix names the hop's version only,
+    // since the plan already numbers the steps (`[2/4]` in the terminal).
     for (i, step) in plan.steps.iter().enumerate() {
+        let slice = &route.steps()[i + 1];
         let label = match step.version {
             Some(v) => v.to_string(),
             None => step.image.clone(),
         };
         let mut hop = ScaledReporter {
             inner: r,
-            base: ROUTE_START + span * i as f32,
-            span,
-            prefix: format!("Step {} of {total} ({label}): ", i + 1),
+            base: slice.from,
+            span: slice.to - slice.from,
+            prefix: format!("{}: ", slice.label),
         };
         hop.stage(
             Stage::Scaffold,
@@ -1296,7 +1300,15 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             "Backing up before switching channels…",
             Some(0.09),
         );
-        match backup(stack, Some("before-channel-switch"), r) {
+        // The backup's own steps land inside this slice; its plan is dropped so it
+        // never replaces the install/update plan already announced.
+        let mut snap = ScaledReporter {
+            inner: r,
+            base: 0.09,
+            span: 0.01,
+            prefix: String::new(),
+        };
+        match backup(stack, Some("before-channel-switch"), &mut snap) {
             Ok(path) => r.stage(
                 Stage::Working,
                 &format!("Snapshot saved: {}", path.display()),
