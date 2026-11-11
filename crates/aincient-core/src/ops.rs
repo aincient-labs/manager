@@ -229,7 +229,8 @@ pub struct Status {
     pub image: String,
     /// Which stream of images this install follows — stable, edge, or pinned.
     pub channel: Channel,
-    /// Local image digest (best effort).
+    /// Registry digest of the build the site's `app` container runs, or of the
+    /// configured tag when there's no container (best effort).
     pub image_digest: Option<String>,
     /// The `org.opencontainers.image.version` the `app` container reports —
     /// what the site actually calls itself (`v0.6.1`, `edge+f8bdcb9`), running
@@ -493,7 +494,7 @@ pub fn status(stack: &Stack) -> Status {
         site_url: stack.site_url(),
         image: stack.image(),
         channel: stack.channel(),
-        image_digest: local_digest(&stack.image()),
+        image_digest: site_digest(stack),
         version: installed.then(|| app_image_version(stack)).flatten(),
         site_id: stack.site_id(),
         engine: installed
@@ -626,7 +627,12 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         return check;
     }
 
-    match local_probe(&image) {
+    // The site's own build is the one its `app` container runs, not whatever the
+    // tag points at now: sites share the moving tag, so another site's update
+    // re-points `:latest` while this one keeps running the old build. Comparing
+    // the tag would then report "up to date" next to an old version. Without a
+    // container (not installed yet, or removed), the tag is all there is.
+    match site_probe(stack) {
         Ok(probe) => {
             check.current = probe.digest;
             check.current_version = probe.version;
@@ -709,7 +715,7 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
         None => stack.prospective_image(),
     };
 
-    let (from, from_problem) = match local_probe(&stack.image()) {
+    let (from, from_problem) = match site_probe(stack) {
         Ok(p) => (
             p.version.as_deref().and_then(Version::parse),
             p.version.is_none().then(|| {
@@ -1817,7 +1823,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     // over provenance. Version 3 adds the site's identity (m2-6, D-04); the
     // label is free text, so the JSON is built by serde and quoted for the shell
     // by `backup_script`.
-    let probe = local_probe(&stack.image()).unwrap_or_default();
+    let probe = site_probe(stack).unwrap_or_default();
     let manifest = serde_json::json!({
         "format": "aincient-snapshot",
         "version": 3,
@@ -2765,7 +2771,7 @@ pub fn restore_skew(stack: &Stack, file: &Path) -> Option<String> {
     if manifest.digest.is_empty() {
         return None;
     }
-    let current = local_probe(&stack.image()).ok()?.digest?;
+    let current = site_probe(stack).ok()?.digest?;
     if current == manifest.digest {
         return None;
     }
@@ -3204,8 +3210,41 @@ struct ImageProbe {
     extensions: Option<Vec<String>>,
 }
 
-fn local_digest(image: &str) -> Option<String> {
-    local_probe(image).ok().and_then(|p| p.digest)
+/// The image id (`sha256:…`) the site's `app` container was created from, running
+/// or stopped. Survives the tag moving on: the old image stays on disk, with its
+/// `RepoDigests`, as long as a container uses it. `None` without an `app`
+/// container.
+fn running_image_id(stack: &Stack) -> Option<String> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "-q", "app"]);
+    let cid = try_capture(ps)?;
+    let cid = cid.lines().next()?.trim().to_string();
+    if cid.is_empty() {
+        return None;
+    }
+    let mut c = docker::docker();
+    c.args(["inspect", &cid, "--format", "{{.Image}}"]);
+    let id = try_capture(c)?.trim().to_string();
+    id.starts_with("sha256:").then_some(id)
+}
+
+/// [`local_probe`] of the build this site runs (see [`running_image_id`]),
+/// falling back to the configured tag when there's no container.
+///
+/// Every question about "what is this site on" goes through here, never through
+/// the tag: sites share the moving tag, so another site's update re-points it
+/// while this one keeps running its old build. Read off the tag, the update
+/// check said "up to date", the route planner started from the wrong version,
+/// and a backup's manifest pinned a digest its database never ran on.
+fn site_probe(stack: &Stack) -> std::result::Result<ImageProbe, String> {
+    match running_image_id(stack) {
+        Some(id) => local_probe(&id),
+        None => local_probe(&stack.image()),
+    }
+}
+
+fn site_digest(stack: &Stack) -> Option<String> {
+    site_probe(stack).ok().and_then(|p| p.digest)
 }
 
 /// Read the pulled image's registry digest **and** version label in one

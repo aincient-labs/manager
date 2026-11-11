@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With several sites on this computer, updating one no longer makes the others look up to date.
+  Sites share the same image name, so an update moved it for all of them while the others kept
+  running their older version. The update check, upgrade route planning, the version a backup
+  records and the restore version warning now read the version each site's container actually
+  runs.
 - Two backups started at the same moment (from the app and the terminal, say) no longer write
   the same file: each gets its own name, and neither packs the other's half-finished files. The
   same holds for two restores or two static exports running at once.
