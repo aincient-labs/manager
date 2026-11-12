@@ -13,12 +13,15 @@ on:
   pull_request:
 env:
   MODULE: __MODULE__
+# Read-only by default; the image job widens to packages: write for the GHCR push.
+permissions:
+  contents: read
 jobs:
   css:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 22 }
       - name: Build CSS and assert no diff vs the committed file
         # A real install, not bare npx: input.css `@import "tailwindcss"`
@@ -45,7 +48,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build the deployable image
         run: docker build -t "${MODULE}:ci" .
