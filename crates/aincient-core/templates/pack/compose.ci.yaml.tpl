@@ -21,7 +21,8 @@ services:
     environment:
       DATABASE_URL: pgsql://aincient:aincient@db/aincient
       # Throwaway CI database — this salt protects nothing and is not a secret.
-      HASH_SALT: ci-throwaway-salt
+      # Atelier refuses a HASH_SALT under 32 characters (cms 966319d5).
+      HASH_SALT: ci-throwaway-salt-0000000000000000000000
       # Opens the /atelier/dev/* endpoints so CI can smoke the gallery.
       # CI-only: never set this on a deployed appliance.
       AINCIENT_DEV: "1"
