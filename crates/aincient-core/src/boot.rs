@@ -780,6 +780,16 @@ fn app_log(app: &AppRun) -> Option<String> {
 /// the FATAL (stderr) it settled, so the site failed again on the old FATAL
 /// (scenario `boot_fatal`).
 pub(crate) fn interleave(stdout: &str, stderr: &str) -> String {
+    merge_by_time(stdout, stderr, false)
+}
+
+/// [`interleave`], keeping each line's timestamp (the saved failure logs,
+/// [`crate::update_logs`]).
+pub(crate) fn interleave_timestamped(stdout: &str, stderr: &str) -> String {
+    merge_by_time(stdout, stderr, true)
+}
+
+fn merge_by_time(stdout: &str, stderr: &str, keep_time: bool) -> String {
     fn split(line: &str) -> (&str, &str) {
         line.split_once(' ').unwrap_or(("", line))
     }
@@ -793,7 +803,11 @@ pub(crate) fn interleave(stdout: &str, stderr: &str) -> String {
             (None, Some(_)) => err.next(),
             (None, None) => break,
         };
-        if let Some((_, line)) = next {
+        if let Some((time, line)) = next {
+            if keep_time && !time.is_empty() {
+                log.push_str(time);
+                log.push(' ');
+            }
             log.push_str(line);
             log.push('\n');
         }

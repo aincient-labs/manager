@@ -32,6 +32,7 @@ pub mod sites;
 pub mod ssh_key;
 pub mod stack;
 pub mod update_cache;
+pub mod update_logs;
 
 pub use boot::{Boot, BootFailed};
 pub use docker::{preflight, Preflight, PullEvent};

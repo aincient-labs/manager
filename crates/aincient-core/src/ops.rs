@@ -1325,6 +1325,9 @@ fn run_upgrade(
     r: &mut dyn Reporter,
 ) -> Result<Updated> {
     ensure_installed(stack)?;
+    // Set once `up` has touched the containers: a failure from then on saves
+    // every service's log before anything restarts them ([`keep_logs`]).
+    let touched = std::cell::Cell::new(false);
     // One source for the groups the front end draws and the slices the hops
     // report into (review 2026-11-12: these were computed twice).
     let route = upgrade_plan(plan);
@@ -1389,6 +1392,7 @@ fn run_upgrade(
                     "Already up to date. Applying your changed settings…",
                     Some(UP_FROM),
                 );
+                touched.set(true);
                 up_updating(stack, r)?;
                 let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
                 if ready {
@@ -1397,6 +1401,7 @@ fn run_upgrade(
                 }
                 Ok(Updated::Booting)
             })();
+            let done = keep_logs(stack, &touched, done, r);
             return settle_woken(stack, woke, done, r);
         }
         let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
@@ -1416,6 +1421,7 @@ fn run_upgrade(
                     r,
                 ))?;
             }
+            touched.set(true);
             up_updating(stack, r)?;
             let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
             if ready {
@@ -1424,6 +1430,7 @@ fn run_upgrade(
             }
             Ok(Updated::from_ready(ready))
         })();
+        let done = keep_logs(stack, &touched, done, r);
         return settle_woken(stack, woke, done, r);
     }
 
@@ -1485,6 +1492,7 @@ fn run_upgrade(
             );
             stack.set_image(&step.image)?;
             pull(stack, &mut hop)?;
+            touched.set(true);
             up_updating(stack, &mut hop)?;
             let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
                 Boot::Ready => true,
@@ -1530,7 +1538,23 @@ fn run_upgrade(
         let ready = move_db_image(stack, r)?;
         Ok(Updated::from_ready(ready))
     })();
+    let done = keep_logs(stack, &touched, done, r);
     settle_woken(stack, woke, done, r)
+}
+
+/// A failed update that had touched the containers saves every service's
+/// log first ([`crate::update_logs`]), before [`settle_woken`] (or the owner's
+/// next click) can restart them, and its error names the file.
+fn keep_logs(
+    stack: &Stack,
+    touched: &std::cell::Cell<bool>,
+    done: Result<Updated>,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    match done {
+        Err(e) if touched.get() => Err(crate::update_logs::save_after_failure(stack, e, r)),
+        other => other,
+    }
 }
 
 /// What an update found to do once the download was in.
