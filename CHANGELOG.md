@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   When an update is ready, it shows both versions and a **What's new** link. **System → Updates**
   says how often Atelier checks.
 
+- **Free up space** (System → Disk space, or `atelier app cleanup`) removes Atelier's downloads that
+  no site is using: old versions, and the database and web-server images Atelier has moved away from.
+  After a successful update, old versions are removed automatically. Your sites' data, your backups and
+  other programs' images are never touched; anything removed downloads again when a site needs it.
+
 ### Changed
 
 - A site that is still starting after 3 minutes says "This is taking longer than usual" and offers

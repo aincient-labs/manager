@@ -570,6 +570,22 @@
             </button>
             <p id="update-status" class="hint hidden"></p>
 
+            <!-- DECISIONS 0527: anything Atelier can download again can go; user
+                 data never does. Machine-wide, so it is the same for every site. -->
+            <div class="kv">
+              <span class="kv-label">Disk space</span>
+              <span id="cleanup-summary" class="kv-value">—</span>
+            </div>
+            <p class="hint">
+              Removes old Atelier versions and other downloads no site is using. Your sites'
+              data and backups are never touched; anything removed downloads again when a site
+              needs it.
+            </p>
+            <button class="btn small full" id="free-space" data-action="free-space" disabled>
+              <svg class="ic"><use href="#i-trash" /></svg>Free up space
+            </button>
+            <p id="cleanup-status" class="hint hidden"></p>
+
             <details class="advanced danger-zone local-only">
               <summary><svg class="ic chev"><use href="#i-chevron" /></svg>Reset &amp; remove</summary>
               <p class="muted">

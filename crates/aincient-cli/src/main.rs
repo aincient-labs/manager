@@ -350,6 +350,14 @@ enum AppCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Remove Atelier's unused downloads (old versions, replaced database and
+    /// web-server images) to free disk space. Your sites' data and backups are
+    /// never touched; a removed image is downloaded again when a site needs it.
+    Cleanup {
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Tail the appliance logs.
     Logs {
         /// Follow log output.
@@ -1388,6 +1396,38 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             );
             Ok(())
         }
+        AppCommand::Cleanup { dry_run } => {
+            use aincient_core::cleanup::{find, free, human_bytes, Scope};
+            let report = if dry_run {
+                find(Scope::Everything)
+            } else {
+                free(Scope::Everything)
+            }
+            .context("couldn't ask Docker which images are in use; is Docker running?")?;
+            if report.images.is_empty() {
+                println!("Nothing to remove: Atelier has no unused downloads on this computer.");
+            } else {
+                for i in &report.images {
+                    let name = i
+                        .names
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("{} (old version)", i.repo));
+                    println!("  {}  {name}", human_bytes(i.size_bytes));
+                }
+                println!(
+                    "{} {} image{} (up to {}). Your sites' data and backups are untouched.",
+                    if dry_run { "Would remove" } else { "Removed" },
+                    report.images.len(),
+                    if report.images.len() == 1 { "" } else { "s" },
+                    human_bytes(report.total_bytes)
+                );
+            }
+            for f in &report.failed {
+                println!("  Kept {f}: Docker says it's in use.");
+            }
+            Ok(())
+        }
         AppCommand::Logs { follow, service } => {
             let mut cmd = ops::logs_command(stack, follow, service.as_deref());
             cmd.status().context("failed to run docker compose logs")?;
@@ -2317,6 +2357,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
             AppCommand::Down { .. } => return Err(on_server("app down")),
             AppCommand::Channel { .. } => return Err(on_server("app channel")),
             AppCommand::Logs { .. } => return Err(on_server("app logs")),
+            AppCommand::Cleanup { .. } => return Err(on_server("app cleanup")),
             AppCommand::Password { .. } => return Err(on_server("app password")),
         },
         Command::Site { command } => match command {

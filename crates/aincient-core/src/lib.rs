@@ -10,6 +10,7 @@
 //!
 //! [`atelier` CLI]: ../atelier/index.html
 
+pub mod cleanup;
 pub mod docker;
 pub mod doctor;
 pub mod engine;

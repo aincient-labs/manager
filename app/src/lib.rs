@@ -452,6 +452,30 @@ async fn list_backups(sel: State<'_, Selected>) -> Result<Vec<Backup>, String> {
     blocking(move || Ok(ops::list_backups(&s))).await
 }
 
+/// What "Free up space" would remove: Atelier's unused downloads on this
+/// computer (DECISIONS 0527). Machine-wide, not per site. `None` when Docker
+/// can't be asked.
+#[tauri::command]
+async fn find_cleanup() -> Result<Option<aincient_core::cleanup::Report>, String> {
+    blocking(|| {
+        Ok(aincient_core::cleanup::find(
+            aincient_core::cleanup::Scope::Everything,
+        ))
+    })
+    .await
+}
+
+/// Remove them. Sites' data and backups are never touched.
+#[tauri::command]
+async fn do_cleanup() -> Result<aincient_core::cleanup::Report, String> {
+    blocking(|| {
+        aincient_core::cleanup::free(aincient_core::cleanup::Scope::Everything).ok_or_else(|| {
+            "Couldn't ask Docker which images are in use. Is Docker running?".to_string()
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 async fn set_admin_password(
     app: AppHandle,
@@ -1748,6 +1772,8 @@ pub fn run() {
         .manage(paired::Joining::default())
         .manage(ConsoleTunnel::default())
         .invoke_handler(tauri::generate_handler![
+            find_cleanup,
+            do_cleanup,
             check_preflight,
             preflight_problem,
             get_status,

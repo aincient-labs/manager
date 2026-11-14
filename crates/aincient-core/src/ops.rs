@@ -987,6 +987,30 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
 }
 
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
+    let ready = run_upgrade(stack, plan, r)?;
+    if ready {
+        tidy_after_update(r);
+    }
+    Ok(ready)
+}
+
+/// After an update the site answered on: remove the old Atelier versions and
+/// replaced database/web-server images no container uses (DECISIONS 0527).
+/// Best effort and quiet: a leftover only costs disk, never the update.
+fn tidy_after_update(r: &mut dyn Reporter) {
+    if let Some(done) = crate::cleanup::free(crate::cleanup::Scope::AfterUpdate) {
+        if !done.images.is_empty() {
+            r.log(&format!(
+                "Removed {} old Atelier download{} (up to {}).",
+                done.images.len(),
+                if done.images.len() == 1 { "" } else { "s" },
+                crate::cleanup::human_bytes(done.total_bytes)
+            ));
+        }
+    }
+}
+
+fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
     // One source for the groups the front end draws and the slices the hops
     // report into (review 2026-11-12: these were computed twice).

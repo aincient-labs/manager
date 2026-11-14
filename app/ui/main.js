@@ -1881,7 +1881,35 @@ function applianceName(st) {
   return st.image || "—";
 }
 
+// System → Disk space (DECISIONS 0527): what Atelier can remove because it can
+// download it again. Machine-wide; refreshed whenever the System tab opens.
+function decimalBytes(n) {
+  const mb = n / 1e6;
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.max(1, Math.round(mb))} MB`;
+}
+
+async function loadCleanup() {
+  const btn = $("free-space");
+  try {
+    const r = await invoke("find_cleanup");
+    if (!r) {
+      $("cleanup-summary").textContent = "Docker isn't answering";
+      btn.disabled = true;
+      return;
+    }
+    const n = r.images.length;
+    $("cleanup-summary").textContent = n
+      ? `${decimalBytes(r.total_bytes)} can be freed (${n} download${n === 1 ? "" : "s"})`
+      : "Nothing to free";
+    btn.disabled = n === 0;
+  } catch {
+    $("cleanup-summary").textContent = "—";
+    btn.disabled = true;
+  }
+}
+
 function loadSettings() {
+  loadCleanup();
   $("image-tag").textContent = applianceName(lastStatus);
   $("manager-version-row").textContent = managerVersion || "—";
   renderChannel();
@@ -2556,6 +2584,25 @@ const actions = {
       { lifecycle: "repair" }
     );
     if (report) renderDoctor(report);
+  },
+
+  "free-space": async () => {
+    const btn = $("free-space");
+    const status = $("cleanup-status");
+    btn.disabled = true;
+    status.classList.remove("hidden");
+    status.textContent = "Removing unused downloads…";
+    try {
+      const r = await invoke("do_cleanup");
+      const n = r.images.length;
+      status.textContent = n
+        ? `Freed up to ${decimalBytes(r.total_bytes)} (${n} download${n === 1 ? "" : "s"}). Your sites' data and backups are untouched.`
+        : "Nothing to remove.";
+      if (r.failed.length) status.textContent += ` Kept ${r.failed.length} that Docker says are in use.`;
+    } catch (e) {
+      status.textContent = String(e);
+    }
+    loadCleanup();
   },
 
   "check-update": async () => {
