@@ -184,6 +184,23 @@ pub(crate) struct Inspected {
     state: InspectedState,
     #[serde(rename = "NetworkSettings", default)]
     network_settings: InspectedNetworks,
+    #[serde(rename = "HostConfig", default)]
+    host_config: InspectedHostConfig,
+    #[serde(rename = "Config", default)]
+    config: InspectedConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedHostConfig {
+    /// The network the container was created on (compose: `<project>_default`).
+    #[serde(rename = "NetworkMode", default)]
+    network_mode: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedConfig {
+    #[serde(rename = "Labels", default)]
+    labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -222,6 +239,74 @@ impl Inspected {
             .map(|(n, _)| n.as_str())
             .collect()
     }
+}
+
+/// A container that lost its network: it was created on `network` (its
+/// `HostConfig.NetworkMode`) but holds no endpoint on it, so nothing on the
+/// site can reach it by name. `docker network disconnect` on a stopped
+/// container leaves exactly this (it drops the network from the container's
+/// own settings), and neither `compose start`, `compose up` nor a Docker
+/// restart puts it back (review-tmp, 2026-11-14: db running with no network,
+/// the app "can't reach its database").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detached {
+    pub network: String,
+    pub container: String,
+    /// The compose service (`db`, `app`, …): the name the others reach it by.
+    pub service: String,
+    pub running: bool,
+}
+
+/// The [`Detached`] containers among `containers`. Docker's built-in modes
+/// (`default`, `bridge`, `host`, `none`, `container:…`) aren't a network a
+/// container can lose this way.
+pub(crate) fn detached(containers: &[Inspected]) -> Vec<Detached> {
+    containers
+        .iter()
+        .filter_map(|c| {
+            let network = c.host_config.network_mode.as_str();
+            if matches!(network, "" | "default" | "bridge" | "host" | "none")
+                || network.starts_with("container:")
+            {
+                return None;
+            }
+            let attached = c
+                .network_settings
+                .networks
+                .as_ref()
+                .is_some_and(|n| n.contains_key(network));
+            if attached {
+                return None;
+            }
+            let service = c
+                .config
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("com.docker.compose.service"))
+                .cloned()?;
+            Some(Detached {
+                network: network.to_string(),
+                container: c.name().to_string(),
+                service,
+                running: c.state.running,
+            })
+        })
+        .collect()
+}
+
+/// The site's [`Detached`] containers right now (every service, running or
+/// not), or `None` when Docker didn't answer.
+pub fn detached_now(stack: &Stack) -> Option<Vec<Detached>> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let out = docker::try_capture_empty_ok(ps)?;
+    let names: Vec<String> = crate::ops::parse_ps(&out)
+        .into_iter()
+        .map(|e| e.name)
+        .filter(|n| !n.is_empty())
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    Some(detached(&inspect(&names)))
 }
 
 pub(crate) fn parse_inspect(json: &str) -> Vec<Inspected> {
@@ -395,6 +480,42 @@ pub(crate) fn look(stack: &Stack, network: bool) -> Look {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `docker inspect` of review-tmp's db and app on 2026-11-14, after a
+    /// stale-endpoint recovery had force-disconnected the stopped db: the
+    /// fields this module reads, values as Docker gave them (env left out:
+    /// it holds the site's secrets).
+    const REVIEW_TMP_DB_DETACHED: &str = r#"[{"Name":"/atelier-review-tmp-db-1","State":{"Running":true,"StartedAt":"2026-11-14T17:57:37.553866251Z"},"HostConfig":{"NetworkMode":"atelier-review-tmp_default"},"Config":{"Labels":{"com.docker.compose.project":"atelier-review-tmp","com.docker.compose.service":"db"}},"NetworkSettings":{"Networks":{}}},{"Name":"/atelier-review-tmp-app-1","State":{"Running":true,"StartedAt":"2026-11-14T17:57:37.555892626Z"},"HostConfig":{"NetworkMode":"atelier-review-tmp_default"},"Config":{"Labels":{"com.docker.compose.project":"atelier-review-tmp","com.docker.compose.service":"app"}},"NetworkSettings":{"Networks":{"atelier-review-tmp_default":{"IPAddress":"192.168.158.3","Aliases":["atelier-review-tmp-app-1","app"],"NetworkID":"9ad2edbed3147a61e5420854a6e6228b583728faa6fe6bb3d351a39963dd844b"}}}}]"#;
+
+    #[test]
+    fn a_container_that_lost_its_network_is_found_and_an_attached_one_is_not() {
+        let containers = parse_inspect(REVIEW_TMP_DB_DETACHED);
+        assert_eq!(containers.len(), 2, "both parse");
+        assert_eq!(
+            detached(&containers),
+            vec![Detached {
+                network: "atelier-review-tmp_default".into(),
+                container: "atelier-review-tmp-db-1".into(),
+                service: "db".into(),
+                running: true,
+            }]
+        );
+        // The half-attached check can't see it: neither side lists db.
+        let net = parse_network_inspect(
+            r#"[{"Name":"atelier-review-tmp_default","Containers":{"x":{"Name":"atelier-review-tmp-app-1"}}}]"#,
+        );
+        assert!(half_attached(&net, &containers).is_empty());
+    }
+
+    #[test]
+    fn built_in_network_modes_are_never_detached() {
+        for mode in ["default", "bridge", "host", "none", "container:abc"] {
+            let json = format!(
+                r#"[{{"Name":"/x","State":{{"Running":true}},"HostConfig":{{"NetworkMode":"{mode}"}},"Config":{{"Labels":{{"com.docker.compose.service":"db"}}}},"NetworkSettings":{{"Networks":{{}}}}}}]"#
+            );
+            assert!(detached(&parse_inspect(&json)).is_empty(), "{mode}");
+        }
+    }
 
     /// `docker inspect atelier-hardening-test-app-1 atelier-hardening-test-db-1`,
     /// trimmed to the keys a look reads (2026-11-14), with db as review-tmp had

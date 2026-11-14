@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A site whose database had lost its connection to the site's network (left behind by Docker, or by
+  an earlier start that cleared Docker's leftovers) no longer stays stuck on "can't reach its
+  database", even after restarting Docker. Start, update and **Run a checkup** now reconnect it and
+  restart the site; the checkup names it.
+
 - When Docker fails a start, update, stop or removal, the error now says why in plain words: the
   site's port is taken by another program (naming the port), Docker is out of disk space, or Docker
   isn't running. Any other failure shows Docker's last line instead of only "docker exited with 1".

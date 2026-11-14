@@ -359,6 +359,9 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // `up` would create an empty database and install a fresh site over
             // an erased one; the way back is a restore, as Start says.
             ops::refuse_erased_database(stack).map_err(|e| format!("{e:#}"))?;
+            // A container that lost its network: reconnect it (and reboot the
+            // app that booted without it); `up` alone never would.
+            ops::reconnect_site(stack, r).map_err(|e| format!("{e:#}"))?;
             // No deadline: `up` may pull and recreate. Recovers once from
             // Docker's leftovers (a stale network endpoint), like Start and Update.
             ops::run_recovering(stack, &["up", "-d"], "start the appliance", r)
@@ -1000,7 +1003,10 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     );
     let app_up = app.severity.is_ok();
     out.push(app);
-    out.push(network_verdict(crate::boot::half_attached_now(stack)));
+    out.push(network_verdict(
+        crate::boot::half_attached_now(stack),
+        crate::boot::detached_now(stack),
+    ));
     app_up
 }
 
@@ -1040,11 +1046,41 @@ fn stopped_container(
 
 const NETWORK_LABEL: &str = "Containers attached to the site's network";
 
+/// What the checkup says for a [`crate::boot::Detached`] container.
+pub(crate) const NETWORK_LOST: &str = "Part of your site has lost its connection to the site's \
+     network, so the site can't reach its database. Start your site again (or run \
+     `atelier doctor --fix`): Atelier reconnects it. Your site's data is safe.";
+
 /// Docker's half-attached network (review-tmp, 2026-11-14): a running container
 /// the site's network lists has no address on it, or the reverse. Only
 /// restarting Docker cleared it, so that is the repair ([`Repair::RestartDocker`],
 /// asked first), in the same words a start that runs into it uses.
-fn network_verdict(half_attached: Option<Vec<(String, String)>>) -> Check {
+fn network_verdict(
+    half_attached: Option<Vec<(String, String)>>,
+    detached: Option<Vec<crate::boot::Detached>>,
+) -> Check {
+    // Lost its network entirely: reconnecting fixes it, no Docker restart.
+    if let Some(lost) = detached.filter(|d| !d.is_empty()) {
+        return Check::bad(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            Severity::Fail,
+            NETWORK_LOST,
+        )
+        .fixable(Repair::StartContainers)
+        .detail(
+            lost.iter()
+                .map(|d| {
+                    format!(
+                        "{} ({}) has no connection to {}",
+                        d.container, d.service, d.network
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
     match half_attached {
         None => Check::skipped(
             "stack.network",
@@ -1672,11 +1708,34 @@ mod tests {
     }
 
     #[test]
+    fn a_container_that_lost_its_network_is_fixed_by_starting_not_by_restarting_docker() {
+        let lost = crate::boot::Detached {
+            network: "atelier-review-tmp_default".into(),
+            container: "atelier-review-tmp-db-1".into(),
+            service: "db".into(),
+            running: true,
+        };
+        // Takes precedence over a half-attached reading of the same site.
+        let c = network_verdict(Some(vec![("n".into(), "c".into())]), Some(vec![lost]));
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(c.fix, Some(Repair::StartContainers));
+        assert_eq!(c.remedy.as_deref(), Some(NETWORK_LOST));
+        assert!(!NETWORK_LOST.contains("Restart Docker"));
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("atelier-review-tmp-db-1 (db) has no connection to atelier-review-tmp_default")
+        );
+    }
+
+    #[test]
     fn a_half_attached_network_fails_the_checkup_with_the_restart_docker_remedy() {
-        let c = network_verdict(Some(vec![(
-            "atelier-review-tmp_default".into(),
-            "atelier-review-tmp-db-1".into(),
-        )]));
+        let c = network_verdict(
+            Some(vec![(
+                "atelier-review-tmp_default".into(),
+                "atelier-review-tmp-db-1".into(),
+            )]),
+            Some(Vec::new()),
+        );
         assert_eq!(c.severity, Severity::Fail);
         assert_eq!(
             c.fix,
@@ -1688,8 +1747,11 @@ mod tests {
             c.detail.as_deref(),
             Some("atelier-review-tmp-db-1 is half attached to atelier-review-tmp_default")
         );
-        assert_eq!(network_verdict(Some(Vec::new())).severity, Severity::Ok);
-        assert_eq!(network_verdict(None).severity, Severity::Skipped);
+        assert_eq!(
+            network_verdict(Some(Vec::new()), Some(Vec::new())).severity,
+            Severity::Ok
+        );
+        assert_eq!(network_verdict(None, None).severity, Severity::Skipped);
     }
 
     #[test]

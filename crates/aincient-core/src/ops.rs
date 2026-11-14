@@ -2153,6 +2153,9 @@ pub(crate) fn run_recovering(
     r: &mut dyn Reporter,
 ) -> Result<()> {
     ensure_engine_image(stack, r)?;
+    // Every start, up and update: a container that lost its network gets it
+    // back first (compose never reconnects one).
+    reattach_detached(stack, r);
     let mut cmd = compose(stack);
     cmd.args(args);
     let first = match run_step(cmd, action, r) {
@@ -2163,7 +2166,7 @@ pub(crate) fn run_recovering(
     if stale.is_empty() {
         return Err(first);
     }
-    clear_stale_endpoints(&stale, r);
+    clear_stale_endpoints(stack, &stale, r);
     let mut again = compose(stack);
     again.args(args);
     run_step(again, action, r).map_err(|e| start_stuck(&first, &e))
@@ -2171,7 +2174,7 @@ pub(crate) fn run_recovering(
 
 /// Force-disconnect each `(network, container)` leftover [`stale_endpoints`]
 /// found, saying so. No container, volume or data is touched.
-fn clear_stale_endpoints(stale: &[(String, String)], r: &mut dyn Reporter) {
+fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn Reporter) {
     r.stage(
         Stage::Starting,
         "Docker left part of your site half-started. Clearing that and starting again (your data stays)…",
@@ -2187,6 +2190,72 @@ fn clear_stale_endpoints(stale: &[(String, String)], r: &mut dyn Reporter) {
             Err(e) => r.log(&format!("Couldn't clear {container} from {network}: {e}")),
         }
     }
+    // Disconnecting a stopped container also drops the network from its own
+    // settings: it would start with no network at all, and stay that way.
+    // Put it back now, as a fresh endpoint.
+    reattach_detached(stack, r);
+}
+
+/// Reconnect each of the site's containers that lost its network
+/// ([`crate::boot::Detached`]), under its service name so the others reach it
+/// again. No container, volume or data is touched. The ones reconnected.
+pub(crate) fn reattach_detached(stack: &Stack, r: &mut dyn Reporter) -> Vec<crate::boot::Detached> {
+    let Some(found) = crate::boot::detached_now(stack) else {
+        return Vec::new();
+    };
+    let mut done = Vec::new();
+    for d in found {
+        let mut c = docker::docker();
+        c.args(reattach_args(&d));
+        match docker::probe_unbounded(c) {
+            Ok(_) => {
+                r.log(&format!("Reconnected {} to {}", d.container, d.network));
+                done.push(d);
+            }
+            Err(e) => r.log(&format!(
+                "Couldn't reconnect {} to {}: {e}",
+                d.container, d.network
+            )),
+        }
+    }
+    done
+}
+
+/// `docker network connect` for `d`: by its service name, the alias compose
+/// gave it, so `db` resolves again.
+fn reattach_args(d: &crate::boot::Detached) -> Vec<String> {
+    [
+        "network",
+        "connect",
+        "--alias",
+        &d.service,
+        &d.network,
+        &d.container,
+    ]
+    .iter()
+    .map(|a| (*a).to_string())
+    .collect()
+}
+
+/// [`reattach_detached`], and when something was reconnected while the app
+/// runs, restart the app: its boot ran without what it needed (the database)
+/// and stays failed until it boots again. Whether anything was reconnected.
+pub(crate) fn reconnect_site(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let fixed = reattach_detached(stack, r);
+    if fixed.is_empty() {
+        return Ok(false);
+    }
+    if is_running(stack) {
+        r.stage(
+            Stage::Starting,
+            "Part of your site had lost its network connection. Reconnected it; restarting the site (your data stays)…",
+            None,
+        );
+        let mut c = compose(stack);
+        c.args(["restart", "app"]);
+        run_step(c, "restart the site", r)?;
+    }
+    Ok(true)
 }
 
 /// The steps of [`wake_recovering`], so its order is tested against a fake.
@@ -2271,7 +2340,7 @@ impl WakeSteps for LocalWake<'_> {
         stale_endpoints(self.stack)
     }
     fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter) {
-        clear_stale_endpoints(stale, r);
+        clear_stale_endpoints(self.stack, stale, r);
     }
     fn containers(&mut self) -> ContainerState {
         observe_container(self.stack)
@@ -2560,6 +2629,10 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         ("boot", "Boot", BOOT_FROM, 1.0),
     ])
     .announce(r);
+    // A container that lost its network (Docker's leftovers, an earlier
+    // recovery) never gets it back from `compose start`/`up` or a Docker
+    // restart: reconnect it first, and reboot an app that booted without it.
+    reconnect_site(stack, r)?;
     // DECISIONS 0488: with the engine up, Start is its Wake (refused while
     // locked down), so the engine's state stays the site's state.
     if let Some(info) = ready_engine(stack) {
@@ -4510,6 +4583,27 @@ fn sanitize(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_detached_container_is_reconnected_under_its_service_name() {
+        let d = crate::boot::Detached {
+            network: "atelier-review-tmp_default".into(),
+            container: "atelier-review-tmp-db-1".into(),
+            service: "db".into(),
+            running: true,
+        };
+        assert_eq!(
+            super::reattach_args(&d),
+            [
+                "network",
+                "connect",
+                "--alias",
+                "db",
+                "atelier-review-tmp_default",
+                "atelier-review-tmp-db-1"
+            ]
+        );
+    }
+
     #[test]
     fn start_action_falls_back_to_up_only_when_no_container() {
         assert_eq!(start_action(ContainerState::Missing), StartAction::Up);
