@@ -57,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Run a checkup** says how much memory Docker has and warns below 4 GB, with where to raise it
   for what runs Docker on your computer (Docker Desktop, OrbStack, Colima, Rancher Desktop). It also
   warns when Docker stopped part of a site in the last day because it ran out of memory.
+- One thing at a time per site: while an update, restore, backup, start or any other change runs
+  on a site, from the app or from `atelier`, a second one on the same site waits its turn instead
+  of running alongside it: "Your site is busy: an update started 2 minutes ago is still running.
+  Wait for it to finish." `atelier` exits with code 6. Checking for updates, the site's status and
+  a checkup without repairs still work meanwhile. If the app or `atelier` is closed or crashes
+  mid-way, the site is free again straight away; there is nothing to unlock.
+- When an update fails after it restarted your site, Atelier saves every part's log (the site, its
+  database and its web server) to the site's folder (`logs/update-<date>-<time>.log`) before
+  anything restarts them, and the failure message names the file, so the reason isn't lost with
+  the next start. The newest 10 are kept. Passwords and other secrets from your settings never go
+  in.
 
 ### Changed
 

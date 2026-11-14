@@ -239,6 +239,9 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 14 | `update_blocked.rs` | db running on no network: update refused before any work (`UpdateBlocked`, names the container), nothing reconnected; after Start, it updates |
 | 15 | `update_blocked.rs` | app crash-looping out of memory: update refused with the memory text, nothing changed |
 | 16 | `update_blocked.rs` | db data volume on a 96 MB tmpfs (Docker's disk as the probe reads it): update refused naming Docker's disk; checkup fails `host.docker_disk` |
+| 17 | `site_busy.rs` | an update holds the site (slow boot, on another thread): a restore and a start asked meanwhile are refused (`SiteBusy`, "an update started …"); after it ends, start, backup and restore run |
+| 17b | `site_busy.rs` | another process takes the site's lock and is killed: its lock went with it, the next start runs |
+| 18 | `update_failed_logs.rs` | a failed update (`no_backup`, converge FATAL) saves `logs/update-*.log` with compose ps, each service's State and timestamped logs incl. the FATAL; the error names it; no `DB_PASSWORD` value, no env |
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
