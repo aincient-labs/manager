@@ -90,7 +90,27 @@ until nc -z -w 2 db 5432; do
   sleep 1
 done
 if [ "$tries" -lt 20 ]; then
-  if [ -e "/opt/drupal/private/scn-boot-fails-$SCN_MARK" ]; then
+  # Out of memory during converge (scenarios 11, 11b, 12): an allocation
+  # that doubles a string until the container's memory limit kills it.
+  hog='BEGIN { s = "xxxxxxxxxxxxxxxx"; while (1) s = s s }'
+  if [ -e "/opt/drupal/private/scn-boot-oom-$SCN_MARK" ]; then
+    echo "[converge] running database updates (scenario: PID 1 runs out of memory)"
+    exec awk "$hog"
+  fi
+  if [ -e "/opt/drupal/private/scn-boot-oom-child-$SCN_MARK" ]; then
+    echo "[converge] running database updates (scenario: a child runs out of memory)"
+    awk "$hog"
+    rc=$?
+    echo "[converge] FATAL: drush updatedb failed (exit $rc)" >&2
+    echo "[entrypoint] converge FAILED — starting server on the rolled-back state for inspection" >&2
+  elif [ -e "/opt/drupal/private/scn-boot-db-oom-$SCN_MARK" ]; then
+    echo "[converge] running database updates (scenario: the database runs out of memory)"
+    psql "postgresql://${DATABASE_URL#pgsql://}" -v ON_ERROR_STOP=1 -qAt \
+      -c "SELECT length(repeat('x', 400000000))"
+    rc=$?
+    echo "[converge] FATAL: drush updatedb failed (exit $rc)" >&2
+    echo "[entrypoint] converge FAILED — starting server on the rolled-back state for inspection" >&2
+  elif [ -e "/opt/drupal/private/scn-boot-fails-$SCN_MARK" ]; then
     echo "[converge] FATAL: post-update health check failed (scenario build $SCN_MARK)" >&2
     echo "[entrypoint] converge FAILED — starting server on the rolled-back state for inspection" >&2
   else
@@ -396,11 +416,37 @@ impl Site {
 
     /// Add `name` with `body` next to compose.yaml and have compose read both
     /// (`COMPOSE_FILE` in `.env`, as the engine overlay is read).
+    /// Several overlays stack, read in the order they were added.
     pub fn overlay(&self, name: &str, body: &str) {
         std::fs::write(self.stack.home.join(name), body).expect("overlay");
-        let mut env = std::fs::read_to_string(self.stack.env_path()).expect(".env");
-        env.push_str(&format!("COMPOSE_FILE=compose.yaml:{name}\n"));
-        std::fs::write(self.stack.env_path(), env).expect(".env");
+        let env = std::fs::read_to_string(self.stack.env_path()).expect(".env");
+        let files = env
+            .lines()
+            .find_map(|l| l.strip_prefix("COMPOSE_FILE="))
+            .unwrap_or("compose.yaml")
+            .to_string();
+        self.set_env("COMPOSE_FILE", &format!("{files}:{name}"));
+    }
+
+    /// Give `service` a memory limit of `size` (`48m`), swap included
+    /// (`memswap_limit` = `mem_limit`, or swap would absorb the allocation on a
+    /// host that has it). The shipped restart policy stays.
+    pub fn limit_memory(&self, service: &str, size: &str) {
+        self.overlay(
+            &format!("scn-memory-{service}.yaml"),
+            &format!("services:\n  {service}:\n    mem_limit: {size}\n    memswap_limit: {size}\n"),
+        );
+    }
+
+    /// Leave `flag` (a file name the scenario app's entrypoint looks for,
+    /// with build `mark` appended) in the `private` volume. Needs a running `app`.
+    pub fn flag(&self, flag: &str, mark: &str) {
+        docker(&[
+            "exec",
+            &self.container("app"),
+            "touch",
+            &format!("/opt/drupal/private/{flag}{mark}"),
+        ]);
     }
 
     /// `docker compose <args>` for this site, through the Manager's own builder.
@@ -511,12 +557,8 @@ impl Site {
     /// ([`BOOT_FAILS_FLAG`] in the `private` volume), as a release that can't
     /// migrate the site does; other builds boot. Needs a running `app`.
     pub fn fail_boot(&self, mark: &str) {
-        docker(&[
-            "exec",
-            &self.container("app"),
-            "touch",
-            &format!("{BOOT_FAILS_FLAG}{mark}"),
-        ]);
+        let flag = BOOT_FAILS_FLAG.trim_start_matches("/opt/drupal/private/");
+        self.flag(flag, mark);
     }
 
     /// `query` run by `psql` in `db` as the site's user: the rows, unaligned.
