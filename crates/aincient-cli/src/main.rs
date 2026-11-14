@@ -1956,6 +1956,15 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
         Some(target) => ops::plan_upgrade(stack, Some(target)),
         None => {
             let check = ops::check_update(stack);
+            if check.unfinished {
+                println!(
+                    "{}",
+                    style::heading(&format!(
+                        "Continuing the unfinished update to {}",
+                        check.latest_version.as_deref().unwrap_or(&check.image)
+                    ))
+                );
+            }
             if check.update_available == Some(false)
                 && stack.pending_edge_image_migration().is_none()
             {
@@ -2031,13 +2040,14 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     }
 
     let pinned_to = to.is_some();
-    if ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
-        done_banner("Update complete.", &stack.console_url());
-    } else {
-        pending_banner(
+    match ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
+        ops::Updated::Ready => done_banner("Update complete.", &stack.console_url()),
+        ops::Updated::Booting => pending_banner(
             "Update applied — still finishing boot.",
             &stack.console_url(),
-        );
+        ),
+        // The run itself said "Already up to date" as its last step.
+        ops::Updated::AlreadyCurrent => {}
     }
     if pinned_to {
         println!(
@@ -3001,6 +3011,15 @@ fn print_check_update(check: &ops::UpdateCheck, channel: Channel, json: bool) ->
     // rolling tag like `:edge` the digest alone tells the user nothing.
     let from = check.current_version.as_deref().unwrap_or("unknown");
     match check.update_available {
+        // A stepped update stopped at a waypoint: say so, not "a new version".
+        Some(true) if check.unfinished => {
+            println!(
+            "{} It stopped at {}; {} is where it was going.\nRun `atelier app update` to continue.",
+            style::heading("An update didn't finish."),
+            from,
+            check.latest_version.as_deref().unwrap_or("the newest version"),
+        )
+        }
         Some(true) => {
             println!(
                 "{} for {}.\n{} → {}",

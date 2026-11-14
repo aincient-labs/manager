@@ -315,6 +315,7 @@ mod tests {
                 .then(|| "You're offline — couldn't reach the registry.".into()),
             plan: None,
             offline: update_available.is_none(),
+            unfinished: false,
         }
     }
 

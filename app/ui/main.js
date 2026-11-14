@@ -1540,6 +1540,15 @@ function renderUpdateBanner(cached) {
     : "It hasn't checked yet.";
 
   if (available) {
+    // A stepped update that stopped at a waypoint: continue it, not "a new version".
+    const unfinished = !!check.unfinished;
+    $("update-banner-title").textContent = unfinished
+      ? "An update didn't finish."
+      : "A new version of Atelier is ready.";
+    $("update-banner-sub").textContent = unfinished
+      ? "Your site is safe on the version it reached. Continue to finish the update."
+      : "Updating keeps all your pages and settings.";
+    $("update-banner-action").textContent = unfinished ? "Continue update" : "Update";
     const parts = [];
     if (check.current_version && check.latest_version) {
       parts.push(esc(`${check.current_version} → ${check.latest_version}`));

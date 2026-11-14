@@ -574,7 +574,10 @@ async fn do_install(
 async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || outcome(ops::update(&s, &mut EventReporter { app }))).await
+            blocking(move || {
+                outcome(ops::update(&s, &mut EventReporter { app }).map(ops::Updated::ready))
+            })
+            .await
         }
         Target::Remote(site) => {
             blocking(move || {

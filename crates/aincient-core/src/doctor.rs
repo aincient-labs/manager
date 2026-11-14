@@ -343,6 +343,9 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             .map(|changes| (!changes.is_empty()).then(|| changes.join("; ")))
             .map_err(|e| format!("{e:#}")),
         Repair::StartContainers => {
+            // A locked engine site stays down until its owner unlocks it.
+            ops::refuse_locked(ops::engine_state_of(stack).as_deref())
+                .map_err(|e| format!("{e:#}"))?;
             // No deadline: `up` may pull and recreate. Recovers once from
             // Docker's leftovers (a stale network endpoint), like Start and Update.
             ops::run_recovering(stack, &["up", "-d"], "start the appliance", r)
@@ -932,22 +935,68 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         .fixable(Repair::Scaffold)
     });
 
-    if crate::engine::is_enabled(stack) {
+    // A resting or locked engine site stops its app and db on purpose.
+    let engine_state = if crate::engine::is_enabled(stack) {
         out.extend(check_engine(stack));
-    }
+        ops::engine_state_of(stack)
+    } else {
+        None
+    };
+    let engine_state = engine_state.as_deref();
 
     out.push(check_container(
         stack,
         "db",
         "stack.db",
         "Database container healthy",
+        engine_state,
     ));
 
-    let app = check_container(stack, "app", "stack.app", "Appliance container running");
+    let app = check_container(
+        stack,
+        "app",
+        "stack.app",
+        "Appliance container running",
+        engine_state,
+    );
     let app_up = app.severity.is_ok();
     out.push(app);
     out.push(network_verdict(crate::boot::half_attached_now(stack)));
     app_up
+}
+
+/// The verdict on a container that exists but isn't running. The engine's
+/// Rest stops `app` and `db` on purpose (visitors see the snapshot), so a
+/// resting site is fine; a locked one stays down until its owner unlocks it,
+/// so it is said, not repaired. Anything else is a site that should be up.
+fn stopped_container(
+    id: &'static str,
+    label: &'static str,
+    status: &str,
+    engine_state: Option<&str>,
+) -> Check {
+    match engine_state {
+        Some("resting") => Check::ok(id, Tier::Stack, label)
+            .detail("resting: the engine stopped it; visitors see the snapshot"),
+        Some("locked") => Check::bad(
+            id,
+            Tier::Stack,
+            label,
+            Severity::Warn,
+            "The site is locked down, so its containers stay stopped. Unlock it first \
+             (System → Experimental features, or `atelier site unlock --experimental`).",
+        )
+        .detail(format!("state: {status}")),
+        _ => Check::bad(
+            id,
+            Tier::Stack,
+            label,
+            Severity::Fail,
+            "The container isn't running. Start it with `atelier app start`.",
+        )
+        .detail(format!("state: {status}"))
+        .fixable(Repair::StartContainers),
+    }
 }
 
 const NETWORK_LABEL: &str = "Containers attached to the site's network";
@@ -1150,7 +1199,13 @@ fn engine_port_verdict(ports_json: Option<&str>) -> Check {
 /// healthcheck) healthy? A container stuck in a restart loop reports "running"
 /// on any single glance, so the restart count is read too — that's the state
 /// that otherwise looks fine and never serves.
-fn check_container(stack: &Stack, service: &str, id: &'static str, label: &'static str) -> Check {
+fn check_container(
+    stack: &Stack,
+    service: &str,
+    id: &'static str,
+    label: &'static str,
+    engine_state: Option<&str>,
+) -> Check {
     let mut ps = compose(stack);
     ps.args(["ps", "-q", service]);
     let container = match probe(ps) {
@@ -1201,15 +1256,7 @@ fn check_container(stack: &Stack, service: &str, id: &'static str, label: &'stat
     let state = ContainerState::parse(&raw);
 
     if !state.running {
-        return Check::bad(
-            id,
-            Tier::Stack,
-            label,
-            Severity::Fail,
-            "The container isn't running. Start it with `atelier app start`.",
-        )
-        .detail(format!("state: {}", state.status))
-        .fixable(Repair::StartContainers);
+        return stopped_container(id, label, &state.status, engine_state);
     }
     // A handful of restarts is a crash loop, not a hiccup: compose's
     // `restart: unless-stopped` means it will keep going forever.
@@ -1851,5 +1898,34 @@ mod tests {
         // "it's broken" with nothing to do about it.
         let bad = Check::bad("x", Tier::Site, "x", Severity::Fail, "do the thing");
         assert!(bad.remedy.is_some());
+    }
+
+    #[test]
+    fn a_resting_site_is_fine_and_a_locked_one_is_not_started() {
+        // `docker inspect --format {{.State.Status}}` of a rested app container.
+        let resting = stopped_container(
+            "stack.app",
+            "Appliance container running",
+            "exited",
+            Some("resting"),
+        );
+        assert_eq!(resting.severity, Severity::Ok);
+        assert!(resting.fix.is_none());
+
+        let locked = stopped_container(
+            "stack.app",
+            "Appliance container running",
+            "exited",
+            Some("locked"),
+        );
+        assert_eq!(locked.severity, Severity::Warn);
+        assert!(locked.fix.is_none(), "doctor must not start a locked site");
+
+        for state in [None, Some("awake"), Some("stopped")] {
+            let down =
+                stopped_container("stack.app", "Appliance container running", "exited", state);
+            assert_eq!(down.severity, Severity::Fail);
+            assert_eq!(down.fix, Some(Repair::StartContainers));
+        }
     }
 }

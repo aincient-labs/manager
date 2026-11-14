@@ -74,6 +74,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped, or `atelier data restore`) brings the site back. A database you erased yourself
   (**Remove and erase**, `atelier app down --wipe`) still starts as a fresh site.
 - Start and Stop say "Start Docker" when Docker isn't running, instead of a Docker error.
+- A multi-step update that stopped partway no longer leaves the site stuck on the version it
+  reached. Home shows **Continue update** (`atelier app check-update` says the update didn't
+  finish), and the next update carries on to the version it was heading for.
+- An update downloads first. When the download is the version your site already runs, it says
+  "Already up to date" and takes no backup and restarts nothing, in the app as on the command line.
+- Updating a stopped site starts it first, so the before-update backup can be taken; if it won't
+  start, the update stops and says why. A site with the experimental engine that is resting is woken
+  for the update and put back to rest afterwards. A locked site is not updated or started by
+  `atelier doctor --fix`: it says to unlock it first. `atelier doctor` reports a resting site as fine
+  instead of as stopped containers.
+- When the new database server can't be downloaded during an update, the site keeps its current one
+  and the move is tried again on the next update, instead of the update failing.
+- The "log in to the registry" hint after a failed download appears only when the registry refused
+  access, not for every failed download.
 
 ## [0.16.0] - 2026-11-12
 

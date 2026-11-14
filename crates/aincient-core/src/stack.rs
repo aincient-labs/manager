@@ -482,6 +482,13 @@ pub const SITE_ID_FILE: &str = "site-id";
 /// goes once the database volume exists again.
 pub const DATABASE_WIPED_FILE: &str = ".database-wiped";
 
+/// Where a stepped update keeps the image its route ends on while it walks the
+/// hops: each hop rewrites `.env` to the version it lands on, so without this a
+/// route that stopped halfway would leave the site pinned to a waypoint, and
+/// the next update would see nothing newer than it. Written before the first
+/// hop, removed once the final one answers.
+pub const UPDATE_TARGET_FILE: &str = ".update-target";
+
 /// Whether `id` looks like an identity [`new_site_id`] makes: a lowercase
 /// 8-4-4-4-12 hex UUID.
 pub fn is_site_id(id: &str) -> bool {
@@ -717,6 +724,33 @@ impl Stack {
     /// Where the owner's-wipe marker lives: `<home>/.database-wiped`.
     pub fn database_wiped_path(&self) -> PathBuf {
         self.home.join(DATABASE_WIPED_FILE)
+    }
+
+    /// Where an unfinished update's final image is kept:
+    /// `<home>/.update-target` ([`UPDATE_TARGET_FILE`]).
+    pub fn update_target_path(&self) -> PathBuf {
+        self.home.join(UPDATE_TARGET_FILE)
+    }
+
+    /// The image an unfinished stepped update is heading for, when one stopped
+    /// before its last hop answered. `None` when no update is under way.
+    pub fn update_target(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.update_target_path()).ok()?;
+        let image = raw.trim();
+        (!image.is_empty()).then(|| image.to_string())
+    }
+
+    /// Record the image a stepped update is heading for, before its first hop.
+    pub fn set_update_target(&self, image: &str) -> Result<()> {
+        let path = self.update_target_path();
+        std::fs::write(&path, format!("{image}\n"))
+            .with_context(|| format!("could not write {}", path.display()))
+    }
+
+    /// The route is finished (or abandoned for another channel): forget it.
+    /// Best effort: a leftover only makes the next update head for it again.
+    pub fn clear_update_target(&self) {
+        let _ = std::fs::remove_file(self.update_target_path());
     }
 
     /// Whether the owner wiped this site's database on purpose and it hasn't
