@@ -69,3 +69,28 @@ jobs:
       - name: cargo deny check advisories
         if: matrix.os == 'ubuntu-22.04'
         run: cargo deny --locked check advisories
+
+  # Real-Docker scenario tests (umbrella DECISIONS 0528): every incident in code
+  # that changes the owner's Docker, reproduced on a tiny real compose project.
+  # Linux runners ship Docker + compose; macOS runners have none, and the
+  # owner's Mac covers OrbStack/Docker Desktop.
+  scenarios:
+    name: scenarios (real Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Docker
+        run: docker version && docker compose version
+
+      - name: cargo test --test scenarios
+        run: cargo test -p aincient-core --test scenarios --locked -- --ignored --test-threads=1
