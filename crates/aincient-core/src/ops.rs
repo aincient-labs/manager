@@ -1659,6 +1659,7 @@ pub(crate) fn run_recovering(
     action: &str,
     r: &mut dyn Reporter,
 ) -> Result<()> {
+    ensure_engine_image(stack, r)?;
     let mut cmd = compose(stack);
     cmd.args(args);
     let first = match run_step(cmd, action, r) {
@@ -1687,6 +1688,69 @@ pub(crate) fn run_recovering(
     let mut again = compose(stack);
     again.args(args);
     run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
+}
+
+/// What a start needs to do about the engine's pinned image (0487).
+#[derive(Debug, PartialEq, Eq)]
+enum EngineImage {
+    /// No engine, or its image is on this computer.
+    Ready,
+    /// Pinned by digest but gone from this computer: fetch exactly that digest.
+    Fetch(String),
+    /// A local developer build (a bare image ID) that is gone: nothing to fetch.
+    LocalBuildGone,
+}
+
+fn engine_image_need(pinned: Option<&str>, present: bool) -> EngineImage {
+    match pinned {
+        None => EngineImage::Ready,
+        Some(_) if present => EngineImage::Ready,
+        Some(p) if crate::engine::is_image_id(p) => EngineImage::LocalBuildGone,
+        Some(p) => EngineImage::Fetch(p.to_string()),
+    }
+}
+
+const LOCAL_ENGINE_GONE: &str = "This site's engine was a local build that is no longer on this \
+     computer, so it can't start. Turn the engine off and on again (System → Experimental \
+     features, or `atelier engine enable`).";
+
+/// Before a start: make sure the engine's pinned image is on this computer.
+///
+/// `compose.engine.yaml` sets `pull_policy: never` so only `atelier engine
+/// enable` decides what the engine runs. An image prune or a Docker reset can
+/// still remove that image, and the start then dies on "No such image"
+/// (owner's test, 2026-11-14). Fetching the pinned digest again brings back the
+/// same bytes `enable` chose, so the rule holds. A local build can't be fetched:
+/// say so before Docker does.
+fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    if !crate::engine::is_enabled(stack) {
+        return Ok(());
+    }
+    let pinned = crate::engine::pinned_image(stack);
+    let present = pinned.as_deref().is_some_and(|p| {
+        let mut c = docker::docker();
+        c.args(["image", "inspect", "--format", "{{.Id}}", p]);
+        docker::try_capture(c).is_some()
+    });
+    match engine_image_need(pinned.as_deref(), present) {
+        EngineImage::Ready => Ok(()),
+        EngineImage::LocalBuildGone => bail!(LOCAL_ENGINE_GONE),
+        EngineImage::Fetch(image) => {
+            r.stage(
+                Stage::Pull,
+                "Downloading your site's engine again (it was removed from this computer)…",
+                None,
+            );
+            let mut c = docker::docker();
+            c.args(["pull", &image]);
+            run_step(c, "download the site's engine", r).map_err(|e| {
+                anyhow::anyhow!(
+                    "Couldn't download your site's engine, which is no longer on this computer. \
+                     If you're offline, connect and try again. ({e:#})"
+                )
+            })
+        }
+    }
 }
 
 /// `(network, container)` for each of this site's `db`/`app` containers that
@@ -3738,6 +3802,25 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_pinned_engine_is_fetched_by_digest_and_a_missing_local_build_is_named() {
+        // The owner's test, 2026-11-14: the Engine POC's pinned engine was gone.
+        let digest = "ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert_eq!(
+            engine_image_need(Some(digest), false),
+            EngineImage::Fetch(digest.into())
+        );
+        assert_eq!(engine_image_need(Some(digest), true), EngineImage::Ready);
+        let local = "sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert_eq!(
+            engine_image_need(Some(local), false),
+            EngineImage::LocalBuildGone
+        );
+        assert_eq!(engine_image_need(Some(local), true), EngineImage::Ready);
+        assert_eq!(engine_image_need(None, false), EngineImage::Ready);
+        assert!(LOCAL_ENGINE_GONE.contains("Turn the engine off and on again"));
+    }
+
+    #[test]
     fn only_a_stopped_container_still_holding_its_endpoint_is_recovered() {
         // The 2026-11-14 update: db exited, its endpoint left in atelier_default,
         // and the new app container created but not running.
@@ -3777,6 +3860,7 @@ mod tests {
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
         IdentityMismatch, RestoreOptions, Silent,
     };
+    use super::{engine_image_need, EngineImage, LOCAL_ENGINE_GONE};
     use super::{
         lifecycle_plan, Plan, PlanStep, Reporter, ScaledReporter, Stage, BOOT_FROM, PULL_FROM,
         UP_FROM,
