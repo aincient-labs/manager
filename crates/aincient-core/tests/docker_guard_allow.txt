@@ -1,0 +1,57 @@
+# Changing calls no scenario covers yet (see tests/docker_guard.rs).
+# <path> | <fn> | <what> | <reason>
+crates/aincient-cli/src/engine.rs | disable | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario (disable brings the plain stack back up)
+crates/aincient-core/src/cleanup.rs | free | docker: image rm | Free up space removing images is never run for real: scenario 7 checks the selection (cleanup::find) only, updates assert the automatic clean-up removes nothing
+crates/aincient-core/src/cleanup.rs | remove_older_backups | fs: remove_file | Free up space removing older backups; no scenario runs cleanup::free
+crates/aincient-core/src/docker_runtime.rs | colima_restart | runtime: colima restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
+crates/aincient-core/src/docker_runtime.rs | restart_plan | docker: docker desktop restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
+crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: orbctl restart docker | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
+crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: rdctl shutdown | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
+crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: rdctl start | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
+crates/aincient-core/src/doctor.rs | apply | docker: up -d --no-recreate | doctor --fix starting stopped services; scenario 8 runs --fix but it refuses before this repair
+crates/aincient-core/src/engine.rs | disable | docker: image rm | engine mode (the experimental engine sidecar) has no scenario (disable removes the pinned engine tag)
+crates/aincient-core/src/engine.rs | disable | fs: remove_file | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine.rs | disable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine.rs | enable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine.rs | enable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine.rs | enable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine.rs | refuse_unless_loopback_only | fs: remove_file | engine mode (the experimental engine sidecar) has no scenario (loopback check removes its candidate file)
+crates/aincient-core/src/engine.rs | refuse_unless_loopback_only | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario (loopback check writes a candidate file)
+crates/aincient-core/src/engine_admin.rs | enable_up_args | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine_admin.rs | pull_image | docker: pull --quiet | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine_admin.rs | up | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/engine_admin.rs | wake | docker: start db app | engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/ops.rs | claim_name | fs: rename | the fallback when claiming the backup name by hard link fails; not reached
+crates/aincient-core/src/ops.rs | clear_stale_endpoints | docker: network disconnect -f | the stale-endpoint clear itself: scenario 1 builds the state it leaves, nothing makes Docker report a stale endpoint
+crates/aincient-core/src/ops.rs | down | docker: down | removing a site (atelier app down); no scenario
+crates/aincient-core/src/ops.rs | ensure_engine_image | docker: pull | engine sites only; engine mode (the experimental engine sidecar) has no scenario
+crates/aincient-core/src/ops.rs | export_static_in | fs: remove_dir_all | static export (atelier export) has no scenario
+crates/aincient-core/src/ops.rs | export_static_in | fs: remove_dir_all | static export (atelier export) has no scenario
+crates/aincient-core/src/ops.rs | install_export | fs: remove_dir_all | static export (atelier export) has no scenario; replaces the export target
+crates/aincient-core/src/ops.rs | install_export | fs: rename | static export (atelier export) has no scenario
+crates/aincient-core/src/ops.rs | mark_database_wiped | fs: write | the marker of an owner wipe (app down --wipe); no scenario
+crates/aincient-core/src/ops.rs | move_db_image | docker: up -d --force-recreate db app | the database server move runs only when the shipped db image changes; no scenario moves it
+crates/aincient-core/src/ops.rs | pull_db_image | docker: pull | the database server move runs only when the shipped db image changes; no scenario moves it
+crates/aincient-core/src/ops.rs | reconnect_args | docker: network connect | reconnecting a network without an alias; the scenarios reconnect db, which always has one
+crates/aincient-core/src/ops.rs | reconnect_site | docker: restart app | restarting app after a reconnect; no scenario reaches it
+crates/aincient-core/src/ops.rs | restore | docker: cp | restoring a plain .sql dump; the scenarios restore backup bundles
+crates/aincient-core/src/ops.rs | start_args | docker: up -d --no-recreate | Start of a site whose containers are gone; scenarios start existing containers
+crates/aincient-core/src/ops.rs | sweep_stale_parts | fs: remove_file | removes .part files older than the stale age; no scenario leaves one
+crates/aincient-core/src/pack.rs | dev_down | docker: down | the theme-pack dev stack (atelier pack dev) has no scenario
+crates/aincient-core/src/pack.rs | dev_down_purge | docker: down -v | the theme-pack dev stack (atelier pack dev) has no scenario; deletes the dev overlay's volumes
+crates/aincient-core/src/pack.rs | dev_up | docker: up -d --wait | the theme-pack dev stack (atelier pack dev) has no scenario
+crates/aincient-core/src/remote.rs | create_private | fs: truncate | server sites: the local copy of a server backup; no scenario has an SSH server
+crates/aincient-core/src/remote.rs | drop | fs: remove_dir_all | server sites: removes its own private temp dir after a transfer; no scenario has an SSH server
+crates/aincient-core/src/remote.rs | fetch_backup | fs: remove_file | server sites: the local copy of a server backup; no scenario has an SSH server
+crates/aincient-core/src/remote.rs | fetch_backup | fs: rename | server sites: the local copy of a server backup; no scenario has an SSH server
+crates/aincient-core/src/stack.rs | ensure_site_id | fs: remove_file | cleanup after a failed site-id rename; not reached
+crates/aincient-core/src/stack.rs | refresh_shipped_edge_conf | fs: write | refreshing a superseded edge.conf; no scenario ships an old edge.conf
+crates/aincient-core/src/stack.rs | repair_scaffold | fs: write | repair_scaffold writing a missing file; scenario 8 repairs a changed one
+crates/aincient-core/src/stack.rs | rewrite_image_line | fs: write | rewriting compose.yaml's image line (db image move); no scenario moves it
+crates/aincient-core/src/stack.rs | set_update_target | fs: write | a stepped (multi-hop) update; no scenario has hops
+crates/aincient-core/src/update_cache.rs | write | fs: remove_file | the update-check cache write; no scenario runs check_update
+crates/aincient-core/src/update_cache.rs | write | fs: rename | the update-check cache write; no scenario runs check_update
+crates/aincient-core/src/update_cache.rs | write | fs: write | the update-check cache write; no scenario runs check_update
+crates/aincient-core/src/update_logs.rs | prune | fs: remove_file | keeping the newest 10 saved logs; no scenario saves more than one (unit-tested only)
+crates/aincient-engine/src/site.rs | start_db_and_app | docker: start db app | engine mode (the experimental engine sidecar) has no scenario (the sidecar starts a frozen server site)
+crates/aincient-engine/src/site.rs | stop_app_and_db | docker: stop app db | engine mode (the experimental engine sidecar) has no scenario (the sidecar stops a server site to freeze it)
