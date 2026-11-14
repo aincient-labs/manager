@@ -18,3 +18,4 @@ mod restore_safety;
 mod settings_applied;
 mod shared_tag;
 mod stale_endpoint;
+mod update_stopped;
