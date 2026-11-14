@@ -343,11 +343,9 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             .map(|changes| (!changes.is_empty()).then(|| changes.join("; ")))
             .map_err(|e| format!("{e:#}")),
         Repair::StartContainers => {
-            let mut c = compose(stack);
-            c.args(["up", "-d"]);
             // No deadline: `up` may pull and recreate. Recovers once from
             // Docker's leftovers (a stale network endpoint), like Start and Update.
-            ops::run_recovering(stack, c, "start the appliance", r)
+            ops::run_recovering(stack, &["up", "-d"], "start the appliance", r)
                 .map_err(|e| format!("{e:#}"))?;
             // Containers report "running" the instant they start, but the
             // entrypoint then runs converge (site install or migrations) for up

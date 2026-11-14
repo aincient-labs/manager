@@ -1052,6 +1052,8 @@ function resetSiteUi() {
   lastCachedUpdate = null;
   updateCheckProblem = null;
   updateAttempted = false;
+  updateChecks = 0;
+  siteGen++;
   startingSince = null;
   setHomeNotice(null);
   $("doctor-summary").classList.add("hidden");
@@ -1487,7 +1489,12 @@ function timeAgo(unixSecs) {
 // checked_at, check}) or null (never checked). Kept so the "checked … ago"
 // words can be repainted every minute without asking anything.
 let lastCachedUpdate = null;
-let updateChecking = false; // a check is running (first forced one, or Check now)
+// Checks in flight for the open site (a count: Check now can overlap the
+// background poll, and the first to finish must not say "done" for both).
+let updateChecks = 0;
+// Bumped when the open site changes, so a slow check for the previous site
+// can't paint its answer onto this one.
+let siteGen = 0;
 let updateAttempted = false; // a check has run for this site since it was opened
 // A live check that couldn't answer ({text, since: checked_at it saw}). The
 // cache keeps an older conclusive answer, so this says what the attempt found
@@ -1537,7 +1544,7 @@ function renderUpdateBanner(cached) {
     return;
   }
   const button = (label) =>
-    updateChecking
+    updateChecks > 0
       ? `<button class="text-btn" disabled>Checking…</button>`
       : `<button class="text-btn" data-action="update-check-now">${label}</button>`;
   let html;
@@ -1547,7 +1554,7 @@ function renderUpdateBanner(cached) {
   } else if (check && check.update_available === false) {
     const v = check.current_version ? ` (${esc(check.current_version)})` : "";
     html = `Up to date${v} · ${esc(ago)} · ${button("Check now")}`;
-  } else if (updateChecking || !updateAttempted) {
+  } else if (updateChecks > 0 || !updateAttempted) {
     html = "Checking for updates…";
   } else {
     html = `Couldn't check for updates: try again later · ${button("Try again")}`;
@@ -1558,9 +1565,12 @@ function renderUpdateBanner(cached) {
 
 // Paint the banner from the on-disk cache — a file read, never the network.
 async function refreshUpdate() {
+  const gen = siteGen;
   try {
-    renderUpdateBanner(await invoke("get_cached_update"));
+    const cached = await invoke("get_cached_update");
+    if (gen === siteGen) renderUpdateBanner(cached);
   } catch {
+    if (gen !== siteGen) return;
     $("update-banner").classList.add("hidden");
     $("update-line").classList.add("hidden");
   }
@@ -1571,20 +1581,24 @@ async function refreshUpdate() {
 // Returns the check, or throws what went wrong.
 async function liveUpdateCheck() {
   const since = lastCachedUpdate ? lastCachedUpdate.checked_at : 0;
-  updateChecking = true;
+  const gen = siteGen;
+  updateChecks++;
   renderUpdateBanner(lastCachedUpdate);
   try {
     const u = await invoke("get_update");
+    if (gen !== siteGen) return u;
     const answered = u.update_available === true || u.update_available === false;
     updateCheckProblem = answered ? null : { text: u.problem || "try again later", since };
     return u;
   } catch (e) {
-    updateCheckProblem = { text: String(e), since };
+    if (gen === siteGen) updateCheckProblem = { text: String(e), since };
     throw e;
   } finally {
-    updateChecking = false;
-    updateAttempted = true;
-    await refreshUpdate();
+    if (gen === siteGen) {
+      updateChecks--;
+      updateAttempted = true;
+      await refreshUpdate();
+    }
   }
 }
 
@@ -1609,19 +1623,23 @@ async function backgroundUpdateRefresh(force) {
   // Only a call that will ask the registry says "Checking…"; a fresh cache is
   // a file read and repaints without a flicker.
   const asks = force || !lastCachedUpdate || !lastCachedUpdate.fresh;
+  const gen = siteGen;
   if (asks) {
-    updateChecking = true;
+    updateChecks++;
     renderUpdateBanner(lastCachedUpdate);
   }
   try {
-    renderUpdateBanner(await invoke("refresh_update_cache", { force }));
+    const cached = await invoke("refresh_update_cache", { force });
+    if (gen === siteGen) renderUpdateBanner(cached);
   } catch {
     /* offline / no stack / Docker down — the banner simply stays as it was. */
   } finally {
-    updateAttempted = true;
-    if (asks) {
-      updateChecking = false;
-      renderUpdateBanner(lastCachedUpdate);
+    if (gen === siteGen) {
+      updateAttempted = true;
+      if (asks) {
+        updateChecks--;
+        renderUpdateBanner(lastCachedUpdate);
+      }
     }
   }
 }

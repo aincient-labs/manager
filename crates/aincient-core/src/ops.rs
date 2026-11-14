@@ -473,6 +473,8 @@ impl ModelRole {
 
 #[derive(Deserialize)]
 struct PsEntry {
+    #[serde(rename = "Name", default)]
+    name: String,
     #[serde(rename = "Service", default)]
     service: String,
     #[serde(rename = "State", default)]
@@ -992,21 +994,25 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     route.announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
     preflight().require()?;
-    announce_legacy_migrations(stack, r)?;
+    let snapshot_taken = announce_legacy_migrations(stack, r)?;
     refresh_edge_conf(stack);
 
     if !plan.is_stepped() {
         // The banner promises "Updating keeps all your pages and settings": a
         // one-step update took no backup until 0.17.0, so a failed migration had
-        // nothing to go back to. Best effort, like the stepped route's snapshot.
-        safety_backup(
-            stack,
-            "before-update",
-            "Backing up before the update…",
-            0.03,
-            PULL_FROM - 0.04,
-            r,
-        );
+        // nothing to go back to. Best effort, like the stepped route's snapshot;
+        // skipped when the channel move above just took one.
+        if !snapshot_taken {
+            safety_backup(
+                stack,
+                "before-update",
+                "Backing up before the update…",
+                0.03,
+                PULL_FROM - 0.04,
+                None,
+                r,
+            );
+        }
         retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
         up(stack, r)?;
@@ -1166,9 +1172,12 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         Some(0.9),
     );
     pull(stack, r)?;
-    let mut c = compose(stack);
-    c.args(["up", "-d", "--force-recreate", "db", "app"]);
-    run_recovering(stack, c, "move the database server", r)?;
+    run_recovering(
+        stack,
+        &["up", "-d", "--force-recreate", "db", "app"],
+        "move the database server",
+        r,
+    )?;
     Ok(wait_until_ready(stack, READY_TIMEOUT, r))
 }
 
@@ -1205,7 +1214,8 @@ impl Reporter for ScaledReporter<'_> {
         self.inner.stage(
             stage,
             &format!("{}{message}", self.prefix),
-            fraction.map(|f| self.base + f * self.span),
+            // A zero span means "no slice of the outer bar": indeterminate.
+            fraction.and_then(|f| (self.span > 0.0).then_some(self.base + f * self.span)),
         );
     }
 
@@ -1247,7 +1257,9 @@ impl Reporter for ScaledReporter<'_> {
 /// a full portable snapshot (database + files) first, while the *old* image is still
 /// the one running. Best effort: if the snapshot can't be taken the switch still
 /// proceeds, since converge's own rollback is the real safety net.
-fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+/// Returns whether it saved a snapshot, so the update doesn't take a second one.
+fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let mut saved = false;
     // The repository rename first, and unconditionally: it is a dead pointer rather
     // than a preference (see `Stack::migrate_image_repo`), it needs no snapshot
     // because it changes no version, and the channel migration below reads its output
@@ -1278,7 +1290,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
         );
     }
     if !stack.pending_default_channel_migration() {
-        return Ok(());
+        return Ok(saved);
     }
     // ASK FIRST. This is the one place the manager changes, on its own initiative,
     // which build somebody's existing site runs on — it fires on ADOPTION of an
@@ -1303,7 +1315,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
              `atelier app channel stable` moves it to released versions whenever you want.",
             Some(0.09),
         );
-        return Ok(());
+        return Ok(saved);
     }
     if status(stack).running {
         r.stage(
@@ -1320,11 +1332,14 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             prefix: String::new(),
         };
         match backup(stack, Some("before-channel-switch"), &mut snap) {
-            Ok(path) => r.stage(
-                Stage::Working,
-                &format!("Snapshot saved: {}", path.display()),
-                Some(0.1),
-            ),
+            Ok(path) => {
+                saved = true;
+                r.stage(
+                    Stage::Working,
+                    &format!("Snapshot saved: {}", path.display()),
+                    Some(0.1),
+                )
+            }
             Err(e) => r.stage(
                 Stage::Working,
                 &format!(
@@ -1346,7 +1361,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             Some(0.11),
         );
     }
-    Ok(())
+    Ok(saved)
 }
 
 /// Point the install at a different channel and, unless `apply` is false, pull it
@@ -1617,67 +1632,118 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
 /// `docker compose up -d`.
 fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
-    let mut c = compose(stack);
-    c.args(["up", "-d"]);
-    run_recovering(stack, c, "start the appliance", r)
+    run_recovering(stack, &["up", "-d"], "start the appliance", r)
 }
 
-/// What the owner reads when a start fails even after the clean retry: the one
-/// step they can always take, and that their data is safe. Docker's own line
-/// follows in brackets for a bug report.
-const START_STUCK: &str =
-    "Docker couldn't start your site, even after clearing its containers and \
-     trying again. Restart Docker Desktop, then try again. Your site's data is safe.";
+/// What the owner reads when a start fails even after clearing Docker's
+/// leftovers: the one step they can always take, and that their data is safe.
+/// Docker's own lines follow in brackets for a bug report.
+const START_STUCK: &str = "Docker couldn't start your site, even after clearing what it had left \
+     behind and trying again. Restart Docker Desktop, then try again. Your site's data is safe.";
 
-/// Run a start step (`up`, `start`), and recover once from Docker's own
-/// leftovers.
+/// Run a compose start step (`up …`, `start`), and recover once from Docker's
+/// own leftovers.
 ///
-/// Docker Desktop sometimes keeps a container's network endpoint after a sleep,
-/// restart or crash. The container then can't start again ("endpoint with name
-/// atelier-db-1 already exists in network atelier_default") and compose reports
-/// only "dependency failed to start: container atelier-db-1 exited (1)" — an
-/// update stopped there on 0.29.0 (2026-11-14). `compose down` removes the
-/// containers and the network, which clears the endpoint; it keeps the volumes,
-/// so the database and files stay. Only a failure that left `db` or `app`
-/// existing but not running is retried: anything else (no Docker, a missing
-/// image, a port in use) keeps its own error.
+/// Docker Desktop sometimes keeps a stopped container's network endpoint after
+/// a sleep, restart or crash. The container then can't start again ("endpoint
+/// with name atelier-db-1 already exists in network atelier_default") and
+/// compose reports only "dependency failed to start: container atelier-db-1
+/// exited (1)" — an update stopped there on 2026-11-14. Only that exact state
+/// is recovered: a `db`/`app` container that isn't running but still holds an
+/// endpoint. Its endpoint is force-disconnected (what fixed it by hand; no
+/// container, volume or data is touched) and the same step runs again. Any
+/// other failure keeps its own error.
 pub(crate) fn run_recovering(
     stack: &Stack,
-    cmd: Command,
+    args: &[&str],
     action: &str,
     r: &mut dyn Reporter,
 ) -> Result<()> {
+    let mut cmd = compose(stack);
+    cmd.args(args);
     let first = match run_step(cmd, action, r) {
         Ok(()) => return Ok(()),
         Err(e) => e,
     };
-    let mut ps = compose(stack);
-    ps.args(["ps", "-a", "--format", "json"]);
-    let half = docker::try_capture_empty_ok(ps).is_some_and(|out| half_started(&out));
-    if !half {
+    let stale = stale_endpoints(stack);
+    if stale.is_empty() {
         return Err(first);
     }
     r.stage(
         Stage::Starting,
-        "Docker left your site half-started. Clearing its containers and starting again (your data stays)…",
+        "Docker left part of your site half-started. Clearing that and starting again (your data stays)…",
         None,
     );
-    let mut down = compose(stack);
-    down.arg("down");
+    for (network, container) in &stale {
+        let mut c = docker::docker();
+        c.args(["network", "disconnect", "-f", network, container]);
+        match docker::probe_unbounded(c) {
+            Ok(_) => r.log(&format!(
+                "Cleared a leftover network entry: {container} in {network}"
+            )),
+            Err(e) => r.log(&format!("Couldn't clear {container} from {network}: {e}")),
+        }
+    }
     let mut again = compose(stack);
-    again.args(["up", "-d"]);
-    run_step(down, "clear the half-started containers", r)
-        .and_then(|()| run_step(again, action, r))
-        .map_err(|e| anyhow::anyhow!("{START_STUCK} ({e:#})"))
+    again.args(args);
+    run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
 }
 
-/// Whether `compose ps -a` shows `db` or `app` present but not running: the
-/// shape a start leaves when Docker's leftovers stop a container (see
-/// [`run_recovering`]).
-fn half_started(ps_json: &str) -> bool {
-    parse_ps(ps_json).iter().any(|e| {
-        matches!(e.service.as_str(), "db" | "app") && !e.state.to_lowercase().contains("running")
-    })
+/// `(network, container)` for each of this site's `db`/`app` containers that
+/// isn't running yet still holds an endpoint in one of its networks — Docker's
+/// leftover that [`run_recovering`] clears. Best effort: any failed probe
+/// counts as "none found", so the original error stands.
+fn stale_endpoints(stack: &Stack) -> Vec<(String, String)> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let Some(out) = docker::try_capture_empty_ok(ps) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for name in stopped_service_containers(&out) {
+        let mut nets = docker::docker();
+        nets.args([
+            "inspect",
+            "-f",
+            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
+            &name,
+        ]);
+        let Some(nets) = docker::try_capture(nets) else {
+            continue;
+        };
+        for network in nets.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            let mut members = docker::docker();
+            members.args([
+                "network",
+                "inspect",
+                "-f",
+                "{{range .Containers}}{{.Name}}\n{{end}}",
+                network,
+            ]);
+            if docker::try_capture(members).is_some_and(|m| holds_endpoint(&m, &name)) {
+                found.push((network.to_string(), name.clone()));
+            }
+        }
+    }
+    found
+}
+
+/// Names of the `db`/`app` containers `compose ps -a` lists as not running.
+fn stopped_service_containers(ps_json: &str) -> Vec<String> {
+    parse_ps(ps_json)
+        .into_iter()
+        .filter(|e| {
+            matches!(e.service.as_str(), "db" | "app")
+                && !e.state.to_lowercase().contains("running")
+                && !e.name.is_empty()
+        })
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Whether `network inspect`'s endpoint names (one per line) include `name`.
+fn holds_endpoint(members: &str, name: &str) -> bool {
+    members.lines().any(|l| l.trim() == name)
 }
 
 /// Stop the site. With the engine up, Stop is its Rest (DECISIONS 0488):
@@ -1812,9 +1878,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
     match start_action(observe_container(stack)) {
         StartAction::Start => {
-            let mut c = compose(stack);
-            c.arg("start");
-            run_recovering(stack, c, "start the appliance", r)?;
+            run_recovering(stack, &["start"], "start the appliance", r)?;
         }
         StartAction::Up => up(stack, r)?,
     }
@@ -2806,6 +2870,7 @@ pub fn restore_with(
         "Backing up your site as it is now…",
         0.0,
         0.0,
+        Some(file),
         r,
     );
     restore(stack, file, r).map_err(|e| match &before {
@@ -2828,6 +2893,7 @@ fn safety_backup(
     headline: &str,
     base: f32,
     span: f32,
+    protect: Option<&Path>,
     r: &mut dyn Reporter,
 ) -> Option<PathBuf> {
     if !status(stack).running {
@@ -2848,7 +2914,7 @@ fn safety_backup(
                 &format!("Backup saved: {}", path.display()),
                 at(base + span),
             );
-            prune_automatic_backups(stack, r);
+            prune_automatic_backups(stack, protect, r);
             Some(path)
         }
         Err(e) => {
@@ -3118,7 +3184,7 @@ fn automatic_backups_to_prune(backups: &[Backup], keep: usize) -> Vec<&Backup> {
                     .strip_prefix(l)
                     .and_then(|rest| rest.strip_prefix('-'))
                     .is_some_and(|rest| {
-                        rest.len() >= 15 && rest[..8].bytes().all(|c| c.is_ascii_digit())
+                        rest.len() >= 15 && rest.as_bytes()[..8].iter().all(u8::is_ascii_digit)
                     })
             })
         })
@@ -3134,9 +3200,14 @@ fn automatic_backups_to_prune(backups: &[Backup], keep: usize) -> Vec<&Backup> {
 /// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] automatic backups; delete older
 /// ones. Runs only after a new automatic backup succeeded, so there are always
 /// at least that many to go back to. A file that won't delete is logged, not fatal.
-fn prune_automatic_backups(stack: &Stack, r: &mut dyn Reporter) {
+fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Reporter) {
     let backups = list_backups(stack);
     for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT) {
+        // Never the backup a restore is about to load (review 2026-11-14: a
+        // prune after the before-restore backup could delete the owner's pick).
+        if protect.is_some_and(|p| Path::new(&b.path) == p) {
+            continue;
+        }
         match std::fs::remove_file(&b.path) {
             Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
             Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),
@@ -3650,6 +3721,7 @@ mod tests {
             b("20261001-090000.tar.gz", 0),
             b("before-redesign-20261001-090000.tar.gz", 0),
             b("before-update-notes.tar.gz", 0),
+            b("before-update-éé-20261101.tar.gz", 0),
         ];
         let gone: Vec<&str> = automatic_backups_to_prune(&all, 3)
             .iter()
@@ -3666,32 +3738,40 @@ mod tests {
     }
 
     #[test]
-    fn a_start_is_retried_only_when_docker_left_the_site_half_started() {
-        // The 0.29.0 update on 2026-11-14: a stale network endpoint stopped db
-        // (exited 1) and left the new app container created, not running.
-        let stale = "{\"Service\":\"db\",\"State\":\"exited\"}\n{\"Service\":\"app\",\"State\":\"created\"}";
-        assert!(half_started(stale));
-        // Everything running, nothing there, or only edge down: not ours to retry.
-        assert!(!half_started(
-            r#"[{"Service":"db","State":"running"},{"Service":"app","State":"running"}]"#
+    fn only_a_stopped_container_still_holding_its_endpoint_is_recovered() {
+        // The 2026-11-14 update: db exited, its endpoint left in atelier_default,
+        // and the new app container created but not running.
+        let ps = "{\"Name\":\"atelier-db-1\",\"Service\":\"db\",\"State\":\"exited\"}\n\
+                  {\"Name\":\"atelier-app-1\",\"Service\":\"app\",\"State\":\"created\"}\n\
+                  {\"Name\":\"atelier-edge-1\",\"Service\":\"edge\",\"State\":\"exited\"}";
+        assert_eq!(
+            stopped_service_containers(ps),
+            ["atelier-db-1", "atelier-app-1"]
+        );
+        assert!(stopped_service_containers(
+            r#"[{"Name":"atelier-db-1","Service":"db","State":"running"}]"#
+        )
+        .is_empty());
+        // Only a container the network still lists is a leftover; a cleanly
+        // stopped one holds no endpoint, so `compose start` errors stay as they are.
+        assert!(holds_endpoint(
+            "atelier-edge-1\natelier-db-1\n",
+            "atelier-db-1"
         ));
-        assert!(!half_started(""));
-        assert!(!half_started(
-            r#"[{"Service":"db","State":"running"},{"Service":"app","State":"running"},{"Service":"edge","State":"exited"}]"#
-        ));
-        // The message names the step the owner can take and that the data is safe.
+        assert!(!holds_endpoint("atelier-edge-1\n", "atelier-db-1"));
+        assert!(!holds_endpoint("atelier-db-10\n", "atelier-db-1"));
         assert!(START_STUCK.contains("Restart Docker Desktop"));
         assert!(START_STUCK.contains("data is safe"));
     }
 
     use super::{
         automatic_backups_to_prune, backup_dump_script, backup_pack_script,
-        container_state_from_ps, half_started, is_backup_file, is_snapshot_bundle, list_backups,
+        container_state_from_ps, holds_endpoint, is_backup_file, is_snapshot_bundle, list_backups,
         parse_extension_list, parse_http_status, parse_local_probe, parse_remote_probe,
         parse_serialized_extensions, plan_route, plan_route_with, registry_problem,
-        remote_probe_with, restore_bundle_scripts, start_action, waypoint_image, Backup,
-        ContainerState, ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS,
-        REGISTRY_OFFLINE, START_STUCK,
+        remote_probe_with, restore_bundle_scripts, start_action, stopped_service_containers,
+        waypoint_image, Backup, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
+        MAX_WAYPOINTS, REGISTRY_OFFLINE, START_STUCK,
     };
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
