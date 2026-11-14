@@ -357,6 +357,9 @@ enum AppCommand {
         /// Only list what would be removed.
         #[arg(long)]
         dry_run: bool,
+        /// Remove without asking first.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Tail the appliance logs.
     Logs {
@@ -1401,18 +1404,15 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             );
             Ok(())
         }
-        AppCommand::Cleanup { dry_run } => {
+        AppCommand::Cleanup { dry_run, yes } => {
             use aincient_core::cleanup::{find, free, human_bytes, Scope};
-            let report = if dry_run {
-                find(Scope::Everything)
-            } else {
-                free(Scope::Everything)
-            }
-            .context("couldn't ask Docker which images are in use; is Docker running?")?;
-            if report.images.is_empty() {
+            let found = find(Scope::Everything)?;
+            if found.images.is_empty() {
                 println!("Nothing to remove: Atelier has no unused downloads on this computer.");
-            } else {
-                for i in &report.images {
+                return Ok(());
+            }
+            let list = |images: &[aincient_core::cleanup::Reclaimable]| {
+                for i in images {
                     let name = i
                         .names
                         .first()
@@ -1420,14 +1420,35 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
                         .unwrap_or_else(|| format!("{} (old version)", i.repo));
                     println!("  {}  {name}", human_bytes(i.size_bytes));
                 }
+            };
+            let count = |n: usize| format!("{n} image{}", if n == 1 { "" } else { "s" });
+            list(&found.images);
+            if dry_run {
                 println!(
-                    "{} {} image{} (up to {}). Your sites' data and backups are untouched.",
-                    if dry_run { "Would remove" } else { "Removed" },
-                    report.images.len(),
-                    if report.images.len() == 1 { "" } else { "s" },
-                    human_bytes(report.total_bytes)
+                    "Would remove {} (up to {}). Your sites' data and backups are untouched.",
+                    count(found.images.len()),
+                    human_bytes(found.total_bytes)
                 );
+                return Ok(());
             }
+            let question = format!(
+                "Remove {} (up to {})? Each downloads again when a site needs it.",
+                count(found.images.len()),
+                human_bytes(found.total_bytes)
+            );
+            if !confirm(&question, yes)? {
+                println!("{}", style::warn("Aborted."));
+                return Ok(());
+            }
+            // Only what was listed: anything that became removable since stays.
+            let shown: std::collections::HashSet<String> =
+                found.images.iter().map(|i| i.id.clone()).collect();
+            let report = free(Scope::Everything, Some(&shown))?;
+            println!(
+                "Removed {} (up to {}). Your sites' data and backups are untouched.",
+                count(report.images.len()),
+                human_bytes(report.total_bytes)
+            );
             for f in &report.failed {
                 println!("  Kept {f}: Docker says it's in use.");
             }

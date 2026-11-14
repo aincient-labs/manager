@@ -1001,7 +1001,7 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
 /// replaced database/web-server images no container uses (DECISIONS 0527).
 /// Best effort and quiet: a leftover only costs disk, never the update.
 fn tidy_after_update(r: &mut dyn Reporter) {
-    if let Some(done) = crate::cleanup::free(crate::cleanup::Scope::AfterUpdate) {
+    if let Ok(done) = crate::cleanup::free(crate::cleanup::Scope::AfterUpdate, None) {
         if !done.images.is_empty() {
             r.log(&format!(
                 "Removed {} old Atelier download{} (up to {}).",

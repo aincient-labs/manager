@@ -453,25 +453,26 @@ async fn list_backups(sel: State<'_, Selected>) -> Result<Vec<Backup>, String> {
 }
 
 /// What "Free up space" would remove: Atelier's unused downloads on this
-/// computer (DECISIONS 0527). Machine-wide, not per site. `None` when Docker
-/// can't be asked.
+/// computer that no registered site needs (DECISIONS 0527). Machine-wide, not
+/// per site.
 #[tauri::command]
 async fn find_cleanup() -> Result<Option<aincient_core::cleanup::Report>, String> {
     blocking(|| {
-        Ok(aincient_core::cleanup::find(
-            aincient_core::cleanup::Scope::Everything,
-        ))
+        aincient_core::cleanup::find(aincient_core::cleanup::Scope::Everything)
+            .map(Some)
+            .map_err(|e| format!("{e:#}"))
     })
     .await
 }
 
-/// Remove them. Sites' data and backups are never touched.
+/// Remove the images the owner confirmed (`ids`, from [`find_cleanup`]) that
+/// can still go. Sites' data and backups are never touched.
 #[tauri::command]
-async fn do_cleanup() -> Result<aincient_core::cleanup::Report, String> {
-    blocking(|| {
-        aincient_core::cleanup::free(aincient_core::cleanup::Scope::Everything).ok_or_else(|| {
-            "Couldn't ask Docker which images are in use. Is Docker running?".to_string()
-        })
+async fn do_cleanup(ids: Vec<String>) -> Result<aincient_core::cleanup::Report, String> {
+    blocking(move || {
+        let shown: std::collections::HashSet<String> = ids.into_iter().collect();
+        aincient_core::cleanup::free(aincient_core::cleanup::Scope::Everything, Some(&shown))
+            .map_err(|e| format!("{e:#}"))
     })
     .await
 }

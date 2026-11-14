@@ -1890,10 +1890,24 @@ function decimalBytes(n) {
   return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.max(1, Math.round(mb))} MB`;
 }
 
+// While a clean-up runs, a refresh (the System tab reopening) must not turn
+// the button back on.
+let cleaning = false;
+// The last list shown, so the confirmation names exactly what will go.
+let cleanupFound = null;
+
+function cleanupLabel(i) {
+  return i.names[0] || `${i.repo} (old version)`;
+}
+
 async function loadCleanup() {
   const btn = $("free-space");
+  if (cleaning) return;
   try {
     const r = await invoke("find_cleanup");
+    if (cleaning) return;
+    cleanupFound = r;
+    $("cleanup-summary").title = "";
     if (!r) {
       $("cleanup-summary").textContent = "Docker isn't answering";
       btn.disabled = true;
@@ -1904,8 +1918,11 @@ async function loadCleanup() {
       ? `${decimalBytes(r.total_bytes)} can be freed (${n} download${n === 1 ? "" : "s"})`
       : "Nothing to free";
     btn.disabled = n === 0;
-  } catch {
+  } catch (e) {
+    if (cleaning) return;
+    cleanupFound = null;
     $("cleanup-summary").textContent = "—";
+    $("cleanup-summary").title = String(e);
     btn.disabled = true;
   }
 }
@@ -2591,18 +2608,34 @@ const actions = {
   "free-space": async () => {
     const btn = $("free-space");
     const status = $("cleanup-status");
+    const found = cleanupFound;
+    if (cleaning || !found || !found.images.length) return;
+    const n = found.images.length;
+    const lines = found.images
+      .map((i) => `${decimalBytes(i.size_bytes)}  ${cleanupLabel(i)}`)
+      .join("\n");
+    const ok = await confirmModal(
+      `${lines}\n\nEach downloads again when a site needs it. Your sites' data and backups are untouched.`,
+      {
+        title: `Remove ${n} download${n === 1 ? "" : "s"} (up to ${decimalBytes(found.total_bytes)})?`,
+      }
+    );
+    if (!ok) return;
+    cleaning = true;
     btn.disabled = true;
     status.classList.remove("hidden");
     status.textContent = "Removing unused downloads…";
     try {
-      const r = await invoke("do_cleanup");
-      const n = r.images.length;
-      status.textContent = n
-        ? `Freed up to ${decimalBytes(r.total_bytes)} (${n} download${n === 1 ? "" : "s"}). Your sites' data and backups are untouched.`
+      const r = await invoke("do_cleanup", { ids: found.images.map((i) => i.id) });
+      const m = r.images.length;
+      status.textContent = m
+        ? `Freed up to ${decimalBytes(r.total_bytes)} (${m} download${m === 1 ? "" : "s"}). Your sites' data and backups are untouched.`
         : "Nothing to remove.";
       if (r.failed.length) status.textContent += ` Kept ${r.failed.length} that Docker says are in use.`;
     } catch (e) {
       status.textContent = String(e);
+    } finally {
+      cleaning = false;
     }
     loadCleanup();
   },

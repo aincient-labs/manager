@@ -23,8 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Free up space** (System → Disk space, or `atelier app cleanup`) removes Atelier's downloads that
   no site is using: old versions, and the database and web-server images Atelier has moved away from.
-  After a successful update, old versions are removed automatically. Your sites' data, your backups and
-  other programs' images are never touched; anything removed downloads again when a site needs it.
+  It lists what will go, with sizes, and asks first (`--yes` skips the question, `--dry-run` only
+  lists). After a successful update, old versions are removed automatically. Anything one of your
+  sites needs to start stays, even while that site is stopped, as do images that can't be downloaded
+  again (your own builds) and the database and web-server images other programs may share. Your
+  sites' data, your backups and other programs' images are never touched; anything removed downloads
+  again when a site needs it.
 
 ### Changed
 
