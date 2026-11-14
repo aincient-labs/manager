@@ -203,7 +203,7 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about nine minutes together (21 scenarios, 536 s on OrbStack; 15–40 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about nine minutes together (21 scenarios, 542 s on OrbStack; 15–40 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
@@ -214,10 +214,26 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
   real backups and restores run. Tests then call the real `ops`/`doctor`/`cleanup` functions.
 - gives the Manager a temp user home for the whole run, so `~/.atelier/sites.toml` (which
   clean-up reads) is the scenario's own, never yours.
-- only ever addresses compose projects named `atelier-scn-<test>-<n>`, and refuses any other.
+- only ever addresses compose projects named `atelier-scn-<test>-<pid>-<n>`, and refuses any other.
 - cleans up when the test ends, passed or failed: `compose down -v`, then every image tag and
   image the test built. Images it did not build are never touched; a scenario whose update would
   run the automatic clean-up refuses to run if that clean-up would remove anything here.
+- **on a failed scenario**, prints before tearing down (to the test's output, so a CI log alone
+  says why), between `===== scenario site <project>: state before teardown =====` markers:
+  `docker compose ps -a`, each container's `State` + restart count (never `Config`/`Env`), and
+  its last 200 log lines with Docker's timestamps, stdout and stderr merged by time.
+- **`ATELIER_SCN_KEEP=1`**: a failed scenario's site is left running instead, with the commands to
+  look at it (`docker compose -p <project> ps -a` / `logs` in its temp dir) and to remove it by
+  hand (`docker compose -p <project> down -v`, `docker image rm <its tags and images>`,
+  `rm -rf <its temp dir>`). Its dir gets a `.scn-kept` file; later runs leave it alone until
+  that file is gone.
+- **cleans up after a killed run** (SIGKILL, a CI cancel: `Drop` never runs). Every container
+  (an overlay's `labels:`) and image (`docker build --label`) carries `atelier.scn.pid=<test
+  process pid>`, and the first harness call of a run sweeps `atelier-scn-*` projects, images and
+  temp dirs whose owning process is gone (`sweep_dead_runs`; the decision is the pure
+  `sweepable`, unit-tested in plain `cargo test`). A live run's projects (parallel runs) and
+  anything not `atelier-scn-*` are never touched. CI also has an `if: always()` step that removes
+  every `atelier-scn-*` leftover after the scenarios job.
 
 | Scenario | File | What it holds |
 |---|---|---|
@@ -242,6 +258,27 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 17 | `site_busy.rs` | an update holds the site (slow boot, on another thread): a restore and a start asked meanwhile are refused (`SiteBusy`, "an update started …"); after it ends, start, backup and restore run |
 | 17b | `site_busy.rs` | another process takes the site's lock and is killed: its lock went with it, the next start runs |
 | 18 | `update_failed_logs.rs` | a failed update (`no_backup`, converge FATAL) saves `logs/update-*.log` with compose ps, each service's State and timestamped logs incl. the FATAL; the error names it; no `DB_PASSWORD` value, no env |
+
+**Guard: every changing call names its scenario** (`crates/aincient-core/tests/docker_guard.rs`,
+runs in plain `cargo test`). It scans `crates/*/src` (not test code) for calls that change the
+owner's Docker (a `docker`/`compose` argument list with `rm`, `rmi`, `up`, `down`, `update`,
+`restart`, `start`, `stop`, `kill`, `tag`, `pull`, `prune`, `network connect|disconnect`, `cp`
+into a container, or a runtime restart) or delete/overwrite files in `aincient-core`
+(`remove_file`, `remove_dir_all`, `fs::write`, `fs::rename`, `write_atomic`, …). Each must carry,
+on its statement or in the comment lines directly above:
+
+```rust
+// scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks
+// scenario: none — <why no scenario covers it yet>
+```
+
+A named scenario must be a `#[test]` fn in `tests/scenarios/`. `none` must also be listed, with
+its reason, in `crates/aincient-core/tests/docker_guard_allow.txt` (`<path> | <fn> | <what> |
+<reason>`): that file is the backlog of changing calls no scenario covers. A new unannotated
+call, a name that is no test, an unlisted `none`, or a stale allowlist line fails the build. The
+scanner reads string literals, so it can't see command words built at run time or a script
+run inside a container; the file's header lists its limits. To list every call it finds:
+`ATELIER_GUARD_LIST=1 cargo test -p aincient-core --test docker_guard -- --exact list --nocapture`.
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
