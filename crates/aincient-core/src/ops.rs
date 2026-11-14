@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::boot::{self, Boot};
 use crate::docker::{
     self, compose, preflight, run_capture, run_inherited, run_streaming, try_capture,
 };
@@ -472,11 +473,11 @@ impl ModelRole {
 }
 
 #[derive(Deserialize)]
-struct PsEntry {
+pub(crate) struct PsEntry {
     #[serde(rename = "Name", default)]
-    name: String,
+    pub(crate) name: String,
     #[serde(rename = "Service", default)]
-    service: String,
+    pub(crate) service: String,
     #[serde(rename = "State", default)]
     state: String,
 }
@@ -542,15 +543,22 @@ pub fn is_running(stack: &Stack) -> bool {
 }
 
 /// Poll the console until it serves a healthy response, or `timeout` elapses,
-/// reporting boot progress as it goes. Returns `true` once it's ready.
+/// reporting boot progress as it goes.
 ///
 /// This is what holds the manager's "ready" signal back until Drupal has
 /// actually finished booting (site install, `converge.sh` migrations) instead of
-/// the moment the container reports "running".
-pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> bool {
+/// the moment the container reports "running". Every [`boot::LOOK_EVERY`] it
+/// also looks at the containers and the app's log since it last started, so a
+/// boot that has already failed, or a site or Docker that went away, ends the
+/// wait with the reason instead of running out the clock; and it reads the log
+/// once more before calling an answering site ready, because the entrypoint
+/// starts the web server even after a failed converge ([`Boot`]).
+pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> Boot {
     let port = stack.http_port();
     let started = Instant::now();
     let deadline = started + timeout;
+    let mut next_look = started + boot::LOOK_EVERY;
+    let mut strikes = boot::Strikes::default();
     r.stage(
         Stage::Booting,
         "Waiting for the console to finish booting…",
@@ -558,8 +566,20 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
     );
     loop {
         if http_ready(port) {
+            let look = boot::look(stack, false);
+            if let Some(why) = look.log.as_deref().and_then(boot::boot_failure) {
+                return boot_failed(r, &look, why);
+            }
             r.stage(Stage::Ready, "The console is up.", Some(1.0));
-            return true;
+            return Boot::Ready;
+        }
+        let now = Instant::now();
+        if now >= next_look {
+            let look = boot::look(stack, true);
+            if let Some(why) = boot::judge(&look, &mut strikes) {
+                return boot_failed(r, &look, why);
+            }
+            next_look = Instant::now() + boot::LOOK_EVERY;
         }
         if Instant::now() >= deadline {
             r.stage(
@@ -567,7 +587,7 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
                 "Still booting — this is taking longer than usual.",
                 Some(0.95),
             );
-            return false;
+            return Boot::Booting;
         }
         // Creep the bar across the boot window (0.72 → 0.95) and tick the timer.
         let elapsed = started.elapsed();
@@ -579,6 +599,23 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
         );
         std::thread::sleep(Duration::from_millis(750));
     }
+}
+
+/// End a wait as failed: the app's own failure lines go to the log (a bug
+/// report wants them), the reason to the caller.
+fn boot_failed(r: &mut dyn Reporter, look: &boot::Look, why: String) -> Boot {
+    for line in look
+        .log
+        .iter()
+        .flat_map(|l| l.lines())
+        .filter(|l| l.contains("[converge] FATAL") || l.contains("converge FAILED"))
+    {
+        r.log(line);
+    }
+    for (network, container) in &look.half_attached {
+        r.log(&format!("Half attached: {container} in {network}"));
+    }
+    Boot::Failed(why)
 }
 
 /// Run a chatty step, relaying its output to the reporter (GUI) or letting it
@@ -906,7 +943,7 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     }
     pull(stack, r)?;
     up(stack, r)?;
-    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+    wait_until_ready(stack, READY_TIMEOUT, r).ready()
 }
 
 /// Pull a newer image and recreate the stack — the upgrade path. Plans the route
@@ -1048,7 +1085,7 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
         retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
         up(stack, r)?;
-        let ready = wait_until_ready(stack, READY_TIMEOUT, r);
+        let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
         if ready {
             return move_db_image(stack, r);
         }
@@ -1116,7 +1153,21 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
         stack.set_image(&step.image)?;
         pull(stack, &mut hop)?;
         up(stack, &mut hop)?;
-        let ready = wait_until_ready(stack, READY_TIMEOUT, &mut hop);
+        let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
+            Boot::Ready => true,
+            Boot::Booting => false,
+            // Failed is never "carry on": the next hop would meet a database
+            // this one didn't migrate.
+            Boot::Failed(why) if step.is_target => return Boot::Failed(why).ready(),
+            Boot::Failed(why) => {
+                return Err(boot::BootFailed(format!(
+                    "Step {} of {total} ({label}) failed, so the rest of the update was not \
+                     attempted. {why}",
+                    i + 1
+                ))
+                .into())
+            }
+        };
 
         if !ready {
             // Deliberately an error, not a `false`: on a multi-hop route "still
@@ -1210,7 +1261,7 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         "move the database server",
         r,
     )?;
-    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+    wait_until_ready(stack, READY_TIMEOUT, r).ready()
 }
 
 /// Whether the running `app` container's converge carries the collation step.
@@ -1416,7 +1467,8 @@ pub fn switch_channel(
     preflight().require()?;
     pull(stack, r)?;
     up(stack, r)?;
-    Ok((image, Some(wait_until_ready(stack, READY_TIMEOUT, r))))
+    let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+    Ok((image, Some(ready)))
 }
 
 /// `docker compose pull`, with a registry-login hint for the private image.
@@ -1981,7 +2033,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
             }
         })?;
         say(r, &said);
-        return Ok(wait_until_ready(stack, START_READY_TIMEOUT, r));
+        return wait_until_ready(stack, START_READY_TIMEOUT, r).ready();
     }
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
     match start_action(observe_container(stack)) {
@@ -1990,7 +2042,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         }
         StartAction::Up => up(stack, r)?,
     }
-    Ok(wait_until_ready(stack, START_READY_TIMEOUT, r))
+    wait_until_ready(stack, START_READY_TIMEOUT, r).ready()
 }
 
 /// `docker compose down`. With `wipe_data`, also removes the volumes — a
@@ -3595,7 +3647,7 @@ fn ensure_running(stack: &Stack) -> Result<()> {
     Ok(())
 }
 
-fn parse_ps(out: &str) -> Vec<PsEntry> {
+pub(crate) fn parse_ps(out: &str) -> Vec<PsEntry> {
     let trimmed = out.trim();
     if trimmed.is_empty() {
         return Vec::new();

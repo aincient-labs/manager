@@ -10,6 +10,7 @@
 //!
 //! [`atelier` CLI]: ../atelier/index.html
 
+pub mod boot;
 pub mod cleanup;
 pub mod docker;
 pub mod doctor;
@@ -28,6 +29,7 @@ pub mod ssh_key;
 pub mod stack;
 pub mod update_cache;
 
+pub use boot::{Boot, BootFailed};
 pub use docker::{preflight, Preflight, PullEvent};
 pub use doctor::{Check, HostTier, Repair, Report, Severity, Tier};
 pub use guard::ChangeGuard;

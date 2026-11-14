@@ -672,6 +672,16 @@ struct CliReporter {
     plan: Vec<ops::PlanStep>,
 }
 
+/// A wait that ends in an error leaves the booting line open; close it, so the
+/// `error:` line starts on its own.
+impl Drop for CliReporter {
+    fn drop(&mut self) {
+        if self.open_line {
+            println!();
+        }
+    }
+}
+
 /// `[2/4] message` when the fraction falls inside an announced step; the final
 /// 100% headline stays bare.
 fn numbered(plan: &[ops::PlanStep], message: &str, fraction: Option<f32>) -> String {

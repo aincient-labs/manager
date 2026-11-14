@@ -352,13 +352,13 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // to minutes. Re-diagnosing immediately would ask a half-booted
             // Drupal whether it bootstraps, get "no", and escalate to a repair
             // the site never needed. Wait for it to actually serve first.
-            if ops::wait_until_ready(stack, ops::READY_TIMEOUT, r) {
-                Ok(None)
-            } else {
-                Ok(Some(
+            match ops::wait_until_ready(stack, ops::READY_TIMEOUT, r) {
+                crate::Boot::Ready => Ok(None),
+                crate::Boot::Booting => Ok(Some(
                     "started, but the console hasn't answered yet — it may still be booting"
                         .to_string(),
-                ))
+                )),
+                crate::Boot::Failed(why) => Err(why),
             }
         }
         Repair::CacheRebuild => drush(stack, &["cache:rebuild"]).map(Some),
@@ -884,6 +884,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             ("stack.files_current", "Stack files match this manager"),
             ("stack.db", "Database container healthy"),
             ("stack.app", "Appliance container running"),
+            ("stack.network", NETWORK_LABEL),
         ] {
             out.push(Check::skipped(id, Tier::Stack, label, why));
         }
@@ -945,7 +946,40 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     let app = check_container(stack, "app", "stack.app", "Appliance container running");
     let app_up = app.severity.is_ok();
     out.push(app);
+    out.push(network_verdict(crate::boot::half_attached_now(stack)));
     app_up
+}
+
+const NETWORK_LABEL: &str = "Containers attached to the site's network";
+
+/// Docker's half-attached network (review-tmp, 2026-11-14): a running container
+/// the site's network lists has no address on it, or the reverse. Not fixable
+/// here: only restarting Docker cleared it, so the remedy is the owner's, in
+/// the same words a start that runs into it uses.
+fn network_verdict(half_attached: Option<Vec<(String, String)>>) -> Check {
+    match half_attached {
+        None => Check::skipped(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            "Docker didn't answer.",
+        ),
+        Some(found) if found.is_empty() => Check::ok("stack.network", Tier::Stack, NETWORK_LABEL),
+        Some(found) => Check::bad(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            Severity::Fail,
+            crate::boot::NETWORK_STUCK,
+        )
+        .detail(
+            found
+                .iter()
+                .map(|(network, container)| format!("{container} is half attached to {network}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    }
 }
 
 /// The EXPERIMENTAL engine (DECISIONS 0483), only on a stack that opted in:
@@ -1501,6 +1535,23 @@ fn health_detail(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_half_attached_network_fails_the_checkup_with_the_restart_docker_remedy() {
+        let c = network_verdict(Some(vec![(
+            "atelier-review-tmp_default".into(),
+            "atelier-review-tmp-db-1".into(),
+        )]));
+        assert_eq!(c.severity, Severity::Fail);
+        assert!(c.fix.is_none(), "detected, never repaired");
+        assert_eq!(c.remedy.as_deref(), Some(crate::boot::NETWORK_STUCK));
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("atelier-review-tmp-db-1 is half attached to atelier-review-tmp_default")
+        );
+        assert_eq!(network_verdict(Some(Vec::new())).severity, Severity::Ok);
+        assert_eq!(network_verdict(None).severity, Severity::Skipped);
+    }
 
     #[test]
     fn default_db_password_warns_without_a_fix() {

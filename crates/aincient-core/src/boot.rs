@@ -1,0 +1,655 @@
+//! What a wait for the site found: ready, still booting, or failed (M3).
+//!
+//! The console answering is not enough to call a site ready. The appliance's
+//! entrypoint starts the web server even after a failed converge, on the
+//! rolled-back state (`cms/docker/entrypoint.sh`), so a site whose update or
+//! database check failed answers HTTP anyway. And a converge that gave up on its
+//! database leaves the site serving nothing for minutes while the wait counts
+//! down. So [`crate::ops::wait_until_ready`] also reads the app's own log, by
+//! Docker's clock, from the moment the container last started, and looks at the
+//! containers themselves every few seconds ([`look`] + [`judge`]).
+
+use std::collections::HashMap;
+use std::fmt;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::docker::{self, compose, preflight, LOCAL_PROBE_TIMEOUT};
+use crate::stack::Stack;
+
+/// How a wait for the site came out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Boot {
+    /// The console answered and the app's log shows no failed converge.
+    Ready,
+    /// Nothing failed that we could see, but it hadn't answered when the wait
+    /// ran out.
+    Booting,
+    /// The site won't come up by itself; the reason in plain words.
+    Failed(String),
+}
+
+impl Boot {
+    /// `Ok(true)` ready, `Ok(false)` still booting; a failed boot is an error
+    /// ([`BootFailed`]), so nothing after it (a backup prune, the next hop of
+    /// an update) runs as if it had worked, and the CLI exits non-zero.
+    pub fn ready(self) -> anyhow::Result<bool> {
+        match self {
+            Boot::Ready => Ok(true),
+            Boot::Booting => Ok(false),
+            Boot::Failed(why) => Err(BootFailed(why).into()),
+        }
+    }
+}
+
+/// The error a [`Boot::Failed`] becomes. Its text is the reason, already
+/// phrased for the owner; the GUI finds it by type to show its failure panel.
+#[derive(Debug)]
+pub struct BootFailed(pub String);
+
+impl fmt::Display for BootFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BootFailed {}
+
+/// How often the wait looks at the containers and the app's log.
+pub(crate) const LOOK_EVERY: Duration = Duration::from_secs(5);
+
+const CHECKUP: &str = "Run a checkup (System → Troubleshoot, or `atelier doctor`) to see why.";
+
+/// Docker's network for the site is half attached (review-tmp, 2026-11-14):
+/// a running container the network lists has no address on it, or the reverse.
+/// Detected, never repaired: only restarting Docker cleared it.
+pub const NETWORK_STUCK: &str = "Docker's network for your site is only half connected, so \
+     its parts can't reach each other. Restart Docker Desktop, then start your site again. \
+     Your site's data is safe.";
+
+const DOCKER_STOPPED: &str = "Docker stopped while your site was starting. Start Docker \
+     Desktop, then start your site again. Your site's data is safe.";
+
+const SITE_STOPPED: &str = "Your site stopped while it was starting. Start it again; if it \
+     stops again, run a checkup (System → Troubleshoot, or `atelier doctor`).";
+
+/// The reason a converge gave, in plain words, when the app's log says it
+/// failed: `[converge] FATAL: …` (`converge.sh`'s `die`) or the entrypoint's
+/// `converge FAILED` line. `None` when neither is there.
+pub(crate) fn boot_failure(log: &str) -> Option<String> {
+    let fatal = log
+        .lines()
+        .find_map(|l| l.split_once("[converge] FATAL:").map(|(_, why)| why.trim()));
+    let why = match fatal {
+        Some(why) => why,
+        None if log.lines().any(|l| l.contains("converge FAILED")) => "",
+        None => return None,
+    };
+    let said = if why.contains("database not reachable") {
+        "Your site can't reach its database, so it couldn't finish starting.".to_string()
+    } else if why.contains("rolled back to pre-upgrade snapshot") {
+        "The new version couldn't finish updating your site, so your site was put back \
+         the way it was before the update."
+            .to_string()
+    } else if why.contains("installed modules absent from this image") {
+        format!(
+            "This version is missing parts your site uses, so it left your site as it was ({why})."
+        )
+    } else if why.contains("with an image that requires") {
+        format!("Your site is too old for this version to update it directly ({why}).")
+    } else if why.is_empty() {
+        "Your site couldn't finish starting.".to_string()
+    } else {
+        format!("Your site couldn't finish starting ({why}).")
+    };
+    Some(format!("{said} {CHECKUP}"))
+}
+
+/// One look at a booting site.
+#[derive(Debug, Default)]
+pub(crate) struct Look {
+    /// Docker answered.
+    pub docker: bool,
+    /// The `app` container, if there is one: running, and when it last started.
+    pub app: Option<AppRun>,
+    /// The app's log since it last started; `None` when that probe failed.
+    pub log: Option<String>,
+    /// `(network, container)` pairs Docker has half attached ([`half_attached`]).
+    pub half_attached: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AppRun {
+    pub name: String,
+    pub running: bool,
+    pub started_at: String,
+}
+
+/// What the looks so far add up to. Stopping and a half-attached network have
+/// to be seen twice in a row (one [`LOOK_EVERY`] apart) before they end the
+/// wait, so a container caught mid-start never fails a healthy boot.
+#[derive(Debug, Default)]
+pub(crate) struct Strikes {
+    stopped: u8,
+    network: u8,
+}
+
+/// Whether this look ends the wait, and why.
+pub(crate) fn judge(look: &Look, strikes: &mut Strikes) -> Option<String> {
+    if !look.docker {
+        return Some(DOCKER_STOPPED.to_string());
+    }
+    if let Some(why) = look.log.as_deref().and_then(boot_failure) {
+        // The database is out of reach because the network is half attached:
+        // the owner's step is restarting Docker, not a checkup.
+        if why.contains("can't reach its database") && !look.half_attached.is_empty() {
+            return Some(NETWORK_STUCK.to_string());
+        }
+        return Some(why);
+    }
+    let stopped = !look.app.as_ref().is_some_and(|a| a.running) || look.log.is_none();
+    strikes.stopped = if stopped { strikes.stopped + 1 } else { 0 };
+    if strikes.stopped >= 2 {
+        return Some(SITE_STOPPED.to_string());
+    }
+    strikes.network = if look.half_attached.is_empty() {
+        0
+    } else {
+        strikes.network + 1
+    };
+    if strikes.network >= 2 {
+        return Some(NETWORK_STUCK.to_string());
+    }
+    None
+}
+
+/// `docker inspect` of one container, the fields a look reads.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Inspected {
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "State", default)]
+    state: InspectedState,
+    #[serde(rename = "NetworkSettings", default)]
+    network_settings: InspectedNetworks,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedState {
+    #[serde(rename = "Running", default)]
+    running: bool,
+    #[serde(rename = "StartedAt", default)]
+    started_at: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedNetworks {
+    #[serde(rename = "Networks", default)]
+    networks: Option<HashMap<String, InspectedEndpoint>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectedEndpoint {
+    #[serde(rename = "IPAddress", default)]
+    ip_address: String,
+}
+
+impl Inspected {
+    /// The container name without `docker inspect`'s leading `/`.
+    fn name(&self) -> &str {
+        self.name.trim_start_matches('/')
+    }
+
+    /// The networks this container has an address on.
+    fn addressed(&self) -> Vec<&str> {
+        self.network_settings
+            .networks
+            .iter()
+            .flatten()
+            .filter(|(_, e)| !e.ip_address.is_empty())
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+}
+
+pub(crate) fn parse_inspect(json: &str) -> Vec<Inspected> {
+    serde_json::from_str(json.trim()).unwrap_or_default()
+}
+
+/// `docker network inspect` of one network: its name and the containers it
+/// lists as attached.
+#[derive(Debug, Deserialize)]
+pub(crate) struct NetworkMembers {
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Containers", default)]
+    containers: Option<HashMap<String, NetworkMember>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkMember {
+    #[serde(rename = "Name", default)]
+    name: String,
+}
+
+impl NetworkMembers {
+    fn lists(&self, container: &str) -> bool {
+        self.containers
+            .iter()
+            .flatten()
+            .any(|(_, m)| m.name == container)
+    }
+}
+
+pub(crate) fn parse_network_inspect(json: &str) -> Vec<NetworkMembers> {
+    serde_json::from_str(json.trim()).unwrap_or_default()
+}
+
+/// `(network, container)` for each running container that one of the site's
+/// networks lists while the container has no address on it, or that has an
+/// address on a network that doesn't list it. Docker's half-attached state
+/// (review-tmp, 2026-11-14: the network listed db at .2, db itself had no
+/// network; the app got "No route to host").
+pub(crate) fn half_attached(
+    networks: &[NetworkMembers],
+    containers: &[Inspected],
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for c in containers.iter().filter(|c| c.state.running) {
+        let addressed = c.addressed();
+        for n in networks {
+            if n.lists(c.name()) != addressed.contains(&n.name.as_str()) {
+                out.push((n.name.clone(), c.name().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The site's running `db` and `app` containers by `compose ps` (`name`,
+/// `service`), or `None` when Docker didn't answer.
+fn service_containers(stack: &Stack) -> Option<Vec<(String, String)>> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let out = docker::try_capture_empty_ok(ps)?;
+    Some(
+        crate::ops::parse_ps(&out)
+            .into_iter()
+            .filter(|e| matches!(e.service.as_str(), "db" | "app") && !e.name.is_empty())
+            .map(|e| (e.name, e.service))
+            .collect(),
+    )
+}
+
+fn inspect(names: &[&str]) -> Vec<Inspected> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut c = docker::docker();
+    c.arg("inspect").args(names);
+    docker::try_capture(c)
+        .map(|out| parse_inspect(&out))
+        .unwrap_or_default()
+}
+
+/// The half-attached pairs among `containers`, over the site's own networks.
+fn half_attached_among(stack: &Stack, containers: &[Inspected]) -> Vec<(String, String)> {
+    let mut ls = docker::docker();
+    ls.args([
+        "network",
+        "ls",
+        "--filter",
+        &format!("label=com.docker.compose.project={}", stack.project_name()),
+        "--format",
+        "{{.Name}}",
+    ]);
+    let names: Vec<String> = docker::try_capture(ls)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut c = docker::docker();
+    c.args(["network", "inspect"]).args(&names);
+    let networks = docker::try_capture(c)
+        .map(|out| parse_network_inspect(&out))
+        .unwrap_or_default();
+    half_attached(&networks, containers)
+}
+
+/// The site's half-attached `(network, container)` pairs right now, or `None`
+/// when Docker didn't answer. For doctor.
+pub fn half_attached_now(stack: &Stack) -> Option<Vec<(String, String)>> {
+    let services = service_containers(stack)?;
+    let names: Vec<&str> = services.iter().map(|(n, _)| n.as_str()).collect();
+    Some(half_attached_among(stack, &inspect(&names)))
+}
+
+/// The app's log since its container last started, stdout and stderr
+/// together (`converge.sh` reports FATAL on stderr). `None` when it can't be
+/// read.
+fn app_log(app: &AppRun) -> Option<String> {
+    let mut c = docker::docker();
+    c.args(["logs", "--since", &app.started_at, &app.name]);
+    let out = docker::output_within(&mut c, LOCAL_PROBE_TIMEOUT).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(log)
+}
+
+/// Look at the site. With `network`, also at how Docker attached its
+/// containers (a few more `docker` calls).
+pub(crate) fn look(stack: &Stack, network: bool) -> Look {
+    let Some(services) = service_containers(stack) else {
+        return Look {
+            docker: preflight().ok(),
+            ..Look::default()
+        };
+    };
+    let names: Vec<&str> = services.iter().map(|(n, _)| n.as_str()).collect();
+    let inspected = inspect(&names);
+    let app = services
+        .iter()
+        .find(|(_, s)| s == "app")
+        .and_then(|(n, _)| inspected.iter().find(|i| i.name() == n))
+        .map(|i| AppRun {
+            name: i.name().to_string(),
+            running: i.state.running,
+            started_at: i.state.started_at.clone(),
+        });
+    let log = app.as_ref().and_then(app_log);
+    // A failed read is Docker going away, or the container with it.
+    let docker = log.is_some() || preflight().ok();
+    let half_attached = if network && docker {
+        half_attached_among(stack, &inspected)
+    } else {
+        Vec::new()
+    };
+    Look {
+        docker,
+        app,
+        log,
+        half_attached,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `docker inspect atelier-hardening-test-app-1 atelier-hardening-test-db-1`,
+    /// trimmed to the keys a look reads (2026-11-14), with db as review-tmp had
+    /// it: running and healthy, but with no network at all.
+    const INSPECT_DB_DETACHED: &str = r#"[
+      {
+        "Id": "9772e359133ddd3c21adfb553555d1cd1ac0b1caf54c4d310d0e50b93ffffd09",
+        "Name": "/atelier-hardening-test-app-1",
+        "State": {"Status": "running", "Running": true, "Paused": false, "Restarting": false,
+          "OOMKilled": false, "Dead": false, "Pid": 1544735, "ExitCode": 0, "Error": "",
+          "StartedAt": "2026-11-14T12:08:06.529116477Z", "FinishedAt": "2026-11-14T12:07:34.979414189Z"},
+        "NetworkSettings": {"Networks": {"atelier-hardening-test_default": {
+          "IPAMConfig": null, "Links": null, "Aliases": ["atelier-hardening-test-app-1", "app"],
+          "NetworkID": "17bfd5038b0e6ed9747e209d1b67d967e8166c2aed2e3e5642821902faf70027",
+          "EndpointID": "f830e3d61794ffef0c944df5e8c6db7014818219433ffdd6f45d2bf19f2645ab",
+          "Gateway": "192.168.171.1", "IPAddress": "192.168.171.3", "IPPrefixLen": 24,
+          "DNSNames": ["atelier-hardening-test-app-1", "app", "9772e359133d"]}}}
+      },
+      {
+        "Id": "561110aa79767cf82dfbfec002ef65cd08d44222ee5fd1bca8146f348013503d",
+        "Name": "/atelier-hardening-test-db-1",
+        "State": {"Status": "running", "Running": true, "Paused": false, "Restarting": false,
+          "OOMKilled": false, "Dead": false, "Pid": 1544176, "ExitCode": 0, "Error": "",
+          "StartedAt": "2026-11-14T12:07:55.823410098Z", "FinishedAt": "2026-11-14T12:07:35.339974162Z"},
+        "NetworkSettings": {"Networks": {}}
+      }
+    ]"#;
+
+    /// `docker network inspect atelier-hardening-test_default`, trimmed: the
+    /// network still lists db at .2.
+    const NETWORK: &str = r#"[
+      {
+        "Name": "atelier-hardening-test_default",
+        "Id": "17bfd5038b0e6ed9747e209d1b67d967e8166c2aed2e3e5642821902faf70027",
+        "Scope": "local", "Driver": "bridge",
+        "Labels": {"com.docker.compose.network": "default",
+          "com.docker.compose.project": "atelier-hardening-test"},
+        "Containers": {
+          "3ca00c913a8cabed1aaa5237eea8f2a63e9c2a0c2e846f0990e1c8b569b29c45": {
+            "Name": "atelier-hardening-test-edge-1",
+            "EndpointID": "5719b2f208900b24bc7cffe71e4ff0dad8d29f737eb56ff0b62a311ad5f78c9e",
+            "MacAddress": "0a:3f:d6:ab:3c:b3", "IPv4Address": "192.168.171.4/24", "IPv6Address": ""},
+          "561110aa79767cf82dfbfec002ef65cd08d44222ee5fd1bca8146f348013503d": {
+            "Name": "atelier-hardening-test-db-1",
+            "EndpointID": "9cc70a7144e30a974f4d12eab74bc62096989e613f6b31d0765421110412e527",
+            "MacAddress": "8a:a9:90:47:4f:8c", "IPv4Address": "192.168.171.2/24", "IPv6Address": ""},
+          "9772e359133ddd3c21adfb553555d1cd1ac0b1caf54c4d310d0e50b93ffffd09": {
+            "Name": "atelier-hardening-test-app-1",
+            "EndpointID": "f830e3d61794ffef0c944df5e8c6db7014818219433ffdd6f45d2bf19f2645ab",
+            "MacAddress": "6a:5a:62:a7:0c:ee", "IPv4Address": "192.168.171.3/24", "IPv6Address": ""}
+        }
+      }
+    ]"#;
+
+    #[test]
+    fn a_running_container_the_network_lists_without_an_address_is_half_attached() {
+        let found = half_attached(
+            &parse_network_inspect(NETWORK),
+            &parse_inspect(INSPECT_DB_DETACHED),
+        );
+        assert_eq!(
+            found,
+            [(
+                "atelier-hardening-test_default".to_string(),
+                "atelier-hardening-test-db-1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_container_with_an_address_the_network_doesnt_list_is_half_attached() {
+        // The reverse: app has its address, the network forgot it.
+        let healthy_db = INSPECT_DB_DETACHED.replace(
+            r#""NetworkSettings": {"Networks": {}}"#,
+            r#""NetworkSettings": {"Networks": {"atelier-hardening-test_default": {"IPAddress": "192.168.171.2"}}}"#,
+        );
+        let mut network = parse_network_inspect(NETWORK);
+        network[0]
+            .containers
+            .as_mut()
+            .unwrap()
+            .retain(|_, m| m.name != "atelier-hardening-test-app-1");
+        assert_eq!(
+            half_attached(&network, &parse_inspect(&healthy_db)),
+            [(
+                "atelier-hardening-test_default".to_string(),
+                "atelier-hardening-test-app-1".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_attached_site_or_a_stopped_container_is_not_half_attached() {
+        let healthy = INSPECT_DB_DETACHED.replace(
+            r#""NetworkSettings": {"Networks": {}}"#,
+            r#""NetworkSettings": {"Networks": {"atelier-hardening-test_default": {"IPAddress": "192.168.171.2"}}}"#,
+        );
+        assert!(
+            half_attached(&parse_network_inspect(NETWORK), &parse_inspect(&healthy)).is_empty()
+        );
+        // A stopped db keeps no address; that is stale_endpoints' case, not this one.
+        let mut stopped = parse_inspect(INSPECT_DB_DETACHED);
+        stopped[1].state.running = false;
+        assert!(half_attached(&parse_network_inspect(NETWORK), &stopped).is_empty());
+    }
+
+    /// The tail of `docker logs` of an app whose database stayed out of reach
+    /// (converge.sh `wait_for_db`, then entrypoint.sh).
+    const DB_UNREACHABLE: &str = "[converge] waiting for database… (56s)\n\
+        [converge] waiting for database… (58s)\n\
+        [converge] FATAL: database not reachable after 60s\n\
+        [entrypoint] converge FAILED — starting server on the rolled-back state for inspection\n";
+
+    #[test]
+    fn a_failed_converge_reads_in_plain_words() {
+        let why = boot_failure(DB_UNREACHABLE).unwrap();
+        assert!(
+            why.starts_with("Your site can't reach its database"),
+            "{why}"
+        );
+        assert!(why.contains("atelier doctor"));
+        let rolled = boot_failure(
+            "[converge] upgrade failed — the converged site is not healthy\n\
+             [converge] FATAL: rolled back to pre-upgrade snapshot\n\
+             [entrypoint] converge FAILED — starting server on the rolled-back state for inspection\n",
+        )
+        .unwrap();
+        assert!(
+            rolled.contains("put back the way it was before the update"),
+            "{rolled}"
+        );
+        assert_eq!(
+            boot_failure("[converge] FATAL: post-install health check failed\n").unwrap(),
+            format!(
+                "Your site couldn't finish starting (post-install health check failed). {CHECKUP}"
+            )
+        );
+        // The entrypoint's line alone still counts.
+        assert!(boot_failure(
+            "[entrypoint] converge FAILED — starting server on the rolled-back state for inspection"
+        )
+        .unwrap()
+        .starts_with("Your site couldn't finish starting."));
+    }
+
+    #[test]
+    fn a_good_boot_log_is_not_a_failure() {
+        // `docker logs --since <StartedAt> atelier-hardening-test-app-1`, 2026-11-14.
+        let ok = "[converge] database is reachable\n\
+            [converge] pgvector extension present\n\
+            [converge] database is populated\n\
+            [converge] this build already converged this database → restart (no snapshot, updates, import, rebuild or health gate)\n\
+            [converge] converge OK — restart of the build that converged this site\n\
+            [entrypoint] converge succeeded\n";
+        assert_eq!(boot_failure(ok), None);
+    }
+
+    fn running_app() -> Option<AppRun> {
+        Some(AppRun {
+            name: "atelier-hardening-test-app-1".into(),
+            running: true,
+            started_at: "2026-11-14T12:08:06.529116477Z".into(),
+        })
+    }
+
+    #[test]
+    fn a_failed_converge_ends_the_wait_at_once() {
+        let look = Look {
+            docker: true,
+            app: running_app(),
+            log: Some(DB_UNREACHABLE.into()),
+            half_attached: Vec::new(),
+        };
+        let why = judge(&look, &mut Strikes::default()).unwrap();
+        assert!(why.contains("can't reach its database"));
+    }
+
+    #[test]
+    fn an_unreachable_database_on_a_half_attached_network_says_restart_docker() {
+        let look = Look {
+            docker: true,
+            app: running_app(),
+            log: Some(DB_UNREACHABLE.into()),
+            half_attached: vec![("n".into(), "atelier-hardening-test-db-1".into())],
+        };
+        assert_eq!(
+            judge(&look, &mut Strikes::default()).as_deref(),
+            Some(NETWORK_STUCK)
+        );
+        assert!(NETWORK_STUCK.contains("Restart Docker Desktop"));
+    }
+
+    #[test]
+    fn docker_going_away_ends_the_wait_and_says_so() {
+        let look = Look::default();
+        assert_eq!(
+            judge(&look, &mut Strikes::default()).as_deref(),
+            Some(DOCKER_STOPPED)
+        );
+    }
+
+    #[test]
+    fn the_app_stopping_ends_the_wait_on_the_second_look() {
+        let mut strikes = Strikes::default();
+        let stopped = Look {
+            docker: true,
+            app: Some(AppRun {
+                running: false,
+                ..running_app().unwrap()
+            }),
+            log: Some(String::new()),
+            half_attached: Vec::new(),
+        };
+        assert_eq!(judge(&stopped, &mut strikes), None);
+        assert_eq!(judge(&stopped, &mut strikes).as_deref(), Some(SITE_STOPPED));
+        // Gone altogether (no app container, so no log either).
+        let mut strikes = Strikes::default();
+        let gone = Look {
+            docker: true,
+            ..Look::default()
+        };
+        assert_eq!(judge(&gone, &mut strikes), None);
+        assert_eq!(judge(&gone, &mut strikes).as_deref(), Some(SITE_STOPPED));
+    }
+
+    #[test]
+    fn one_odd_look_between_good_ones_never_fails_a_boot() {
+        let mut strikes = Strikes::default();
+        let good = Look {
+            docker: true,
+            app: running_app(),
+            log: Some("[converge] waiting for database… (0s)\n".into()),
+            half_attached: Vec::new(),
+        };
+        let odd = Look {
+            docker: true,
+            app: Some(AppRun {
+                running: false,
+                ..running_app().unwrap()
+            }),
+            log: Some(String::new()),
+            half_attached: vec![("n".into(), "c".into())],
+        };
+        for _ in 0..3 {
+            assert_eq!(judge(&odd, &mut strikes), None);
+            assert_eq!(judge(&good, &mut strikes), None);
+        }
+        // Half attached twice in a row ends it.
+        let stuck = Look {
+            half_attached: vec![("n".into(), "c".into())],
+            ..good
+        };
+        assert_eq!(judge(&stuck, &mut strikes), None);
+        assert_eq!(judge(&stuck, &mut strikes).as_deref(), Some(NETWORK_STUCK));
+    }
+
+    #[test]
+    fn a_failed_boot_is_an_error_a_slow_one_is_not() {
+        assert!(Boot::Ready.ready().unwrap());
+        assert!(!Boot::Booting.ready().unwrap());
+        let e = Boot::Failed("Your site can't reach its database".into())
+            .ready()
+            .unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<BootFailed>().map(|b| b.0.as_str()),
+            Some("Your site can't reach its database")
+        );
+    }
+}

@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
   image clean-up (`docker image prune`) no longer removes it. Turning the engine off drops that name.
   An engine built locally can't be downloaded, so it says to turn the engine off and on again.
+- A start, setup or update whose site failed to come up now says it failed, and why ("Your site
+  can't reach its database…"), instead of reporting success or waiting minutes on "Booting…". This
+  includes a failed update that put your site back the way it was: the site answers, but the update
+  didn't happen. The app shows the failure panel with **Copy report**, `atelier` exits with an error,
+  and a failed update keeps your backups and old versions and stops a multi-step update. If Docker or
+  the site stops during the wait, it says that.
+- When Docker has left your site's network half connected, so the site can't reach its database,
+  starting it says to restart Docker Desktop, and **Run a checkup** (`atelier doctor`) reports it.
+- Switching to released versions in the app now says when the site hasn't answered yet, like an
+  update.
 
 ## [0.16.0] - 2026-11-12
 

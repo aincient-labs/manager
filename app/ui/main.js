@@ -779,6 +779,20 @@ async function runProgressOp(title, fn, opts = {}) {
   } catch (e) {
     failure = String(e);
   }
+  // A start, setup or update says how it came out: {state: ready|booting|failed,
+  // reason}. Failed gets the failure panel (Close / Copy / Details) with its
+  // reason; booting is the "not answering yet" notice, already past the point
+  // where "a few seconds" would be true.
+  if (result && typeof result === "object" && typeof result.state === "string") {
+    if (result.state === "failed") {
+      failure = result.reason || "Your website couldn't finish starting.";
+    } else if (result.state === "booting") {
+      result = false;
+      startingSince = Date.now() - STARTING_SLOW_MS;
+    } else {
+      result = true;
+    }
+  }
   try {
     if (failure !== null) {
       if (DIDNT_FINISH[opts.lifecycle]) setHomeNotice(DIDNT_FINISH[opts.lifecycle]);
