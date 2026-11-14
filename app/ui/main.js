@@ -102,6 +102,21 @@ function confirmModal(msg, opts = {}) {
     $("confirm-title").classList.toggle("hidden", !opts.title);
     $("confirm-msg").textContent = msg || "";
     $("confirm-lead").textContent = opts.lead || "";
+    // { checks: ["label", …] } adds unticked checkboxes under the message; what
+    // was ticked comes back in opts.checked (one boolean each).
+    const checks = $("confirm-checks");
+    checks.innerHTML = "";
+    for (const text of opts.checks || []) {
+      const label = document.createElement("label");
+      label.className = "check";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      const span = document.createElement("span");
+      span.textContent = text;
+      label.append(box, span);
+      checks.append(label);
+    }
+    checks.classList.toggle("hidden", !(opts.checks && opts.checks.length));
     if (requireText) {
       $("confirm-word").textContent = requireText;
       input.value = "";
@@ -119,6 +134,7 @@ function confirmModal(msg, opts = {}) {
     $("confirm").classList.remove("hidden");
     if (requireText) setTimeout(() => input.focus(), 0);
     const done = (val) => {
+      opts.checked = [...checks.querySelectorAll("input")].map((b) => val && b.checked);
       $("confirm").classList.add("hidden");
       yes.textContent = "Confirm";
       yes.onclick = null;
@@ -162,9 +178,10 @@ async function confirmChange(question, detail, opts = {}) {
       requireText: slug,
       exact: true,
       lead: `${label} is live ${place}. `,
+      yes: opts.yes,
     });
   }
-  return confirmModal(detail, { title, requireText: opts.requireText || null });
+  return confirmModal(detail, { title, requireText: opts.requireText || null, yes: opts.yes });
 }
 
 // Another site's backup (m2-6, D-04): name both, and make "Restore anyway" a
@@ -207,7 +224,23 @@ async function restoreFlow(path, what) {
     `Restoring replaces the current pages, images, and settings with this ${what}.` +
     (note ? `\n\n${note}` : "");
   if (!(await confirmChange("Restore {site}?", detail, { always: true }))) return;
-  return runProgressOp("Restoring your backup", () => invoke("do_restore", { path, otherSite }));
+  const restore = (noSafetyBackup) =>
+    runProgressOp("Restoring your backup", () =>
+      invoke("do_restore", { path, otherSite, noSafetyBackup })
+    );
+  if (await restore(false)) return true;
+  // The copy of the site as it is now failed (a full disk, a damaged database):
+  // nothing was restored. The way past it costs that copy, so it is asked.
+  if (!(lastOpOutcome && lastOpOutcome.safety_backup_failed)) return false;
+  const go = await confirmChange(
+    "Restore {site} without a safety copy?",
+    "Atelier couldn't save a copy of your site as it is now, so nothing was restored.\n\n" +
+      "Restoring without that copy replaces your current pages, images, and settings for " +
+      "good: they can't be brought back afterwards.",
+    { always: true, yes: "Restore without a copy" }
+  );
+  if (!go) return false;
+  return restore(true);
 }
 
 // --- progress panel (DECISIONS 0515) ---------------------------------------
@@ -767,6 +800,10 @@ $("progress-copy").addEventListener("click", () => copyText(progressReport(), $(
 // released (progressReset), and its runProgressOp then resumes while the new one
 // is running: it must not hide the panel or stop the new op's render loop.
 let progressOwner = 0;
+// The last op's answer object ({state, reason, …}), so a flow can offer what
+// its failure allows (safety_backup_failed, backup_failed); null when the op
+// answered with anything else.
+let lastOpOutcome = null;
 
 // `opts.lifecycle` names a start-or-update kind of op ("start" | "update" |
 // "setup"; "repair" and "clear" only clear): its failure leaves a line on Home, its
@@ -811,10 +848,14 @@ async function runProgressOp(title, fn, opts = {}) {
   let failure = null;
   let dockerRestart = false;
   let result;
+  lastOpOutcome = null;
   try {
     result = await fn();
   } catch (e) {
     failure = String(e);
+  }
+  if (result && typeof result === "object" && typeof result.state === "string") {
+    lastOpOutcome = result;
   }
   // A start, setup or update says how it came out: {state: ready|booting|failed,
   // reason}. Failed gets the failure panel (Close / Copy / Details) with its
@@ -2032,18 +2073,22 @@ const BACKUPS_NEEDS_RUNNING = "Your website needs to be running to make a backup
 
 function updateBackupsGate() {
   const up = !!(lastStatus && lastStatus.running);
-  // Running isn't answering: a backup of a site still booting fails or is partial.
-  const running = up && !!lastStatus.reachable;
-  const starting = up && !running;
+  // Running isn't answering: a backup of a site still booting fails or is
+  // partial, so Back up now waits. A restore only needs the containers up (it
+  // runs inside them), and a site that runs but errors — broken by a
+  // migration, say — is exactly the one that needs it (review 2026-11-14).
+  const answering = up && !!lastStatus.reachable;
+  const notAnswering = up && !answering;
   const erased = !up && !!(lastStatus && lastStatus.database_erased);
-  const canRestore = running || erased;
-  $("backups-needs-running").classList.toggle("hidden", canRestore);
-  $("backups-needs-running-text").textContent = starting
-    ? "Your website is still starting. Backups and restores are available once it answers."
+  const canRestore = up || erased;
+  $("backups-needs-running").classList.toggle("hidden", answering || erased);
+  $("backups-needs-running-text").textContent = notAnswering
+    ? "Your website isn't answering yet (still starting, or it has a problem), so it can't " +
+      "be backed up until it does. You can restore a backup now."
     : BACKUPS_NEEDS_RUNNING;
-  document.querySelector('#backups-needs-running [data-action="startstop-from-publish"]').classList.toggle("hidden", starting);
+  document.querySelector('#backups-needs-running [data-action="startstop-from-publish"]').classList.toggle("hidden", notAnswering);
   $("backups-database-erased").classList.toggle("hidden", !erased);
-  $("backup-now").classList.toggle("hidden", !running);
+  $("backup-now").classList.toggle("hidden", !answering);
   document.querySelector('[data-action="restore"]').disabled = !(canRestore && hasBackups);
   $("btn-import").disabled = !canRestore;
 }
@@ -2130,6 +2175,14 @@ function decimalBytes(n) {
 let cleaning = false;
 // The last list shown, so the confirmation names exactly what will go.
 let cleanupFound = null;
+// Each local site's older automatic backups (taken by a Manager before 0.17,
+// never pruned): offered as unticked items in the confirmation.
+let olderFound = [];
+
+function olderBackupsLabel(o) {
+  const n = o.backups.length;
+  return `${n} older automatic backup${n === 1 ? "" : "s"} of ${o.label}, ${decimalBytes(o.total_bytes)}`;
+}
 
 function cleanupLabel(i) {
   return i.names[0] || `${i.repo} (old version)`;
@@ -2139,9 +2192,13 @@ async function loadCleanup() {
   const btn = $("free-space");
   if (cleaning) return;
   try {
-    const r = await invoke("find_cleanup");
+    const [r, older] = await Promise.all([
+      invoke("find_cleanup"),
+      invoke("find_older_backups").catch(() => []),
+    ]);
     if (cleaning) return;
     cleanupFound = r;
+    olderFound = older || [];
     $("cleanup-summary").title = "";
     if (!r) {
       $("cleanup-summary").textContent = "Docker isn't answering";
@@ -2149,10 +2206,12 @@ async function loadCleanup() {
       return;
     }
     const n = r.images.length;
-    $("cleanup-summary").textContent = n
-      ? `${decimalBytes(r.total_bytes)} can be freed (${n} download${n === 1 ? "" : "s"})`
-      : "Nothing to free";
-    btn.disabled = n === 0;
+    const olderBytes = olderFound.reduce((sum, o) => sum + o.total_bytes, 0);
+    const parts = [];
+    if (n) parts.push(`${decimalBytes(r.total_bytes)} can be freed (${n} download${n === 1 ? "" : "s"})`);
+    if (olderFound.length) parts.push(`${decimalBytes(olderBytes)} in older backups`);
+    $("cleanup-summary").textContent = parts.length ? parts.join(" · ") : "Nothing to free";
+    btn.disabled = n === 0 && !olderFound.length;
   } catch (e) {
     if (cleaning) return;
     cleanupFound = null;
@@ -2690,7 +2749,23 @@ const actions = {
     }
     // A stepped route always asks; a live site on a server always asks for its slug.
     if (!(await confirmChange("Update {site}?", detail, { always: stepped }))) return;
-    return runProgressOp("Updating Atelier", () => invoke("do_update"), { lifecycle: "update" });
+    const update = (noBackup) =>
+      runProgressOp("Updating Atelier", () => invoke("do_update", { noBackup }), {
+        lifecycle: "update",
+      });
+    if (await update(false)) return true;
+    // The site couldn't be backed up first (stopped, and it won't start on the
+    // version it runs — often why it is being updated): nothing was updated.
+    if (!(lastOpOutcome && lastOpOutcome.backup_failed)) return false;
+    const go = await confirmChange(
+      "Update {site} without a backup?",
+      "Atelier couldn't back up your site before the update, so it wasn't updated.\n\n" +
+        "Updating without a backup means that if the update goes wrong, your pages, images, " +
+        "and settings as they are now can't be brought back.",
+      { always: true, yes: "Update without a backup" }
+    );
+    if (!go) return false;
+    return update(true);
   },
 
   // Start or stop, decided by the live status rather than a label.
@@ -2874,35 +2949,68 @@ const actions = {
     const btn = $("free-space");
     const status = $("cleanup-status");
     const found = cleanupFound;
-    if (cleaning || !found || !found.images.length) return;
+    const older = olderFound;
+    if (cleaning || !found || (!found.images.length && !older.length)) return;
     const n = found.images.length;
-    const lines = found.images
-      .map((i) => `${decimalBytes(i.size_bytes)}  ${cleanupLabel(i)}`)
-      .join("\n");
-    const ok = await confirmModal(
-      `${lines}\n\nEach downloads again when a site needs it. Your sites' data and backups are untouched.`,
-      {
-        title: `Remove ${n} download${n === 1 ? "" : "s"} (up to ${decimalBytes(found.total_bytes)})?`,
-      }
-    );
+    const parts = [];
+    if (n) {
+      const lines = found.images
+        .map((i) => `${decimalBytes(i.size_bytes)}  ${cleanupLabel(i)}`)
+        .join("\n");
+      parts.push(`${lines}\n\nEach downloads again when a site needs it.`);
+    }
+    if (older.length) {
+      parts.push(
+        "Earlier versions of the Manager kept every automatic backup (before updates, " +
+          "restores and version switches). Tick any you want removed too; they can't be " +
+          "brought back. Your own backups and the newest automatic ones always stay."
+      );
+    }
+    parts.push("Your sites' data is untouched.");
+    const opts = {
+      title: n
+        ? `Remove ${n} download${n === 1 ? "" : "s"} (up to ${decimalBytes(found.total_bytes)})?`
+        : "Remove older automatic backups?",
+      yes: "Remove",
+      checks: older.map(olderBackupsLabel),
+    };
+    const ok = await confirmModal(parts.join("\n\n"), opts);
     if (!ok) return;
+    const paths = older
+      .filter((_, i) => opts.checked[i])
+      .flatMap((o) => o.backups.map((b) => b.path));
+    if (!n && !paths.length) return;
     cleaning = true;
     btn.disabled = true;
     status.classList.remove("hidden");
-    status.textContent = "Removing unused downloads…";
+    status.textContent = "Freeing up space…";
+    const said = [];
     try {
-      const r = await invoke("do_cleanup", { ids: found.images.map((i) => i.id) });
-      const m = r.images.length;
-      status.textContent = m
-        ? `Freed up to ${decimalBytes(r.total_bytes)} (${m} download${m === 1 ? "" : "s"}). Your sites' data and backups are untouched.`
-        : "Nothing to remove.";
-      if (r.failed.length) status.textContent += ` Kept ${r.failed.length} that Docker says are in use.`;
+      if (n) {
+        const r = await invoke("do_cleanup", { ids: found.images.map((i) => i.id) });
+        const m = r.images.length;
+        said.push(
+          m
+            ? `Freed up to ${decimalBytes(r.total_bytes)} (${m} download${m === 1 ? "" : "s"}).`
+            : "No downloads to remove."
+        );
+        if (r.failed.length) said.push(`Kept ${r.failed.length} that Docker says are in use.`);
+      }
+      if (paths.length) {
+        const r = await invoke("remove_older_backups", { paths });
+        const m = r.removed.length;
+        said.push(`Removed ${m} older backup${m === 1 ? "" : "s"} (${decimalBytes(r.total_bytes)}).`);
+        if (r.failed.length) said.push(`Couldn't remove ${r.failed.length}.`);
+      }
+      said.push("Your sites' data is untouched.");
+      status.textContent = said.join(" ");
     } catch (e) {
-      status.textContent = String(e);
+      status.textContent = [...said, String(e)].join(" ");
     } finally {
       cleaning = false;
     }
     loadCleanup();
+    if (paths.length && currentTab === "backups") refreshBackups();
   },
 
   "check-update": async () => {

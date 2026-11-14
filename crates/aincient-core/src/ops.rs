@@ -668,10 +668,6 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     // machine. Digests compare across the rename regardless: `parse_local_probe`
     // keeps only the `sha256:…`, and the rename moved the package rather than
     // republishing it.
-    // An unfinished stepped update heads for the image its route ends on: the
-    // `.env` now names the waypoint it stopped at, which has nothing newer.
-    let resumes = stack.update_target();
-    let target_image = resumes.clone().unwrap_or_else(|| stack.prospective_image());
     let mut check = UpdateCheck {
         image: image.clone(),
         current: None,
@@ -716,6 +712,11 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         }
     }
 
+    // An unfinished stepped update heads for the image its route ends on: the
+    // `.env` now names the waypoint it stopped at, which has nothing newer. One
+    // the site has since moved past is dropped ([`live_update_target`]).
+    let resumes = live_update_target(stack, check.current_version.as_deref());
+    let target_image = resumes.clone().unwrap_or_else(|| stack.prospective_image());
     let mut target = None;
     match remote_probe(&target_image) {
         Ok(probe) => {
@@ -773,6 +774,66 @@ fn route_target(
     }
 }
 
+/// The version an image reference names by its tag (`…/atelier-cms:v0.21.0`,
+/// as [`waypoint_image`] writes it); `None` for a moving tag or a digest.
+fn tag_version(image: &str) -> Option<Version> {
+    let name = image.split('@').next()?;
+    let (_, tag) = name.rsplit_once(':').filter(|(_, t)| !t.contains('/'))?;
+    Version::parse(tag)
+}
+
+/// Whether an unfinished update's target is stale: the site already runs that
+/// version or a newer one (an install, a restore, or another route moved it
+/// past). Unknown on either side is not stale, the way it always was.
+fn update_target_is_stale(target: Option<Version>, running: Option<Version>) -> bool {
+    matches!((target, running), (Some(t), Some(r)) if t <= r)
+}
+
+/// [`Stack::update_target`], unless it is stale ([`update_target_is_stale`])
+/// next to the version the site runs (`running`): then it is deleted, so check
+/// stops saying "update unfinished" and Update stops heading for an older
+/// image (review 2026-11-14). A target with no version in its tag is asked of
+/// the registry.
+fn live_update_target(stack: &Stack, running: Option<&str>) -> Option<String> {
+    live_update_target_with(stack, running, |image| {
+        remote_probe(image)
+            .ok()?
+            .version
+            .as_deref()
+            .and_then(Version::parse)
+    })
+}
+
+fn live_update_target_with(
+    stack: &Stack,
+    running: Option<&str>,
+    registry_version: impl FnOnce(&str) -> Option<Version>,
+) -> Option<String> {
+    let target = stack.update_target()?;
+    // Unknown is never stale: keep the route without asking the registry.
+    let Some(running) = running.and_then(Version::parse) else {
+        return Some(target);
+    };
+    let version = tag_version(&target).or_else(|| registry_version(&target));
+    if update_target_is_stale(version, Some(running)) {
+        stack.clear_update_target();
+        return None;
+    }
+    Some(target)
+}
+
+/// After an install or a restore: drop an unfinished update's target the site
+/// has moved past ([`live_update_target`]). One still ahead is kept: its hops
+/// pinned `.env` to a waypoint, and without the target the next update would
+/// find nothing newer than that waypoint.
+fn drop_stale_update_target(stack: &Stack) {
+    if stack.update_target().is_none() {
+        return;
+    }
+    let running = site_probe(stack).ok().and_then(|p| p.version);
+    let _ = live_update_target(stack, running.as_deref());
+}
+
 /// How many waypoints a route may contain before we call it broken rather than
 /// long. Each hop is a full pull + migrate + health check, and a floor chain that
 /// deep would mean a release history nobody should be upgrading across in one go;
@@ -798,10 +859,14 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
     // retired repository name), or the route would be planned against a tag the
     // operator is about to leave, or against a repository that cannot answer.
     // An unfinished stepped update continues to where it was going.
+    let probe = site_probe(stack);
+    let running = probe.as_ref().ok().and_then(|p| p.version.as_deref());
     let (target_image, explicit_target) =
-        route_target(named, stack.update_target(), || stack.prospective_image());
+        route_target(named, live_update_target(stack, running), || {
+            stack.prospective_image()
+        });
 
-    let (from, from_problem) = match site_probe(stack) {
+    let (from, from_problem) = match probe {
         Ok(p) => (
             p.version.as_deref().and_then(Version::parse),
             p.version.is_none().then(|| {
@@ -992,6 +1057,13 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
     // Exempt from the erased-database refusal: an install lays the site down
     // (and a reinstall has just wiped it on purpose).
     up_unguarded(stack, r)?;
+    // An unfinished update's target (review 2026-11-14): an image the owner
+    // named replaces the route; otherwise only one the site is past goes.
+    if opts.image.is_some() {
+        stack.clear_update_target();
+    } else {
+        drop_stale_update_target(stack);
+    }
     wait_until_ready(stack, READY_TIMEOUT, r).ready()
 }
 
@@ -1122,7 +1194,51 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
 }
 
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<Updated> {
-    let done = run_upgrade(stack, plan, r)?;
+    apply_upgrade_with(stack, plan, &UpdateOptions::default(), r)
+}
+
+/// How [`apply_upgrade_with`] treats the backup before an update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateOptions {
+    /// Update without a backup first (`--no-backup`, "Update without a backup"):
+    /// a stopped site is not started for one, a running one is not backed up.
+    /// Without it, a stopped site that won't start refuses the update with
+    /// [`BackupBeforeUpdateFailed`].
+    pub no_backup: bool,
+}
+
+/// An update was refused because the site couldn't be backed up first: it is
+/// stopped and wouldn't start (or didn't finish starting) on the version it
+/// runs. Carried as an error's context, so the cause (a [`boot::BootFailed`] that
+/// needs Docker restarted, say) can still be told apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupBeforeUpdateFailed {
+    /// What stopped the backup, in words.
+    pub cause: String,
+}
+
+impl std::fmt::Display for BackupBeforeUpdateFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, so it wasn't updated", self.cause)
+    }
+}
+
+impl std::error::Error for BackupBeforeUpdateFailed {}
+
+/// [`update`] with [`UpdateOptions`].
+pub fn update_with(stack: &Stack, opts: &UpdateOptions, r: &mut dyn Reporter) -> Result<Updated> {
+    let plan = plan_upgrade(stack, None);
+    apply_upgrade_with(stack, &plan, opts, r)
+}
+
+/// [`apply_upgrade`] with [`UpdateOptions`].
+pub fn apply_upgrade_with(
+    stack: &Stack,
+    plan: &UpgradePlan,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    let done = run_upgrade(stack, plan, opts, r)?;
     if done == Updated::Ready {
         // Only after the site answered on the new version: a failed attempt
         // keeps every backup, so retrying can never prune the last good one.
@@ -1148,7 +1264,12 @@ fn tidy_after_update(r: &mut dyn Reporter) {
     }
 }
 
-fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<Updated> {
+fn run_upgrade(
+    stack: &Stack,
+    plan: &UpgradePlan,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
     ensure_installed(stack)?;
     // One source for the groups the front end draws and the slices the hops
     // report into (review 2026-11-12: these were computed twice).
@@ -1195,50 +1316,55 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
             stack.clear_update_target();
             // A stopped site starts (a resting one wakes, and rests again
             // after), as for an update; there is nothing to back up for.
-            let woke = start_for_backup(stack, engine_state.as_deref(), r)?;
-            r.stage(
-                Stage::Starting,
-                "Already up to date. Applying your changed settings…",
-                Some(UP_FROM),
-            );
-            up(stack, r)?;
-            let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
-            rest_again(stack, woke, ready, r);
-            if ready {
-                r.stage(Stage::Ready, SETTINGS_APPLIED, Some(1.0));
-                return Ok(Updated::SettingsApplied);
-            }
-            return Ok(Updated::Booting);
-        }
-        let woke = start_for_backup(stack, engine_state.as_deref(), r)?;
-        // The banner promises "Updating keeps all your pages and settings": a
-        // one-step update took no backup until 0.17.0, so a failed migration had
-        // nothing to go back to. Best effort, like the stepped route's snapshot;
-        // skipped when the channel move above just took one.
-        if !snapshot_taken {
-            if let Err(e) = safety_backup(
-                stack,
-                "before-update",
-                "Backing up before the update…",
-                0.03,
-                PULL_FROM - 0.04,
-                r,
-            ) {
+            let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+            let done = (|| -> Result<Updated> {
                 r.stage(
-                    Stage::Working,
-                    &format!("Couldn't take a backup first ({e:#}). Continuing."),
-                    Some(PULL_FROM - 0.01),
+                    Stage::Starting,
+                    "Already up to date. Applying your changed settings…",
+                    Some(UP_FROM),
                 );
+                up(stack, r)?;
+                let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+                if ready {
+                    r.stage(Stage::Ready, SETTINGS_APPLIED, Some(1.0));
+                    return Ok(Updated::SettingsApplied);
+                }
+                Ok(Updated::Booting)
+            })();
+            return settle_woken(stack, woke, done, r);
+        }
+        let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+        let done = (|| -> Result<Updated> {
+            // The banner promises "Updating keeps all your pages and settings": a
+            // one-step update took no backup until 0.17.0, so a failed migration had
+            // nothing to go back to. Best effort, like the stepped route's snapshot;
+            // skipped when the channel move above just took one, or when the owner
+            // said to go without.
+            if !snapshot_taken && !opts.no_backup {
+                if let Err(e) = safety_backup(
+                    stack,
+                    "before-update",
+                    "Backing up before the update…",
+                    0.03,
+                    PULL_FROM - 0.04,
+                    r,
+                ) {
+                    r.stage(
+                        Stage::Working,
+                        &format!("Couldn't take a backup first ({e:#}). Continuing."),
+                        Some(PULL_FROM - 0.01),
+                    );
+                }
             }
-        }
-        up(stack, r)?;
-        let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
-        if ready {
-            stack.clear_update_target();
-            ready = move_db_image(stack, r)?;
-        }
-        rest_again(stack, woke, ready, r);
-        return Ok(Updated::from_ready(ready));
+            up(stack, r)?;
+            let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+            if ready {
+                stack.clear_update_target();
+                ready = move_db_image(stack, r)?;
+            }
+            Ok(Updated::from_ready(ready))
+        })();
+        return settle_woken(stack, woke, done, r);
     }
 
     // A stepped route is the case where a snapshot is least optional: it is longer,
@@ -1247,111 +1373,113 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
     // running the old image again. Best effort, like the channel-switch snapshot —
     // converge's own per-hop rollback is the guarantee; this is the belt.
     let total = plan.steps.len();
-    let woke = start_for_backup(stack, engine_state.as_deref(), r)?;
-    if status(stack).running {
-        r.stage(
-            Stage::Working,
-            "Backing up before the first step…",
-            Some(0.03),
-        );
-        // The backup's own steps land inside this slice; its plan is dropped.
-        let mut snap = ScaledReporter {
-            inner: r,
-            base: 0.03,
-            span: ROUTE_START - 0.03,
-            prefix: String::new(),
-        };
-        match backup(stack, Some("before-stepped-upgrade"), &mut snap) {
-            Ok(path) => r.stage(
+    let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+    let done = (|| -> Result<Updated> {
+        if !opts.no_backup && status(stack).running {
+            r.stage(
                 Stage::Working,
-                &format!("Snapshot saved: {}", path.display()),
-                Some(0.05),
-            ),
-            Err(e) => r.stage(
-                Stage::Working,
-                &format!(
-                    "Couldn't take a snapshot first ({e:#}) — continuing; each step \
-                     rolls its own database back if it fails."
-                ),
-                Some(0.05),
-            ),
-        }
-    }
-
-    // Each hop rewrites `.env` to the version it lands on, so a route that
-    // stops halfway must remember where it was going, or the next update would
-    // find nothing newer than the waypoint ([`Stack::update_target`]).
-    stack.set_update_target(&plan.target_image)?;
-
-    // Hops share the bar after the Prep slice, each rescaling the stage fractions
-    // the shared pull/up/wait helpers report so a five-minute route doesn't look
-    // like five separate runs that each finish at 100%. Slice and label come from
-    // the announced plan (step 0 is Prep); the prefix names the hop's version only,
-    // since the plan already numbers the steps (`[2/4]` in the terminal).
-    for (i, step) in plan.steps.iter().enumerate() {
-        let slice = &route.steps()[i + 1];
-        let label = match step.version {
-            Some(v) => v.to_string(),
-            None => step.image.clone(),
-        };
-        let mut hop = ScaledReporter {
-            inner: r,
-            base: slice.from,
-            span: slice.to - slice.from,
-            prefix: format!("{}: ", slice.label),
-        };
-        hop.stage(
-            Stage::Scaffold,
-            &format!("switching to {}…", step.image),
-            Some(0.0),
-        );
-        stack.set_image(&step.image)?;
-        pull(stack, &mut hop)?;
-        up(stack, &mut hop)?;
-        let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
-            Boot::Ready => true,
-            Boot::Booting => false,
-            // Failed is never "carry on": the next hop would meet a database
-            // this one didn't migrate.
-            Boot::Failed(why) if step.is_target => {
-                return Boot::Failed(why).ready().map(Updated::from_ready)
-            }
-            Boot::Failed(why) => {
-                return Err(boot::BootFailed(format!(
-                    "Step {} of {total} ({label}) failed, so the rest of the update was not \
-                     attempted. {why} Once that is fixed, run the update again: it \
-                     continues from {label}.",
-                    i + 1
-                ))
-                .into())
-            }
-        };
-
-        if !ready {
-            // Deliberately an error, not a `false`: on a multi-hop route "still
-            // booting" and "this step refused or rolled back" look identical from
-            // out here, and the difference decides whether the operator should
-            // wait or read the logs. Only the LAST hop can honestly report
-            // still-booting, and it returns below.
-            if step.is_target {
-                return Ok(Updated::Booting);
-            }
-            bail!(
-                "step {} of {total} ({label}) didn't finish coming up, so the rest of \
-                 the upgrade was not attempted. Your site is on {label} — its own \
-                 migration either succeeded or rolled itself back, so it is not \
-                 half-upgraded. Check `atelier app logs` for what happened, then run \
-                 `atelier app update` again (Continue update in the Manager): it \
-                 continues from {label} to {}.",
-                i + 1,
-                plan.target_image
+                "Backing up before the first step…",
+                Some(0.03),
             );
+            // The backup's own steps land inside this slice; its plan is dropped.
+            let mut snap = ScaledReporter {
+                inner: r,
+                base: 0.03,
+                span: ROUTE_START - 0.03,
+                prefix: String::new(),
+            };
+            match backup(stack, Some("before-stepped-upgrade"), &mut snap) {
+                Ok(path) => r.stage(
+                    Stage::Working,
+                    &format!("Snapshot saved: {}", path.display()),
+                    Some(0.05),
+                ),
+                Err(e) => r.stage(
+                    Stage::Working,
+                    &format!(
+                        "Couldn't take a snapshot first ({e:#}) — continuing; each step \
+                         rolls its own database back if it fails."
+                    ),
+                    Some(0.05),
+                ),
+            }
         }
-    }
-    stack.clear_update_target();
-    let ready = move_db_image(stack, r)?;
-    rest_again(stack, woke, ready, r);
-    Ok(Updated::from_ready(ready))
+
+        // Each hop rewrites `.env` to the version it lands on, so a route that
+        // stops halfway must remember where it was going, or the next update would
+        // find nothing newer than the waypoint ([`Stack::update_target`]).
+        stack.set_update_target(&plan.target_image)?;
+
+        // Hops share the bar after the Prep slice, each rescaling the stage fractions
+        // the shared pull/up/wait helpers report so a five-minute route doesn't look
+        // like five separate runs that each finish at 100%. Slice and label come from
+        // the announced plan (step 0 is Prep); the prefix names the hop's version only,
+        // since the plan already numbers the steps (`[2/4]` in the terminal).
+        for (i, step) in plan.steps.iter().enumerate() {
+            let slice = &route.steps()[i + 1];
+            let label = match step.version {
+                Some(v) => v.to_string(),
+                None => step.image.clone(),
+            };
+            let mut hop = ScaledReporter {
+                inner: r,
+                base: slice.from,
+                span: slice.to - slice.from,
+                prefix: format!("{}: ", slice.label),
+            };
+            hop.stage(
+                Stage::Scaffold,
+                &format!("switching to {}…", step.image),
+                Some(0.0),
+            );
+            stack.set_image(&step.image)?;
+            pull(stack, &mut hop)?;
+            up(stack, &mut hop)?;
+            let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
+                Boot::Ready => true,
+                Boot::Booting => false,
+                // Failed is never "carry on": the next hop would meet a database
+                // this one didn't migrate.
+                Boot::Failed(why) if step.is_target => {
+                    return Boot::Failed(why).ready().map(Updated::from_ready)
+                }
+                Boot::Failed(why) => {
+                    return Err(boot::BootFailed(format!(
+                        "Step {} of {total} ({label}) failed, so the rest of the update was not \
+                         attempted. {why} Once that is fixed, run the update again: it \
+                         continues from {label}.",
+                        i + 1
+                    ))
+                    .into())
+                }
+            };
+
+            if !ready {
+                // Deliberately an error, not a `false`: on a multi-hop route "still
+                // booting" and "this step refused or rolled back" look identical from
+                // out here, and the difference decides whether the operator should
+                // wait or read the logs. Only the LAST hop can honestly report
+                // still-booting, and it returns below.
+                if step.is_target {
+                    return Ok(Updated::Booting);
+                }
+                bail!(
+                    "step {} of {total} ({label}) didn't finish coming up, so the rest of \
+                     the upgrade was not attempted. Your site is on {label} — its own \
+                     migration either succeeded or rolled itself back, so it is not \
+                     half-upgraded. Check `atelier app logs` for what happened, then run \
+                     `atelier app update` again (Continue update in the Manager): it \
+                     continues from {label} to {}.",
+                    i + 1,
+                    plan.target_image
+                );
+            }
+        }
+        stack.clear_update_target();
+        let ready = move_db_image(stack, r)?;
+        Ok(Updated::from_ready(ready))
+    })();
+    settle_woken(stack, woke, done, r)
 }
 
 /// What an update found to do once the download was in.
@@ -1500,8 +1628,37 @@ fn start_for_backup_needed(state: ContainerState) -> bool {
 }
 
 /// A stopped site has no backup to take, so start it first (a resting engine
-/// site through its Wake). If it won't start, refuse: an update with no way
-/// back is worse than no update.
+/// site through its Wake). If it won't start, refuse with
+/// [`BackupBeforeUpdateFailed`]: an update with no way back is worse than no
+/// update, unless the owner said to go without one (`opts.no_backup`). Then a
+/// stopped site is left for the update's own `up` to start, and a resting one
+/// still counts as woken, so it rests again after.
+fn wake_for_update(
+    stack: &Stack,
+    engine_state: Option<&str>,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Woke> {
+    if opts.no_backup {
+        r.log("Updating without a backup first (--no-backup).");
+        return Ok(woke_without_start(observe_container(stack), engine_state));
+    }
+    start_for_backup(stack, engine_state, r)
+}
+
+/// What an update that doesn't start the site first ([`UpdateOptions::no_backup`])
+/// counts as having woken: its `up` starts a stopped site, and a resting one
+/// must go back to rest after, as it would had it been woken for a backup.
+fn woke_without_start(state: ContainerState, engine_state: Option<&str>) -> Woke {
+    if !start_for_backup_needed(state) {
+        Woke::No
+    } else if engine_state == Some("resting") {
+        Woke::FromRest
+    } else {
+        Woke::Started
+    }
+}
+
 fn start_for_backup(
     stack: &Stack,
     engine_state: Option<&str>,
@@ -1527,14 +1684,15 @@ fn start_for_backup(
         span: 0.0,
         prefix: String::new(),
     };
-    let started = start(stack, &mut quiet).context(
-        "the site is stopped and couldn't be started to back it up first, so it wasn't updated",
-    )?;
+    let started = start(stack, &mut quiet).context(BackupBeforeUpdateFailed {
+        cause: "The site is stopped and couldn't be started to back it up first".into(),
+    })?;
     if !started {
-        bail!(
-            "the site is stopped, and it didn't finish starting in time to back it up first, \
-             so it wasn't updated. Start it, wait until it answers, then update again."
-        );
+        return Err(anyhow::Error::new(BackupBeforeUpdateFailed {
+            cause: "The site is stopped, and it didn't finish starting in time to back it up \
+                    first"
+                .into(),
+        }));
     }
     Ok(if resting {
         Woke::FromRest
@@ -1543,16 +1701,49 @@ fn start_for_backup(
     })
 }
 
-/// Put a site the update woke from rest back to rest, once it answers on the
-/// new version. Best effort: a site left awake is still a working site.
-fn rest_again(stack: &Stack, woke: Woke, ready: bool, r: &mut dyn Reporter) {
-    if woke != Woke::FromRest {
-        return;
+/// What happens to a site the update woke, once the update has come out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterWake {
+    /// It wasn't resting before: leave it as it is.
+    Leave,
+    /// Put it back to rest.
+    Rest,
+    /// It is still booting: resting it now would cut its converge short.
+    StayAwake,
+}
+
+/// [`AfterWake`] for a site `woke` describes and how the update came out
+/// (`Ok(ready)`, or failed). A failed update rests the site again too (review
+/// 2026-11-14: it stayed awake); a site that wasn't resting is never rested.
+fn after_wake(woke: Woke, outcome: Result<bool, ()>) -> AfterWake {
+    match (woke, outcome) {
+        (Woke::No | Woke::Started, _) => AfterWake::Leave,
+        (Woke::FromRest, Ok(false)) => AfterWake::StayAwake,
+        (Woke::FromRest, Ok(true) | Err(())) => AfterWake::Rest,
     }
-    if !ready {
-        r.log("The site stays awake until it has finished booting; Stop puts it back to rest.");
-        return;
+}
+
+/// Hand back the update's result `done`, after putting a site it woke from rest
+/// back to rest ([`after_wake`]), whether the update worked or not. Best effort:
+/// a site left awake is still a working site.
+fn settle_woken(
+    stack: &Stack,
+    woke: Woke,
+    done: Result<Updated>,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    match after_wake(woke, done.as_ref().map(|u| u.ready()).map_err(|_| ())) {
+        AfterWake::Leave => {}
+        AfterWake::StayAwake => {
+            r.log("The site stays awake until it has finished booting; Stop puts it back to rest.")
+        }
+        AfterWake::Rest => rest_now(stack, r),
     }
+    done
+}
+
+/// Put an engine site to rest through its engine.
+fn rest_now(stack: &Stack, r: &mut dyn Reporter) {
     let Some(info) = ready_engine(stack) else {
         r.log("Couldn't reach the engine to put the site back to rest; Stop does it.");
         return;
@@ -3044,6 +3235,15 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
 
     // Best-effort cleanup of the in-container temp files.
     remove_in_container(stack, &[&stage, &archive]);
+    // The first automatic backup this version takes starts the count of the
+    // ones kept ([`AUTOMATIC_SINCE_FILE`]); older ones are never pruned.
+    let name = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if let Some(stamp) = automatic_backup_stamp(name) {
+        note_automatic_backups_since(stack, stamp);
+    }
 
     r.log(&format!("Snapshot written to {}", host_path.display()));
     plan.finish(r, "Backup saved.");
@@ -3889,6 +4089,51 @@ impl std::fmt::Display for SafetyBackupFailed {
 
 impl std::error::Error for SafetyBackupFailed {}
 
+/// A refusal the owner can override, knowing what it costs: a restore whose
+/// safety backup failed ([`SafetyBackupFailed`]; `--no-safety-backup`) or an
+/// update whose site couldn't be backed up first ([`BackupBeforeUpdateFailed`];
+/// `--no-backup`). The Manager offers the override behind a confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overridable {
+    /// Restore again without the safety backup.
+    RestoreWithoutSafetyBackup,
+    /// Update again without the backup first.
+    UpdateWithoutBackup,
+}
+
+impl Overridable {
+    /// The exit code `atelier` ends with for this refusal, so a Manager driving
+    /// it over SSH can tell it apart without reading its words.
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Overridable::RestoreWithoutSafetyBackup => 3,
+            Overridable::UpdateWithoutBackup => 4,
+        }
+    }
+
+    fn from_exit_code(code: i32) -> Option<Self> {
+        [
+            Overridable::RestoreWithoutSafetyBackup,
+            Overridable::UpdateWithoutBackup,
+        ]
+        .into_iter()
+        .find(|o| o.exit_code() == code)
+    }
+
+    /// Which refusal `e` is, if any: the typed error here, or a server's
+    /// `atelier` that ended with its exit code.
+    pub fn of(e: &anyhow::Error) -> Option<Self> {
+        if e.is::<SafetyBackupFailed>() {
+            Some(Overridable::RestoreWithoutSafetyBackup)
+        } else if e.is::<BackupBeforeUpdateFailed>() {
+            Some(Overridable::UpdateWithoutBackup)
+        } else {
+            e.downcast_ref::<crate::remote::RemoteExit>()
+                .and_then(|x| Self::from_exit_code(x.code))
+        }
+    }
+}
+
 /// The restore's safety backup must have worked, or been skipped because the
 /// site isn't running (no running database to lose): a failure stops the
 /// restore before anything is dropped.
@@ -3943,6 +4188,8 @@ pub fn restore_with(
         )),
         None => e,
     })?;
+    // The site may now run past an unfinished update's target.
+    drop_stale_update_target(stack);
     // Only after the restore worked, and never the backup just restored.
     prune_automatic_backups(stack, Some(file), r);
     Ok(())
@@ -4264,25 +4511,53 @@ const AUTOMATIC_BACKUP_LABELS: [&str; 4] = [
 /// How many automatic backups to keep (owner, 2026-11-14).
 const AUTOMATIC_BACKUPS_KEPT: usize = 3;
 
-/// True for a backup Atelier took by itself, as [`backup`] names it:
-/// `aincient-<label>-<YYYYMMDD>-<HHMMSS>[-N].tar.gz`. The `aincient-` prefix
-/// comes first (review 2026-11-14: matching the label against the whole name
-/// meant nothing was ever pruned).
-fn is_automatic_backup(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("aincient-") else {
-        return false;
-    };
-    AUTOMATIC_BACKUP_LABELS.iter().any(|l| {
-        rest.strip_prefix(l)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|stamp| {
-                let b = stamp.as_bytes();
-                b.len() >= 15
-                    && b[..8].iter().all(u8::is_ascii_digit)
-                    && b[8] == b'-'
-                    && b[9..15].iter().all(u8::is_ascii_digit)
-            })
+/// Where a site records when its automatic backups started counting toward
+/// [`AUTOMATIC_BACKUPS_KEPT`]: `<home>/.automatic-backups-since`, holding a
+/// `YYYYMMDD-HHMMSS` stamp as backup names carry it.
+///
+/// Manager versions before 0.17.0 took automatic backups and never removed
+/// any. Owner, 2026-11-14: only those taken from 0.17.0 on count toward the
+/// three kept; older ones are never removed automatically (Free up space
+/// offers them, [`older_automatic_backups`]). The stamp is that of the first
+/// automatic backup this version took, so every one it takes counts and none
+/// before it does.
+pub const AUTOMATIC_SINCE_FILE: &str = ".automatic-backups-since";
+
+/// The `YYYYMMDD-HHMMSS` stamp of a backup Atelier took by itself, as
+/// [`backup`] names it: `aincient-<label>-<YYYYMMDD>-<HHMMSS>[-N].tar.gz`.
+/// `None` for any other file. The `aincient-` prefix comes first (review
+/// 2026-11-14: matching the label against the whole name meant nothing was
+/// ever pruned).
+fn automatic_backup_stamp(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("aincient-")?;
+    AUTOMATIC_BACKUP_LABELS.iter().find_map(|l| {
+        let stamp = rest.strip_prefix(l)?.strip_prefix('-')?;
+        is_stamp(stamp.get(..15)?).then(|| &stamp[..15])
     })
+}
+
+/// `YYYYMMDD-HHMMSS`.
+fn is_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 15
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'-'
+        && b[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// The stamp in [`AUTOMATIC_SINCE_FILE`], if this site has one yet.
+pub fn automatic_backups_since(stack: &Stack) -> Option<String> {
+    let raw = std::fs::read_to_string(stack.home.join(AUTOMATIC_SINCE_FILE)).ok()?;
+    let stamp = raw.trim();
+    is_stamp(stamp).then(|| stamp.to_string())
+}
+
+/// Record `stamp` as the start of counted automatic backups, unless the site
+/// has a start already. Best effort: without it nothing is pruned.
+fn note_automatic_backups_since(stack: &Stack, stamp: &str) {
+    if automatic_backups_since(stack).is_none() {
+        let _ = std::fs::write(stack.home.join(AUTOMATIC_SINCE_FILE), format!("{stamp}\n"));
+    }
 }
 
 /// The same file, however each path spells it (a relative path, `..`, a
@@ -4295,24 +4570,38 @@ fn same_file(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// The automatic backups beyond the newest `keep`, oldest last — what a prune
-/// removes. `protect` (the backup a restore just loaded) is never among them,
-/// however its path is spelled.
-fn automatic_backups_to_prune<'a>(
-    backups: &'a [Backup],
-    keep: usize,
-    protect: Option<&Path>,
-) -> Vec<&'a Backup> {
+/// Automatic backups that count toward the newest `keep`: those stamped at or
+/// after `since` ([`AUTOMATIC_SINCE_FILE`]), newest first. None without a
+/// `since`.
+fn counted_automatic_backups<'a>(backups: &'a [Backup], since: Option<&str>) -> Vec<&'a Backup> {
+    let Some(since) = since else {
+        return Vec::new();
+    };
     let mut auto: Vec<&Backup> = backups
         .iter()
-        .filter(|b| is_automatic_backup(&b.name))
+        .filter(|b| automatic_backup_stamp(&b.name).is_some_and(|s| s >= since))
         .collect();
     auto.sort_by(|a, b| {
         b.modified_unix
             .cmp(&a.modified_unix)
+            .then_with(|| automatic_backup_stamp(&b.name).cmp(&automatic_backup_stamp(&a.name)))
             .then_with(|| b.name.cmp(&a.name))
     });
-    auto.into_iter()
+    auto
+}
+
+/// The counted automatic backups ([`counted_automatic_backups`]) beyond the
+/// newest `keep`, oldest last — what a prune removes. Older automatic backups
+/// are never among them, and neither is `protect` (the backup a restore just
+/// loaded), however its path is spelled.
+fn automatic_backups_to_prune<'a>(
+    backups: &'a [Backup],
+    keep: usize,
+    protect: Option<&Path>,
+    since: Option<&str>,
+) -> Vec<&'a Backup> {
+    counted_automatic_backups(backups, since)
+        .into_iter()
         .skip(keep)
         // Never the backup a restore loaded (review 2026-11-14: a prune after
         // the before-restore backup could delete the owner's pick).
@@ -4320,13 +4609,50 @@ fn automatic_backups_to_prune<'a>(
         .collect()
 }
 
-/// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] automatic backups; delete older
-/// ones. Runs only after the update or restore that took one succeeded, so a
-/// failed attempt (and its retries) never costs a backup. A file that won't
-/// delete is logged, not fatal.
-fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Reporter) {
+/// Automatic backups older than `since` (all of them without one): taken
+/// before automatic backups counted, never pruned, and what Free up space
+/// offers to remove. Never an owner's backup, never a counted one.
+fn older_automatic_backups<'a>(backups: &'a [Backup], since: Option<&str>) -> Vec<&'a Backup> {
+    backups
+        .iter()
+        .filter(|b| {
+            automatic_backup_stamp(&b.name).is_some_and(|s| since.is_none_or(|since| s < since))
+        })
+        .collect()
+}
+
+/// [`older_automatic_backups`] for `stack`, newest first by the stamp in
+/// their names (a copied file's date says nothing).
+pub fn older_backups(stack: &Stack) -> Vec<Backup> {
     let backups = list_backups(stack);
-    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT, protect) {
+    let since = automatic_backups_since(stack);
+    let mut older: Vec<Backup> = older_automatic_backups(&backups, since.as_deref())
+        .into_iter()
+        .cloned()
+        .collect();
+    older.sort_by(|a, b| {
+        automatic_backup_stamp(&b.name)
+            .cmp(&automatic_backup_stamp(&a.name))
+            .then_with(|| b.name.cmp(&a.name))
+    });
+    older
+}
+
+/// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] counted automatic backups;
+/// delete older counted ones. Runs only after the update or restore that took
+/// one succeeded, so a failed attempt (and its retries) never costs a backup. A
+/// file that won't delete is logged, not fatal. A site with no start for
+/// counting yet gets one now, and nothing goes.
+fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Reporter) {
+    let Some(since) = automatic_backups_since(stack) else {
+        note_automatic_backups_since(
+            stack,
+            &chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
+        );
+        return;
+    };
+    let backups = list_backups(stack);
+    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT, protect, Some(&since)) {
         match std::fs::remove_file(&b.path) {
             Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
             Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),
@@ -4997,6 +5323,9 @@ mod tests {
         assert!(format!("{e:#}").contains("failed to connect"), "{e:#}");
     }
 
+    /// When the backups in the prune tests started counting: before all of them.
+    const SINCE: Option<&str> = Some("20261101-000000");
+
     #[test]
     fn only_automatic_backups_beyond_the_newest_three_are_pruned() {
         // Names exactly as `backup()` writes them (review 2026-11-14: the old
@@ -5030,7 +5359,7 @@ mod tests {
             // A file brought in from elsewhere, named like ours without the prefix.
             b("before-update-20261001-090000.tar.gz".into(), 0),
         ];
-        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3, None)
+        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3, None, SINCE)
             .iter()
             .map(|b| b.name.as_str())
             .collect();
@@ -5042,7 +5371,7 @@ mod tests {
                 "aincient-before-update-20261101-100000.tar.gz"
             ]
         );
-        assert!(automatic_backups_to_prune(&all[..3], 3, None).is_empty());
+        assert!(automatic_backups_to_prune(&all[..3], 3, None, SINCE).is_empty());
     }
 
     #[test]
@@ -5071,9 +5400,9 @@ mod tests {
         let oldest = "aincient-before-update-20261101-100000.tar.gz";
         let spelled = backups.join("..").join("backups").join(oldest);
         assert_ne!(spelled, Path::new(&all[0].path));
-        assert!(automatic_backups_to_prune(&all, 3, Some(&spelled)).is_empty());
+        assert!(automatic_backups_to_prune(&all, 3, Some(&spelled), SINCE).is_empty());
         assert_eq!(
-            automatic_backups_to_prune(&all, 3, None)[0].name,
+            automatic_backups_to_prune(&all, 3, None, SINCE)[0].name,
             oldest,
             "without the protect it is the one pruned"
         );
@@ -5097,6 +5426,260 @@ mod tests {
             require_safety_backup(Ok(Some(saved.clone()))).unwrap(),
             Some(saved)
         );
+    }
+
+    /// Backups as `backup()` names them, in a site's backups folder.
+    fn backups_in(stack: &Stack, names: &[&str]) {
+        let dir = stack.backups_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+    }
+
+    fn names_left(stack: &Stack) -> Vec<String> {
+        let mut v: Vec<String> = list_backups(stack).into_iter().map(|b| b.name).collect();
+        v.sort();
+        v
+    }
+
+    // Automatic backups an earlier Manager took and never pruned (B6), and the
+    // owner's own: the same file names `backup()` writes.
+    const OLD_STEPPED: &str = "aincient-before-stepped-upgrade-20260101-120000.tar.gz";
+    const OLD_SWITCH: &str = "aincient-before-channel-switch-20260301-090000.tar.gz";
+    const OLD_UPDATE: &str = "aincient-before-update-20261020-080000.tar.gz";
+    const OWNERS: &str = "aincient-20250101-000000.tar.gz";
+    const OWNERS_LABELLED: &str = "aincient-before-redesign-20250101-000000.tar.gz";
+
+    #[test]
+    fn automatic_backups_from_before_counting_started_are_never_pruned() {
+        let dir = Scratch::new("prune-since");
+        let stack = Stack::at(dir.0.clone());
+        let new = [
+            "aincient-before-update-20261114-100000.tar.gz",
+            "aincient-before-restore-20261114-110000.tar.gz",
+            "aincient-before-update-20261114-120000.tar.gz",
+            "aincient-before-update-20261114-130000.tar.gz",
+        ];
+        backups_in(
+            &stack,
+            &[OLD_STEPPED, OLD_SWITCH, OLD_UPDATE, OWNERS, OWNERS_LABELLED],
+        );
+        backups_in(&stack, &new);
+
+        // No start recorded yet (a site whose first 0.17 update took no backup):
+        // nothing goes, and counting starts now.
+        super::prune_automatic_backups(&stack, None, &mut Silent);
+        assert_eq!(names_left(&stack).len(), 9);
+        let since = super::automatic_backups_since(&stack).expect("recorded");
+        assert!(since.as_str() > "20261114-130000", "{since}");
+
+        // As `backup()` records it: the first automatic backup's own stamp.
+        std::fs::remove_file(stack.home.join(super::AUTOMATIC_SINCE_FILE)).unwrap();
+        super::note_automatic_backups_since(&stack, "20261114-100000");
+        // Never moved by a later one.
+        super::note_automatic_backups_since(&stack, "20261114-130000");
+        assert_eq!(
+            super::automatic_backups_since(&stack).as_deref(),
+            Some("20261114-100000")
+        );
+        super::prune_automatic_backups(&stack, None, &mut Silent);
+        let left = names_left(&stack);
+        // Only the oldest of the four counted ones; every older one stays.
+        assert!(!left.contains(&new[0].to_string()), "{left:?}");
+        for keep in [OLD_STEPPED, OLD_SWITCH, OLD_UPDATE, OWNERS, OWNERS_LABELLED] {
+            assert!(left.contains(&keep.to_string()), "{keep} gone: {left:?}");
+        }
+        assert_eq!(left.len(), 8);
+    }
+
+    #[test]
+    fn free_up_space_offers_only_older_automatic_backups() {
+        let dir = Scratch::new("older-backups");
+        let stack = Stack::at(dir.0.clone());
+        backups_in(
+            &stack,
+            &[
+                OLD_STEPPED,
+                OLD_SWITCH,
+                OLD_UPDATE,
+                OWNERS,
+                OWNERS_LABELLED,
+                "aincient-before-update-20261114-100000.tar.gz",
+                "aincient-before-update-20261114-100000-2.tar.gz",
+            ],
+        );
+        let names = |v: Vec<Backup>| {
+            let mut n: Vec<String> = v.into_iter().map(|b| b.name).collect();
+            n.sort();
+            n
+        };
+        // Before counting started, every automatic backup is an older one.
+        assert_eq!(
+            names(super::older_backups(&stack)),
+            [
+                "aincient-before-channel-switch-20260301-090000.tar.gz",
+                "aincient-before-stepped-upgrade-20260101-120000.tar.gz",
+                "aincient-before-update-20261020-080000.tar.gz",
+                "aincient-before-update-20261114-100000-2.tar.gz",
+                "aincient-before-update-20261114-100000.tar.gz",
+            ]
+        );
+        // Once it has, only those before it: never a counted one.
+        super::note_automatic_backups_since(&stack, "20261114-100000");
+        assert_eq!(
+            names(super::older_backups(&stack)),
+            [OLD_SWITCH, OLD_STEPPED, OLD_UPDATE]
+        );
+    }
+
+    #[test]
+    fn an_update_target_the_site_has_moved_past_is_dropped() {
+        use super::{live_update_target_with, tag_version, waypoint_image};
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert_eq!(tag_version(&waypoint_image(v("0.21.0"))), Some(v("0.21.0")));
+        assert_eq!(
+            tag_version("ghcr.io/aincient-labs/atelier-cms:latest"),
+            None
+        );
+        assert_eq!(tag_version("localhost:5000/atelier-cms"), None);
+        assert_eq!(
+            tag_version("ghcr.io/aincient-labs/atelier-cms@sha256:0f93c730bf54a025610ea0c4fafb1a80012773152cd22ce5227bd968e6e96bae"),
+            None
+        );
+
+        let dir = Scratch::new("stale-target");
+        let stack = Stack::at(dir.0.clone());
+        let no_registry = |_: &str| -> Option<Version> { panic!("tag says it") };
+        // A route to 0.20.0, and the site now runs 0.21.0 (a restore, an install).
+        stack
+            .set_update_target(&waypoint_image(v("0.20.0")))
+            .unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), no_registry),
+            None
+        );
+        assert!(stack.update_target().is_none(), "deleted");
+        // Reached exactly: done.
+        stack
+            .set_update_target(&waypoint_image(v("0.21.0")))
+            .unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("v0.21.0"), no_registry),
+            None
+        );
+        // Still ahead: kept.
+        let ahead = waypoint_image(v("0.22.0"));
+        stack.set_update_target(&ahead).unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), no_registry),
+            Some(ahead.clone())
+        );
+        // Unknown running version (an `edge+sha` build, no container): kept.
+        assert_eq!(
+            live_update_target_with(&stack, Some("edge+1a2b3c4"), no_registry),
+            Some(ahead.clone())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, None, no_registry),
+            Some(ahead)
+        );
+        // A channel target: its version comes from the registry.
+        let channel = "ghcr.io/aincient-labs/atelier-cms:latest";
+        stack.set_update_target(channel).unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| Some(v("0.22.0"))),
+            Some(channel.to_string())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| None),
+            Some(channel.to_string())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| Some(v("0.21.0"))),
+            None
+        );
+        assert!(stack.update_target().is_none());
+    }
+
+    #[test]
+    fn a_site_woken_from_rest_rests_again_whether_the_update_worked_or_not() {
+        use super::{after_wake, AfterWake, Woke};
+        assert_eq!(after_wake(Woke::FromRest, Ok(true)), AfterWake::Rest);
+        // The failed update (review 2026-11-14: it stayed awake).
+        assert_eq!(after_wake(Woke::FromRest, Err(())), AfterWake::Rest);
+        // Still converging: resting it now would cut that short.
+        assert_eq!(after_wake(Woke::FromRest, Ok(false)), AfterWake::StayAwake);
+        // A site that wasn't resting is never rested.
+        for outcome in [Ok(true), Ok(false), Err(())] {
+            assert_eq!(after_wake(Woke::No, outcome), AfterWake::Leave);
+            assert_eq!(after_wake(Woke::Started, outcome), AfterWake::Leave);
+        }
+    }
+
+    #[test]
+    fn an_update_without_a_backup_does_not_start_the_site_but_rests_it_again() {
+        use super::{woke_without_start, Woke};
+        let stopped = format!(
+            "{}\n{}\n{}",
+            stopped(PS_APP),
+            stopped(PS_DB),
+            stopped(PS_EDGE)
+        );
+        let state = container_state_from_ps(&stopped);
+        assert_eq!(woke_without_start(state, Some("resting")), Woke::FromRest);
+        assert_eq!(woke_without_start(state, None), Woke::Started);
+        let running = format!("{PS_APP}\n{PS_DB}\n{PS_EDGE}");
+        assert_eq!(
+            woke_without_start(container_state_from_ps(&running), Some("awake")),
+            Woke::No
+        );
+    }
+
+    #[test]
+    fn refusals_with_an_override_are_told_apart_by_type_and_exit_code() {
+        use super::{BackupBeforeUpdateFailed, Overridable};
+        use anyhow::Context;
+        // As `start_for_backup` builds it: the cause stays readable (a failed
+        // boot that needs Docker restarted keeps its button).
+        let e = Err::<(), _>(anyhow::Error::new(crate::boot::BootFailed(
+            "The database didn't start.".into(),
+        )))
+        .context(BackupBeforeUpdateFailed {
+            cause: "The site is stopped and couldn't be started to back it up first".into(),
+        })
+        .unwrap_err();
+        assert_eq!(Overridable::of(&e), Some(Overridable::UpdateWithoutBackup));
+        assert!(e.downcast_ref::<crate::boot::BootFailed>().is_some());
+        assert_eq!(
+            format!("{e:#}"),
+            "The site is stopped and couldn't be started to back it up first, so it wasn't \
+             updated: The database didn't start."
+        );
+        let e = require_safety_backup(Err(anyhow::anyhow!("No space left on device"))).unwrap_err();
+        assert_eq!(
+            Overridable::of(&e),
+            Some(Overridable::RestoreWithoutSafetyBackup)
+        );
+        // A server's `atelier` says it by its exit code.
+        for o in [
+            Overridable::RestoreWithoutSafetyBackup,
+            Overridable::UpdateWithoutBackup,
+        ] {
+            let remote = anyhow::Error::new(crate::remote::RemoteExit {
+                host: "deploy@example.com".into(),
+                what: "`atelier app update`".into(),
+                code: o.exit_code(),
+            });
+            assert_eq!(Overridable::of(&remote), Some(o));
+        }
+        let other = anyhow::Error::new(crate::remote::RemoteExit {
+            host: "deploy@example.com".into(),
+            what: "`atelier app update`".into(),
+            code: 1,
+        });
+        assert_eq!(Overridable::of(&other), None);
+        assert_eq!(Overridable::of(&anyhow::anyhow!("anything else")), None);
     }
 
     #[test]

@@ -585,9 +585,10 @@
               <span id="cleanup-summary" class="kv-value">—</span>
             </div>
             <p class="hint">
-              Removes old Atelier versions and other downloads no site is using. Your sites'
-              data and backups are never touched; anything removed downloads again when a site
-              needs it.
+              Removes old Atelier versions and other downloads no site is using; anything
+              removed downloads again when a site needs it. Your sites' data is never touched,
+              and backups only when you tick the older automatic ones earlier versions of the
+              Manager kept.
             </p>
             <button class="btn small full" id="free-space" data-action="free-space" disabled>
               <svg class="ic"><use href="#i-trash" /></svg>Free up space
@@ -789,6 +790,7 @@
         <p id="confirm-site" class="modal-site whisper hidden"></p>
         <h3 id="confirm-title" class="modal-title hidden"></h3>
         <p id="confirm-msg"></p>
+        <div id="confirm-checks" class="confirm-checks hidden"></div>
         <label id="confirm-typecheck" class="confirm-type hidden">
           <span><span id="confirm-lead"></span>Type <b id="confirm-word">confirm</b> to continue</span>
           <input id="confirm-input" type="text" autocomplete="off" spellcheck="false" />

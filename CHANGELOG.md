@@ -12,11 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Before every update, Atelier backs up your site first (a "before-update" backup), so a one-step
   update can be undone from **Backups** like a multi-step one. Before a restore, it saves your site
   as it is now ("before-restore"); if the restore fails, the error names that file. If that backup
-  can't be taken (a full disk, a read-only backups folder), the restore stops and your site is left
-  as it was; `atelier data restore --no-safety-backup` restores without one.
-- Atelier keeps the newest 3 of the backups it takes by itself and removes older ones, but only
-  after an update or restore has worked: a failed attempt, and every retry, keeps them all. The
-  backup you just restored is never removed. Backups you make are never removed.
+  can't be taken (a full disk, a damaged database), the restore stops and your site is left as it
+  was. The app then offers **Restore without a safety copy**, after saying your site as it is now
+  will be lost for good; `atelier data restore --no-safety-backup` does the same.
+- Atelier keeps the newest 3 of the backups it takes by itself from this version on and removes
+  older ones, but only after an update or restore has worked: a failed attempt, and every retry,
+  keeps them all. The backup you just restored is never removed. Backups you make are never removed,
+  and neither are the automatic ones earlier versions kept: **Free up space** lists them for each
+  site, unticked, and `atelier app cleanup --older-backups` includes them.
 - **Home** always says whether you're up to date and when it last checked, with **Check now**.
   When an update is ready, it shows both versions and a **What's new** link. **System → Updates**
   says how often Atelier checks.
@@ -27,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists). After a successful update, old versions are removed automatically. Anything one of your
   sites needs to start stays, even while that site is stopped, as do images that can't be downloaded
   again (your own builds) and the database and web-server images other programs may share. Your
-  sites' data, your backups and other programs' images are never touched; anything removed downloads
-  again when a site needs it.
+  sites' data and other programs' images are never touched, nor are your backups unless you tick
+  the older automatic ones; anything removed downloads again when a site needs it.
 
 - **Restart Docker** for you: when a start, update or checkup ends with "Restart Docker", the app
   shows a **Restart** button named for what runs Docker on your computer (Docker Desktop, OrbStack,
@@ -43,7 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Run a checkup** and **View activity**, instead of waiting forever.
 - When a start, update or setup finishes but the site hasn't answered yet, the app says so instead
   of reporting success. After a failed one, Home shows what didn't finish, with **Run a checkup**.
-- With the site stopped, **Backups** offers **Start my website** instead of failing.
+- With the site stopped, **Backups** offers **Start my website** instead of failing. A site that
+  runs but doesn't answer (still starting, or broken by a failed update) can be restored right away;
+  only **Back up now** waits until it answers.
 - Backups are listed by date, size and what they're for ("Before update · 14 Nov 2026, 10:15 ·
   12 MB") instead of by file name.
 
@@ -62,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or version switch it checks again instead of saying "Couldn't check"; "What's new" links the
   release (or the releases list when the version isn't a plain number); the "didn't finish starting"
   and "still starting" lines clear once the site is up or stopped; only one "Run a checkup" shows;
-  Backups waits until the site answers ("Your website is still starting"); the update line keeps
+  **Back up now** waits until the site answers; the update line keeps
   keyboard focus when it refreshes; and the page behind a running operation can't be clicked or
   tabbed into, so a second operation can't be started by accident. The finished panel says what the
   clean-up after an update removed.
@@ -103,15 +108,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Start and Stop say "Start Docker" when Docker isn't running, instead of a Docker error.
 - A multi-step update that stopped partway no longer leaves the site stuck on the version it
   reached. Home shows **Continue update** (`atelier app check-update` says the update didn't
-  finish), and the next update carries on to the version it was heading for.
+  finish), and the next update carries on to the version it was heading for. Once the site runs
+  that version or a newer one (after a restore, an install or another update), the unfinished
+  update is forgotten instead of steering the next update back to an older version.
 - An update downloads first. When the download is the version your site already runs, it says
   "Already up to date" and takes no backup and restarts nothing, in the app as on the command line.
   If you changed the site's settings since it started (its `.env`, such as the port or trusted
   hosts), `atelier app update` applies them on the same version, with no backup, and says "Already
   up to date. Applied your changed settings."
 - Updating a stopped site starts it first, so the before-update backup can be taken; if it won't
-  start, the update stops and says why. A site with the experimental engine that is resting is woken
-  for the update and put back to rest afterwards. A locked site is not updated or started by
+  start, the update stops and says why. The app then offers **Update without a backup**, after
+  saying your site as it is now can't be brought back if the update goes wrong; `atelier app update
+  --no-backup` does the same. A site with the experimental engine that is resting is woken for the
+  update and put back to rest afterwards, also when the update fails. A locked site is not updated or started by
   `atelier doctor --fix`: it says to unlock it first. `atelier doctor` reports a resting site as fine
   instead of as stopped containers.
 - Waking a site with the experimental engine recovers like a start does: a network entry Docker

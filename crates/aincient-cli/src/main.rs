@@ -342,6 +342,12 @@ enum AppCommand {
         /// Don't ask before walking a multi-step upgrade.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Update without a backup first. Without it, a stopped site that
+        /// won't start on its current version (so it can't be backed up) is
+        /// not updated. Its pages and settings as they are now can't be
+        /// brought back if the update goes wrong.
+        #[arg(long, conflicts_with = "all")]
+        no_backup: bool,
     },
     /// Check whether a newer image is available in the registry.
     #[command(visible_alias = "check")]
@@ -373,11 +379,18 @@ enum AppCommand {
     },
     /// Remove Atelier's unused downloads (old versions, replaced database and
     /// web-server images) to free disk space. Your sites' data and backups are
-    /// never touched; a removed image is downloaded again when a site needs it.
+    /// never touched (unless you add --older-backups); a removed image is
+    /// downloaded again when a site needs it.
     Cleanup {
         /// Only list what would be removed.
         #[arg(long)]
         dry_run: bool,
+        /// Also remove this site's older automatic backups: the ones earlier
+        /// Manager versions took before updates, restores and channel switches
+        /// and never removed. Your own backups and the newest automatic ones
+        /// are never included.
+        #[arg(long)]
+        older_backups: bool,
         /// Remove without asking first.
         #[arg(short = 'y', long)]
         yes: bool,
@@ -611,11 +624,19 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("{} {err:#}", style::error("error:"));
         // A remote command's own exit code is the answer a script wants (m2-7).
-        let code = err
-            .downcast_ref::<remote::RemoteExit>()
-            .map_or(1, |exit| exit.code);
+        let code = exit_code(&err);
         std::process::exit(code);
     }
+}
+
+/// What `atelier` exits with for `err`: a remote command's own code (the answer
+/// a script wants, m2-7), a refusal the Manager can override
+/// ([`ops::Overridable::exit_code`]), else 1.
+fn exit_code(err: &anyhow::Error) -> i32 {
+    if let Some(exit) = err.downcast_ref::<remote::RemoteExit>() {
+        return exit.code;
+    }
+    ops::Overridable::of(err).map_or(1, ops::Overridable::exit_code)
 }
 
 /// A success banner: a restrained hairline rule (when colour is on) over a mint headline and the
@@ -1234,7 +1255,7 @@ fn update_all(yes: bool) -> Result<()> {
             "\n{}",
             style::heading(&format!("== {} ({}) ==", row.slug, row.label))
         );
-        if let Err(e) = update_cmd(&row.stack(), None, yes) {
+        if let Err(e) = update_cmd(&row.stack(), None, yes, false) {
             println!("{} {e:#}", style::error("error:"));
             failed.push(row.slug.clone());
         }
@@ -1397,7 +1418,9 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             show_login(stack);
             Ok(())
         }
-        AppCommand::Update { to, yes, .. } => update_cmd(stack, to, yes),
+        AppCommand::Update {
+            to, yes, no_backup, ..
+        } => update_cmd(stack, to, yes, no_backup),
         AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
@@ -1466,15 +1489,43 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             );
             Ok(())
         }
-        AppCommand::Cleanup { dry_run, yes } => {
-            use aincient_core::cleanup::{find, free, human_bytes, Scope};
+        AppCommand::Cleanup {
+            dry_run,
+            yes,
+            older_backups,
+        } => {
+            use aincient_core::cleanup::{
+                find, free, human_bytes, older_backups_of, remove_older_backups, Scope,
+            };
             let found = find(Scope::Everything)?;
-            if found.images.is_empty() {
+            let backups_word = |n: usize| {
+                format!(
+                    "{n} older automatic backup{}",
+                    if n == 1 { "" } else { "s" }
+                )
+            };
+            // Offered, never assumed: only with --older-backups.
+            let older = match older_backups_of(stack) {
+                Some(o) if !older_backups => {
+                    println!(
+                        "{} of {} ({}) can go too: add --older-backups.",
+                        backups_word(o.backups.len()),
+                        o.label,
+                        human_bytes(o.total_bytes)
+                    );
+                    None
+                }
+                other => other,
+            };
+            if found.images.is_empty() && older.is_none() {
                 println!("Nothing to remove: Atelier has no unused downloads on this computer.");
                 return Ok(());
             }
-            let list = |images: &[aincient_core::cleanup::Reclaimable]| {
-                for i in images {
+            let count = |n: usize| format!("{n} image{}", if n == 1 { "" } else { "s" });
+            let mut what = Vec::new();
+            if !found.images.is_empty() {
+                println!("Unused downloads (each downloads again when a site needs it):");
+                for i in &found.images {
                     let name = i
                         .names
                         .first()
@@ -1482,38 +1533,69 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
                         .unwrap_or_else(|| format!("{} (old version)", i.repo));
                     println!("  {}  {name}", human_bytes(i.size_bytes));
                 }
-            };
-            let count = |n: usize| format!("{n} image{}", if n == 1 { "" } else { "s" });
-            list(&found.images);
-            if dry_run {
-                println!(
-                    "Would remove {} (up to {}). Your sites' data and backups are untouched.",
+                what.push(format!(
+                    "{} (up to {})",
                     count(found.images.len()),
                     human_bytes(found.total_bytes)
+                ));
+            }
+            if let Some(o) = &older {
+                println!(
+                    "{} of {} (they can't be brought back; your own backups and the newest \
+                     automatic ones stay):",
+                    backups_word(o.backups.len()),
+                    o.label
                 );
+                for b in &o.backups {
+                    println!("  {}  {}", human_bytes(b.size_bytes), b.name);
+                }
+                what.push(format!(
+                    "{} ({})",
+                    backups_word(o.backups.len()),
+                    human_bytes(o.total_bytes)
+                ));
+            }
+            let what = what.join(" and ");
+            let untouched = if older.is_some() {
+                "Your sites' data and other backups are untouched."
+            } else {
+                "Your sites' data and backups are untouched."
+            };
+            if dry_run {
+                println!("Would remove {what}. {untouched}");
                 return Ok(());
             }
-            let question = format!(
-                "Remove {} (up to {})? Each downloads again when a site needs it.",
-                count(found.images.len()),
-                human_bytes(found.total_bytes)
-            );
-            if !confirm(&question, yes)? {
+            if !confirm(&format!("Remove {what}?"), yes)? {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            // Only what was listed: anything that became removable since stays.
-            let shown: std::collections::HashSet<String> =
-                found.images.iter().map(|i| i.id.clone()).collect();
-            let report = free(Scope::Everything, Some(&shown))?;
-            println!(
-                "Removed {} (up to {}). Your sites' data and backups are untouched.",
-                count(report.images.len()),
-                human_bytes(report.total_bytes)
-            );
-            for f in &report.failed {
-                println!("  Kept {f}: Docker says it's in use.");
+            if !found.images.is_empty() {
+                // Only what was listed: anything that became removable since stays.
+                let shown: std::collections::HashSet<String> =
+                    found.images.iter().map(|i| i.id.clone()).collect();
+                let report = free(Scope::Everything, Some(&shown))?;
+                println!(
+                    "Removed {} (up to {}).",
+                    count(report.images.len()),
+                    human_bytes(report.total_bytes)
+                );
+                for f in &report.failed {
+                    println!("  Kept {f}: Docker says it's in use.");
+                }
             }
+            if let Some(o) = older {
+                let shown = o.backups.iter().map(|b| b.path.clone()).collect();
+                let done = remove_older_backups(std::slice::from_ref(stack), &shown);
+                println!(
+                    "Removed {} ({}).",
+                    backups_word(done.removed.len()),
+                    human_bytes(done.total_bytes)
+                );
+                for f in &done.failed {
+                    println!("  Kept {f}.");
+                }
+            }
+            println!("{untouched}");
             Ok(())
         }
         AppCommand::Logs { follow, service } => {
@@ -2064,7 +2146,7 @@ fn parse_channel(name: &str) -> Result<Channel> {
 /// "update" is one pull and one restart — landing them in a five-minute sequence
 /// through versions they never chose, without saying so first, is how a routine
 /// update becomes a support conversation.
-fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
+fn update_cmd(stack: &Stack, to: Option<String>, yes: bool, no_backup: bool) -> Result<()> {
     // A channel update (no explicit target) can be conclusively "nothing new" — and
     // an update that always claims success can never tell the operator so. On a
     // definite answer, short-circuit; fall through when the check is inconclusive.
@@ -2162,7 +2244,21 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     }
 
     let pinned_to = to.is_some();
-    match ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
+    let opts = ops::UpdateOptions { no_backup };
+    let done = ops::apply_upgrade_with(stack, &plan, &opts, &mut CliReporter::default())
+        .inspect_err(|e| {
+            if ops::Overridable::of(e) == Some(ops::Overridable::UpdateWithoutBackup) {
+                println!(
+                    "{}",
+                    style::warn(
+                        "Fix what stopped it and try again, or pass --no-backup to update \
+                         without a backup (your site as it is now can't be brought back if \
+                         the update goes wrong)."
+                    )
+                );
+            }
+        })?;
+    match done {
         ops::Updated::Ready => done_banner("Update complete.", &stack.console_url()),
         ops::Updated::Booting => pending_banner(
             "Update applied — still finishing boot.",
@@ -2360,7 +2456,11 @@ enum Route {
     /// `app check-update [--json]`.
     CheckUpdate { json: bool },
     /// `app update`: plan + confirm here, then the server walks it.
-    Update { to: Option<String>, yes: bool },
+    Update {
+        to: Option<String>,
+        yes: bool,
+        no_backup: bool,
+    },
     /// `data restore`: confirm here, then the server restores its own file,
     /// or one uploaded from here.
     Restore {
@@ -2517,7 +2617,9 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
         Command::App { command } => match command {
             AppCommand::Status { json } => Route::Status { json },
             AppCommand::CheckUpdate { json } => Route::CheckUpdate { json },
-            AppCommand::Update { to, yes, .. } => Route::Update { to, yes },
+            AppCommand::Update {
+                to, yes, no_backup, ..
+            } => Route::Update { to, yes, no_backup },
             AppCommand::Start => Route::Run(Action::Start),
             AppCommand::Stop { yes } => Route::Change {
                 action: Action::Stop,
@@ -2826,7 +2928,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
             }
             Ok(())
         }
-        Route::Update { to, yes } => remote_update(&session, site, to, yes),
+        Route::Update { to, yes, no_backup } => remote_update(&session, site, to, yes, no_backup),
         Route::Restore {
             file,
             yes,
@@ -2943,6 +3045,7 @@ fn remote_update(
     site: &sites::Site,
     to: Option<String>,
     yes: bool,
+    no_backup: bool,
 ) -> Result<()> {
     let mut confirmed = yes;
     let mut asked = false;
@@ -2981,7 +3084,14 @@ fn remote_update(
             confirmed = true;
         }
     }
-    session.run_action(&remote::Action::Update { to, yes: confirmed }, &mut relay)
+    session.run_action(
+        &remote::Action::Update {
+            to,
+            yes: confirmed,
+            no_backup,
+        },
+        &mut relay,
+    )
 }
 
 /// `app open` on a remote site (m2-4, D-02): the recorded domain, or an SSH
@@ -3414,9 +3524,20 @@ mod tests {
             }
         ));
         match route(&["app", "update", "--to", "0.21.0"]).unwrap() {
-            Route::Update { to, yes } => {
+            Route::Update { to, yes, no_backup } => {
                 assert_eq!(to.as_deref(), Some("0.21.0"));
-                assert!(!yes);
+                assert!(!yes && !no_backup);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Forwarded only when set, like --no-safety-backup.
+        match route(&["app", "update", "--no-backup"]).unwrap() {
+            Route::Update { to, yes, no_backup } => {
+                assert!(no_backup);
+                let sent = remote::Action::Update { to, yes, no_backup }
+                    .argv()
+                    .join(" ");
+                assert_eq!(sent, "app update --no-backup");
             }
             other => panic!("{other:?}"),
         }
@@ -3913,6 +4034,57 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["atelier", "docker"]).is_err());
         assert!(Cli::try_parse_from(["atelier", "docker", "restart", "now"]).is_err());
+    }
+
+    #[test]
+    fn update_takes_no_backup_and_cleanup_takes_older_backups() {
+        match Cli::try_parse_from(["atelier", "app", "update", "--no-backup", "-y"])
+            .unwrap()
+            .command
+        {
+            Command::App {
+                command: AppCommand::Update { no_backup, yes, .. },
+            } => assert!(no_backup && yes),
+            _ => panic!("not app update"),
+        }
+        // Each site's own refusal decides: not one flag for all of them.
+        assert!(Cli::try_parse_from(["atelier", "app", "update", "--all", "--no-backup"]).is_err());
+        match Cli::try_parse_from(["atelier", "app", "cleanup", "--dry-run", "--older-backups"])
+            .unwrap()
+            .command
+        {
+            Command::App {
+                command:
+                    AppCommand::Cleanup {
+                        dry_run,
+                        older_backups,
+                        yes,
+                    },
+            } => assert!(dry_run && older_backups && !yes),
+            _ => panic!("not app cleanup"),
+        }
+    }
+
+    #[test]
+    fn refusals_with_an_override_exit_with_their_own_code() {
+        let e = anyhow::Error::new(ops::BackupBeforeUpdateFailed {
+            cause: "The site is stopped, and it didn't finish starting in time to back it up \
+                    first"
+                .into(),
+        });
+        assert_eq!(exit_code(&e), 4);
+        let e = anyhow::Error::new(ops::SafetyBackupFailed {
+            cause: "No space left on device".into(),
+        });
+        assert_eq!(exit_code(&e), 3);
+        assert_eq!(exit_code(&anyhow::anyhow!("anything else")), 1);
+        // A server's own code passes through, these included.
+        let remote = anyhow::Error::new(remote::RemoteExit {
+            host: "deploy@example.com".into(),
+            what: "`atelier app update`".into(),
+            code: 4,
+        });
+        assert_eq!(exit_code(&remote), 4);
     }
 
     #[test]

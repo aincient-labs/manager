@@ -471,9 +471,15 @@ pub enum Action {
     Status,
     /// `app check-update --json` — see [`Session::check_update`].
     CheckUpdate,
-    /// `app update [--to V] [--yes]`. `yes` only when the route was confirmed
-    /// here first (or there was nothing to confirm).
-    Update { to: Option<String>, yes: bool },
+    /// `app update [--to V] [--yes] [--no-backup]`. `yes` only when the route
+    /// was confirmed here first (or there was nothing to confirm);
+    /// `--no-backup` only when the owner chose to go without one, so a server
+    /// whose `atelier` predates the flag still takes every other update.
+    Update {
+        to: Option<String>,
+        yes: bool,
+        no_backup: bool,
+    },
     /// `app start`.
     Start,
     /// `app stop`.
@@ -537,10 +543,13 @@ impl Action {
             }
         };
         match self {
-            Action::Update { to, yes } => {
+            Action::Update { to, yes, no_backup } => {
                 opt("--to", to);
                 if *yes {
                     v.push("--yes".into());
+                }
+                if *no_backup {
+                    v.push("--no-backup".into());
                 }
             }
             Action::Backup { label, json } => {
@@ -2653,6 +2662,7 @@ mod tests {
                 Action::Update {
                     to: None,
                     yes: true,
+                    no_backup: false,
                 },
                 "app update --yes",
                 UPDATE_DEADLINE,
@@ -2661,8 +2671,18 @@ mod tests {
                 Action::Update {
                     to: Some("0.21.0".into()),
                     yes: false,
+                    no_backup: false,
                 },
                 "app update --to 0.21.0",
+                UPDATE_DEADLINE,
+            ),
+            (
+                Action::Update {
+                    to: None,
+                    yes: true,
+                    no_backup: true,
+                },
+                "app update --yes --no-backup",
                 UPDATE_DEADLINE,
             ),
             (Action::Start, "app start", LIFECYCLE_DEADLINE),
@@ -2809,6 +2829,7 @@ mod tests {
                 &Action::Update {
                     to: None,
                     yes: true,
+                    no_backup: false,
                 },
                 &mut |_, _| {},
             )

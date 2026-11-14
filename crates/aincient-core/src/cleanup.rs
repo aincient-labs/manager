@@ -407,6 +407,87 @@ fn remove_each(
     report
 }
 
+/// One local site's older automatic backups ([`crate::ops::older_backups`]):
+/// taken by a Manager before 0.17.0, never pruned, offered here for the owner
+/// to tick. Never an owner's backup, never one of the newest kept.
+#[derive(Debug, Clone, Serialize)]
+pub struct OlderBackups {
+    /// The site's slug (`None` for an unregistered `~/.atelier`).
+    pub slug: Option<String>,
+    /// The site's name, as the Manager shows it.
+    pub label: String,
+    pub backups: Vec<crate::ops::Backup>,
+    pub total_bytes: u64,
+}
+
+/// What [`remove_older_backups`] removed.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BackupsRemoved {
+    pub removed: Vec<String>,
+    pub total_bytes: u64,
+    /// Files that wouldn't delete.
+    pub failed: Vec<String>,
+}
+
+/// `stack`'s older automatic backups, if it has any.
+pub fn older_backups_of(stack: &Stack) -> Option<OlderBackups> {
+    let backups = crate::ops::older_backups(stack);
+    (!backups.is_empty()).then(|| OlderBackups {
+        slug: stack.slug.clone(),
+        label: stack.display_name(),
+        total_bytes: backups.iter().map(|b| b.size_bytes).sum(),
+        backups,
+    })
+}
+
+/// The sites on this computer (the registry plus an unadopted `~/.atelier`).
+fn local_stacks(user_home: &Path) -> Result<Vec<Stack>> {
+    let registry =
+        crate::sites::load_effective(user_home).context("couldn't read the list of sites")?;
+    Ok(registry
+        .iter()
+        .flat_map(|r| &r.sites)
+        .filter(|s| !s.is_remote())
+        .map(|s| s.stack())
+        .collect())
+}
+
+/// [`older_backups_of`] for every site on this computer.
+pub fn older_backups_everywhere() -> Result<Vec<OlderBackups>> {
+    let user_home = crate::sites::user_home()?;
+    Ok(local_stacks(&user_home)?
+        .iter()
+        .filter_map(older_backups_of)
+        .collect())
+}
+
+/// Remove the older automatic backups of `stacks` whose paths are in `only`
+/// (what the owner was shown and ticked). Asked afresh: a file that is no
+/// longer an older automatic backup is never removed, whatever `only` says.
+pub fn remove_older_backups(stacks: &[Stack], only: &HashSet<String>) -> BackupsRemoved {
+    let mut done = BackupsRemoved::default();
+    for b in stacks
+        .iter()
+        .flat_map(crate::ops::older_backups)
+        .filter(|b| only.contains(&b.path))
+    {
+        match std::fs::remove_file(&b.path) {
+            Ok(()) => {
+                done.total_bytes += b.size_bytes;
+                done.removed.push(b.name);
+            }
+            Err(e) => done.failed.push(format!("{} ({e})", b.name)),
+        }
+    }
+    done
+}
+
+/// [`remove_older_backups`] across every site on this computer.
+pub fn remove_older_backups_everywhere(only: &HashSet<String>) -> Result<BackupsRemoved> {
+    let user_home = crate::sites::user_home()?;
+    Ok(remove_older_backups(&local_stacks(&user_home)?, only))
+}
+
 /// Bytes as people read them: "420 MB", "1.2 GB".
 pub fn human_bytes(n: u64) -> String {
     const MB: f64 = 1_000_000.0;
@@ -691,6 +772,55 @@ mod tests {
         // Docker can't say: nothing goes.
         let r = remove_each(vec![image("sha256:a", &[])], || None, |_| true);
         assert!(r.images.is_empty());
+    }
+
+    #[test]
+    fn free_up_space_removes_only_the_older_automatic_backups_ticked() {
+        let th = TempHome::new(&[("blog", "HASH_SALT=x\nHTTP_PORT=41233\n")]);
+        let stack = Stack::at(crate::sites::site_home(&th.0, "blog"));
+        let dir = stack.backups_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        // As `backup()` names them: two from an earlier Manager, the owner's
+        // own, and four counted since 0.17.0.
+        let old = [
+            "aincient-before-stepped-upgrade-20260101-120000.tar.gz",
+            "aincient-before-channel-switch-20260301-090000.tar.gz",
+        ];
+        let owners = "aincient-20250101-000000.tar.gz";
+        let counted = [
+            "aincient-before-update-20261114-100000.tar.gz",
+            "aincient-before-update-20261114-110000.tar.gz",
+            "aincient-before-restore-20261114-120000.tar.gz",
+            "aincient-before-update-20261114-130000.tar.gz",
+        ];
+        for n in old.iter().chain(&counted).chain([&owners]) {
+            std::fs::write(dir.join(n), vec![0u8; 1000]).unwrap();
+        }
+        std::fs::write(
+            stack.home.join(crate::ops::AUTOMATIC_SINCE_FILE),
+            "20261114-100000\n",
+        )
+        .unwrap();
+
+        let found = older_backups_of(&stack).expect("two older ones");
+        let mut shown: Vec<&str> = found.backups.iter().map(|b| b.name.as_str()).collect();
+        shown.sort();
+        assert_eq!(shown, [old[1], old[0]]);
+        assert_eq!(found.total_bytes, 2000);
+
+        // Ticked: the older ones, plus paths that aren't older automatic
+        // backups (a counted one, the owner's): only the older ones go.
+        let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        let only: HashSet<String> =
+            [path(old[0]), path(old[1]), path(counted[0]), path(owners)].into();
+        let done = remove_older_backups(std::slice::from_ref(&stack), &only);
+        assert_eq!(done.removed.len(), 2);
+        assert_eq!(done.total_bytes, 2000);
+        for n in counted.iter().chain([&owners]) {
+            assert!(dir.join(n).is_file(), "{n} removed");
+        }
+        assert!(old.iter().all(|n| !dir.join(n).exists()));
+        assert!(older_backups_of(&stack).is_none());
     }
 
     #[test]

@@ -86,6 +86,16 @@ struct Outcome {
     /// Restart button next to the reason.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     docker_restart: bool,
+    /// A restore refused because the backup of the site as it is now failed
+    /// ([`ops::Overridable::RestoreWithoutSafetyBackup`]): the window offers
+    /// "Restore without a safety copy" behind a confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    safety_backup_failed: bool,
+    /// An update refused because the site couldn't be backed up first
+    /// ([`ops::Overridable::UpdateWithoutBackup`]): the window offers "Update
+    /// without a backup" behind a confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    backup_failed: bool,
 }
 
 impl Outcome {
@@ -93,6 +103,8 @@ impl Outcome {
         state: "ready",
         reason: None,
         docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
     };
     /// An update that found the site already on the newest build: nothing was
     /// downloaded, backed up or restarted, and the window says so.
@@ -100,6 +112,8 @@ impl Outcome {
         state: "current",
         reason: None,
         docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
     };
 
     /// An update that found the site on the newest build with changed
@@ -108,6 +122,8 @@ impl Outcome {
         state: "settings",
         reason: None,
         docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
     };
 
     fn failed(reason: String, docker_restart: bool) -> Outcome {
@@ -115,7 +131,24 @@ impl Outcome {
             state: "failed",
             reason: Some(reason),
             docker_restart,
+            safety_backup_failed: false,
+            backup_failed: false,
         }
+    }
+
+    /// A refusal the owner may override ([`ops::Overridable`], told apart by
+    /// type or a server's exit code, never by its words) as a failed answer
+    /// carrying its flag; any other error stays an error.
+    fn overridable(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        let Some(kind) = ops::Overridable::of(&e) else {
+            return Err(e);
+        };
+        let mut out = Outcome::failed(err_ref(&e), aincient_core::needs_docker_restart(&e));
+        match kind {
+            ops::Overridable::RestoreWithoutSafetyBackup => out.safety_backup_failed = true,
+            ops::Overridable::UpdateWithoutBackup => out.backup_failed = true,
+        }
+        Ok(out)
     }
 }
 
@@ -124,6 +157,12 @@ fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, Strin
     match result {
         Ok(ops::Updated::AlreadyCurrent) => Ok(Outcome::CURRENT),
         Ok(ops::Updated::SettingsApplied) => Ok(Outcome::SETTINGS),
+        // Before a failed boot: a site that wouldn't start for its backup is
+        // refused with the boot's failure inside.
+        Err(e) => match Outcome::overridable(e) {
+            Ok(refused) => Ok(refused),
+            Err(e) => outcome(Err(e)),
+        },
         other => outcome(other.map(ops::Updated::ready)),
     }
 }
@@ -133,8 +172,7 @@ fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
         Ok(true) => Ok(Outcome::READY),
         Ok(false) => Ok(Outcome {
             state: "booting",
-            reason: None,
-            docker_restart: false,
+            ..Outcome::READY
         }),
         Err(e) => match e.downcast::<aincient_core::BootFailed>() {
             Ok(failed) => {
@@ -151,6 +189,10 @@ fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
 }
 
 fn err(e: anyhow::Error) -> String {
+    err_ref(&e)
+}
+
+fn err_ref(e: &anyhow::Error) -> String {
     // The core words this one for the CLI (`atelier app start`); the window
     // has a button for it.
     if e.downcast_ref::<ops::NotRunning>().is_some() {
@@ -570,6 +612,28 @@ async fn do_cleanup(ids: Vec<String>) -> Result<aincient_core::cleanup::Report, 
     .await
 }
 
+/// The older automatic backups of every site on this computer: taken by a
+/// Manager before 0.17.0, never pruned. Free up space lists each site's as an
+/// item the owner can tick (unticked by default).
+#[tauri::command]
+async fn find_older_backups() -> Result<Vec<aincient_core::cleanup::OlderBackups>, String> {
+    blocking(|| aincient_core::cleanup::older_backups_everywhere().map_err(|e| format!("{e:#}")))
+        .await
+}
+
+/// Remove the older automatic backups the owner ticked (`paths`, from
+/// [`find_older_backups`]) that still are older automatic backups.
+#[tauri::command]
+async fn remove_older_backups(
+    paths: Vec<String>,
+) -> Result<aincient_core::cleanup::BackupsRemoved, String> {
+    blocking(move || {
+        let only: std::collections::HashSet<String> = paths.into_iter().collect();
+        aincient_core::cleanup::remove_older_backups_everywhere(&only).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn set_admin_password(
     app: AppHandle,
@@ -626,12 +690,24 @@ async fn do_install(
 /// streamed — unless its check says there is nothing to do.
 ///
 /// Returns how it came out ([`Outcome`]; always `ready` on a server, whose
-/// own run waits for it and fails as an error).
+/// own run waits for it and fails as an error). `no_backup` is the owner's
+/// "Update without a backup", confirmed after an update refused for want of
+/// one (`backup_failed` on the answer).
 #[tauri::command]
-async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
+async fn do_update(
+    app: AppHandle,
+    no_backup: Option<bool>,
+    sel: State<'_, Selected>,
+) -> Result<Outcome, String> {
+    let opts = ops::UpdateOptions {
+        no_backup: no_backup.unwrap_or(false),
+    };
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || update_outcome(ops::update(&s, &mut EventReporter { app }))).await
+            blocking(move || {
+                update_outcome(ops::update_with(&s, &opts, &mut EventReporter { app }))
+            })
+            .await
         }
         Target::Remote(site) => {
             blocking(move || {
@@ -639,16 +715,18 @@ async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, 
                 if session.check_update().map_err(err)?.update_available == Some(false) {
                     return Ok(Outcome::CURRENT);
                 }
-                session
-                    .run_action(
-                        &remote::Action::Update {
-                            to: None,
-                            yes: true,
-                        },
-                        &mut feed(&app),
-                    )
-                    .map(|()| Outcome::READY)
-                    .map_err(err)
+                let ran = session.run_action(
+                    &remote::Action::Update {
+                        to: None,
+                        yes: true,
+                        no_backup: opts.no_backup,
+                    },
+                    &mut feed(&app),
+                );
+                match ran {
+                    Ok(()) => Ok(Outcome::READY),
+                    Err(e) => Outcome::overridable(e).map_err(err),
+                }
             })
             .await
         }
@@ -751,49 +829,37 @@ async fn check_restore(path: String, sel: State<'_, Selected>) -> Result<Restore
     .await
 }
 
-/// Restore `path` onto the selected site, behind the identity check
-/// (`ops::restore_with`; on a server, its own `data restore` after a
-/// verified upload). `other_site` is the explicit "Restore anyway".
+/// Restore `path` onto the selected site (a listed backup or an imported
+/// file), behind the identity check (`ops::restore_with`; on a server, its own
+/// `data restore` after a verified upload). `other_site` is the explicit
+/// "Restore anyway"; `no_safety_backup` the owner's "Restore without a safety
+/// copy", confirmed after a restore refused because that copy failed
+/// (`safety_backup_failed` on the answer).
 #[tauri::command]
 async fn do_restore(
     app: AppHandle,
     path: String,
     other_site: Option<bool>,
+    no_safety_backup: Option<bool>,
     sel: State<'_, Selected>,
-) -> Result<(), String> {
-    let other_site = other_site.unwrap_or(false);
-    match target(&sel)? {
-        Target::Local(s) => {
-            blocking(move || {
-                ops::restore_with(
-                    &s,
-                    std::path::Path::new(&path),
-                    &ops::RestoreOptions {
-                        other_site,
-                        ..Default::default()
-                    },
-                    &mut EventReporter { app },
-                )
-                .map_err(err)
-            })
-            .await
+) -> Result<Outcome, String> {
+    let opts = ops::RestoreOptions {
+        other_site: other_site.unwrap_or(false),
+        no_safety_backup: no_safety_backup.unwrap_or(false),
+    };
+    let target = target(&sel)?;
+    blocking(move || {
+        let file = std::path::Path::new(&path);
+        let done = match &target {
+            Target::Local(s) => ops::restore_with(s, file, &opts, &mut EventReporter { app }),
+            Target::Remote(site) => session(site)?.restore_upload(file, &opts, &mut feed(&app)),
+        };
+        match done {
+            Ok(()) => Ok(Outcome::READY),
+            Err(e) => Outcome::overridable(e).map_err(err),
         }
-        Target::Remote(site) => {
-            blocking(move || {
-                session(&site)?
-                    .restore_upload(
-                        std::path::Path::new(&path),
-                        &ops::RestoreOptions {
-                            other_site,
-                            ..Default::default()
-                        },
-                        &mut feed(&app),
-                    )
-                    .map_err(err)
-            })
-            .await
-        }
-    }
+    })
+    .await
 }
 
 /// Open a native "open file" dialog and return the chosen backup's path (or
@@ -1958,6 +2024,8 @@ pub fn run() {
             do_restart_docker,
             find_cleanup,
             do_cleanup,
+            find_older_backups,
+            remove_older_backups,
             check_preflight,
             preflight_problem,
             get_status,

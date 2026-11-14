@@ -1348,6 +1348,11 @@ select {
   font-family: var(--font-mono);
   font-weight: 600;
 }
+.confirm-checks {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
 #confirm-msg {
   white-space: pre-line;
 }
