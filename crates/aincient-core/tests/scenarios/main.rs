@@ -13,6 +13,7 @@
 
 mod harness;
 
+mod boot_fatal;
 mod cleanup_needed;
 mod detached_db;
 mod erased_db;
