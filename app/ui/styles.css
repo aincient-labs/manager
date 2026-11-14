@@ -1624,6 +1624,21 @@ select {
   display: flex;
   margin-top: 12px;
 }
+/* An update refused because the site isn't ready: one row per reason, its
+   button (or the Docker slot) under the words. */
+.progress-blockers {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 12px;
+}
+.progress-blockers li {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  color: var(--text-2);
+}
 .docker-slot .docker-manual {
   color: var(--text-2);
 }

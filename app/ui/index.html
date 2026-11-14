@@ -768,6 +768,9 @@
           <!-- A failure whose way out is restarting Docker: the button, or how
                to do it by hand (main.js fillDockerSlots). -->
           <div id="progress-docker" class="docker-slot progress-docker hidden" role="status" data-docker-slot="button"></div>
+          <!-- An update refused because the site isn't ready: each reason and
+               the button for it (main.js showBlockers). -->
+          <ul id="progress-blockers" class="progress-blockers hidden"></ul>
           <div class="progress-actions">
             <button type="button" id="progress-details" class="btn ghost" aria-expanded="false" aria-controls="progress-more">Details</button>
             <span class="progress-actions-gap"></span>

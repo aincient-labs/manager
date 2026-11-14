@@ -319,6 +319,7 @@ function progressReset(title) {
   $("progress-copy").classList.add("hidden");
   $("progress-close").classList.add("hidden");
   showDockerSlot($("progress-docker"), false);
+  showBlockers(null);
   pm.afterClose = null;
   resetPull();
   buildBusy();
@@ -756,6 +757,47 @@ function progressFail(message, dockerRestart = false) {
   });
 }
 
+// An update refused because the site isn't ready (gate.rs): each reason in its
+// own words, with the button for its way forward when the app has one. The
+// actions are the window's own; a Restart Docker reason gets the Docker slot
+// (the button, or the steps for a runtime the Manager can't restart).
+const BLOCKER_BUTTONS = {
+  "free-space-open": "Free up space",
+  "backups-open": "Open Backups",
+  "startstop-from-publish": "Start your site",
+  "checkup-now": "Run a checkup",
+  "engine-unlock": "Unlock",
+};
+
+function showBlockers(blockers) {
+  const list = $("progress-blockers");
+  list.textContent = "";
+  list.classList.toggle("hidden", !(blockers && blockers.length));
+  if (!blockers) return;
+  for (const b of blockers) {
+    const li = document.createElement("li");
+    const text = document.createElement("span");
+    text.textContent = b.text;
+    li.append(text);
+    if (b.action === "restart-docker") {
+      const slot = document.createElement("span");
+      slot.className = "docker-slot";
+      slot.dataset.dockerSlot = "button";
+      li.append(slot);
+      showDockerSlot(slot, true);
+    } else if (BLOCKER_BUTTONS[b.action]) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn small";
+      btn.dataset.action = "blocker";
+      btn.dataset.next = b.action;
+      btn.textContent = BLOCKER_BUTTONS[b.action];
+      li.append(btn);
+    }
+    list.append(li);
+  }
+}
+
 function fmtSecs(ms) {
   return `${(ms / 1000).toFixed(1)}s`;
 }
@@ -872,6 +914,11 @@ async function runProgressOp(title, fn, opts = {}) {
       // The core marked it (a typed error, not this text): restarting Docker
       // is the way out, so every place showing it offers the button.
       dockerRestart = !!result.docker_restart;
+      if (result.blockers) {
+        showBlockers(result.blockers);
+        // The banner left after Close keeps every reason; the panel lists them.
+        failure = [failure, ...result.blockers.map((b) => b.text)].join(" ");
+      }
     } else if (result.state === "booting") {
       result = false;
       startingSince = Date.now() - STARTING_SLOW_MS;
@@ -2665,6 +2712,25 @@ const actions = {
     restartDockerFlow();
   },
   "copy-docker-cmd": (el) => copyText(dockerRt && dockerRt.copy, el),
+
+  // A refused update's way forward (showBlockers): close the failure panel,
+  // then run the window's own action for it.
+  blocker: (el) => {
+    const next = actions[el.dataset.next];
+    if (!next) return;
+    if (pm.release) {
+      pm.afterClose = () => next(el);
+      pm.release();
+      return;
+    }
+    next(el);
+  },
+  "free-space-open": () => {
+    showTab("settings");
+    $("free-space").scrollIntoView({ block: "center" });
+    $("free-space").focus({ preventScroll: true });
+  },
+  "backups-open": () => showTab("backups"),
 
   // "Edit my site" — drop the operator into the console signed in. A fresh
   // appliance's admin password is never shown, so a plain /atelier link would

@@ -96,6 +96,20 @@ struct Outcome {
     /// without a backup" behind a confirmation.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     backup_failed: bool,
+    /// An update refused before any work because the site isn't ready
+    /// ([`aincient_core::gate::UpdateBlocked`]): each reason with the action
+    /// of the window's button for it, when the app has one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blockers: Vec<BlockerView>,
+}
+
+/// One [`aincient_core::gate::Blocker`] for the window.
+#[derive(Serialize)]
+struct BlockerView {
+    text: String,
+    /// A `data-action` in `ui/main.js` ([`aincient_core::gate::WayForward::action`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'static str>,
 }
 
 impl Outcome {
@@ -105,6 +119,7 @@ impl Outcome {
         docker_restart: false,
         safety_backup_failed: false,
         backup_failed: false,
+        blockers: Vec::new(),
     };
     /// An update that found the site already on the newest build: nothing was
     /// downloaded, backed up or restarted, and the window says so.
@@ -114,6 +129,7 @@ impl Outcome {
         docker_restart: false,
         safety_backup_failed: false,
         backup_failed: false,
+        blockers: Vec::new(),
     };
 
     /// An update that found the site on the newest build with changed
@@ -124,6 +140,7 @@ impl Outcome {
         docker_restart: false,
         safety_backup_failed: false,
         backup_failed: false,
+        blockers: Vec::new(),
     };
 
     fn failed(reason: String, docker_restart: bool) -> Outcome {
@@ -133,7 +150,38 @@ impl Outcome {
             docker_restart,
             safety_backup_failed: false,
             backup_failed: false,
+            blockers: Vec::new(),
         }
+    }
+
+    /// An update refused because the site isn't ready: the reasons, each
+    /// with its button. A server's refusal (its exit code) carries its words
+    /// only; its buttons would act on this computer.
+    fn blocked(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !aincient_core::gate::UpdateBlocked::is(&e) {
+            return Err(e);
+        }
+        let blockers: Vec<BlockerView> = e
+            .downcast_ref::<aincient_core::gate::UpdateBlocked>()
+            .map(|b| {
+                b.blockers
+                    .iter()
+                    .map(|b| BlockerView {
+                        text: b.message(),
+                        action: b.way_forward().map(aincient_core::gate::WayForward::action),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reason = if blockers.is_empty() {
+            err_ref(&e)
+        } else {
+            aincient_core::gate::NOT_READY.to_string()
+        };
+        Ok(Outcome {
+            blockers,
+            ..Outcome::failed(reason, false)
+        })
     }
 
     /// A refusal the owner may override ([`ops::Overridable`], told apart by
@@ -159,7 +207,7 @@ fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, Strin
         Ok(ops::Updated::SettingsApplied) => Ok(Outcome::SETTINGS),
         // Before a failed boot: a site that wouldn't start for its backup is
         // refused with the boot's failure inside.
-        Err(e) => match Outcome::overridable(e) {
+        Err(e) => match Outcome::blocked(e).or_else(Outcome::overridable) {
             Ok(refused) => Ok(refused),
             Err(e) => outcome(Err(e)),
         },
@@ -725,7 +773,9 @@ async fn do_update(
                 );
                 match ran {
                     Ok(()) => Ok(Outcome::READY),
-                    Err(e) => Outcome::overridable(e).map_err(err),
+                    Err(e) => Outcome::blocked(e)
+                        .or_else(Outcome::overridable)
+                        .map_err(err),
                 }
             })
             .await
