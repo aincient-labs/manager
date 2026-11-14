@@ -246,6 +246,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U aincient -d aincient"]
       interval: 10s
       retries: 10
+    restart: unless-stopped
   app:
     image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:latest}
     depends_on:
@@ -425,8 +426,61 @@ fn is_shipped_edge_conf(s: &str) -> bool {
     s == EDGE_CONF_TEMPLATE || SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&s)
 }
 
+/// Every `compose.yaml` an earlier manager (or `install.sh`) shipped, as the
+/// release that first wrote it had it. [`Stack::refresh_shipped_compose`]
+/// rewrites a stack still holding one to [`COMPOSE_TEMPLATE`]. When the
+/// template changes, add the outgoing text here as
+/// `templates/compose-<first version>.yaml`. Templates before 0.14.1 differ from
+/// it only in their `db` / `edge` image lines, which the refresh carries over
+/// (those move on their own migrations), so they need no entry.
+pub const SUPERSEDED_COMPOSE_TEMPLATES: &[&str] =
+    &[include_str!("../templates/compose-0.14.1.yaml")];
+
+/// True for the current compose template or a superseded shipped one, exactly
+/// as shipped (the same rule as [`is_shipped_edge_conf`]).
+fn is_shipped_compose(s: &str) -> bool {
+    s == COMPOSE_TEMPLATE || SUPERSEDED_COMPOSE_TEMPLATES.contains(&s)
+}
+
+/// `template` with its `db` and `edge` images swapped for `db` and `edge`.
+fn compose_with_images(template: &str, db: &str, edge: &str) -> String {
+    template
+        .replace(
+            &format!("    image: {DB_IMAGE}\n"),
+            &format!("    image: {db}\n"),
+        )
+        .replace(
+            &format!("    image: {EDGE_IMAGE}\n"),
+            &format!("    image: {edge}\n"),
+        )
+}
+
+/// The `compose.yaml` to write over `current`, when `current` is a superseded
+/// shipped template (with whatever `db` / `edge` images it runs now): the
+/// current template with those same images. `None` for anything else — the
+/// current template, a hand-edited file, one with more or fewer services.
+fn refreshed_compose(current: &str) -> Option<String> {
+    let images: Vec<&str> = current
+        .lines()
+        .filter_map(|l| l.strip_prefix("    image: "))
+        .collect();
+    let [db, _app, edge] = images.as_slice() else {
+        return None;
+    };
+    SUPERSEDED_COMPOSE_TEMPLATES
+        .iter()
+        .any(|t| compose_with_images(t, db, edge) == current)
+        .then(|| compose_with_images(COMPOSE_TEMPLATE, db, edge))
+}
+
 /// The file in a stack directory holding the site's identity (m2-6, D-04).
 pub const SITE_ID_FILE: &str = "site-id";
+
+/// The marker an owner's own wipe (`app down --wipe`, "Remove and erase")
+/// leaves in a stack directory: the database volume is gone on purpose, so the
+/// next start sets up a fresh site instead of refusing as if it were lost. It
+/// goes once the database volume exists again.
+pub const DATABASE_WIPED_FILE: &str = ".database-wiped";
 
 /// Whether `id` looks like an identity [`new_site_id`] makes: a lowercase
 /// 8-4-4-4-12 hex UUID.
@@ -547,11 +601,14 @@ impl Stack {
         self.home.join("edge.conf")
     }
 
-    /// True when both stack files are exactly this manager's templates. False
-    /// for a stack laid down by an older manager (pre-`edge`) or hand-edited —
+    /// True when both stack files are exactly this manager's templates, or an
+    /// untouched superseded one the next start or update refreshes. False for a
+    /// stack laid down by an older manager (pre-`edge`) or hand-edited —
     /// `doctor` reports it and `--fix` rewrites them (keeping the originals).
     pub fn stack_files_current(&self) -> bool {
-        std::fs::read_to_string(self.compose_path()).ok().as_deref() == Some(COMPOSE_TEMPLATE)
+        std::fs::read_to_string(self.compose_path())
+            .ok()
+            .is_some_and(|s| is_shipped_compose(&s))
             && std::fs::read_to_string(self.edge_conf_path())
                 .ok()
                 .is_some_and(|s| is_shipped_edge_conf(&s))
@@ -569,6 +626,23 @@ impl Stack {
             return Ok(false);
         }
         std::fs::write(&path, EDGE_CONF_TEMPLATE)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Replace a `compose.yaml` that is a superseded shipped template (see
+    /// [`SUPERSEDED_COMPOSE_TEMPLATES`]) with the current one, keeping its `db`
+    /// and `edge` images. Anything else is left alone. Returns whether the file
+    /// changed: the containers only take it on their next `up`.
+    pub fn refresh_shipped_compose(&self) -> Result<bool> {
+        let path = self.compose_path();
+        let Ok(current) = std::fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        let Some(refreshed) = refreshed_compose(&current) else {
+            return Ok(false);
+        };
+        std::fs::write(&path, refreshed)
             .with_context(|| format!("could not write {}", path.display()))?;
         Ok(true)
     }
@@ -638,6 +712,17 @@ impl Stack {
         let raw = std::fs::read_to_string(self.site_id_path()).ok()?;
         let id = raw.trim();
         is_site_id(id).then(|| id.to_string())
+    }
+
+    /// Where the owner's-wipe marker lives: `<home>/.database-wiped`.
+    pub fn database_wiped_path(&self) -> PathBuf {
+        self.home.join(DATABASE_WIPED_FILE)
+    }
+
+    /// Whether the owner wiped this site's database on purpose and it hasn't
+    /// been started again since (see [`DATABASE_WIPED_FILE`]).
+    pub fn database_wiped(&self) -> bool {
+        self.database_wiped_path().is_file()
     }
 
     /// [`site_id`](Self::site_id), minting and saving one when there is none.
@@ -990,6 +1075,7 @@ impl Stack {
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
         done.edge_conf_refreshed = self.refresh_shipped_edge_conf()?;
+        self.refresh_shipped_compose()?;
 
         let env_path = self.env_path();
 
@@ -1989,6 +2075,98 @@ mod tests {
                 .unwrap()
                 .edge_conf_refreshed
         );
+    }
+
+    /// The `db` service's block of a compose file, up to the next service.
+    fn db_block(compose: &str) -> &str {
+        let start = compose.find("  db:\n").unwrap();
+        let end = compose[start..].find("  app:\n").unwrap();
+        &compose[start..start + end]
+    }
+
+    #[test]
+    fn db_restarts_with_docker() {
+        // Without it a Docker Desktop restart leaves db stopped while app and
+        // edge come back, and the site answers "starting" for good.
+        assert!(db_block(COMPOSE_TEMPLATE).contains("    restart: unless-stopped\n"));
+        assert!(!db_block(SUPERSEDED_COMPOSE_TEMPLATES[0]).contains("restart:"));
+    }
+
+    #[test]
+    fn superseded_compose_is_rewritten_with_the_db_restart_policy() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        std::fs::write(stack.compose_path(), SUPERSEDED_COMPOSE_TEMPLATES[0]).unwrap();
+        // An untouched older template is not a doctor warning…
+        assert!(stack.stack_files_current());
+
+        assert!(stack.refresh_shipped_compose().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE
+        );
+        assert!(stack.stack_files_current());
+        assert!(!stack.refresh_shipped_compose().unwrap(), "only once");
+
+        // A scaffold (install / sites add over an existing stack) does it too.
+        std::fs::write(stack.compose_path(), SUPERSEDED_COMPOSE_TEMPLATES[0]).unwrap();
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn older_compose_keeps_its_images_when_rewritten() {
+        // The 0.10.0 – 0.12.0 file as shipped: bookworm db, nginx 1.28. Its
+        // images move on their own migrations (the db one only once the app
+        // can rebuild indexes), so the rewrite must not move them.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let old = SUPERSEDED_COMPOSE_TEMPLATES[0]
+            .replace(DB_IMAGE, LEGACY_DB_IMAGE)
+            .replace(EDGE_IMAGE, "nginx:1.28-alpine");
+        std::fs::write(stack.compose_path(), &old).unwrap();
+
+        assert!(stack.refresh_shipped_compose().unwrap());
+        let now = std::fs::read_to_string(stack.compose_path()).unwrap();
+        assert_eq!(
+            now,
+            COMPOSE_TEMPLATE
+                .replace(DB_IMAGE, LEGACY_DB_IMAGE)
+                .replace(EDGE_IMAGE, "nginx:1.28-alpine")
+        );
+        assert!(db_block(&now).contains("    restart: unless-stopped\n"));
+        assert_eq!(
+            stack.pending_db_image_migration(),
+            Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
+        );
+        assert!(stack.pending_edge_image_migration().is_some());
+    }
+
+    #[test]
+    fn hand_edited_compose_is_never_rewritten() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let edited = SUPERSEDED_COMPOSE_TEMPLATES[0].replace(
+            "    restart: unless-stopped\nvolumes:",
+            "    restart: unless-stopped\n    # mine\nvolumes:",
+        );
+        assert_ne!(edited, SUPERSEDED_COMPOSE_TEMPLATES[0]);
+        std::fs::write(stack.compose_path(), &edited).unwrap();
+
+        assert!(!stack.refresh_shipped_compose().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            edited
+        );
+        // The current file is left as is too.
+        std::fs::write(stack.compose_path(), COMPOSE_TEMPLATE).unwrap();
+        assert!(!stack.refresh_shipped_compose().unwrap());
     }
 
     #[test]

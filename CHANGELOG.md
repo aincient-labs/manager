@@ -63,6 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting it says to restart Docker Desktop, and **Run a checkup** (`atelier doctor`) reports it.
 - Switching to released versions in the app now says when the site hasn't answered yet, like an
   update.
+- A site's database now comes back by itself when Docker restarts, like the rest of the site.
+  Existing sites get this on their next start or update (only a `compose.yaml` you haven't edited is
+  rewritten).
+- Starting a site whose database container was removed brings it back, instead of starting the
+  rest of the site without it. A web-server or engine container that Docker left half connected is
+  cleared like the database's.
+- A site whose database was removed from Docker no longer starts as a new, empty site. Start
+  refuses and names your latest backup; restoring it (**Backups**, which allows it while the site is
+  stopped, or `atelier data restore`) brings the site back. A database you erased yourself
+  (**Remove and erase**, `atelier app down --wipe`) still starts as a fresh site.
+- Start and Stop say "Start Docker" when Docker isn't running, instead of a Docker error.
 
 ## [0.16.0] - 2026-11-12
 

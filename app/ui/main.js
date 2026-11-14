@@ -1818,13 +1818,19 @@ let hasBackups = false; // the list holds at least one backup
 
 // Backing up and restoring both need the site up: offer the start, as Publish
 // does, rather than letting either fail with "isn't running". Saving a copy of
-// an existing backup is only a file copy, so it stays available.
+// an existing backup is only a file copy, so it stays available. A site whose
+// database was removed from Docker can't start (Start refuses and points here),
+// so it may restore while stopped: the restore starts it on an empty database
+// and loads the backup into it.
 function updateBackupsGate() {
   const running = !!(lastStatus && lastStatus.running);
-  $("backups-needs-running").classList.toggle("hidden", running);
+  const erased = !running && !!(lastStatus && lastStatus.database_erased);
+  const canRestore = running || erased;
+  $("backups-needs-running").classList.toggle("hidden", canRestore);
+  $("backups-database-erased").classList.toggle("hidden", !erased);
   $("backup-now").classList.toggle("hidden", !running);
-  document.querySelector('[data-action="restore"]').disabled = !(running && hasBackups);
-  $("btn-import").disabled = !running;
+  document.querySelector('[data-action="restore"]').disabled = !(canRestore && hasBackups);
+  $("btn-import").disabled = !canRestore;
 }
 
 // What a backup's file name says it was taken for, in words.

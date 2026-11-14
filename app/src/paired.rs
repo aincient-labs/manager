@@ -74,6 +74,8 @@ pub fn to_status(site: &Site, st: &EngineStatus) -> Status {
             running: true,
             state: (!st.state.is_empty()).then(|| st.state.clone()),
         }),
+        // The engine owns a paired site's database; it reports no such loss.
+        database_erased: false,
     }
 }
 

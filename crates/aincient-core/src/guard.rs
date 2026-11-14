@@ -111,6 +111,7 @@ mod tests {
             version: None,
             site_id: None,
             engine: None,
+            database_erased: false,
         }
     }
 

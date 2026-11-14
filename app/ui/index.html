@@ -483,6 +483,12 @@
 
         <!-- Shown when the site isn't running: backing up and restoring both
              need it up, so offer the start instead of an error. -->
+        <div id="backups-database-erased" class="card note hidden">
+          <p class="muted">
+            Your site's database was removed from Docker, so it can't start. Restore your latest
+            backup below (or import one) to bring it back.
+          </p>
+        </div>
         <div id="backups-needs-running" class="card note hidden">
           <p class="muted">Your website needs to be running to make a backup or restore one.</p>
           <button class="btn" data-action="startstop-from-publish">

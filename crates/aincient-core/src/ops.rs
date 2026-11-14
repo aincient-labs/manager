@@ -248,6 +248,12 @@ pub struct Status {
     /// whose CLI predates it (the Manager then uses the host CLI, m3-7).
     #[serde(default)]
     pub engine: Option<crate::engine_admin::EngineInfo>,
+    /// The site is stopped and its database was removed from Docker by
+    /// accident ([`DatabaseErased`]): Start refuses, and a restore is the way
+    /// back, so the window offers Restore though the site isn't running.
+    /// `false` from a server whose CLI predates it.
+    #[serde(default)]
+    pub database_erased: bool,
 }
 
 /// The result of comparing the local image against the registry.
@@ -445,7 +451,7 @@ pub struct BackupInfo {
 }
 
 /// A backup file on the host.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Backup {
     pub name: String,
     pub path: String,
@@ -504,6 +510,8 @@ pub fn status(stack: &Stack) -> Status {
             .then(|| crate::engine_admin::probe(stack))
             .flatten()
             .map(with_engine_state),
+        // One `volume inspect`, asked only of a stopped site.
+        database_erased: installed && !running && preflight().ok() && stack_database_erased(stack),
     }
 }
 
@@ -942,7 +950,9 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
         announce_legacy_migrations(stack, r)?;
     }
     pull(stack, r)?;
-    up(stack, r)?;
+    // Exempt from the erased-database refusal: an install lays the site down
+    // (and a reinstall has just wiped it on purpose).
+    up_unguarded(stack, r)?;
     wait_until_ready(stack, READY_TIMEOUT, r).ready()
 }
 
@@ -987,6 +997,22 @@ fn retarget_single_hop(stack: &Stack, plan: &UpgradePlan) -> Result<()> {
 fn refresh_edge_conf(stack: &Stack) {
     if let Ok(true) = stack.refresh_shipped_edge_conf() {
         crate::docker::reload_edge(stack);
+    }
+}
+
+/// Swap an untouched older shipped `compose.yaml` for the current one (the db
+/// restart policy, 0.17.0), keeping its images. Returns whether it changed; the
+/// containers take it on their next `up`. Best-effort like
+/// [`refresh_edge_conf`]: a failed write is logged and the stack runs as it is.
+fn refresh_compose(stack: &Stack, r: &mut dyn Reporter) -> bool {
+    match stack.refresh_shipped_compose() {
+        Ok(changed) => changed,
+        Err(e) => {
+            r.log(&format!(
+                "Couldn't update compose.yaml ({e:#}); carrying on with it as it is."
+            ));
+            false
+        }
     }
 }
 
@@ -1060,6 +1086,8 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
     preflight().require()?;
     let snapshot_taken = announce_legacy_migrations(stack, r)?;
     refresh_edge_conf(stack);
+    // Every route ends in `up`, which hands the containers the new file.
+    refresh_compose(stack, r);
 
     if !plan.is_stepped() {
         // The banner promises "Updating keeps all your pages and settings": a
@@ -1713,10 +1741,87 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
     out
 }
 
-/// `docker compose up -d`.
+/// `docker compose up -d`, refused when the site's database was erased
+/// ([`refuse_erased_database`]).
 fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
+    up_unguarded(stack, r)
+}
+
+/// `docker compose up -d`, for the paths that may start an empty database: an
+/// install, and a restore into a site whose database was erased.
+fn up_unguarded(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
-    run_recovering(stack, &["up", "-d"], "start the appliance", r)
+    run_recovering(stack, &["up", "-d"], "start the appliance", r)?;
+    // The database exists again, so an owner's wipe has been acted on.
+    clear_database_wiped(stack);
+    Ok(())
+}
+
+/// Drop the owner's-wipe marker ([`crate::stack::DATABASE_WIPED_FILE`]) once
+/// the database is back, so a later accidental loss is refused again.
+fn clear_database_wiped(stack: &Stack) {
+    // Best effort: a marker left behind only lets one more fresh start through.
+    let _ = std::fs::remove_file(stack.database_wiped_path());
+}
+
+/// A start was refused: this site has been backed up before (it has a
+/// `site-id`), yet Docker no longer has its database volume. `compose up` would
+/// create an empty one and the appliance would install a blank site over the
+/// lost one, so nothing starts until the owner restores a backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseErased {
+    /// The newest backup of this site on this computer, if any.
+    pub latest_backup: Option<Backup>,
+}
+
+impl std::fmt::Display for DatabaseErased {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.latest_backup {
+            Some(b) => write!(
+                f,
+                "Your site's database was removed from Docker. Restore your latest backup \
+                 (Backups tab): {}. On the command line: `atelier data restore {}`.",
+                b.name, b.path
+            ),
+            None => f.write_str(
+                "Your site's database was removed from Docker, and there is no backup of this \
+                 site on this computer. Restore a backup you saved elsewhere (Backups tab), \
+                 or `atelier data restore <file>`.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseErased {}
+
+/// Whether to refuse a start: `site_id` is set and Docker answered that the
+/// database volume is gone. A site never backed up (a first install), an
+/// unanswered probe, and a database the owner wiped on purpose (`wiped`, see
+/// [`crate::stack::DATABASE_WIPED_FILE`]) are let through.
+fn database_erased(site_id: Option<&str>, db_volume: Option<bool>, wiped: bool) -> bool {
+    site_id.is_some() && db_volume == Some(false) && !wiped
+}
+
+/// [`database_erased`] for `stack`, asking Docker. A database volume that
+/// exists again also clears a leftover owner's-wipe marker.
+fn stack_database_erased(stack: &Stack) -> bool {
+    let volume = docker::db_volume_exists(stack);
+    if volume == Some(true) {
+        clear_database_wiped(stack);
+    }
+    database_erased(stack.site_id().as_deref(), volume, stack.database_wiped())
+}
+
+/// Refuse with [`DatabaseErased`] when this site's database volume is gone.
+fn refuse_erased_database(stack: &Stack) -> Result<()> {
+    if stack_database_erased(stack) {
+        return Err(DatabaseErased {
+            latest_backup: list_backups(stack).into_iter().next(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// What the owner reads when a start fails even after clearing Docker's
@@ -1733,8 +1838,8 @@ const START_STUCK: &str = "Docker couldn't start your site, even after clearing 
 /// with name atelier-db-1 already exists in network atelier_default") and
 /// compose reports only "dependency failed to start: container atelier-db-1
 /// exited (1)" — an update stopped there on 2026-11-14. Only that exact state
-/// is recovered: a `db`/`app` container that isn't running but still holds an
-/// endpoint. Its endpoint is force-disconnected (what fixed it by hand; no
+/// is recovered: a container of the site (any service) that isn't running but
+/// still holds an endpoint. Its endpoint is force-disconnected (what fixed it by hand; no
 /// container, volume or data is touched) and the same step runs again. Any
 /// other failure keeps its own error.
 pub(crate) fn run_recovering(
@@ -1774,6 +1879,18 @@ pub(crate) fn run_recovering(
     run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
 }
 
+/// Read `docker image inspect`'s answer about the engine's image: there, or
+/// "No such image" (gone: fetch it). Any other failure (Docker not answering, a
+/// timeout) is an error: fetching on it would download for nothing and then
+/// fail on the same Docker.
+fn engine_image_present(inspect: std::result::Result<String, String>) -> Result<bool> {
+    match inspect {
+        Ok(_) => Ok(true),
+        Err(e) if e.to_lowercase().contains("no such image") => Ok(false),
+        Err(e) => bail!("Couldn't check your site's engine image with Docker ({e})"),
+    }
+}
+
 /// What a start needs to do about the engine's pinned image (0487).
 #[derive(Debug, PartialEq, Eq)]
 enum EngineImage {
@@ -1811,11 +1928,14 @@ fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
         return Ok(());
     }
     let pinned = crate::engine::pinned_image(stack);
-    let present = pinned.as_deref().is_some_and(|p| {
-        let mut c = docker::docker();
-        c.args(["image", "inspect", "--format", "{{.Id}}", p]);
-        docker::try_capture(c).is_some()
-    });
+    let present = match pinned.as_deref() {
+        None => false,
+        Some(p) => {
+            let mut c = docker::docker();
+            c.args(["image", "inspect", "--format", "{{.Id}}", p]);
+            engine_image_present(docker::probe(c))?
+        }
+    };
     match engine_image_need(pinned.as_deref(), present) {
         EngineImage::Ready => {
             // Sites pinned before 0.17.0 have no local name yet: add it, so the
@@ -1846,8 +1966,8 @@ fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     }
 }
 
-/// `(network, container)` for each of this site's `db`/`app` containers that
-/// isn't running yet still holds an endpoint in one of its networks — Docker's
+/// `(network, container)` for each of this site's containers (any service:
+/// db, app, edge, the engine) that isn't running yet still holds an endpoint in one of its networks — Docker's
 /// leftover that [`run_recovering`] clears. Best effort: any failed probe
 /// counts as "none found", so the original error stands.
 fn stale_endpoints(stack: &Stack) -> Vec<(String, String)> {
@@ -1885,15 +2005,13 @@ fn stale_endpoints(stack: &Stack) -> Vec<(String, String)> {
     found
 }
 
-/// Names of the `db`/`app` containers `compose ps -a` lists as not running.
+/// Names of the containers `compose ps -a` lists as not running, whatever
+/// their service: Docker leaves an `edge` or engine endpoint behind as readily
+/// as a `db` one.
 fn stopped_service_containers(ps_json: &str) -> Vec<String> {
     parse_ps(ps_json)
         .into_iter()
-        .filter(|e| {
-            matches!(e.service.as_str(), "db" | "app")
-                && !e.state.to_lowercase().contains("running")
-                && !e.name.is_empty()
-        })
+        .filter(|e| !e.state.to_lowercase().contains("running") && !e.name.is_empty())
         .map(|e| e.name)
         .collect()
 }
@@ -1908,6 +2026,9 @@ fn holds_endpoint(members: &str, name: &str) -> bool {
 /// engine's answer. Without it, [`stop_containers`].
 pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
     ensure_installed(stack)?;
+    // Docker first: without it, the engine probe and `compose stop` fail with
+    // Docker's own words instead of "Start Docker".
+    preflight().require()?;
     if let Some(info) = ready_engine(stack) {
         r.stage(Stage::Working, "Putting the site to rest…", None);
         let said = engine_verb(&info, AdminVerb::Rest, "rest")?;
@@ -1951,14 +2072,15 @@ fn say(r: &mut dyn Reporter, said: &str) {
     }
 }
 
-/// What was observed of the stack's `app` container before starting it.
+/// What was observed of the stack's containers before starting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
     /// The container exists and is running.
     Running,
     /// The container exists but is stopped.
     Stopped,
-    /// No container exists (e.g. `pack down` / `down` removed it).
+    /// A `db`, `app` or `edge` container doesn't exist (e.g. `pack down` /
+    /// `down` removed them, or one was removed by hand).
     Missing,
     /// The probe itself failed — nothing is known.
     Unknown,
@@ -1973,9 +2095,9 @@ pub enum StartAction {
     Up,
 }
 
-/// Pure decision: `compose start` only works on containers that exist, so a
-/// removed container needs `up -d`. When the probe failed, keep the old
-/// behaviour (`start`).
+/// Pure decision: `compose start` only works on containers that exist (and
+/// starts only those), so a removed container needs `up -d`. When the probe
+/// failed, keep the old behaviour (`start`).
 pub fn start_action(state: ContainerState) -> StartAction {
     match state {
         ContainerState::Missing => StartAction::Up,
@@ -1985,12 +2107,25 @@ pub fn start_action(state: ContainerState) -> StartAction {
     }
 }
 
-/// Classify `compose ps -a --format json` output for the `app` service.
+/// The services every site has; `compose start` can't bring back one whose
+/// container is gone.
+const CORE_SERVICES: [&str; 3] = ["db", "app", "edge"];
+
+/// Classify `compose ps -a --format json` output: [`Missing`](ContainerState::Missing)
+/// when any of [`CORE_SERVICES`] has no container (a `docker rm` of `db` alone
+/// left `compose start` starting app and edge against no database), otherwise
+/// by the `app` container's state.
 fn container_state_from_ps(out: &str) -> ContainerState {
-    match parse_ps(out).iter().find(|e| e.service == "app") {
-        None => ContainerState::Missing,
+    let entries = parse_ps(out);
+    if CORE_SERVICES
+        .iter()
+        .any(|s| !entries.iter().any(|e| e.service == *s))
+    {
+        return ContainerState::Missing;
+    }
+    match entries.iter().find(|e| e.service == "app") {
         Some(e) if e.state.to_lowercase().contains("running") => ContainerState::Running,
-        Some(_) => ContainerState::Stopped,
+        _ => ContainerState::Stopped,
     }
 }
 
@@ -2010,6 +2145,11 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
+    // Docker first, so a stopped Docker reads "Start Docker", not a probe's error.
+    preflight().require()?;
+    // Before anything starts a container: an erased database must not come
+    // back empty (the engine's Wake starts db too).
+    refuse_erased_database(stack)?;
     // Before the engine's Wake too: a resting engine site starts that way, and
     // its pinned image needs its local name as much as on a cold start.
     ensure_engine_image(stack, r)?;
@@ -2036,7 +2176,14 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         return wait_until_ready(stack, START_READY_TIMEOUT, r).ready();
     }
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
-    match start_action(observe_container(stack)) {
+    // An untouched older compose.yaml gets this manager's (the db restart
+    // policy); only `up` hands the containers the new file.
+    let action = if refresh_compose(stack, r) {
+        StartAction::Up
+    } else {
+        start_action(observe_container(stack))
+    };
+    match action {
         StartAction::Start => {
             run_recovering(stack, &["start"], "start the appliance", r)?;
         }
@@ -2048,14 +2195,30 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
 /// `docker compose down`. With `wipe_data`, also removes the volumes — a
 /// destructive reset (database, files, and the saved admin password). Callers
 /// must confirm with the user first.
+///
+/// A wipe first leaves [`crate::stack::DATABASE_WIPED_FILE`], so the next
+/// start sets up a fresh site rather than refusing with [`DatabaseErased`]: the
+/// owner erased it, it wasn't lost. Written before `down -v`, so a wipe that
+/// fails halfway still counts; a database that survives clears it again.
 pub fn down(stack: &Stack, wipe_data: bool) -> Result<()> {
     ensure_installed(stack)?;
     let mut c = compose(stack);
     c.arg("down");
     if wipe_data {
+        mark_database_wiped(stack)?;
         c.arg("-v");
     }
     run_inherited(c, "stop and remove the appliance")
+}
+
+/// Leave the owner's-wipe marker in `stack`'s directory.
+fn mark_database_wiped(stack: &Stack) -> Result<()> {
+    let path = stack.database_wiped_path();
+    std::fs::write(
+        &path,
+        "The database was wiped on purpose; the next start sets up a fresh site.\n",
+    )
+    .with_context(|| format!("could not write {}", path.display()))
 }
 
 /// Wipe everything and install from scratch. Destructive — confirm first.
@@ -3056,12 +3219,16 @@ pub fn restore_with(
     if let Some(note) = restore_identity(stack, file, opts.other_site)?.message() {
         r.log(note);
     }
+    let erased = restore_into_erased(stack, r)?;
     // A restore drops the database before loading the backup: without a copy of
     // the site as it is now, a wrong pick or a failed load loses the work since.
     // So a backup that fails stops the restore (review 2026-11-14), unless the
     // owner said to go without one.
     let before = if opts.no_safety_backup {
         r.log("Restoring without backing up your site as it is now (--no-safety-backup).");
+        None
+    } else if erased {
+        r.log("Your site's database was removed, so there is nothing to back up first.");
         None
     } else {
         require_safety_backup(safety_backup(
@@ -3083,6 +3250,31 @@ pub fn restore_with(
     // Only after the restore worked, and never the backup just restored.
     prune_automatic_backups(stack, Some(file), r);
     Ok(())
+}
+
+/// The way back from [`DatabaseErased`]: Start refuses such a site, so a
+/// restore starts it with an empty database first (what an install does) and
+/// then loads the backup into it. Returns whether it did. A running site, or one
+/// whose database is still there, is left to [`restore`]'s own checks.
+fn restore_into_erased(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    ensure_installed(stack)?;
+    preflight().require()?;
+    if status(stack).running || !stack_database_erased(stack) {
+        return Ok(false);
+    }
+    r.stage(
+        Stage::Starting,
+        "Your site's database was removed from Docker. Starting the site with an empty one to restore into…",
+        None,
+    );
+    up_unguarded(stack, r)?;
+    if !wait_until_ready(stack, READY_TIMEOUT, r).ready()? {
+        bail!(
+            "The site is still setting up its empty database, so the backup wasn't restored yet. \
+             Try the restore again in a few minutes."
+        );
+    }
+    Ok(true)
 }
 
 /// A backup before a change the owner can't undo by running the old image again
@@ -3922,16 +4114,141 @@ mod tests {
         assert_eq!(start_action(ContainerState::Unknown), StartAction::Start);
     }
 
+    /// `docker compose ps -a --format json` lines as Compose 5.1 prints them
+    /// (hardening-test, 2026-11-14; labels trimmed).
+    const PS_DB: &str = r#"{"Command":"\"docker-entrypoint.s…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"healthy","ID":"561110aa7976","Image":"pgvector/pgvector:pg16-trixie","LocalVolumes":"1","Name":"atelier-hardening-test-db-1","Names":"atelier-hardening-test-db-1","Networks":"atelier-hardening-test_default","Ports":"5432/tcp","Project":"atelier-hardening-test","Service":"db","State":"running","Status":"Up 6 minutes (healthy)"}"#;
+    const PS_APP: &str = r#"{"Command":"\"/usr/local/bin/entr…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"healthy","ID":"9772e359133d","Image":"ghcr.io/aincient-labs/atelier-cms:latest","LocalVolumes":"2","Name":"atelier-hardening-test-app-1","Names":"atelier-hardening-test-app-1","Networks":"atelier-hardening-test_default","Ports":"80/tcp","Project":"atelier-hardening-test","Service":"app","State":"running","Status":"Up 6 minutes (healthy)"}"#;
+    const PS_EDGE: &str = r#"{"Command":"\"/docker-entrypoint.…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"","ID":"3ca00c913a8c","Image":"nginx:1.30-alpine-slim","LocalVolumes":"1","Name":"atelier-hardening-test-edge-1","Names":"atelier-hardening-test-edge-1","Networks":"atelier-hardening-test_default","Ports":"0.0.0.0:41227->80/tcp, [::]:41227->80/tcp","Project":"atelier-hardening-test","Service":"edge","State":"running","Status":"Up 6 minutes"}"#;
+
+    fn stopped(line: &str) -> String {
+        line.replace(r#""State":"running""#, r#""State":"exited""#)
+    }
+
     #[test]
     fn container_state_from_compose_ps() {
         assert_eq!(container_state_from_ps(""), ContainerState::Missing);
         assert_eq!(container_state_from_ps("[]"), ContainerState::Missing);
-        let stopped = r#"{"Service":"app","State":"exited"}"#;
-        assert_eq!(container_state_from_ps(stopped), ContainerState::Stopped);
-        let running = r#"[{"Service":"db","State":"exited"},{"Service":"app","State":"running"}]"#;
-        assert_eq!(container_state_from_ps(running), ContainerState::Running);
-        let db_only = r#"{"Service":"db","State":"running"}"#;
-        assert_eq!(container_state_from_ps(db_only), ContainerState::Missing);
+        let all = format!("{PS_APP}\n{PS_DB}\n{PS_EDGE}");
+        assert_eq!(container_state_from_ps(&all), ContainerState::Running);
+        let all_stopped = format!(
+            "{}\n{}\n{}",
+            stopped(PS_APP),
+            stopped(PS_DB),
+            stopped(PS_EDGE)
+        );
+        assert_eq!(
+            container_state_from_ps(&all_stopped),
+            ContainerState::Stopped
+        );
+        assert_eq!(container_state_from_ps(PS_DB), ContainerState::Missing);
+    }
+
+    #[test]
+    fn a_removed_db_or_edge_container_needs_up() {
+        // `docker rm -f` of db alone: `compose start` started app and edge
+        // and left the site with no database.
+        let no_db = format!("{PS_APP}\n{PS_EDGE}");
+        assert_eq!(container_state_from_ps(&no_db), ContainerState::Missing);
+        assert_eq!(
+            start_action(container_state_from_ps(&no_db)),
+            StartAction::Up
+        );
+        let no_edge = format!("{}\n{}", stopped(PS_APP), stopped(PS_DB));
+        assert_eq!(container_state_from_ps(&no_edge), ContainerState::Missing);
+        // As a JSON array (older Compose) too.
+        let array = format!("[{PS_APP},{PS_EDGE}]");
+        assert_eq!(container_state_from_ps(&array), ContainerState::Missing);
+    }
+
+    #[test]
+    fn an_erased_database_is_refused_only_for_a_site_backed_up_before() {
+        let id = Some("5f0c2a7e-3b1d-4c8e-9a6f-2d7b1e4c9a03");
+        assert!(database_erased(id, Some(false), false));
+        // A first install has no site-id yet; an unanswered probe proves nothing.
+        assert!(!database_erased(None, Some(false), false));
+        assert!(!database_erased(id, None, false));
+        assert!(!database_erased(id, Some(true), false));
+    }
+
+    #[test]
+    fn a_database_the_owner_wiped_starts_fresh_until_it_exists_again() {
+        let dir = Scratch::new("wiped-db");
+        let stack = Stack::at(dir.0.clone());
+        let id = stack.ensure_site_id().unwrap();
+        // Lost by accident: refused.
+        assert!(database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+        // `app down --wipe` / "Remove and erase" leaves the marker first (and keeps
+        // the site-id), so the next start sets up a fresh site instead.
+        super::mark_database_wiped(&stack).unwrap();
+        assert!(stack.database_wiped_path().ends_with(".database-wiped"));
+        assert_eq!(stack.site_id().as_deref(), Some(id.as_str()));
+        assert!(!database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+        // Once the database is back the marker goes, and a later loss is refused again.
+        super::clear_database_wiped(&stack);
+        assert!(!stack.database_wiped());
+        assert!(database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+    }
+
+    #[test]
+    fn the_erased_database_refusal_names_the_latest_backup() {
+        let dir = Scratch::new("erased-db");
+        let stack = Stack::at(dir.0.clone());
+        let backups = stack.backups_dir();
+        std::fs::create_dir_all(&backups).unwrap();
+        // Names exactly as `backup()` writes them; the newest wins whatever its label.
+        let old = backups.join("aincient-before-update-20261113-091500.tar.gz");
+        let new = backups.join("aincient-20261114-101010.tar.gz");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&new, b"x").unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+
+        let refusal = DatabaseErased {
+            latest_backup: list_backups(&stack).into_iter().next(),
+        };
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("Your site's database was removed from Docker. Restore your latest backup (Backups tab): aincient-20261114-101010.tar.gz."),
+            "{text}"
+        );
+        assert!(text.contains(&new.display().to_string()), "{text}");
+
+        let none = DatabaseErased {
+            latest_backup: None,
+        }
+        .to_string();
+        assert!(
+            none.contains("no backup of this site on this computer"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn only_no_such_image_fetches_the_engine_again() {
+        // `docker image inspect` stderr, Docker 29.4.
+        let gone = "Error response from daemon: No such image: ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert!(!engine_image_present(Err(gone.into())).unwrap());
+        assert!(engine_image_present(Ok("sha256:435e2d22".into())).unwrap());
+        let down = "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory";
+        let e = engine_image_present(Err(down.into())).unwrap_err();
+        assert!(format!("{e:#}").contains("failed to connect"), "{e:#}");
     }
 
     #[test]
@@ -4062,9 +4379,20 @@ mod tests {
         let ps = "{\"Name\":\"atelier-db-1\",\"Service\":\"db\",\"State\":\"exited\"}\n\
                   {\"Name\":\"atelier-app-1\",\"Service\":\"app\",\"State\":\"created\"}\n\
                   {\"Name\":\"atelier-edge-1\",\"Service\":\"edge\",\"State\":\"exited\"}";
+        // Every service: edge (and the engine) can be left half attached too.
         assert_eq!(
             stopped_service_containers(ps),
-            ["atelier-db-1", "atelier-app-1"]
+            ["atelier-db-1", "atelier-app-1", "atelier-edge-1"]
+        );
+        let engine = format!(
+            "{PS_APP}\n{}",
+            stopped(PS_EDGE)
+                .replace("edge", "engine")
+                .replace("nginx:1.30-alpine-slim", "atelier-engine")
+        );
+        assert_eq!(
+            stopped_service_containers(&engine),
+            ["atelier-hardening-test-engine-1"]
         );
         assert!(stopped_service_containers(
             r#"[{"Name":"atelier-db-1","Service":"db","State":"running"}]"#
@@ -4096,6 +4424,7 @@ mod tests {
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
         IdentityMismatch, RestoreOptions, Silent,
     };
+    use super::{database_erased, engine_image_present, DatabaseErased};
     use super::{engine_image_need, EngineImage, LOCAL_ENGINE_GONE};
     use super::{
         lifecycle_plan, Plan, PlanStep, Reporter, ScaledReporter, Stage, BOOT_FROM, PULL_FROM,

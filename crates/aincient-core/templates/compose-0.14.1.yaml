@@ -1,0 +1,43 @@
+name: atelier
+services:
+  db:
+    image: pgvector/pgvector:pg16-trixie
+    environment:
+      POSTGRES_DB: aincient
+      POSTGRES_USER: aincient
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aincient}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aincient -d aincient"]
+      interval: 10s
+      retries: 10
+  app:
+    image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:latest}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: pgsql://aincient:${DB_PASSWORD:-aincient}@db/aincient
+      HASH_SALT: ${HASH_SALT:?set HASH_SALT in .env}
+      AINCIENT_TRUSTED_HOSTS: ${AINCIENT_TRUSTED_HOSTS:-}
+      AINCIENT_ADMIN_PASS: ${ADMIN_PASS:-}
+      AINCIENT_REVERSE_PROXY: "1"
+    volumes:
+      - files:/opt/drupal/web/sites/default/files
+      - private:/opt/drupal/private
+    restart: unless-stopped
+  edge:
+    image: nginx:1.30-alpine-slim
+    depends_on:
+      - app
+    ports:
+      - "${HTTP_PORT:-41221}:80"
+    volumes:
+      - ./edge.conf:/etc/nginx/conf.d/default.conf:ro
+      - private:/srv/private:ro
+    restart: unless-stopped
+volumes:
+  db-data:
+  files:
+  private:
