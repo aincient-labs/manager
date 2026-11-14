@@ -13,6 +13,7 @@
 
 mod harness;
 
+mod cleanup_needed;
 mod detached_db;
 mod restore_safety;
 mod settings_applied;
