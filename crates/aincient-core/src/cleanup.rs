@@ -6,7 +6,7 @@
 //! database or web-server move leaves the old image; nothing removed them.
 //!
 //! Only Atelier's own images (and the database / web-server images it moved
-//! off) are candidates, and only those no container (in any state) uses, no
+//! off: after an update, only the exact tags Atelier itself shipped) are candidates, and only those no container (in any state) uses, no
 //! registered site needs to start, and that can be downloaded again. Never
 //! `docker image prune`: it also takes other tools' images. Data volumes and
 //! backups are never touched.
@@ -24,8 +24,10 @@ use crate::stack::{edge_nginx_upgrade, Stack, IMAGE_REPO, LEGACY_DB_IMAGE, LEGAC
 /// How much to free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// After a successful update: old untagged Atelier versions and the database
-    /// and web-server images Atelier has moved away from.
+    /// After a successful update, without asking: old untagged Atelier versions
+    /// and the exact database and web-server tags Atelier itself shipped and
+    /// moved away from ([`SHIPPED_SUPERSEDED_BASES`]), never another tag of
+    /// those generic images.
     AfterUpdate,
     /// On request: every unused Atelier image no registered site names, and the
     /// database and web-server images Atelier has moved away from.
@@ -91,6 +93,15 @@ fn is_superseded_base(name: &str) -> bool {
     name == LEGACY_DB_IMAGE || edge_nginx_upgrade(name).is_some()
 }
 
+/// The superseded database and web-server tags Atelier itself wrote into a
+/// site's `compose.yaml` (this Manager's template and `install.sh`) before
+/// moving its sites off them. The automatic clean-up after an update removes
+/// only these: [`is_superseded_base`] also matches every older
+/// `nginx:1.N-alpine`, which another project on this computer may keep without
+/// a container. "Free up space" lists those too, and asks.
+const SHIPPED_SUPERSEDED_BASES: [&str; 3] =
+    [LEGACY_DB_IMAGE, "nginx:1.28-alpine", "nginx:1.30-alpine"];
+
 /// The images `scope` may remove, grouped by image ID (an image with two tags is
 /// one entry). An image qualifies when:
 ///
@@ -100,7 +111,8 @@ fn is_superseded_base(name: &str) -> bool {
 ///   local or fork build has none, and removing it would lose it for good;
 /// - every name it has qualifies: an Atelier image (only an untagged one after
 ///   an update), or a database / web-server image Atelier has moved its sites
-///   off ([`is_superseded_base`]). The current `nginx` and `pgvector` images
+///   off ([`is_superseded_base`]; after an update only
+///   [`SHIPPED_SUPERSEDED_BASES`]). The current `nginx` and `pgvector` images
 ///   are generic and other projects may use them, so they always stay.
 fn select(
     rows: &[Row],
@@ -115,7 +127,11 @@ fn select(
                 Scope::Everything => true,
             };
         }
-        !r.untagged() && is_superseded_base(&r.name())
+        !r.untagged()
+            && match scope {
+                Scope::AfterUpdate => SHIPPED_SUPERSEDED_BASES.contains(&r.name().as_str()),
+                Scope::Everything => is_superseded_base(&r.name()),
+            }
     };
     let is_needed = |r: &Row| -> bool {
         needed.contains(&r.id)
@@ -569,6 +585,30 @@ mod tests {
         // A container (any state) using it keeps it.
         let busy: HashSet<String> = [all[1].id.clone()].into();
         assert!(!ids(&select(&all, &busy, &none(), Scope::Everything)).contains(&short(CMS_LATEST)));
+    }
+
+    // Another project's `nginx:1.27-alpine`, which Atelier never shipped
+    // (Docker Hub, arm64 config digest and index digest, 2026-11-14).
+    const NGINX_OTHER: &str = "sha256:96868d9fa38f469a86d2f25787e43ee9ad330339d30be260aa9f5a338bb03751\tnginx\t1.27-alpine\tsha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10";
+
+    #[test]
+    fn the_automatic_pass_takes_only_the_base_tags_atelier_shipped() {
+        let all = rows(&[NGINX_OTHER, PG_OLD, NGINX_FULL, NGINX_NOW, PG_NOW]);
+        // After an update, without asking: the bookworm db and the full 1.30
+        // edge Atelier wrote; another project's 1.27 stays.
+        assert_eq!(
+            ids(&select(&all, &none(), &none(), Scope::AfterUpdate)),
+            [short(PG_OLD), short(NGINX_FULL)]
+        );
+        // On request it is listed (and the owner is asked).
+        assert_eq!(
+            ids(&select(&all, &none(), &none(), Scope::Everything)),
+            [short(NGINX_OTHER), short(PG_OLD), short(NGINX_FULL)]
+        );
+        // Every tag the automatic pass takes is one Atelier moves its sites off.
+        for name in SHIPPED_SUPERSEDED_BASES {
+            assert!(is_superseded_base(name), "{name}");
+        }
     }
 
     #[test]

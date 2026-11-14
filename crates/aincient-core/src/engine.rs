@@ -970,11 +970,54 @@ pub fn disable(stack: &Stack) -> Result<()> {
         }
     }
     // Drop the local name protect_image gave the engine, so a prune can clean
-    // the image up once the engine is off. Best effort; only the name goes.
-    let mut c = crate::docker::docker();
-    c.args(["image", "rm", &pinned_tag(&stack.project_name())]);
-    let _ = crate::docker::try_capture(c);
+    // the image up once the engine is off: only when the image can be
+    // downloaded again or keeps another name. Best effort.
+    let tag = pinned_tag(&stack.project_name());
+    let mut inspect = crate::docker::docker();
+    inspect.args(["image", "inspect", &tag]);
+    if let Some(json) = crate::docker::try_capture(inspect) {
+        match pinned_name_can_go(&json) {
+            Ok(()) => {
+                let mut c = crate::docker::docker();
+                c.args(["image", "rm", &tag]);
+                let _ = crate::docker::try_capture(c);
+            }
+            Err(why) => eprintln!("Kept the engine image's local name {tag}: {why}."),
+        }
+    }
     Ok(())
+}
+
+/// The names `docker image inspect` gives an image.
+#[derive(Debug, serde::Deserialize)]
+struct ImageNames {
+    #[serde(rename = "RepoTags", default)]
+    repo_tags: Option<Vec<String>>,
+    #[serde(rename = "RepoDigests", default)]
+    repo_digests: Option<Vec<String>>,
+}
+
+/// Whether [`disable`] may remove the pinned name, from `docker image inspect
+/// <pinned name>`'s output; why not, otherwise. Removing an image's last name
+/// deletes the image: fine for one pulled from a registry (it has a
+/// `RepoDigests` entry and downloads again), never for a local build known by
+/// that name alone, which would be lost for good.
+fn pinned_name_can_go(inspect_json: &str) -> std::result::Result<(), String> {
+    let images: Vec<ImageNames> = serde_json::from_str(inspect_json)
+        .map_err(|e| format!("couldn't read `docker image inspect` ({e})"))?;
+    let image = images
+        .first()
+        .ok_or("`docker image inspect` listed no image")?;
+    let digests = image.repo_digests.as_deref().unwrap_or_default();
+    let tags = image.repo_tags.as_deref().unwrap_or_default();
+    if !digests.is_empty() || tags.len() > 1 {
+        return Ok(());
+    }
+    Err(
+        "it is a local build with no other name, which can't be downloaded again; remove it \
+         yourself (`docker image rm`) when you no longer need it"
+            .into(),
+    )
 }
 
 /// Write `path` through a fresh temp file in the same directory, renamed over
@@ -1126,6 +1169,30 @@ mod tests {
         assert!(!names.iter().any(|n| n.contains(".tmp-")), "{names:?}");
         enable(s, ID, &fake).unwrap();
         assert!(files_current(s), "idempotent");
+    }
+
+    // `docker image inspect` output (Docker 29.4 on OrbStack, 2026-11-14),
+    // trimmed to the fields around the names.
+    const PULLED: &str = r#"[{"Id":"sha256:bece2626a42ce7764ac03f94358cc1951fe89b5bf48890e51419a22631495110","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":["ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f"],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-10-31T20:18:51.559631057Z"}]"#;
+    const LOCAL_ONLY: &str = r#"[{"Id":"sha256:e75719a4a4e9bb18c4f644cc8193e441d9a7630470736aefa3d2301d8578b9fd","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":[],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-11-14T01:21:56.997664847+01:00"}]"#;
+    const LOCAL_TWO_NAMES: &str = r#"[{"Id":"sha256:e75719a4a4e9bb18c4f644cc8193e441d9a7630470736aefa3d2301d8578b9fd","RepoTags":["atelier-engine:dev","ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":[],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-11-14T01:21:56.997664847+01:00"}]"#;
+
+    #[test]
+    fn disable_keeps_a_local_engine_build_known_only_by_its_pinned_name() {
+        // Pulled from the registry: downloads again, the name can go.
+        assert_eq!(pinned_name_can_go(PULLED), Ok(()));
+        // A local build with another name: removing ours only untags it.
+        assert_eq!(pinned_name_can_go(LOCAL_TWO_NAMES), Ok(()));
+        // A local build whose only name is ours: removing it would delete it.
+        let why = pinned_name_can_go(LOCAL_ONLY).unwrap_err();
+        assert!(why.contains("can't be downloaded again"), "{why}");
+        // Docker may write `null` for an empty list; unreadable output keeps it.
+        assert!(pinned_name_can_go(
+            &LOCAL_ONLY.replace("\"RepoDigests\":[]", "\"RepoDigests\":null")
+        )
+        .is_err());
+        assert!(pinned_name_can_go("[]").is_err());
+        assert!(pinned_name_can_go("not json").is_err());
     }
 
     #[test]

@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Free up space** (System → Disk space, or `atelier app cleanup`) removes Atelier's downloads that
   no site is using: old versions, and the database and web-server images Atelier has moved away from.
   It lists what will go, with sizes, and asks first (`--yes` skips the question, `--dry-run` only
-  lists). After a successful update, old versions are removed automatically. Anything one of your
+  lists). After a successful update, old versions are removed automatically, along with only the
+  exact database and web-server versions Atelier itself used before (never another version of
+  those images another program may keep). Anything one of your
   sites needs to start stays, even while that site is stopped, as do images that can't be downloaded
   again (your own builds) and the database and web-server images other programs may share. Your
   sites' data and other programs' images are never touched, nor are your backups unless you tick
@@ -39,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lists the other containers the restart stops and asks, then restarts Docker, waits for it to
   answer and starts your site again. **Run a checkup**'s repair (`atelier doctor --fix`) offers it
   too, asking first. Docker Engine on Linux is restarted by hand: you get the command to copy.
+  OrbStack restarts only its Docker engine (your OrbStack Linux machines keep running), and a Colima
+  profile other than the default one is restarted by name.
 
 ### Changed
 
@@ -82,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A site with the experimental engine no longer fails to start with "No such image" when its engine
   image was removed from your computer (an image clean-up or a Docker reset). Atelier downloads the
   exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
-  image clean-up (`docker image prune`) no longer removes it. Turning the engine off drops that name.
+  image clean-up (`docker image prune`) no longer removes it. Turning the engine off drops that name,
+  except for an engine built locally that has no other name, which would otherwise be deleted.
   An engine built locally can't be downloaded, so it says to turn the engine off and on again.
 - A start, setup or update whose site failed to come up now says it failed, and why ("Your site
   can't reach its database…"), instead of reporting success or waiting minutes on "Booting…". This

@@ -160,6 +160,43 @@ pub fn detect_from(signals: &Signals, os: HostOs) -> Runtime {
     Runtime::Unknown
 }
 
+/// The Colima profile `signals` name when it isn't the default one: Colima
+/// names its daemon and its context `colima-<profile>` (plain `colima` for
+/// `default`) and keeps the socket in `~/.colima/<profile>/`. A bare `colima
+/// restart` restarts the default profile, whatever Docker is talking to.
+pub fn colima_profile(signals: &Signals) -> Option<String> {
+    let named = |s: &str| -> Option<String> {
+        let s = s.trim();
+        if s == "colima" {
+            return Some("default".into());
+        }
+        s.strip_prefix("colima-")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    };
+    let in_endpoint = |e: &str| -> Option<String> {
+        let (_, rest) = e.split_once("/.colima/")?;
+        let (dir, _) = rest.split_once('/')?;
+        (!dir.is_empty() && !dir.starts_with('_')).then(|| dir.to_string())
+    };
+    signals
+        .name
+        .as_deref()
+        .and_then(named)
+        .or_else(|| signals.context.as_deref().and_then(named))
+        .or_else(|| signals.endpoint.as_deref().and_then(in_endpoint))
+        .filter(|p| p != "default")
+}
+
+/// `colima restart`, with `--profile` for any profile but the default one.
+fn colima_restart(profile: Option<&str>) -> Vec<String> {
+    let mut args = vec!["colima".to_string(), "restart".to_string()];
+    if let Some(p) = profile {
+        args.extend(["--profile".to_string(), p.to_string()]);
+    }
+    args
+}
+
 /// One step of a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -186,13 +223,19 @@ pub enum RestartPlan {
 }
 
 /// The restart for `runtime` on `os`. `desktop_cli` is whether `docker
-/// desktop` answers (Docker Desktop 4.37 and later).
-pub fn restart_plan(runtime: Runtime, os: HostOs, desktop_cli: bool) -> RestartPlan {
+/// desktop` answers (Docker Desktop 4.37 and later); `profile` is the Colima
+/// profile when it isn't the default one ([`colima_profile`]).
+///
+/// OrbStack restarts only its built-in `docker` machine: `orbctl stop` would
+/// stop all of OrbStack, the owner's Linux machines too.
+pub fn restart_plan(
+    runtime: Runtime,
+    os: HostOs,
+    desktop_cli: bool,
+    profile: Option<&str>,
+) -> RestartPlan {
     match runtime {
-        Runtime::OrbStack => RestartPlan::Steps(vec![
-            Step::run(&["orbctl", "stop"]),
-            Step::run(&["orbctl", "start"]),
-        ]),
+        Runtime::OrbStack => RestartPlan::Steps(vec![Step::run(&["orbctl", "restart", "docker"])]),
         Runtime::DockerDesktop if desktop_cli => {
             RestartPlan::Steps(vec![Step::run(&["docker", "desktop", "restart"])])
         }
@@ -201,24 +244,35 @@ pub fn restart_plan(runtime: Runtime, os: HostOs, desktop_cli: bool) -> RestartP
             Step::WaitQuit("Docker".into()),
             Step::run(&["open", "-a", "Docker"]),
         ]),
-        Runtime::Colima => RestartPlan::Steps(vec![Step::run(&["colima", "restart"])]),
+        Runtime::Colima => RestartPlan::Steps(vec![Step::Run(colima_restart(profile))]),
         Runtime::RancherDesktop => RestartPlan::Steps(vec![
             Step::run(&["rdctl", "shutdown"]),
             Step::run(&["rdctl", "start"]),
         ]),
         _ => {
-            let (steps, copy) = manual_steps(runtime, os);
+            let (steps, copy) = manual_steps(runtime, os, profile);
             RestartPlan::Manual { steps, copy }
         }
     }
 }
 
 /// How to restart `runtime` by hand, in plain words, and the command to
-/// copy when there is one. Also what a failed restart ends with.
-pub fn manual_steps(runtime: Runtime, os: HostOs) -> (String, Option<String>) {
+/// copy when there is one. Also what a failed restart ends with. `profile`
+/// as for [`restart_plan`].
+pub fn manual_steps(
+    runtime: Runtime,
+    os: HostOs,
+    profile: Option<&str>,
+) -> (String, Option<String>) {
     let said = |s: &str| (s.to_string(), None);
+    let command = |c: String| (format!("Run `{c}` in a terminal."), Some(c));
     match (runtime, os) {
-        (Runtime::OrbStack, _) => said("Quit OrbStack from the menu bar, then open it again."),
+        (Runtime::OrbStack, _) => (
+            "Run `orbctl restart docker` in a terminal, or quit OrbStack from the menu bar and \
+             open it again."
+                .into(),
+            Some("orbctl restart docker".into()),
+        ),
         (Runtime::DockerDesktop, HostOs::Mac) => {
             said("Quit Docker Desktop from the menu bar (the whale icon), then open it again.")
         }
@@ -229,10 +283,7 @@ pub fn manual_steps(runtime: Runtime, os: HostOs) -> (String, Option<String>) {
         (Runtime::DockerDesktop, _) => {
             said("Quit Docker Desktop from its icon in the system tray, then open it again.")
         }
-        (Runtime::Colima, _) => (
-            "Run `colima restart` in a terminal.".into(),
-            Some("colima restart".into()),
-        ),
+        (Runtime::Colima, _) => command(colima_restart(profile).join(" ")),
         (Runtime::RancherDesktop, _) => said("Quit Rancher Desktop, then open it again."),
         (Runtime::LinuxEngine, _) => (
             "Run `sudo systemctl restart docker` in a terminal.".into(),
@@ -244,8 +295,8 @@ pub fn manual_steps(runtime: Runtime, os: HostOs) -> (String, Option<String>) {
 
 /// How long one detection probe may take: Docker may be the stuck thing.
 const DETECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long one restart step may take (`orbctl stop` waits for every
-/// container to stop).
+/// How long one restart step may take (a restart waits for every container
+/// to stop).
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long Docker Desktop may take to quit.
 const QUIT_WITHIN: Duration = Duration::from_secs(60);
@@ -319,18 +370,25 @@ fn has_desktop_cli() -> bool {
 pub struct Detected {
     pub runtime: Runtime,
     pub os: HostOs,
+    /// The Colima profile, when it isn't the default one.
+    pub profile: Option<String>,
     pub plan: RestartPlan,
 }
 
 /// Find out which runtime runs Docker here, and how to restart it.
 pub fn detect() -> Detected {
     let os = HostOs::current();
-    let runtime = detect_from(&gather(), os);
+    let signals = gather();
+    let runtime = detect_from(&signals, os);
     let desktop_cli = runtime == Runtime::DockerDesktop && has_desktop_cli();
+    let profile = (runtime == Runtime::Colima)
+        .then(|| colima_profile(&signals))
+        .flatten();
     Detected {
         runtime,
         os,
-        plan: restart_plan(runtime, os, desktop_cli),
+        plan: restart_plan(runtime, os, desktop_cli, profile.as_deref()),
+        profile,
     }
 }
 
@@ -346,7 +404,7 @@ pub fn restart_docker(r: &mut dyn Reporter) -> Result<Runtime> {
 /// that ends with how to do it by hand.
 pub fn restart(found: &Detected, r: &mut dyn Reporter) -> Result<()> {
     let name = found.runtime.name();
-    let (by_hand, _) = manual_steps(found.runtime, found.os);
+    let (by_hand, _) = manual_steps(found.runtime, found.os, found.profile.as_deref());
     let steps = match &found.plan {
         RestartPlan::Steps(steps) => steps,
         RestartPlan::Manual { steps, .. } => {
@@ -707,15 +765,17 @@ mod tests {
     fn each_runtime_gets_its_own_restart() {
         let run = |a: &[&str]| Step::run(a);
         assert_eq!(
-            restart_plan(Runtime::OrbStack, HostOs::Mac, false),
-            RestartPlan::Steps(vec![run(&["orbctl", "stop"]), run(&["orbctl", "start"])])
+            // Only OrbStack's Docker engine (its built-in `docker` machine):
+            // `orbctl stop` would stop the owner's Linux machines too.
+            restart_plan(Runtime::OrbStack, HostOs::Mac, false, None),
+            RestartPlan::Steps(vec![run(&["orbctl", "restart", "docker"])])
         );
         assert_eq!(
-            restart_plan(Runtime::DockerDesktop, HostOs::Windows, true),
+            restart_plan(Runtime::DockerDesktop, HostOs::Windows, true, None),
             RestartPlan::Steps(vec![run(&["docker", "desktop", "restart"])])
         );
         assert_eq!(
-            restart_plan(Runtime::DockerDesktop, HostOs::Mac, false),
+            restart_plan(Runtime::DockerDesktop, HostOs::Mac, false, None),
             RestartPlan::Steps(vec![
                 run(&["osascript", "-e", "quit app \"Docker\""]),
                 Step::WaitQuit("Docker".into()),
@@ -723,26 +783,84 @@ mod tests {
             ])
         );
         assert_eq!(
-            restart_plan(Runtime::Colima, HostOs::Mac, false),
+            restart_plan(Runtime::Colima, HostOs::Mac, false, None),
             RestartPlan::Steps(vec![run(&["colima", "restart"])])
         );
         assert_eq!(
-            restart_plan(Runtime::RancherDesktop, HostOs::Mac, false),
+            restart_plan(Runtime::RancherDesktop, HostOs::Mac, false, None),
             RestartPlan::Steps(vec![run(&["rdctl", "shutdown"]), run(&["rdctl", "start"])])
+        );
+    }
+
+    #[test]
+    fn a_colima_restart_names_the_profile_docker_talks_to() {
+        let profile = |name, ctx, ep| colima_profile(&signals(None, name, ctx, ep));
+        // The default profile: daemon `colima`, context `colima`,
+        // `~/.colima/default/docker.sock`. A bare `colima restart` is right.
+        assert_eq!(
+            profile(
+                Some("colima"),
+                Some("colima"),
+                Some("unix:///Users/u/.colima/default/docker.sock")
+            ),
+            None
+        );
+        // Profile `work`, from each signal alone (Docker may not answer).
+        assert_eq!(
+            profile(Some("colima-work"), None, None).as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            profile(None, Some("colima-work"), None).as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            profile(
+                None,
+                Some("default"),
+                Some("unix:///Users/u/.colima/work/docker.sock")
+            )
+            .as_deref(),
+            Some("work")
+        );
+        // Not Colima at all.
+        assert_eq!(profile(Some("orbstack"), Some("orbstack"), None), None);
+
+        let work = Some("work");
+        assert_eq!(
+            restart_plan(Runtime::Colima, HostOs::Mac, false, work),
+            RestartPlan::Steps(vec![Step::run(&["colima", "restart", "--profile", "work"])])
+        );
+        assert_eq!(
+            restart_plan(Runtime::Colima, HostOs::Mac, false, None),
+            RestartPlan::Steps(vec![Step::run(&["colima", "restart"])])
+        );
+        assert_eq!(
+            manual_steps(Runtime::Colima, HostOs::Mac, work),
+            (
+                "Run `colima restart --profile work` in a terminal.".to_string(),
+                Some("colima restart --profile work".to_string())
+            )
+        );
+        assert_eq!(
+            manual_steps(Runtime::Colima, HostOs::Linux, None)
+                .1
+                .as_deref(),
+            Some("colima restart")
         );
     }
 
     #[test]
     fn what_the_manager_cant_restart_is_said_in_plain_words() {
         assert_eq!(
-            restart_plan(Runtime::LinuxEngine, HostOs::Linux, false),
+            restart_plan(Runtime::LinuxEngine, HostOs::Linux, false, None),
             RestartPlan::Manual {
                 steps: "Run `sudo systemctl restart docker` in a terminal.".into(),
                 copy: Some("sudo systemctl restart docker".into()),
             }
         );
         for os in [HostOs::Windows, HostOs::Linux] {
-            match restart_plan(Runtime::DockerDesktop, os, false) {
+            match restart_plan(Runtime::DockerDesktop, os, false, None) {
                 RestartPlan::Manual { steps, copy } => {
                     assert!(steps.starts_with("Right-click") || steps.starts_with("Quit"));
                     assert!(steps.contains("Docker Desktop"), "{steps}");
@@ -752,15 +870,20 @@ mod tests {
             }
         }
         assert_eq!(
-            restart_plan(Runtime::Unknown, HostOs::Mac, false),
+            restart_plan(Runtime::Unknown, HostOs::Mac, false, None),
             RestartPlan::Manual {
                 steps: "Quit Docker and open it again.".into(),
                 copy: None,
             }
         );
         assert_eq!(
-            manual_steps(Runtime::OrbStack, HostOs::Mac).0,
-            "Quit OrbStack from the menu bar, then open it again."
+            manual_steps(Runtime::OrbStack, HostOs::Mac, None),
+            (
+                "Run `orbctl restart docker` in a terminal, or quit OrbStack from the menu bar \
+                 and open it again."
+                    .to_string(),
+                Some("orbctl restart docker".to_string())
+            )
         );
     }
 
@@ -769,7 +892,8 @@ mod tests {
         let found = Detected {
             runtime: Runtime::LinuxEngine,
             os: HostOs::Linux,
-            plan: restart_plan(Runtime::LinuxEngine, HostOs::Linux, false),
+            profile: None,
+            plan: restart_plan(Runtime::LinuxEngine, HostOs::Linux, false, None),
         };
         let e = restart(&found, &mut crate::ops::Silent).unwrap_err();
         assert_eq!(
@@ -804,6 +928,10 @@ mod tests {
         assert_eq!(
             step_headline("Colima", &s(&["colima", "restart"])),
             "Restarting Colima…"
+        );
+        assert_eq!(
+            step_headline("OrbStack", &s(&["orbctl", "restart", "docker"])),
+            "Restarting OrbStack…"
         );
     }
 
