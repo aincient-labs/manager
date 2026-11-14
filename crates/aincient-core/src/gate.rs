@@ -156,6 +156,16 @@ impl Blocker {
 
 /// The blockers `facts` add up to, in the order the owner should clear them
 /// (Docker first: nothing else can be read without it). Empty: ready.
+/// Whether a container's own `OOMKilled` flag blocks an update. Only while it
+/// is restarting: a container whose child was killed keeps the flag until its
+/// next start while it runs fine, so the flag alone would block every update
+/// until the owner restarted the site ("Update once it runs again" while it
+/// already runs). A kill in the last [`OOM_RECENT`] still blocks through its
+/// `oom` event.
+fn oom_blocks(oom_killed: bool, restarting: bool) -> bool {
+    oom_killed && restarting
+}
+
 pub fn ready_to_update(facts: &UpdateFacts) -> Vec<Blocker> {
     let mut out = Vec::new();
     if !facts.docker_answering {
@@ -212,7 +222,7 @@ pub fn gather(stack: &Stack, pf: &Preflight) -> UpdateFacts {
     let now = boot::services_now(stack);
     let mut out_of_memory: BTreeSet<String> = now
         .iter()
-        .filter(|s| s.oom_killed)
+        .filter(|s| oom_blocks(s.oom_killed, s.restarting))
         .map(|s| s.service.clone())
         .collect();
     if !now.is_empty() {
@@ -287,6 +297,19 @@ pub fn require_ready(facts: &UpdateFacts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_oom_flag_on_a_running_container_does_not_block() {
+        assert!(oom_blocks(true, true), "OOM-killed and restarting blocks");
+        assert!(
+            !oom_blocks(true, false),
+            "a child killed long ago, container running fine: no dead end"
+        );
+        assert!(
+            !oom_blocks(false, true),
+            "restarting without OOM is a crash loop, not memory"
+        );
+    }
     use crate::disk::{Place, BLOCK_BELOW, WARN_BELOW};
 
     fn healthy() -> UpdateFacts {
