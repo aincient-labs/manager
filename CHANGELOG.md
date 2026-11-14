@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The desktop app's Home is honest after updates, starts and site switches. After an update, setup
+  or version switch it checks again instead of saying "Couldn't check"; "What's new" links the
+  release (or the releases list when the version isn't a plain number); the "didn't finish starting"
+  and "still starting" lines clear once the site is up or stopped; only one "Run a checkup" shows;
+  Backups waits until the site answers ("Your website is still starting"); the update line keeps
+  keyboard focus when it refreshes; and the page behind a running operation can't be clicked or
+  tabbed into, so a second operation can't be started by accident. The finished panel says what the
+  clean-up after an update removed.
 - Backups now include the images attached in chat, and a restore puts them back. Restoring a
   backup taken before this version leaves the current ones as they are.
 - Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker

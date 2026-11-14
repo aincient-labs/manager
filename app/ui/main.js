@@ -267,6 +267,7 @@ function progressReset(title) {
   pm.entered = [];
   pm.current = -1;
   pm.log = [];
+  pm.tidied = null;
   $("progress-title").textContent = title;
   $("progress-stage").textContent = pm.stageText;
   $("progress-stage").classList.remove("failed");
@@ -658,6 +659,9 @@ function progressUpdate(p) {
   }
   if (p.kind === "log") {
     if (p.message.trim()) appendLog(p.message, logClass(p.message));
+    // The after-update clean-up's one line ("Removed N old download(s), …"):
+    // the finished panel says it, not only the Details log.
+    if (/^Removed \d+ old download/.test(p.message)) pm.tidied = p.message.trim();
     return;
   }
   pm.stageText = p.message;
@@ -751,7 +755,7 @@ $("progress-copy").addEventListener("click", () => copyText(progressReport(), $(
 let progressOwner = 0;
 
 // `opts.lifecycle` names a start-or-update kind of op ("start" | "update" |
-// "setup"; "repair" only clears): its failure leaves a line on Home, its
+// "setup"; "repair" and "clear" only clear): its failure leaves a line on Home, its
 // success clears it, and a result of `false` (the site didn't answer before
 // the wait ran out) is said as "not yet", not success.
 const NOT_READY_TEXT =
@@ -763,13 +767,26 @@ const DIDNT_FINISH = {
   setup: "The last setup didn't finish.",
 };
 
+// While the progress panel is up the page behind it is inert: Enter on a
+// focused button there must not start a second operation (the panel is a modal
+// in markup only; focus could still sit on a control underneath).
+function setProgressOpen(open) {
+  for (const el of document.querySelectorAll(".topbar, .shell")) el.inert = open;
+  $("progress").classList.toggle("hidden", !open);
+  if (open) {
+    const panel = document.querySelector("#progress .progress-panel");
+    panel.tabIndex = -1;
+    panel.focus({ preventScroll: true });
+  }
+}
+
 async function runProgressOp(title, fn, opts = {}) {
   const me = ++progressOwner;
   // A new attempt supersedes the previous failure — leaving the old banner up
   // makes a retry that succeeds look like it failed.
   hideError();
   progressReset(title);
-  $("progress").classList.remove("hidden");
+  setProgressOpen(true);
   startMatrixLoop();
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
   let failure = null;
@@ -812,18 +829,24 @@ async function runProgressOp(title, fn, opts = {}) {
     if (opts.lifecycle) setHomeNotice(result === false ? NOT_READY_TEXT : null);
     const settled = progressFinish();
     if (opts.lifecycle && result === false) $("progress-stage").textContent = NOT_READY_TEXT;
+    else if (pm.tidied) $("progress-stage").textContent = `Done. ${pm.tidied}`;
     try {
       await refresh();
     } catch (e) {
       showError(String(e));
     }
     await settled; // let the blocks finish their run before the panel closes
+    // Long enough to read the clean-up line before the panel goes.
+    if (pm.tidied && result !== false) await new Promise((r) => setTimeout(r, 2500));
+    // An update, setup or channel switch changes what "up to date" means: ask
+    // again rather than leave the line on a stale or empty answer.
+    if (opts.lifecycle === "update" || opts.lifecycle === "setup") backgroundUpdateRefresh(false);
     return true;
   } finally {
     unlisten();
     if (progressOwner === me) {
       cancelAnimationFrame(pm.raf);
-      $("progress").classList.add("hidden");
+      setProgressOpen(false);
     }
   }
 }
@@ -1395,7 +1418,14 @@ function renderStatus(status) {
   const slow = starting && Date.now() - startingSince >= STARTING_SLOW_MS;
   $("starting-slow").classList.toggle("hidden", !slow);
   // A site that answers settles any "not answering yet" line.
-  if (status.running && status.reachable && homeNotice === NOT_READY_TEXT) setHomeNotice(null);
+  // ...and so does a start that failed once the site is up again; a "still
+  // starting" line is wrong the moment nothing is running.
+  if (status.running && status.reachable && (homeNotice === NOT_READY_TEXT || homeNotice === DIDNT_FINISH.start)) {
+    setHomeNotice(null);
+  } else if (!status.running && homeNotice === NOT_READY_TEXT) {
+    setHomeNotice(null);
+  }
+  syncCheckupButtons();
 
   if (status.running && status.reachable) {
     dot.className = "dot up";
@@ -1477,6 +1507,13 @@ function setHomeNotice(text) {
   homeNotice = text || null;
   $("home-notice-text").textContent = homeNotice || "";
   $("home-notice").classList.toggle("hidden", !homeNotice);
+  syncCheckupButtons();
+}
+
+// One "Run a checkup" at a time: the slow-start row has its own, so the notice
+// under it drops its button while both are up.
+function syncCheckupButtons() {
+  $("home-notice-checkup").classList.toggle("hidden", !$("starting-slow").classList.contains("hidden"));
 }
 
 // "just now", "12 minutes ago", "3 hours ago", "yesterday", "on 12 Nov 2026".
@@ -1516,9 +1553,13 @@ let updateAttempted = false; // a check has run for this site since it was opene
 let updateCheckProblem = null;
 
 // Release tags are `v<semver>`; the image label may or may not carry the `v`.
-const releaseNotesUrl = (version) =>
-  "https://github.com/aincient-labs/atelier-cms/releases/tag/" +
-  encodeURIComponent(version.startsWith("v") ? version : `v${version}`);
+// Only a plain X.Y.Z names a tag (build metadata after `+` is cut); anything
+// else ("edge", a digest, a prerelease) links the releases list instead of a 404.
+const RELEASES_URL = "https://github.com/aincient-labs/atelier-cms/releases";
+const releaseNotesUrl = (version) => {
+  const v = String(version).split("+")[0].replace(/^v/, "");
+  return /^\d+\.\d+\.\d+$/.test(v) ? `${RELEASES_URL}/tag/v${v}` : RELEASES_URL;
+};
 
 // Paint Home's update banner and line, and the System tab's "Last checked",
 // from a cache status. Nothing shows for a site on a server: its check is the
@@ -1558,7 +1599,7 @@ function renderUpdateBanner(cached) {
       const url = releaseNotesUrl(check.latest_version);
       parts.push(`<a href="${esc(url)}">What's new</a>`);
     }
-    $("update-banner-meta").innerHTML = parts.join(" · ");
+    setHtml($("update-banner-meta"), parts.join(" · "));
   }
 
   const line = $("update-line");
@@ -1566,24 +1607,66 @@ function renderUpdateBanner(cached) {
     line.classList.add("hidden");
     return;
   }
-  const button = (label) =>
-    updateChecks > 0
-      ? `<button class="text-btn" disabled>Checking…</button>`
-      : `<button class="text-btn" data-action="update-check-now">${label}</button>`;
-  let html;
+  // Text and button are updated in place (never rebuilt), so the 60 s repaint
+  // can't drop focus from "Check now".
+  let text;
+  let label = null; // the button's label, or null for none
+  let title = "";
   if (updateCheckProblem || (check && check.update_available !== false && check.update_available !== true)) {
     const why = (updateCheckProblem && updateCheckProblem.text) || (check && check.problem) || "try again later";
-    html = `Couldn't check for updates: ${esc(why)} · ${button("Try again")}`;
+    text = `Couldn't check for updates: ${shortProblem(why)}`;
+    title = why;
+    label = "Try again";
   } else if (check && check.update_available === false) {
-    const v = check.current_version ? ` (${esc(check.current_version)})` : "";
-    html = `Up to date${v} · ${esc(ago)} · ${button("Check now")}`;
+    const v = check.current_version ? ` (${check.current_version})` : "";
+    text = `Up to date${v} · ${ago}`;
+    label = "Check now";
   } else if (updateChecks > 0 || !updateAttempted) {
-    html = "Checking for updates…";
+    text = "Checking for updates…";
   } else {
-    html = `Couldn't check for updates: try again later · ${button("Try again")}`;
+    // Nothing cached and nothing running: not a failure, just not asked yet
+    // (a fresh site, or one changed by an update or setup).
+    text = "Not checked since the last change";
+    label = "Check now";
   }
-  line.innerHTML = html;
+  const parts = updateLineParts(line);
+  parts.text.textContent = label ? `${text} · ` : text;
+  line.title = title;
+  parts.button.classList.toggle("hidden", !label);
+  if (label) {
+    parts.button.textContent = updateChecks > 0 ? "Checking…" : label;
+    parts.button.disabled = updateChecks > 0;
+  }
   line.classList.remove("hidden");
+}
+
+// The update line's two stable children (text, button), made on first use.
+function updateLineParts(line) {
+  if (!line.firstElementChild) {
+    const text = document.createElement("span");
+    const button = document.createElement("button");
+    button.className = "text-btn";
+    button.dataset.action = "update-check-now";
+    line.replaceChildren(text, button);
+  }
+  return { text: line.children[0], button: line.children[1] };
+}
+
+// Set innerHTML only when it changed, so a repaint doesn't replace a focused link.
+function setHtml(el, html) {
+  if (el.dataset.html !== html) {
+    el.innerHTML = html;
+    el.dataset.html = html;
+  }
+}
+
+// Registry and Docker trouble in one short sentence; the full text stays in the
+// line's title. Anything else is shown as it came.
+function shortProblem(why) {
+  const w = String(why);
+  if (/docker|buildx/i.test(w)) return "Docker isn't ready.";
+  if (/offline|registry|reach|resolve|timed? ?out|network/i.test(w)) return "couldn't reach the update server.";
+  return w;
 }
 
 // Paint the banner from the on-disk cache — a file read, never the network.
@@ -1831,11 +1914,20 @@ let hasBackups = false; // the list holds at least one backup
 // database was removed from Docker can't start (Start refuses and points here),
 // so it may restore while stopped: the restore starts it on an empty database
 // and loads the backup into it.
+const BACKUPS_NEEDS_RUNNING = "Your website needs to be running to make a backup or restore one.";
+
 function updateBackupsGate() {
-  const running = !!(lastStatus && lastStatus.running);
-  const erased = !running && !!(lastStatus && lastStatus.database_erased);
+  const up = !!(lastStatus && lastStatus.running);
+  // Running isn't answering: a backup of a site still booting fails or is partial.
+  const running = up && !!lastStatus.reachable;
+  const starting = up && !running;
+  const erased = !up && !!(lastStatus && lastStatus.database_erased);
   const canRestore = running || erased;
   $("backups-needs-running").classList.toggle("hidden", canRestore);
+  $("backups-needs-running-text").textContent = starting
+    ? "Your website is still starting. Backups and restores are available once it answers."
+    : BACKUPS_NEEDS_RUNNING;
+  document.querySelector('#backups-needs-running [data-action="startstop-from-publish"]').classList.toggle("hidden", starting);
   $("backups-database-erased").classList.toggle("hidden", !erased);
   $("backup-now").classList.toggle("hidden", !running);
   document.querySelector('[data-action="restore"]').disabled = !(canRestore && hasBackups);
@@ -2243,6 +2335,7 @@ async function refreshLogs() {
 }
 
 // --- Troubleshoot (doctor) --------------------------------------------------
+let doctorRunning = false;
 
 // Tier headings, in the order the core reports them: outward-in, from the
 // machine to the site. Plain words — the core's tier ids are the stable handle,
@@ -2492,7 +2585,7 @@ const actions = {
         ? "Waking the site"
         : "Starting your website";
     await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"), {
-      lifecycle: running ? null : "start",
+      lifecycle: running ? "clear" : "start",
     });
     if (engine) refreshEngine();
   },
@@ -2608,15 +2701,23 @@ const actions = {
   "refresh-logs": () => refreshLogs(),
 
   doctor: async () => {
+    // One checkup at a time, and one that belongs to the open site: a slow run
+    // for the site just left must not paint its report onto this one.
+    if (doctorRunning) return;
+    const gen = siteGen;
     const summary = $("doctor-summary");
     summary.classList.remove("hidden");
     summary.textContent = "Checking…";
     $("doctor-results").classList.add("hidden");
     $("doctor-fix").classList.add("hidden");
+    doctorRunning = true;
     try {
-      renderDoctor(await invoke("run_doctor"));
+      const report = await invoke("run_doctor");
+      if (gen === siteGen) renderDoctor(report);
     } catch (e) {
-      summary.textContent = String(e);
+      if (gen === siteGen) summary.textContent = String(e);
+    } finally {
+      doctorRunning = false;
     }
   },
 
@@ -2818,13 +2919,17 @@ const actions = {
       { always: true }
     );
     if (!ok) return;
-    await runProgressOp("Putting the site to rest", () => invoke("engine_rest", { rest: true }));
+    await runProgressOp("Putting the site to rest", () => invoke("engine_rest", { rest: true }), {
+      lifecycle: "clear",
+    });
     refreshEngine();
     refresh().catch((e) => showError(String(e)));
   },
 
   "engine-wake": async () => {
-    await runProgressOp("Waking the site", () => invoke("engine_rest", { rest: false }));
+    await runProgressOp("Waking the site", () => invoke("engine_rest", { rest: false }), {
+      lifecycle: "clear",
+    });
     refreshEngine();
     refresh().catch((e) => showError(String(e)));
   },

@@ -251,7 +251,7 @@
           <p id="status-sub" class="muted hero-sub"></p>
           <!-- Shown once "Starting up…" has lasted 3 minutes: never leave
                someone waiting on a site that isn't coming up. -->
-          <div id="starting-slow" class="quiet-row hidden">
+          <div id="starting-slow" class="quiet-row hidden" role="status">
             <button class="btn ghost small" data-action="checkup-now">
               <svg class="ic"><use href="#i-stethoscope" /></svg>Run a checkup
             </button>
@@ -273,14 +273,14 @@
           </div>
           <!-- The last start or update didn't finish (or finished without the
                site answering): one line, one way forward. In memory only. -->
-          <p id="home-notice" class="hint home-notice hidden">
+          <p id="home-notice" class="hint home-notice hidden" role="status">
             <span id="home-notice-text"></span>
-            <button class="text-btn" data-action="checkup-now">Run a checkup</button>
+            <button id="home-notice-checkup" class="text-btn" data-action="checkup-now">Run a checkup</button>
           </p>
           <!-- Where updates stand, always (a site on this computer): up to date,
                couldn't check, or checking. "Update available" lives in the
                banner below instead. Filled by renderUpdateLine(). -->
-          <p id="update-line" class="hint update-line local-only hidden"></p>
+          <p id="update-line" class="hint update-line local-only hidden" role="status"></p>
         </div>
 
         <div id="update-banner" class="banner hidden">
@@ -490,7 +490,7 @@
           </p>
         </div>
         <div id="backups-needs-running" class="card note hidden">
-          <p class="muted">Your website needs to be running to make a backup or restore one.</p>
+          <p id="backups-needs-running-text" class="muted">Your website needs to be running to make a backup or restore one.</p>
           <button class="btn" data-action="startstop-from-publish">
             <svg class="ic"><use href="#i-play" /></svg>Start my website
           </button>

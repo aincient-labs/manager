@@ -1125,7 +1125,7 @@ fn tidy_after_update(r: &mut dyn Reporter) {
     if let Ok(done) = crate::cleanup::free(crate::cleanup::Scope::AfterUpdate, None) {
         if !done.images.is_empty() {
             r.log(&format!(
-                "Removed {} old Atelier download{} (up to {}).",
+                "Removed {} old download{}, up to {} freed.",
                 done.images.len(),
                 if done.images.len() == 1 { "" } else { "s" },
                 crate::cleanup::human_bytes(done.total_bytes)
