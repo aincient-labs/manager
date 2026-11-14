@@ -249,6 +249,16 @@
             <span id="status-headline" class="status-headline">—</span>
           </div>
           <p id="status-sub" class="muted hero-sub"></p>
+          <!-- Shown once "Starting up…" has lasted 3 minutes: never leave
+               someone waiting on a site that isn't coming up. -->
+          <div id="starting-slow" class="quiet-row hidden">
+            <button class="btn ghost small" data-action="checkup-now">
+              <svg class="ic"><use href="#i-stethoscope" /></svg>Run a checkup
+            </button>
+            <button class="btn ghost small local-only" data-action="view-activity">
+              <svg class="ic"><use href="#i-logs" /></svg>View activity
+            </button>
+          </div>
           <a id="console-url" class="console-link" data-action="view" href="#"></a>
           <div class="hero-actions">
             <button class="btn primary big" id="home-primary" data-action="edit">
@@ -261,12 +271,23 @@
               <svg class="ic"><use href="#i-power" /></svg><span id="startstop-label">Stop</span>
             </button>
           </div>
+          <!-- The last start or update didn't finish (or finished without the
+               site answering): one line, one way forward. In memory only. -->
+          <p id="home-notice" class="hint home-notice hidden">
+            <span id="home-notice-text"></span>
+            <button class="text-btn" data-action="checkup-now">Run a checkup</button>
+          </p>
+          <!-- Where updates stand, always (a site on this computer): up to date,
+               couldn't check, or checking. "Update available" lives in the
+               banner below instead. Filled by renderUpdateLine(). -->
+          <p id="update-line" class="hint update-line local-only hidden"></p>
         </div>
 
         <div id="update-banner" class="banner hidden">
           <div>
             <b>A new version of Atelier is ready.</b>
             <span class="banner-sub">Updating keeps all your pages and settings.</span>
+            <span id="update-banner-meta" class="banner-sub"></span>
           </div>
           <button class="btn small" data-action="update">
             <svg class="ic"><use href="#i-download" /></svg>Update
@@ -460,7 +481,16 @@
           </p>
         </div>
 
-        <button class="btn primary big" data-action="backup">
+        <!-- Shown when the site isn't running: backing up and restoring both
+             need it up, so offer the start instead of an error. -->
+        <div id="backups-needs-running" class="card note hidden">
+          <p class="muted">Your website needs to be running to make a backup or restore one.</p>
+          <button class="btn" data-action="startstop-from-publish">
+            <svg class="ic"><use href="#i-play" /></svg>Start my website
+          </button>
+        </div>
+
+        <button id="backup-now" class="btn primary big" data-action="backup">
           <svg class="ic"><use href="#i-backup" /></svg>Back up now
         </button>
 
@@ -480,7 +510,7 @@
               </button>
             </div>
           </div>
-          <button class="btn small full" data-action="import">
+          <button id="btn-import" class="btn small full" data-action="import">
             <svg class="ic"><use href="#i-restore" /></svg>Restore from a file on my computer…
           </button>
         </section>
@@ -531,6 +561,10 @@
               </span>
             </div>
             <p id="channel-hint" class="hint local-only">Released versions only — the supported choice.</p>
+            <p class="hint local-only">
+              Atelier checks for updates when the app opens and every 6 hours.
+              <span id="update-last-checked"></span>
+            </p>
             <button class="btn small full" data-action="check-update">
               <svg class="ic"><use href="#i-refresh" /></svg>Check for updates
             </button>

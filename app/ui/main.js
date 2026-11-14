@@ -25,6 +25,10 @@ let managerVersion = ""; // this app's own version, shown in the chrome
 let siteRows = []; // list_sites rows, for the header switcher
 let selectedSlug = null; // the site this window operates on (registry slug)
 let startingRecheck = null; // timer that re-reads status while "Starting up…"
+let startingSince = null; // when this "Starting up…" began (ms), for the slow note
+// The last start/update in words when it didn't finish (or finished without
+// the site answering) — one Home line until the next successful one. In memory.
+let homeNotice = null;
 // Sites on a server (M2): what each one's server last said (probe_site /
 // get_status), by slug — {state: running|frozen|stopped|unreachable, …}.
 const remoteStates = {};
@@ -746,7 +750,20 @@ $("progress-copy").addEventListener("click", () => copyText(progressReport(), $(
 // is running: it must not hide the panel or stop the new op's render loop.
 let progressOwner = 0;
 
-async function runProgressOp(title, fn) {
+// `opts.lifecycle` names a start-or-update kind of op ("start" | "update" |
+// "setup"; "repair" only clears): its failure leaves a line on Home, its
+// success clears it, and a result of `false` (the site didn't answer before
+// the wait ran out) is said as "not yet", not success.
+const NOT_READY_TEXT =
+  "Atelier started, but your site hasn't answered yet. It may still be finishing — " +
+  "if it doesn't come up in a few minutes, run a checkup.";
+const DIDNT_FINISH = {
+  start: "Your website didn't finish starting last time.",
+  update: "The last update didn't finish.",
+  setup: "The last setup didn't finish.",
+};
+
+async function runProgressOp(title, fn, opts = {}) {
   const me = ++progressOwner;
   // A new attempt supersedes the previous failure — leaving the old banner up
   // makes a retry that succeeds look like it failed.
@@ -756,20 +773,31 @@ async function runProgressOp(title, fn) {
   startMatrixLoop();
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
   let failure = null;
+  let result;
   try {
-    await fn();
+    result = await fn();
   } catch (e) {
     failure = String(e);
   }
   try {
     if (failure !== null) {
+      if (DIDNT_FINISH[opts.lifecycle]) setHomeNotice(DIDNT_FINISH[opts.lifecycle]);
       await progressFail(failure);
       // Closing the panel must not erase the failure: the banner stays until the
       // next action (unless a newer op already took over the screen).
       if (progressOwner === me) showError(failure);
+      // The failed op may have left the site somewhere new (stopped, half
+      // updated): show where it is now, not where it was.
+      try {
+        await refresh();
+      } catch {
+        /* the failure above is the message that matters */
+      }
       return false;
     }
+    if (opts.lifecycle) setHomeNotice(result === false ? NOT_READY_TEXT : null);
     const settled = progressFinish();
+    if (opts.lifecycle && result === false) $("progress-stage").textContent = NOT_READY_TEXT;
     try {
       await refresh();
     } catch (e) {
@@ -1020,6 +1048,12 @@ function resetSiteUi() {
   $("publish-result").classList.add("hidden");
   $("update-status").classList.add("hidden");
   $("update-banner").classList.add("hidden");
+  $("update-line").classList.add("hidden");
+  lastCachedUpdate = null;
+  updateCheckProblem = null;
+  updateAttempted = false;
+  startingSince = null;
+  setHomeNotice(null);
   $("doctor-summary").classList.add("hidden");
   $("doctor-results").classList.add("hidden");
   $("doctor-fix").classList.add("hidden");
@@ -1338,6 +1372,15 @@ function renderStatus(status) {
   urlLink.classList.toggle("hidden", !status.reachable || !url);
   const place = sitePlace(currentSite());
 
+  // "Starting up…" is timed from when it began; any other state ends it.
+  const starting = status.running && !status.reachable;
+  if (!starting) startingSince = null;
+  else if (startingSince === null) startingSince = Date.now();
+  const slow = starting && Date.now() - startingSince >= STARTING_SLOW_MS;
+  $("starting-slow").classList.toggle("hidden", !slow);
+  // A site that answers settles any "not answering yet" line.
+  if (status.running && status.reachable && homeNotice === NOT_READY_TEXT) setHomeNotice(null);
+
   if (status.running && status.reachable) {
     dot.className = "dot up";
     headline.textContent = "Your website is running";
@@ -1364,7 +1407,9 @@ function renderStatus(status) {
     }
     dot.className = "dot warn"; // waiting = ochre (0501), not yet running
     headline.textContent = "Starting up…";
-    sub.textContent = "Almost there — this usually takes a few seconds.";
+    sub.textContent = slow
+      ? "This is taking longer than usual."
+      : "Almost there — this usually takes a few seconds.";
     primary.disabled = true;
     primary.dataset.action = "edit";
     primaryIcon.setAttribute("href", "#i-open");
@@ -1401,16 +1446,111 @@ function renderStatus(status) {
 
   // Keep any open panels honest about the new state.
   if (currentTab === "publish") updatePublishGate();
+  if (currentTab === "backups") updateBackupsGate();
   if (currentTab === "settings") {
     $("image-tag").textContent = applianceName(status);
     renderChannel();
   }
 }
 
-// Show/hide the Home update banner from a cache status ({fresh, checked_at,
-// check}) or null (never checked) — hidden unless the check says yes.
+// How long "Starting up…" may last before Home says so and offers a way on.
+const STARTING_SLOW_MS = 3 * 60 * 1000;
+
+// The Home line about the last start or update (null clears it).
+function setHomeNotice(text) {
+  homeNotice = text || null;
+  $("home-notice-text").textContent = homeNotice || "";
+  $("home-notice").classList.toggle("hidden", !homeNotice);
+}
+
+// "just now", "12 minutes ago", "3 hours ago", "yesterday", "on 12 Nov 2026".
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function fmtDay(d) {
+  return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function timeAgo(unixSecs) {
+  const then = new Date(unixSecs * 1000);
+  const mins = Math.floor(Math.max(0, Date.now() - then.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins === 1 ? "1 minute ago" : `${mins} minutes ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours === 1 ? "1 hour ago" : `${hours} hours ago`;
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (then.toDateString() === yesterday.toDateString()) return "yesterday";
+  return `on ${fmtDay(then)}`;
+}
+
+// The update answer Home last painted from: the cache status ({fresh,
+// checked_at, check}) or null (never checked). Kept so the "checked … ago"
+// words can be repainted every minute without asking anything.
+let lastCachedUpdate = null;
+let updateChecking = false; // a check is running (first forced one, or Check now)
+let updateAttempted = false; // a check has run for this site since it was opened
+// A live check that couldn't answer ({text, since: checked_at it saw}). The
+// cache keeps an older conclusive answer, so this says what the attempt found
+// until a newer answer lands.
+let updateCheckProblem = null;
+
+const RELEASE_NOTES = "https://github.com/aincient-labs/atelier-cms/releases/tag/v";
+
+// Paint Home's update banner and line, and the System tab's "Last checked",
+// from a cache status. Nothing shows for a site on a server: its check is the
+// server's own (the cache is always null there).
 function renderUpdateBanner(cached) {
-  $("update-banner").classList.toggle("hidden", !(cached && cached.check.update_available === true));
+  lastCachedUpdate = cached || null;
+  const row = currentSite();
+  const remote = !!(row && row.host);
+  const check = cached && cached.check;
+  if (updateCheckProblem && cached && cached.checked_at > updateCheckProblem.since) {
+    updateCheckProblem = null;
+  }
+  const available = !remote && !!check && check.update_available === true;
+  $("update-banner").classList.toggle("hidden", !available);
+
+  const ago = cached ? `checked ${timeAgo(cached.checked_at)}` : "";
+  $("update-last-checked").textContent = cached
+    ? `Last checked ${timeAgo(cached.checked_at)}.`
+    : "It hasn't checked yet.";
+
+  if (available) {
+    const parts = [];
+    if (check.current_version && check.latest_version) {
+      parts.push(esc(`${check.current_version} → ${check.latest_version}`));
+    }
+    parts.push(esc(ago));
+    if (check.latest_version) {
+      const url = RELEASE_NOTES + encodeURIComponent(check.latest_version);
+      parts.push(`<a href="${esc(url)}">What's new</a>`);
+    }
+    $("update-banner-meta").innerHTML = parts.join(" · ");
+  }
+
+  const line = $("update-line");
+  if (remote || available) {
+    line.classList.add("hidden");
+    return;
+  }
+  const button = (label) =>
+    updateChecking
+      ? `<button class="text-btn" disabled>Checking…</button>`
+      : `<button class="text-btn" data-action="update-check-now">${label}</button>`;
+  let html;
+  if (updateCheckProblem || (check && check.update_available !== false && check.update_available !== true)) {
+    const why = (updateCheckProblem && updateCheckProblem.text) || (check && check.problem) || "try again later";
+    html = `Couldn't check for updates: ${esc(why)} · ${button("Try again")}`;
+  } else if (check && check.update_available === false) {
+    const v = check.current_version ? ` (${esc(check.current_version)})` : "";
+    html = `Up to date${v} · ${esc(ago)} · ${button("Check now")}`;
+  } else if (updateChecking || !updateAttempted) {
+    html = "Checking for updates…";
+  } else {
+    html = `Couldn't check for updates: try again later · ${button("Try again")}`;
+  }
+  line.innerHTML = html;
+  line.classList.remove("hidden");
 }
 
 // Paint the banner from the on-disk cache — a file read, never the network.
@@ -1419,8 +1559,40 @@ async function refreshUpdate() {
     renderUpdateBanner(await invoke("get_cached_update"));
   } catch {
     $("update-banner").classList.add("hidden");
+    $("update-line").classList.add("hidden");
   }
 }
+
+// A live check (Check now / Try again, and the System tab's button): asks the
+// registry, records what this attempt found, then repaints from the cache.
+// Returns the check, or throws what went wrong.
+async function liveUpdateCheck() {
+  const since = lastCachedUpdate ? lastCachedUpdate.checked_at : 0;
+  updateChecking = true;
+  renderUpdateBanner(lastCachedUpdate);
+  try {
+    const u = await invoke("get_update");
+    const answered = u.update_available === true || u.update_available === false;
+    updateCheckProblem = answered ? null : { text: u.problem || "try again later", since };
+    return u;
+  } catch (e) {
+    updateCheckProblem = { text: String(e), since };
+    throw e;
+  } finally {
+    updateChecking = false;
+    updateAttempted = true;
+    await refreshUpdate();
+  }
+}
+
+// "checked 12 minutes ago" must not go stale while the window sits open.
+setInterval(() => {
+  if (!$("update-line").classList.contains("hidden") || !$("update-banner").classList.contains("hidden")) {
+    renderUpdateBanner(lastCachedUpdate);
+  } else if (lastCachedUpdate) {
+    $("update-last-checked").textContent = `Last checked ${timeAgo(lastCachedUpdate.checked_at)}.`;
+  }
+}, 60 * 1000);
 
 // Background registry checks (manager#6). One forced check shortly after first
 // paint, then a cheap poll: the backend only re-asks the registry once its cache
@@ -1431,10 +1603,23 @@ const UPDATE_POLL_MS = 30 * 60 * 1000;
 let updateRefreshStarted = false;
 
 async function backgroundUpdateRefresh(force) {
+  // Only a call that will ask the registry says "Checking…"; a fresh cache is
+  // a file read and repaints without a flicker.
+  const asks = force || !lastCachedUpdate || !lastCachedUpdate.fresh;
+  if (asks) {
+    updateChecking = true;
+    renderUpdateBanner(lastCachedUpdate);
+  }
   try {
     renderUpdateBanner(await invoke("refresh_update_cache", { force }));
   } catch {
     /* offline / no stack / Docker down — the banner simply stays as it was. */
+  } finally {
+    updateAttempted = true;
+    if (asks) {
+      updateChecking = false;
+      renderUpdateBanner(lastCachedUpdate);
+    }
   }
 }
 
@@ -1594,17 +1779,55 @@ async function copyText(text, button) {
 
 // --- Backups panel ----------------------------------------------------------
 
+let hasBackups = false; // the list holds at least one backup
+
+// Backing up and restoring both need the site up: offer the start, as Publish
+// does, rather than letting either fail with "isn't running". Saving a copy of
+// an existing backup is only a file copy, so it stays available.
+function updateBackupsGate() {
+  const running = !!(lastStatus && lastStatus.running);
+  $("backups-needs-running").classList.toggle("hidden", running);
+  $("backup-now").classList.toggle("hidden", !running);
+  document.querySelector('[data-action="restore"]').disabled = !(running && hasBackups);
+  $("btn-import").disabled = !running;
+}
+
+// What a backup's file name says it was taken for, in words.
+const BACKUP_LABELS = {
+  "before-update": "Before update",
+  "before-stepped-upgrade": "Before update",
+  "before-restore": "Before restore",
+  "before-channel-switch": "Before switching versions",
+};
+
+// "14 Nov 2026, 10:15 · 12 MB", led by why it was taken when the name says
+// ("Before update · …"). Names are `[label-]YYYYMMDD-HHMMSS[-N].tar.gz`; any
+// other file (an imported one) keeps its name so it can still be told apart.
+function backupText(b) {
+  const d = new Date(b.modified_unix * 1000);
+  const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const parts = [`${fmtDay(d)}, ${time}`, fmtBytes(b.size_bytes)];
+  const m = /^(?:(.+?)-)?\d{8}-\d{6}(?:-\d+)?\.(?:tar\.gz|tgz)$/i.exec(b.name);
+  if (!m) parts.push(b.name);
+  else if (m[1]) {
+    const words = m[1].replace(/-/g, " ");
+    parts.unshift(BACKUP_LABELS[m[1]] || words.charAt(0).toUpperCase() + words.slice(1));
+  }
+  return parts.join(" · ");
+}
+
 async function refreshBackups() {
   const select = $("backup-select");
   const empty = $("backups-empty");
-  const restoreBtn = document.querySelector('[data-action="restore"]');
   const exportBtn = $("btn-export");
   const setEnabled = (on) => {
-    restoreBtn.disabled = !on;
+    hasBackups = on;
     exportBtn.disabled = !on;
     empty.classList.toggle("hidden", on);
     select.classList.toggle("hidden", !on);
+    updateBackupsGate();
   };
+  updateBackupsGate();
   try {
     const backups = await invoke("list_backups");
     select.innerHTML = "";
@@ -1615,8 +1838,8 @@ async function refreshBackups() {
     for (const b of backups) {
       const opt = document.createElement("option");
       opt.value = b.path;
-      const mb = (b.size_bytes / 1048576).toFixed(1);
-      opt.textContent = `${b.name}  (${mb} MB)`;
+      opt.textContent = backupText(b);
+      opt.title = b.name;
       select.appendChild(opt);
     }
     setEnabled(true);
@@ -2095,7 +2318,9 @@ const actions = {
     // port it was registered on, or a free one.
     const typed = parseInt($("install-port").value, 10) || null;
     const port = typed === installPortDefault ? null : typed;
-    return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }));
+    return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }), {
+      lifecycle: "setup",
+    });
   },
 
   // A very old site can't always reach the newest release in one move: a release
@@ -2140,7 +2365,7 @@ const actions = {
     }
     // A stepped route always asks; a live site on a server always asks for its slug.
     if (!(await confirmChange("Update {site}?", detail, { always: stepped }))) return;
-    return runProgressOp("Updating Atelier", () => invoke("do_update"));
+    return runProgressOp("Updating Atelier", () => invoke("do_update"), { lifecycle: "update" });
   },
 
   // Start or stop, decided by the live status rather than a label.
@@ -2169,12 +2394,34 @@ const actions = {
       : engine
         ? "Waking the site"
         : "Starting your website";
-    await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"));
+    await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"), {
+      lifecycle: running ? null : "start",
+    });
     if (engine) refreshEngine();
   },
 
-  "startstop-from-publish": () =>
-    runProgressOp("Starting your website", () => invoke("do_start")),
+  "startstop-from-publish": async () => {
+    await runProgressOp("Starting your website", () => invoke("do_start"), { lifecycle: "start" });
+  },
+
+  // "Run a checkup" from Home (a slow start, a start or update that didn't
+  // finish): the System tab's checkup, started for you.
+  "checkup-now": () => {
+    showTab("settings");
+    const run = actions.doctor(); // shows the summary line before it awaits
+    $("doctor-summary").scrollIntoView({ block: "center" });
+    return run;
+  },
+
+  // "View activity" from a slow start: the System tab's log, loaded.
+  "view-activity": () => {
+    showTab("settings");
+    $("logs-view").scrollIntoView({ block: "center" });
+    return refreshLogs();
+  },
+
+  // Home's "Check now" / "Try again": the same live check as the System tab.
+  "update-check-now": () => liveUpdateCheck().catch(() => {}),
 
   // ---- Publish ----
   "pick-export-dir": async () => {
@@ -2280,9 +2527,13 @@ const actions = {
     // Repairs can take minutes (a self-heal run streams its own output), so this
     // goes through the shared progress overlay rather than a silent button.
     let report = null;
-    await runProgressOp("Repairing your website", async () => {
-      report = await invoke("run_doctor_fix");
-    });
+    await runProgressOp(
+      "Repairing your website",
+      async () => {
+        report = await invoke("run_doctor_fix");
+      },
+      { lifecycle: "repair" }
+    );
     if (report) renderDoctor(report);
   },
 
@@ -2291,7 +2542,7 @@ const actions = {
     s.classList.remove("hidden");
     s.textContent = "Checking…";
     try {
-      const u = await invoke("get_update");
+      const u = await liveUpdateCheck();
       // Name the versions when the image says what it is — on a rolling tag the
       // digest changes every build, so "an update is available" alone is noise.
       const from = u.current_version ? ` (you're on ${u.current_version})` : "";
@@ -2310,7 +2561,6 @@ const actions = {
         // Say which of the four causes it was, not a guess at two of them.
         s.textContent = u.problem || "Couldn't check for updates right now.";
       }
-      refreshUpdate();
     } catch (e) {
       s.textContent = String(e);
     }
@@ -2512,7 +2762,9 @@ const actions = {
       { always: true, requireText: "confirm" }
     );
     if (!ok) return;
-    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"));
+    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"), {
+      lifecycle: "setup",
+    });
   },
 };
 
@@ -2567,7 +2819,9 @@ $("channel-select").addEventListener("change", async (e) => {
   }
   // runProgressOp refreshes the status itself (and reports failures), so the row
   // is re-rendered from what the appliance now reports, not from the click.
-  await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }));
+  await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }), {
+    lifecycle: "update",
+  });
   renderChannel();
 });
 

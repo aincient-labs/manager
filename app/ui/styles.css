@@ -705,6 +705,43 @@ main {
 .help-line {
   font-size: 14px;
 }
+
+/* Home's quiet status lines under the hero: where updates stand, and a start
+   or update that didn't finish. A text button keeps the next step in the line. */
+.hero .update-line,
+.hero .home-notice {
+  margin-top: 12px;
+}
+.hero .home-notice + .update-line {
+  margin-top: 4px;
+}
+#starting-slow {
+  margin-top: 12px;
+  padding-top: 0;
+  gap: 16px;
+}
+.text-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+.text-btn:not(:disabled):hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+.text-btn:disabled {
+  color: var(--text-faint);
+  text-decoration: none;
+  cursor: default;
+}
 .quiet-row + .help-line {
   margin-top: -12px;
 }

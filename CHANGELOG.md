@@ -14,6 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as it is now ("before-restore"); if the restore fails, the error names that file.
 - Atelier keeps the newest 3 of the backups it takes by itself and removes older ones. Backups you
   make are never removed.
+- **Home** always says whether you're up to date and when it last checked, with **Check now**.
+  When an update is ready, it shows both versions and a **What's new** link. **System → Updates**
+  says how often Atelier checks.
+
+### Changed
+
+- A site that is still starting after 3 minutes says "This is taking longer than usual" and offers
+  **Run a checkup** and **View activity**, instead of waiting forever.
+- When a start, update or setup finishes but the site hasn't answered yet, the app says so instead
+  of reporting success. After a failed one, Home shows what didn't finish, with **Run a checkup**.
+- With the site stopped, **Backups** offers **Start my website** instead of failing.
+- Backups are listed by date, size and what they're for ("Before update · 14 Nov 2026, 10:15 ·
+  12 MB") instead of by file name.
 
 ### Fixed
 

@@ -474,7 +474,7 @@ async fn do_install(
     image: Option<String>,
     port: Option<u16>,
     sel: State<'_, Selected>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let s = local_stack(&sel, "Setting up")?;
     blocking(move || {
         // A registered site without a `.env` gets a port no other site claims;
@@ -496,9 +496,9 @@ async fn do_install(
         };
         // `install` reports each phase (and holds until Drupal serves) through the
         // reporter, so the UI's progress bar/log only finish on real readiness —
-        // not the instant the container starts.
-        ops::install(&s, &opts, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
+        // not the instant the container starts. The answer is whether the site
+        // answered before the wait ran out, so the window can say "not yet".
+        ops::install(&s, &opts, &mut EventReporter { app }).map_err(err)
     })
     .await
 }
@@ -506,21 +506,20 @@ async fn do_install(
 /// The window has confirmed (a stepped route; a live remote site's slug).
 /// A site on a server walks its own route: the server's `app update --yes`,
 /// streamed — unless its check says there is nothing to do.
+///
+/// Returns whether the site answered before the wait ran out (always `true`
+/// on a server, whose own run waits for it).
 #[tauri::command]
-async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<bool, String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || {
-                ops::update(&s, &mut EventReporter { app }).map_err(err)?;
-                Ok(())
-            })
-            .await
+            blocking(move || ops::update(&s, &mut EventReporter { app }).map_err(err)).await
         }
         Target::Remote(site) => {
             blocking(move || {
                 let session = session(&site)?;
                 if session.check_update().map_err(err)?.update_available == Some(false) {
-                    return Ok(());
+                    return Ok(true);
                 }
                 session
                     .run_action(
@@ -530,6 +529,7 @@ async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), Strin
                         },
                         &mut feed(&app),
                     )
+                    .map(|()| true)
                     .map_err(err)
             })
             .await
@@ -719,12 +719,11 @@ async fn export_backup(app: AppHandle, source: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<bool, String> {
     let s = local_stack(&sel, "Reinstalling")?;
     blocking(move || {
         let opts = InstallOptions::default();
-        ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
+        ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)
     })
     .await
 }
@@ -739,23 +738,24 @@ async fn run_remote(app: AppHandle, site: Site, action: remote::Action) -> Resul
     .await
 }
 
+/// Returns whether the site answered before the wait ran out, so the window can
+/// say "started, but not answering yet" rather than plain success. A site on a
+/// server reports `true`: its own run (or the engine) does the waiting.
 #[tauri::command]
-async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<bool, String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || {
-                ops::start(&s, &mut EventReporter { app }).map_err(err)?;
-                Ok(())
-            })
-            .await
+            blocking(move || ops::start(&s, &mut EventReporter { app }).map_err(err)).await
         }
         Target::Remote(site) if is_paired(&site) => {
             require_experimental()?;
             let said = blocking(move || paired::act(&site, Verb::Wake)).await?;
             say_lines(&app, &said);
-            Ok(())
+            Ok(true)
         }
-        Target::Remote(site) => run_remote(app, site, remote::Action::Start).await,
+        Target::Remote(site) => run_remote(app, site, remote::Action::Start)
+            .await
+            .map(|()| true),
     }
 }
 
