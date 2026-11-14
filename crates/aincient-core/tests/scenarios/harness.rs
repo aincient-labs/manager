@@ -141,6 +141,9 @@ fn free_port() -> u16 {
 pub enum Template {
     /// This Manager's [`COMPOSE_TEMPLATE`].
     Current,
+    /// A superseded template a real site may still carry (an older Manager
+    /// wrote it), so `refresh_compose` rewrites it on the next start.
+    Shipped(&'static str),
 }
 
 /// A [`Reporter`] that captures Docker's output (as the GUI does) and keeps
@@ -240,6 +243,7 @@ impl Site {
         self.stack.ensure_site_id().expect("site-id");
         let compose = match template {
             Template::Current => COMPOSE_TEMPLATE,
+            Template::Shipped(t) => t,
         };
         std::fs::write(self.stack.compose_path(), with_scn_db(compose)).expect("compose.yaml");
     }
