@@ -15,15 +15,29 @@
 //! - `edge`: the template's `nginx:1.30-alpine-slim` with the shipped
 //!   `edge.conf`, published on a free port.
 //!
-//! Guarantees: every compose project is `atelier-scn-<test>-<n>` and nothing
-//! else is ever addressed ([`project_name`] refuses any other); on drop (pass or
-//! panic) the project is taken down with its volumes and every image tag and
-//! image this site built is removed. Images it did not build are never removed.
+//! Guarantees: every compose project is `atelier-scn-<test>-<pid>-<n>` and
+//! nothing else is ever addressed ([`project_name`] refuses any other); on drop
+//! (pass or panic) the project is taken down with its volumes and every image
+//! tag and image this site built is removed. Images it did not build are never
+//! removed.
+//!
+//! On a failed scenario (a panic) the site first prints what CI needs to see
+//! why ([`Site::dump`]: `compose ps -a`, each container's `State`, the last
+//! [`DUMP_LINES`] timestamped log lines per service); with
+//! `ATELIER_SCN_KEEP=1` it is then left running for inspection ([`KEEP_ENV`]).
+//!
+//! A killed run (SIGKILL, a CI cancel) never reaches `Drop`. So every
+//! container and image the harness makes carries [`PID_LABEL`] = the test
+//! process's pid, and the first harness call of a run removes what runs whose
+//! process is gone left behind ([`sweep_dead_runs`]; the decision is
+//! [`sweepable`]). A live run's projects, and anything not `atelier-scn-*`,
+//! are never touched.
 //!
 //! The Manager's user home (where it finds `~/.atelier/sites.toml`, which
 //! clean-up reads) is a temp dir for the whole run ([`user_home`]): no scenario
 //! reads or writes the owner's real registry.
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,6 +64,22 @@ pub const LOCAL_IMAGES: &str = "services:\n  app:\n    pull_policy: never\n  db:
 
 /// The image repository every app image the harness builds is tagged in.
 pub const APP_REPO: &str = "atelier-scn-app";
+
+/// The label on every container and image the harness makes: the pid of the
+/// test process that owns it, so a later run can tell a dead run's leftovers
+/// from a live parallel run's ([`sweep_dead_runs`]).
+pub const PID_LABEL: &str = "atelier.scn.pid";
+
+/// `ATELIER_SCN_KEEP=1`: a failed scenario leaves its site running (and says
+/// how to look at it and remove it by hand) instead of tearing it down.
+pub const KEEP_ENV: &str = "ATELIER_SCN_KEEP";
+
+/// The file a kept site's directory gets: the sweep leaves that project alone
+/// until it is gone.
+pub const KEPT_MARKER: &str = ".scn-kept";
+
+/// Log lines per service a failed scenario prints.
+pub const DUMP_LINES: usize = 200;
 
 /// The test app: waits for `db` by name like `converge.sh` does, then prints
 /// converge's own success (or FATAL) lines and serves `/user/login`, as the
@@ -170,8 +200,10 @@ esac
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// `atelier-scn-<test>-<n>`, unique per process and call. Panics on a test
-/// name that would make anything else.
+/// `atelier-scn-<test>-<pid>-<n>`, unique per process and call (the pid is
+/// how [`sweepable`] tells whose a project is when no container carries
+/// [`PID_LABEL`] any more). Panics on a test name that would make anything
+/// else.
 pub fn project_name(test: &str) -> String {
     assert!(
         !test.is_empty()
@@ -181,7 +213,7 @@ pub fn project_name(test: &str) -> String {
         "scenario name must be [a-z0-9-]: {test:?}"
     );
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let name = format!("{PREFIX}{test}-{}{n}", std::process::id());
+    let name = format!("{PREFIX}{test}-{}-{n}", std::process::id());
     refuse_foreign(&name);
     name
 }
@@ -210,6 +242,7 @@ pub fn user_home() -> PathBuf {
         }
         let tmp = std::env::temp_dir();
         sweep_dead_homes(&tmp);
+        sweep_dead_runs();
         let home = tmp.join(format!("{PREFIX}home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("scenario user home");
@@ -232,12 +265,223 @@ fn sweep_dead_homes(tmp: &Path) {
         let Some(pid) = name.strip_prefix(&format!("{PREFIX}home-")) else {
             continue;
         };
-        let alive = Command::new("kill")
-            .args(["-0", pid])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !alive && pid.chars().all(|c| c.is_ascii_digit()) {
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if pid != std::process::id() && !pid_alive(pid) {
             let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Whether process `pid` exists. `kill -0` fails for a process of another
+/// user too ("not permitted"): that counts as alive, so the sweep never takes
+/// what might be someone's live run. Off Unix: always alive (never swept).
+pub fn pid_alive(pid: u32) -> bool {
+    if !cfg!(unix) {
+        return true;
+    }
+    match Command::new("kill").args(["-0", &pid.to_string()]).output() {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => String::from_utf8_lossy(&o.stderr)
+            .to_ascii_lowercase()
+            .contains("not permitted"),
+        // Can't ask: assume alive.
+        Err(_) => true,
+    }
+}
+
+/// The pid in a project name [`project_name`] made
+/// (`atelier-scn-<test>-<pid>-<n>`), if it has that shape.
+pub fn pid_in_name(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(PREFIX)?;
+    let mut parts = rest.rsplitn(3, '-');
+    let n = parts.next()?;
+    let pid = parts.next()?;
+    let test = parts.next()?;
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (digits(n) && digits(pid) && !test.is_empty())
+        .then(|| pid.parse().ok())
+        .flatten()
+}
+
+/// Whether the sweep may remove `name` (a compose project, a site dir, or
+/// [`APP_REPO`] for an image) that carries `label` ([`PID_LABEL`]'s value,
+/// if any): only an `atelier-scn-*` thing whose owning process is known and
+/// gone. The owner is the label's pid, else the pid in the name; a label and
+/// a name that disagree, an owner we can't tell, this process, or a live
+/// process (a parallel run, or a reused pid) all keep it.
+pub fn sweepable(name: &str, label: Option<&str>, me: u32, alive: impl Fn(u32) -> bool) -> bool {
+    if !name.starts_with(PREFIX) || name.len() <= PREFIX.len() {
+        return false;
+    }
+    let label = match label.map(str::trim).filter(|l| !l.is_empty()) {
+        None => None,
+        Some(l) => match l.parse::<u32>() {
+            Ok(p) => Some(p),
+            // A label we didn't write: not ours to judge.
+            Err(_) => return false,
+        },
+    };
+    let owner = match (label, pid_in_name(name)) {
+        (Some(a), Some(b)) if a != b => return false,
+        (Some(p), _) | (None, Some(p)) => p,
+        (None, None) => return false,
+    };
+    owner != me && !alive(owner)
+}
+
+/// What runs killed before their `Drop` left behind, removed: every
+/// `atelier-scn-*` compose project (containers, networks, volumes) whose
+/// owning process is gone, the images those runs built (by [`PID_LABEL`];
+/// only tags with [`PREFIX`] in them, then the image if nothing else names
+/// it), and their site dirs in the temp dir. A project whose site dir holds
+/// [`KEPT_MARKER`] (kept on purpose) stays. Best effort: a Docker that
+/// doesn't answer just leaves things for the next run or CI's cleanup step.
+pub fn sweep_dead_runs() {
+    let me = std::process::id();
+    let tmp = std::env::temp_dir();
+    // Projects kept on purpose (`ATELIER_SCN_KEEP=1`): their site dir has the marker.
+    let kept_projects: Vec<String> = std::fs::read_dir(&tmp)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().join(KEPT_MARKER).exists())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(PREFIX))
+                .collect()
+        })
+        .unwrap_or_default();
+    let kept = |project: &str| kept_projects.iter().any(|k| k == project);
+    let project_key = "{{.Label \"com.docker.compose.project\"}}";
+
+    // project → the pid label its containers carry (None: no container, or
+    // one without the label).
+    let mut projects: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let containers = try_docker(&[
+        "ps",
+        "-a",
+        "--filter",
+        "label=com.docker.compose.project",
+        "--format",
+        &format!("{project_key}\t{{{{.Label \"{PID_LABEL}\"}}}}"),
+    ])
+    .unwrap_or_default();
+    for line in containers.lines() {
+        let (project, pid) = line.split_once('\t').unwrap_or((line, ""));
+        let pid = Some(pid.trim().to_string()).filter(|p| !p.is_empty());
+        let slot = projects.entry(project.trim().to_string()).or_default();
+        if slot.is_none() {
+            *slot = pid;
+        }
+    }
+    for kind in ["volume", "network"] {
+        let listed = try_docker(&[
+            kind,
+            "ls",
+            "--filter",
+            "label=com.docker.compose.project",
+            "--format",
+            project_key,
+        ])
+        .unwrap_or_default();
+        for project in listed.lines() {
+            projects.entry(project.trim().to_string()).or_default();
+        }
+    }
+    for (project, label) in &projects {
+        if !sweepable(project, label.as_deref(), me, pid_alive) || kept(project) {
+            continue;
+        }
+        refuse_foreign(project);
+        eprintln!("sweep: removing {project}, left by a run that is gone");
+        let mut down = docker::docker();
+        down.args([
+            "compose",
+            "-p",
+            project,
+            "down",
+            "-v",
+            "--remove-orphans",
+            "-t",
+            "2",
+        ])
+        .current_dir(&tmp);
+        if let Err(e) = output(down) {
+            eprintln!("sweep: compose down {project}: {e}");
+        }
+        // `down` without the project's files can miss what it no longer
+        // declares; take what still carries the project's label.
+        let filter = format!("label=com.docker.compose.project={project}");
+        for (kind, list) in [
+            ("container", ["ps", "-a", "-q"]),
+            ("network", ["network", "ls", "-q"]),
+            ("volume", ["volume", "ls", "-q"]),
+        ] {
+            let ids =
+                try_docker(&[list[0], list[1], list[2], "--filter", &filter]).unwrap_or_default();
+            for id in ids.lines().filter(|l| !l.trim().is_empty()) {
+                let _ = match kind {
+                    "container" => try_docker(&["rm", "-f", "-v", id.trim()]),
+                    _ => try_docker(&[kind, "rm", id.trim()]),
+                };
+            }
+        }
+    }
+
+    // Images: by the pid label, which `docker tag` copies keep.
+    let label_filter = format!("label={PID_LABEL}");
+    let ids = try_docker(&[
+        "image",
+        "ls",
+        "-a",
+        "-q",
+        "--no-trunc",
+        "--filter",
+        &label_filter,
+    ])
+    .unwrap_or_default();
+    let mut seen = std::collections::BTreeSet::new();
+    for id in ids.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let Ok(info) = try_docker(&[
+            "image",
+            "inspect",
+            "-f",
+            &format!("{{{{index .Config.Labels \"{PID_LABEL}\"}}}}\t{{{{join .RepoTags \" \"}}}}"),
+            id,
+        ]) else {
+            continue;
+        };
+        let (label, tags) = info.split_once('\t').unwrap_or((info.as_str(), ""));
+        if !sweepable(APP_REPO, Some(label), me, pid_alive) {
+            continue;
+        }
+        let tags: Vec<&str> = tags.split_whitespace().collect();
+        if tags
+            .iter()
+            .any(|t| kept_projects.iter().any(|k| t.contains(k.as_str())))
+        {
+            continue;
+        }
+        for tag in tags.iter().filter(|t| t.contains(PREFIX)) {
+            eprintln!("sweep: removing image tag {tag}");
+            let _ = try_docker(&["image", "rm", tag]);
+        }
+        // Without force: an image something else still names stays.
+        let _ = try_docker(&["image", "rm", id]);
+    }
+
+    // Site dirs (`<tmp>/atelier-scn-<test>-<pid>-<n>`).
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if sweepable(&name, None, me, pid_alive) && !kept(&name) {
+                eprintln!("sweep: removing {}", e.path().display());
+                remove_site_dir(&e.path());
+            }
         }
     }
 }
@@ -383,9 +627,12 @@ impl Site {
         std::fs::write(ctx.join("drush"), APP_DRUSH).expect("drush");
         let ctx_s = ctx.to_string_lossy().to_string();
         let mark_arg = format!("MARK={mark}");
+        let owner = format!("{PID_LABEL}={}", std::process::id());
         let id = docker(&[
             "build",
             "-q",
+            "--label",
+            &owner,
             "--build-arg",
             &mark_arg,
             "-t",
@@ -418,6 +665,7 @@ impl Site {
             Template::Shipped(t) => t,
         };
         std::fs::write(self.stack.compose_path(), with_scn_db(compose)).expect("compose.yaml");
+        self.overlay("scn-owner.yaml", &owner_overlay(std::process::id()));
     }
 
     /// Add `name` with `body` next to compose.yaml and have compose read both
@@ -615,6 +863,18 @@ impl Site {
     }
 }
 
+/// The overlay every scaffolded site reads first: [`PID_LABEL`] on each
+/// service's container, so a later run's [`sweep_dead_runs`] knows whose it is.
+pub fn owner_overlay(pid: u32) -> String {
+    let mut body = String::from("services:\n");
+    for service in ["db", "app", "edge"] {
+        body.push_str(&format!(
+            "  {service}:\n    labels:\n      {PID_LABEL}: \"{pid}\"\n"
+        ));
+    }
+    body
+}
+
 /// `template` with the scenario db image in place of the shipped one. The
 /// Manager reads the db image from the file the same way (`refreshed_compose`
 /// carries a changed image line over), so a shipped template stays one.
@@ -624,12 +884,123 @@ pub fn with_scn_db(template: &str) -> String {
     template.replace(&from, &format!("    image: {SCN_DB_IMAGE}\n"))
 }
 
+impl Site {
+    /// Print what a failed scenario's site looked like, so a CI log alone
+    /// says why: `compose ps -a`, each container's `State` and restart count
+    /// (never `Config`: its `Env` holds the database password), and its last
+    /// [`DUMP_LINES`] log lines with Docker's timestamps, stdout and stderr
+    /// merged by time. Best effort; to stderr, between clear markers.
+    pub fn dump(&self) {
+        let p = &self.project;
+        eprintln!("\n===== scenario site {p}: state before teardown =====");
+        let mut ps = docker::compose(&self.stack);
+        ps.args(["ps", "-a"]);
+        eprintln!("----- docker compose ps -a -----");
+        eprintln!(
+            "{}",
+            output(ps).unwrap_or_else(|e| format!("(couldn't read it: {e})"))
+        );
+        let mut ls = docker::compose(&self.stack);
+        ls.args(["ps", "-a", "--format", "{{.Service}}\t{{.Name}}"]);
+        let mut services: Vec<(String, String)> = output(ls)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| {
+                let (s, n) = l.split_once('\t')?;
+                Some((s.trim().to_string(), n.trim().to_string()))
+            })
+            .collect();
+        services.sort();
+        for (service, name) in &services {
+            eprintln!("----- {service} ({name}): State -----");
+            eprintln!(
+                "{}",
+                try_docker(&[
+                    "inspect",
+                    "-f",
+                    "{{json .State}}\nRestartCount: {{.RestartCount}}",
+                    name,
+                ])
+                .unwrap_or_else(|e| format!("(couldn't read it: {e})"))
+            );
+            eprintln!("----- {service} ({name}): last {DUMP_LINES} log lines, stdout+stderr by time -----");
+            eprint!("{}", logs_by_time(name, DUMP_LINES));
+        }
+        eprintln!("===== end of {p} =====\n");
+    }
+
+    /// `ATELIER_SCN_KEEP=1` on a failure: leave the site, mark its dir so the
+    /// next run's sweep leaves it too, and say how to look and how to clean up.
+    fn keep(&self) {
+        let p = &self.project;
+        let dir = self.stack.home.display();
+        let _ = std::fs::write(self.stack.home.join(KEPT_MARKER), "kept\n");
+        let images: Vec<&str> = self
+            .tags
+            .iter()
+            .chain(&self.image_ids)
+            .map(String::as_str)
+            .collect();
+        eprintln!(
+            "\n{KEEP_ENV}=1: left {p} as it failed (not torn down).\n\
+             \x20 look:     cd {dir} && docker compose -p {p} ps -a\n\
+             \x20           cd {dir} && docker compose -p {p} logs --timestamps\n\
+             \x20 clean up: docker compose -p {p} down -v\n\
+             \x20           docker image rm {}\n\
+             \x20           rm -rf {dir}\n\
+             \x20 Until {dir}/{KEPT_MARKER} is gone, later scenario runs leave it alone.\n",
+            images.join(" ")
+        );
+    }
+}
+
+/// `docker logs --timestamps --tail <lines>` of `container`, its stdout and
+/// stderr (separate pipes) merged by Docker's timestamp, as
+/// `aincient_core::boot` merges them; a stable sort keeps each stream's order
+/// and puts stdout first on a tie.
+fn logs_by_time(container: &str, lines: usize) -> String {
+    let mut c = docker::docker();
+    c.args([
+        "logs",
+        "--timestamps",
+        "--tail",
+        &lines.to_string(),
+        container,
+    ]);
+    let out = match c.output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            return format!(
+                "(couldn't read it: {})\n",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )
+        }
+        Err(e) => return format!("(couldn't read it: {e})\n"),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut all: Vec<&str> = stdout.lines().chain(stderr.lines()).collect();
+    all.sort_by_key(|l| l.split_once(' ').map_or("", |(t, _)| t));
+    let mut log = all.join("\n");
+    if !log.is_empty() {
+        log.push('\n');
+    }
+    log
+}
+
 impl Drop for Site {
     fn drop(&mut self) {
         // Never anything but our own project, even on the way out of a panic.
         if !self.project.starts_with(PREFIX) || self.stack.project_name() != self.project {
             eprintln!("refusing to clean up a foreign project {:?}", self.project);
             return;
+        }
+        if std::thread::panicking() {
+            self.dump();
+            if std::env::var_os(KEEP_ENV).is_some_and(|v| v == "1") {
+                self.keep();
+                return;
+            }
         }
         let mut down = docker::compose(&self.stack);
         down.args(["down", "-v", "--remove-orphans", "-t", "2"]);
@@ -679,4 +1050,104 @@ pub fn set_mode(dir: &Path, mode: u32) {
     }
     #[cfg(not(unix))]
     let _ = (dir, mode);
+}
+
+/// The sweep's decision, without Docker (these run in plain `cargo test`).
+mod sweep_decision {
+    use super::{pid_in_name, project_name, sweepable, APP_REPO};
+
+    const ME: u32 = 4242;
+    /// Pids 100–199 are alive (a parallel run), everything else is gone.
+    fn alive(pid: u32) -> bool {
+        (100..200).contains(&pid)
+    }
+
+    #[test]
+    fn a_dead_runs_project_is_swept_by_its_label_or_its_name() {
+        assert!(sweepable(
+            "atelier-scn-boot-fatal-777-0",
+            Some("777"),
+            ME,
+            alive
+        ));
+        assert!(sweepable("atelier-scn-boot-fatal-777-0", None, ME, alive));
+        assert!(sweepable(
+            "atelier-scn-cleanup-stopped-9-12",
+            Some(" 9 "),
+            ME,
+            alive
+        ));
+        // An image: its repo plus the label.
+        assert!(sweepable(APP_REPO, Some("777"), ME, alive));
+    }
+
+    #[test]
+    fn a_live_runs_or_this_runs_project_is_never_swept() {
+        assert!(!sweepable(
+            "atelier-scn-boot-fatal-150-0",
+            Some("150"),
+            ME,
+            alive
+        ));
+        assert!(!sweepable("atelier-scn-boot-fatal-150-0", None, ME, alive));
+        assert!(!sweepable(APP_REPO, Some("150"), ME, alive));
+        let mine = format!("atelier-scn-boot-fatal-{ME}-3");
+        assert!(!sweepable(&mine, Some(&ME.to_string()), ME, alive));
+        assert!(!sweepable(&mine, None, ME, alive));
+        // Whatever `project_name` makes now names this process.
+        let made = project_name("sweep-decision");
+        assert_eq!(pid_in_name(&made), Some(std::process::id()));
+        assert!(!sweepable(&made, None, std::process::id(), |_| false));
+    }
+
+    #[test]
+    fn an_owner_we_cannot_tell_keeps_it() {
+        // Label and name disagree.
+        assert!(!sweepable(
+            "atelier-scn-boot-fatal-777-0",
+            Some("778"),
+            ME,
+            alive
+        ));
+        // A label we didn't write.
+        assert!(!sweepable(
+            "atelier-scn-boot-fatal-777-0",
+            Some("abc"),
+            ME,
+            alive
+        ));
+        // No label and a name without a pid: the old `<test>-<pid><n>` form,
+        // the run's user home, an image without the label.
+        assert!(!sweepable("atelier-scn-boot-fatal-77700", None, ME, alive));
+        assert!(!sweepable("atelier-scn-home-777", None, ME, alive));
+        assert!(!sweepable(APP_REPO, None, ME, alive));
+        assert!(!sweepable(APP_REPO, Some(""), ME, alive));
+    }
+
+    #[test]
+    fn nothing_but_atelier_scn_is_ever_swept() {
+        for name in [
+            "default",
+            "atelier",
+            "atelier-kelp-kiln",
+            "kelp-kiln-rec",
+            "atelier-foo-bar-baz-777-0",
+            "atelier-engine-poc",
+            "review-tmp-777-0",
+            "atelier-scn-",
+            "xatelier-scn-a-777-0",
+        ] {
+            assert!(!sweepable(name, Some("777"), ME, alive), "{name}");
+            assert!(!sweepable(name, None, ME, alive), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_pid_is_read_from_the_name_shape_only() {
+        assert_eq!(pid_in_name("atelier-scn-a-1-2"), Some(1));
+        assert_eq!(pid_in_name("atelier-scn-oom-db-31337-0"), Some(31337));
+        assert_eq!(pid_in_name("atelier-scn-a-1-x"), None);
+        assert_eq!(pid_in_name("atelier-scn-a-12"), None);
+        assert_eq!(pid_in_name("atelier-a-1-2"), None);
+    }
 }
