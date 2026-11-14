@@ -17,6 +17,7 @@ mod boot_fatal;
 mod cleanup_needed;
 mod detached_db;
 mod erased_db;
+mod prune_backups;
 mod restore_safety;
 mod settings_applied;
 mod shared_tag;
