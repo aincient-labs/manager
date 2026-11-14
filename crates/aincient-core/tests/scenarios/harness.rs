@@ -90,6 +90,12 @@ until nc -z -w 2 db 5432; do
   sleep 1
 done
 if [ "$tries" -lt 20 ]; then
+  # A long migration (scenario 17): the site holds its operation lock while
+  # this boot runs.
+  if [ -e "/opt/drupal/private/scn-boot-slow-$SCN_MARK" ]; then
+    echo "[converge] running database updates (scenario: a slow migration)"
+    sleep 20
+  fi
   # Out of memory during converge (scenarios 11, 11b, 12): an allocation
   # that doubles a string until the container's memory limit kills it.
   hog='BEGIN { s = "xxxxxxxxxxxxxxxx"; while (1) s = s s }'
@@ -559,6 +565,27 @@ impl Site {
     pub fn fail_boot(&self, mark: &str) {
         let flag = BOOT_FAILS_FLAG.trim_start_matches("/opt/drupal/private/");
         self.flag(flag, mark);
+    }
+
+    /// From now on build `mark` takes 20 s longer to boot (a long migration),
+    /// then boots. Needs a running `app`.
+    pub fn slow_boot(&self, mark: &str) {
+        self.flag("scn-boot-slow-", mark);
+    }
+
+    /// Wait (up to 60 s) until the site's operation lock file names `op`
+    /// (`op=update`): an operation started elsewhere now holds the site.
+    pub fn wait_for_holder(&self, op: &str) {
+        let path = self.stack.home.join(".op.lock");
+        let t = std::time::Instant::now();
+        while t.elapsed() < Duration::from_secs(60) {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.lines().any(|l| l == format!("op={op}")) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no {op} came to hold {}", path.display());
     }
 
     /// `query` run by `psql` in `db` as the site's user: the rows, unaligned.
