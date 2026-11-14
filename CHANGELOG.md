@@ -43,6 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too, asking first. Docker Engine on Linux is restarted by hand: you get the command to copy.
   OrbStack restarts only its Docker engine (your OrbStack Linux machines keep running), and a Colima
   profile other than the default one is restarted by name.
+- **Run a checkup** says how much memory Docker has and warns below 4 GB, with where to raise it
+  for what runs Docker on your computer (Docker Desktop, OrbStack, Colima, Rancher Desktop). It also
+  warns when Docker stopped part of a site in the last day because it ran out of memory.
 
 ### Changed
 
@@ -58,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A site that runs out of memory while it starts or updates now says so: "Your site ran out of
+  memory, so Docker stopped part of it (the database)…", with where to give Docker more memory, as
+  soon as it is seen, instead of "still starting" after two minutes or "couldn't finish starting".
+  The database case adds that your data is safe. A part of the site that keeps stopping and
+  starting again for another reason is named too, with **Run a checkup**.
+- A backup or update that fills the disk inside Docker says "Docker has run out of disk space" with
+  how to free it, instead of the raw "No space left on device" error.
 - An update no longer goes ahead when the backup it takes first fails (a full disk, a read-only
   backups folder): it stops and your site stays on its version. **Update without a backup**
   (`atelier app update --no-backup`) goes on without one.

@@ -203,13 +203,13 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about four minutes together (20–40 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about seven minutes together (20–40 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
   temp dir: the shipped template with `postgres:16-alpine` as `db`, a small Alpine `app` built per
-  test that waits for `db` by name, prints converge's own lines (or a FATAL, on a flag in its
-  `private` volume) and serves `/user/login`, and the shipped `edge` on a free port. Its `drush`
+  test that waits for `db` by name, prints converge's own lines (or, on a flag in its `private`
+  volume, a FATAL or an allocation past a memory limit the test sets) and serves `/user/login`, and the shipped `edge` on a free port. Its `drush`
   does only the four calls the Manager's backup/restore scripts make, on the real database, so
   real backups and restores run. Tests then call the real `ops`/`doctor`/`cleanup` functions.
 - gives the Manager a temp user home for the whole run, so `~/.atelier/sites.toml` (which
@@ -232,6 +232,10 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 8 | `erased_db.rs` | erased db volume: Start and `doctor --fix` refuse, create nothing; a restore brings it back |
 | 9 | `boot_fatal.rs` | a FATAL boot fails Start in plain words; a later `converge OK` clears it |
 | 10 | `prune_backups.rs` | a restore keeps the 3 newest counted automatic backups, never a pre-0.17 one |
+| 11 | `oom_app.rs` | app PID 1 OOM-killed during converge (`mem_limit` = `memswap_limit`, shipped restart policy): Start fails "ran out of memory … (the app)", container restarting |
+| 11b | `oom_app.rs` | a child in the app OOM-killed, PID 1 lives: Start fails out of memory; container running with `OOMKilled` |
+| 12 | `oom_db.rs` | a Postgres backend OOM-killed during boot: Start names the database and says the data is safe; db running |
+| 13 | `disk_full.rs` | the backup's dump fills a 1 MB tmpfs `/tmp`: update refused (`BackupBeforeUpdateFailed`) saying Docker's disk is full |
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
