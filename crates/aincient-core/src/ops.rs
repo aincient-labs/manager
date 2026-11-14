@@ -1926,6 +1926,9 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     ensure_installed(stack)?;
+    // Before the engine's Wake too: a resting engine site starts that way, and
+    // its pinned image needs its local name as much as on a cold start.
+    ensure_engine_image(stack, r)?;
     Plan::ranged(&[
         ("start", "Start", START_FROM, BOOT_FROM),
         ("boot", "Boot", BOOT_FROM, 1.0),
