@@ -1157,7 +1157,7 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     pull(stack, r)?;
     let mut c = compose(stack);
     c.args(["up", "-d", "--force-recreate", "db", "app"]);
-    run_step(c, "move the database server", r)?;
+    run_recovering(stack, c, "move the database server", r)?;
     Ok(wait_until_ready(stack, READY_TIMEOUT, r))
 }
 
@@ -1608,7 +1608,65 @@ fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
     let mut c = compose(stack);
     c.args(["up", "-d"]);
-    run_step(c, "start the appliance", r)
+    run_recovering(stack, c, "start the appliance", r)
+}
+
+/// What the owner reads when a start fails even after the clean retry: the one
+/// step they can always take, and that their data is safe. Docker's own line
+/// follows in brackets for a bug report.
+const START_STUCK: &str =
+    "Docker couldn't start your site, even after clearing its containers and \
+     trying again. Restart Docker Desktop, then try again. Your site's data is safe.";
+
+/// Run a start step (`up`, `start`), and recover once from Docker's own
+/// leftovers.
+///
+/// Docker Desktop sometimes keeps a container's network endpoint after a sleep,
+/// restart or crash. The container then can't start again ("endpoint with name
+/// atelier-db-1 already exists in network atelier_default") and compose reports
+/// only "dependency failed to start: container atelier-db-1 exited (1)" — an
+/// update stopped there on 0.29.0 (2026-11-14). `compose down` removes the
+/// containers and the network, which clears the endpoint; it keeps the volumes,
+/// so the database and files stay. Only a failure that left `db` or `app`
+/// existing but not running is retried: anything else (no Docker, a missing
+/// image, a port in use) keeps its own error.
+pub(crate) fn run_recovering(
+    stack: &Stack,
+    cmd: Command,
+    action: &str,
+    r: &mut dyn Reporter,
+) -> Result<()> {
+    let first = match run_step(cmd, action, r) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let half = docker::try_capture_empty_ok(ps).is_some_and(|out| half_started(&out));
+    if !half {
+        return Err(first);
+    }
+    r.stage(
+        Stage::Starting,
+        "Docker left your site half-started. Clearing its containers and starting again (your data stays)…",
+        None,
+    );
+    let mut down = compose(stack);
+    down.arg("down");
+    let mut again = compose(stack);
+    again.args(["up", "-d"]);
+    run_step(down, "clear the half-started containers", r)
+        .and_then(|()| run_step(again, action, r))
+        .map_err(|e| anyhow::anyhow!("{START_STUCK} ({e:#})"))
+}
+
+/// Whether `compose ps -a` shows `db` or `app` present but not running: the
+/// shape a start leaves when Docker's leftovers stop a container (see
+/// [`run_recovering`]).
+fn half_started(ps_json: &str) -> bool {
+    parse_ps(ps_json).iter().any(|e| {
+        matches!(e.service.as_str(), "db" | "app") && !e.state.to_lowercase().contains("running")
+    })
 }
 
 /// Stop the site. With the engine up, Stop is its Rest (DECISIONS 0488):
@@ -1745,7 +1803,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         StartAction::Start => {
             let mut c = compose(stack);
             c.arg("start");
-            run_step(c, "start the appliance", r)?;
+            run_recovering(stack, c, "start the appliance", r)?;
         }
         StartAction::Up => up(stack, r)?,
     }
@@ -3453,13 +3511,32 @@ mod tests {
         assert_eq!(container_state_from_ps(db_only), ContainerState::Missing);
     }
 
+    #[test]
+    fn a_start_is_retried_only_when_docker_left_the_site_half_started() {
+        // The 0.29.0 update on 2026-11-14: a stale network endpoint stopped db
+        // (exited 1) and left the new app container created, not running.
+        let stale = "{\"Service\":\"db\",\"State\":\"exited\"}\n{\"Service\":\"app\",\"State\":\"created\"}";
+        assert!(half_started(stale));
+        // Everything running, nothing there, or only edge down: not ours to retry.
+        assert!(!half_started(
+            r#"[{"Service":"db","State":"running"},{"Service":"app","State":"running"}]"#
+        ));
+        assert!(!half_started(""));
+        assert!(!half_started(
+            r#"[{"Service":"db","State":"running"},{"Service":"app","State":"running"},{"Service":"edge","State":"exited"}]"#
+        ));
+        // The message names the step the owner can take and that the data is safe.
+        assert!(START_STUCK.contains("Restart Docker Desktop"));
+        assert!(START_STUCK.contains("data is safe"));
+    }
+
     use super::{
-        backup_dump_script, backup_pack_script, container_state_from_ps, is_backup_file,
-        is_snapshot_bundle, list_backups, parse_extension_list, parse_http_status,
+        backup_dump_script, backup_pack_script, container_state_from_ps, half_started,
+        is_backup_file, is_snapshot_bundle, list_backups, parse_extension_list, parse_http_status,
         parse_local_probe, parse_remote_probe, parse_serialized_extensions, plan_route,
         plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts, start_action,
         waypoint_image, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
-        MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        MAX_WAYPOINTS, REGISTRY_OFFLINE, START_STUCK,
     };
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,

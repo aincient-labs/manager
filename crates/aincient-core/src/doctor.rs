@@ -345,8 +345,10 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
         Repair::StartContainers => {
             let mut c = compose(stack);
             c.args(["up", "-d"]);
-            // Not a probe: `up` may pull and recreate, so it gets no deadline.
-            docker::probe_unbounded(c)?;
+            // No deadline: `up` may pull and recreate. Recovers once from
+            // Docker's leftovers (a stale network endpoint), like Start and Update.
+            ops::run_recovering(stack, c, "start the appliance", r)
+                .map_err(|e| format!("{e:#}"))?;
             // Containers report "running" the instant they start, but the
             // entrypoint then runs converge (site install or migrations) for up
             // to minutes. Re-diagnosing immediately would ask a half-booted

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker
+  Desktop has left a stale network entry behind (after a sleep, restart or crash). Atelier clears the
+  half-started containers and starts once more, keeping your data. If that also fails, it tells you
+  to restart Docker Desktop instead of showing Docker's error.
+
 ## [0.16.0] - 2026-11-12
 
 ### Changed
