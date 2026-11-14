@@ -2142,12 +2142,21 @@ pub(crate) fn run_recovering(
     if stale.is_empty() {
         return Err(first);
     }
+    clear_stale_endpoints(&stale, r);
+    let mut again = compose(stack);
+    again.args(args);
+    run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
+}
+
+/// Force-disconnect each `(network, container)` leftover [`stale_endpoints`]
+/// found, saying so. No container, volume or data is touched.
+fn clear_stale_endpoints(stale: &[(String, String)], r: &mut dyn Reporter) {
     r.stage(
         Stage::Starting,
         "Docker left part of your site half-started. Clearing that and starting again (your data stays)…",
         None,
     );
-    for (network, container) in &stale {
+    for (network, container) in stale {
         let mut c = docker::docker();
         c.args(["network", "disconnect", "-f", network, container]);
         match docker::probe_unbounded(c) {
@@ -2157,9 +2166,98 @@ pub(crate) fn run_recovering(
             Err(e) => r.log(&format!("Couldn't clear {container} from {network}: {e}")),
         }
     }
-    let mut again = compose(stack);
-    again.args(args);
-    run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
+}
+
+/// The steps of [`wake_recovering`], so its order is tested against a fake.
+/// [`LocalWake`] is the real one.
+trait WakeSteps {
+    /// The engine's Wake (`admin wake`: `compose start db app`); its answer.
+    fn wake(&mut self) -> Result<String>;
+    /// Docker's leftover endpoints ([`stale_endpoints`]).
+    fn stale_endpoints(&mut self) -> Vec<(String, String)>;
+    /// Force-disconnect them ([`clear_stale_endpoints`]).
+    fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter);
+    /// The containers as `compose ps -a` sees them ([`observe_container`]).
+    fn containers(&mut self) -> ContainerState;
+    /// `compose up -d`, recovering once ([`up`]).
+    fn up(&mut self, r: &mut dyn Reporter) -> Result<()>;
+}
+
+/// The engine's Wake with the same recovery a plain start gets (M6):
+///
+/// - Refused while locked down: nothing is recovered, the refusal stands.
+/// - Docker kept a stopped container's endpoint: clear it, Wake once more.
+/// - A container is gone (`compose start`, the engine's Wake, can't create
+///   one): `compose up -d` creates it, then Wake once more. The failed Wake
+///   put the engine's resting mark back on, so edge would keep serving the
+///   resting copy over a running site; the Wake now (the containers exist)
+///   takes the mark off, and the engine's state is the site's again.
+///
+/// Any other failure keeps the engine's own error.
+fn wake_recovering(steps: &mut dyn WakeSteps, r: &mut dyn Reporter) -> Result<()> {
+    let first = match steps.wake() {
+        Ok(said) => {
+            say(r, &said);
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    if format!("{first:#}").contains("locked down") {
+        return Err(first);
+    }
+    let stale = steps.stale_endpoints();
+    let mut last = None;
+    if !stale.is_empty() {
+        steps.clear(&stale, r);
+        match steps.wake() {
+            Ok(said) => {
+                say(r, &said);
+                return Ok(());
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    if steps.containers() == ContainerState::Missing {
+        r.stage(
+            Stage::Starting,
+            "Part of your site's containers are gone. Creating them again (your data stays)…",
+            None,
+        );
+        steps.up(r)?;
+        let said = steps
+            .wake()
+            .context("the site's containers were created again, but the engine couldn't wake it")?;
+        say(r, &said);
+        return Ok(());
+    }
+    match last {
+        Some(e) => Err(anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})")),
+        None => Err(first),
+    }
+}
+
+/// [`WakeSteps`] for a site on this computer.
+struct LocalWake<'a> {
+    stack: &'a Stack,
+    info: &'a crate::engine_admin::EngineInfo,
+}
+
+impl WakeSteps for LocalWake<'_> {
+    fn wake(&mut self) -> Result<String> {
+        engine_verb(self.info, AdminVerb::Wake, "wake")
+    }
+    fn stale_endpoints(&mut self) -> Vec<(String, String)> {
+        stale_endpoints(self.stack)
+    }
+    fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter) {
+        clear_stale_endpoints(stale, r);
+    }
+    fn containers(&mut self) -> ContainerState {
+        observe_container(self.stack)
+    }
+    fn up(&mut self, r: &mut dyn Reporter) -> Result<()> {
+        up(self.stack, r)
+    }
 }
 
 /// Read `docker image inspect`'s answer about the engine's image: there, or
@@ -2445,7 +2543,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     // locked down), so the engine's state stays the site's state.
     if let Some(info) = ready_engine(stack) {
         r.stage(Stage::Starting, "Waking the site…", Some(START_FROM));
-        let said = engine_verb(&info, AdminVerb::Wake, "wake").map_err(|e| {
+        wake_recovering(&mut LocalWake { stack, info: &info }, r).map_err(|e| {
             if format!("{e:#}").contains("locked down") {
                 anyhow::anyhow!(
                     "the site is locked down, so it can't be started. Unlock it first \
@@ -2455,7 +2553,6 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
                 e
             }
         })?;
-        say(r, &said);
         return wait_until_ready(stack, START_READY_TIMEOUT, r).ready();
     }
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
@@ -4691,6 +4788,182 @@ mod tests {
         assert!(!holds_endpoint("atelier-db-10\n", "atelier-db-1"));
         assert!(START_STUCK.contains("Restart Docker Desktop"));
         assert!(START_STUCK.contains("data is safe"));
+    }
+
+    /// A scripted engine site for [`super::wake_recovering`]: each Wake takes
+    /// the next answer; the rest is what Docker shows.
+    struct FakeWake {
+        wakes: std::collections::VecDeque<std::result::Result<&'static str, &'static str>>,
+        stale: Vec<(String, String)>,
+        ps: String,
+        up: std::result::Result<(), &'static str>,
+        calls: Vec<String>,
+    }
+
+    impl FakeWake {
+        fn new(wakes: &[std::result::Result<&'static str, &'static str>], ps: String) -> Self {
+            FakeWake {
+                wakes: wakes.iter().copied().collect(),
+                stale: Vec::new(),
+                ps,
+                up: Ok(()),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl super::WakeSteps for FakeWake {
+        fn wake(&mut self) -> Result<String> {
+            self.calls.push("wake".into());
+            match self.wakes.pop_front().expect("an unscripted wake") {
+                Ok(s) => Ok(s.to_string()),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+        fn stale_endpoints(&mut self) -> Vec<(String, String)> {
+            self.calls.push("stale".into());
+            self.stale.clone()
+        }
+        fn clear(&mut self, stale: &[(String, String)], _r: &mut dyn Reporter) {
+            for (n, c) in stale {
+                self.calls.push(format!("disconnect {n} {c}"));
+            }
+        }
+        fn containers(&mut self) -> ContainerState {
+            self.calls.push("ps".into());
+            container_state_from_ps(&self.ps)
+        }
+        fn up(&mut self, _r: &mut dyn Reporter) -> Result<()> {
+            self.calls.push("up -d".into());
+            self.up.map_err(|e| anyhow::anyhow!(e))
+        }
+    }
+
+    const WOKEN: &str = "Woken: db and app started.";
+    /// The engine's `compose start db app` on the 2026-11-14 leftover.
+    const WAKE_STALE: &str = "start the site: Error response from daemon: endpoint with name \
+        atelier-hardening-test-db-1 already exists in network atelier-hardening-test_default";
+    /// The engine's `compose start db app` with db's container removed.
+    const WAKE_NO_DB: &str = "start the site: service \"db\" has no container to start";
+
+    /// What a resting engine site's `compose ps -a` lists: db and app stopped.
+    fn resting_ps() -> String {
+        format!("{}\n{}\n{PS_EDGE}", stopped(PS_DB), stopped(PS_APP))
+    }
+
+    #[test]
+    fn a_wake_that_works_is_not_touched() {
+        let mut f = FakeWake::new(&[Ok(WOKEN)], resting_ps());
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(f.calls, ["wake"]);
+    }
+
+    #[test]
+    fn a_wake_stuck_on_a_leftover_endpoint_clears_it_and_wakes_again() {
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Ok(WOKEN)], resting_ps());
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-db-1".into(),
+        )];
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(
+            f.calls,
+            [
+                "wake",
+                "stale",
+                "disconnect atelier-hardening-test_default atelier-hardening-test-db-1",
+                "wake"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wake_still_stuck_after_clearing_says_restart_docker_once() {
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_STALE)], resting_ps());
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-db-1".into(),
+        )];
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.starts_with(START_STUCK), "{e}");
+        assert!(e.contains("already exists in network"), "{e}");
+        // One retry, never a loop; the containers all exist, so no `up`.
+        assert_eq!(f.calls.iter().filter(|c| *c == "wake").count(), 2);
+        assert!(!f.calls.contains(&"up -d".to_string()));
+    }
+
+    #[test]
+    fn a_wake_with_a_container_gone_creates_it_and_wakes_through_the_engine() {
+        // `docker rm` of db on a resting site: only app and edge are listed.
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_NO_DB), Ok(WOKEN)], ps);
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        // The last Wake takes the engine's resting mark off, which its failed
+        // Wake put back on, so edge stops serving the resting copy.
+        assert_eq!(f.calls, ["wake", "stale", "ps", "up -d", "wake"]);
+    }
+
+    #[test]
+    fn a_wake_with_a_leftover_and_a_container_gone_recovers_both() {
+        // db removed, app's endpoint left behind: clearing alone isn't enough.
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_NO_DB), Ok(WOKEN)], ps);
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-app-1".into(),
+        )];
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(
+            f.calls,
+            [
+                "wake",
+                "stale",
+                "disconnect atelier-hardening-test_default atelier-hardening-test-app-1",
+                "wake",
+                "ps",
+                "up -d",
+                "wake"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wake_with_nothing_to_recover_keeps_the_engines_error() {
+        let mut f = FakeWake::new(&[Err("start the site: timed out")], resting_ps());
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert_eq!(e, "start the site: timed out");
+        assert_eq!(f.calls, ["wake", "stale", "ps"]);
+    }
+
+    #[test]
+    fn a_locked_down_site_is_not_recovered() {
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err("locked down: unlock first")], ps);
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.contains("locked down"), "{e}");
+        assert_eq!(f.calls, ["wake"]);
+    }
+
+    #[test]
+    fn a_failed_up_after_a_failed_wake_says_why() {
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_NO_DB)], ps);
+        f.up = Err("Your site's database was removed from Docker.");
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.contains("database was removed"), "{e}");
+        assert_eq!(f.calls, ["wake", "stale", "ps", "up -d"]);
     }
 
     use super::{

@@ -84,6 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the update and put back to rest afterwards. A locked site is not updated or started by
   `atelier doctor --fix`: it says to unlock it first. `atelier doctor` reports a resting site as fine
   instead of as stopped containers.
+- Waking a site with the experimental engine recovers like a start does: a network entry Docker
+  left behind is cleared and the wake runs once more, and a container that was removed is created
+  again before the site is woken, instead of the wake failing.
 - When the new database server can't be downloaded during an update, the site keeps its current one
   and the move is tried again on the next update, instead of the update failing.
 - The "log in to the registry" hint after a failed download appears only when the registry refused
