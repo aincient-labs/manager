@@ -2580,7 +2580,10 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
 /// start sets up a fresh site rather than refusing with [`DatabaseErased`]: the
 /// owner erased it, it wasn't lost. Written before `down -v`, so a wipe that
 /// fails halfway still counts; a database that survives clears it again.
-pub fn down(stack: &Stack, wipe_data: bool) -> Result<()> {
+///
+/// Runs through [`run_step`] like stop and start, so the GUI gets Docker's
+/// output in its feed and a failure says why.
+pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> {
     ensure_installed(stack)?;
     let mut c = compose(stack);
     c.arg("down");
@@ -2588,7 +2591,7 @@ pub fn down(stack: &Stack, wipe_data: bool) -> Result<()> {
         mark_database_wiped(stack)?;
         c.arg("-v");
     }
-    run_inherited(c, "stop and remove the appliance")
+    run_step(c, "stop and remove the appliance", r)
 }
 
 /// Leave the owner's-wipe marker in `stack`'s directory.
@@ -2608,7 +2611,7 @@ pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> 
     if stack.exists() {
         lifecycle_plan().announce(r);
         r.stage(Stage::Scaffold, "Removing the old appliance…", Some(0.02));
-        down(stack, true)?;
+        down(stack, true, r)?;
     }
     install(stack, opts, r)
 }

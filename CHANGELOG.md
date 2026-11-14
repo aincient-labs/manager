@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- When Docker fails a start, update, stop or removal, the error now says why in plain words: the
+  site's port is taken by another program (naming the port), Docker is out of disk space, or Docker
+  isn't running. Any other failure shows Docker's last line instead of only "docker exited with 1".
+  Removing a site's containers in the app now shows Docker's output while it runs.
 - The desktop app's Home is honest after updates, starts and site switches. After an update, setup
   or version switch it checks again instead of saying "Couldn't check"; "What's new" links the
   release (or the releases list when the version isn't a plain number); the "didn't finish starting"

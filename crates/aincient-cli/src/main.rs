@@ -1403,7 +1403,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            ops::down(stack, wipe)?;
+            ops::down(stack, wipe, &mut ops::Silent)?;
             println!(
                 "{}",
                 style::success(if wipe {

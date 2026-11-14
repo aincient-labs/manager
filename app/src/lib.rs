@@ -1240,11 +1240,12 @@ async fn engine_wake_code(
 
 /// Remove the appliance's containers. With `wipe = true` this also deletes the
 /// data volumes (database, files, admin password) — a harder teardown than a
-/// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
+/// plain stop, but lighter than a full reinstall. Docker's output goes to the
+/// log feed, so a failure has its reason.
 #[tauri::command]
-async fn do_down(wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_down(app: AppHandle, wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
     let s = local_stack(&sel, "Removing the containers")?;
-    blocking(move || ops::down(&s, wipe).map_err(err)).await
+    blocking(move || ops::down(&s, wipe, &mut EventReporter { app }).map_err(err)).await
 }
 
 /// Read back the most recent appliance log lines for the Activity view.
