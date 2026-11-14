@@ -94,3 +94,32 @@ jobs:
 
       - name: cargo test --test scenarios
         run: cargo test -p aincient-core --test scenarios --locked -- --ignored --test-threads=1
+
+      # A cancelled or timed-out run never reaches the harness's own cleanup
+      # (Drop), and the next run's sweep is on another runner. Remove what it
+      # left: every `atelier-scn-*` compose project, image tag and site dir,
+      # and the images the harness built (label atelier.scn.pid). Nothing
+      # else on the runner is touched.
+      - name: Remove scenario leftovers
+        if: always()
+        run: |
+          projects=$( {
+            docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+            docker volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+            docker network ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+          } | grep '^atelier-scn-' | sort -u || true)
+          for p in $projects; do
+            echo "removing project $p"
+            docker compose -p "$p" down -v --remove-orphans -t 2 || true
+          done
+          docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'atelier-scn-' | xargs -r docker image rm || true
+          docker image ls -a -q --filter label=atelier.scn.pid | sort -u | xargs -r docker image rm || true
+          tmp="${TMPDIR:-/tmp}"
+          for d in "$tmp"/atelier-scn-*; do
+            [ -e "$d" ] || continue
+            chmod -R u+w "$d" || true
+            rm -rf "$d"
+          done
+          echo "left behind:"
+          docker ps -a --filter name=atelier-scn- --format '{{.Names}}'
+          docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'atelier-scn-' || true
