@@ -14,6 +14,7 @@
 mod harness;
 
 mod detached_db;
+mod restore_safety;
 mod settings_applied;
 mod shared_tag;
 mod stale_endpoint;
