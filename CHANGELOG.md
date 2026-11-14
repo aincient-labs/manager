@@ -43,6 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too, asking first. Docker Engine on Linux is restarted by hand: you get the command to copy.
   OrbStack restarts only its Docker engine (your OrbStack Linux machines keep running), and a Colima
   profile other than the default one is restarted by name.
+- An update first checks that your site is ready, and refuses before anything is downloaded,
+  backed up or changed when it isn't, listing each reason with its way forward: Docker isn't
+  answering (**Restart Docker**), less than 2 GB free on your computer's disk or on Docker's
+  (**Free up space**), the site's database was removed (**Backups** → restore), part of the site
+  lost its network connection (**Start your site** reconnects it), part of the site ran out of
+  memory (where to give Docker more) or keeps restarting (**Run a checkup**), or the site is
+  locked (**Unlock**). A stopped site is fine: the update starts it for its backup. In the app each
+  reason has its button; `atelier app update` lists them and exits with code 5.
+- **Run a checkup** checks free disk space in two places: your computer's disk where the site's
+  backups are saved, and Docker's own disk (read inside the running site, so "unknown" while it is
+  stopped). It warns below 5 GB and fails below 2 GB, where updates are refused.
 - **Run a checkup** says how much memory Docker has and warns below 4 GB, with where to raise it
   for what runs Docker on your computer (Docker Desktop, OrbStack, Colima, Rancher Desktop). It also
   warns when Docker stopped part of a site in the last day because it ran out of memory.
@@ -67,15 +78,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The database case adds that your data is safe. A part of the site that keeps stopping and
   starting again for another reason is named too, with **Run a checkup**.
 - A backup or update that fills the disk inside Docker says "Docker has run out of disk space" with
-  how to free it, instead of the raw "No space left on device" error.
+  how to free it, instead of the raw "No space left on device" error. When it is your computer's
+  disk that fills while a backup is saved, it says so ("This computer's disk is full, so the backup
+  couldn't be saved in …") instead of blaming Docker.
 - An update no longer goes ahead when the backup it takes first fails (a full disk, a read-only
   backups folder): it stops and your site stays on its version. **Update without a backup**
   (`atelier app update --no-backup`) goes on without one.
 
 - A site whose database had lost its connection to the site's network (left behind by Docker, or by
   an earlier start that cleared Docker's leftovers) no longer stays stuck on "can't reach its
-  database", even after restarting Docker. Start, update and **Run a checkup** now reconnect it and
-  restart the site; the checkup names it.
+  database", even after restarting Docker. Start and **Run a checkup** now reconnect it and
+  restart the site; the checkup names it. An update refuses until Start has reconnected it.
 
 - When Docker fails a start, update, stop or removal, the error now says why in plain words: the
   site's port is taken by another program (naming the port), Docker is out of disk space, or Docker

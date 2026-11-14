@@ -203,7 +203,7 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about six minutes together (20–40 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about eight minutes together (18 scenarios, 475 s on OrbStack; 20–40 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
@@ -236,6 +236,9 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 11b | `oom_app.rs` | a child in the app OOM-killed, PID 1 lives: Start fails out of memory; container running with `OOMKilled` |
 | 12 | `oom_db.rs` | a Postgres backend OOM-killed during boot: Start names the database and says the data is safe; db running |
 | 13 | `disk_full.rs` | the backup's dump fills a 1 MB tmpfs `/tmp`: update refused (`BackupBeforeUpdateFailed`) saying Docker's disk is full |
+| 14 | `update_blocked.rs` | db running on no network: update refused before any work (`UpdateBlocked`, names the container), nothing reconnected; after Start, it updates |
+| 15 | `update_blocked.rs` | app crash-looping out of memory: update refused with the memory text, nothing changed |
+| 16 | `update_blocked.rs` | db data volume on a 96 MB tmpfs (Docker's disk as the probe reads it): update refused naming Docker's disk; checkup fails `host.docker_disk` |
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
