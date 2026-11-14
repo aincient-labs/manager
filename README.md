@@ -193,6 +193,33 @@ binary is `target/debug/atelier-manager`. The GUI is packaged into `.dmg`/`.msi`
 by `cargo tauri build` (in CI, `release-gui.yml`); the macOS bundle is Developer ID signed
 and notarized when the Apple secrets are configured (see "macOS code signing" below).
 
+### Scenario tests
+
+Code that changes the owner's Docker (`rm`/`rmi`, `network connect`/`disconnect`, `up`,
+`update`, `restart`, file deletes) is tested against real Docker, not parsed output:
+
+```bash
+cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
+```
+
+They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
+plugin, and take about half a minute each; CI runs them on Linux (`check.yml`, job
+`scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
+
+- writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
+  temp dir: the shipped template with `postgres:16-alpine` as `db`, a busybox `app` built per
+  test that waits for `db` by name, prints converge's own lines and serves `/user/login`, and
+  the shipped `edge` on a free port. Tests then call the real `ops`/`doctor` functions.
+- only ever addresses compose projects named `atelier-scn-<test>-<n>`, and refuses any other.
+- cleans up when the test ends, passed or failed: `compose down -v`, then every image tag and
+  image the test built. Images it did not build are never touched.
+
+Adding one: one scenario per incident or regression, in its own file under
+`tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
+Manager's function, and assert the end state the owner needs (running, reachable, same image).
+Before committing, check it out on the commit before the fix (`git worktree add`) and show it
+fails there.
+
 ## Release / distribution
 
 **One tag ships everything.** CLI and GUI share the workspace version and ride the **same `v*`
