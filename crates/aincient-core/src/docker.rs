@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -889,15 +889,65 @@ pub fn run_capture(mut cmd: Command, action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// [`run_capture`] for a step that writes into `host_dir` on this computer
+/// (`docker cp` of a backup into the backups folder): a full disk there is
+/// this computer's, not Docker's, and is said so ([`host_disk_full`]).
+pub fn run_capture_writing_to(mut cmd: Command, action: &str, host_dir: &Path) -> Result<String> {
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "{}",
+            capture_failure_at(action, stderr.trim(), Some(host_dir))
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// What a failed [`run_capture`] says: the plain sentence for a cause the
 /// owner can fix ([`explain_failure`]: a full disk inside a backup's dump, say)
 /// first, then the step's own words for a bug report.
 fn capture_failure(action: &str, stderr: &str) -> String {
+    capture_failure_at(action, stderr, None)
+}
+
+/// [`capture_failure`], telling a full disk on this computer (a line naming
+/// `host_dir`) from Docker's own.
+fn capture_failure_at(action: &str, stderr: &str, host_dir: Option<&Path>) -> String {
     let tail: Vec<String> = stderr.lines().map(str::to_string).collect();
-    match explain_failure(&tail) {
+    let on_host = host_dir.filter(|dir| tail.iter().any(|l| fills_host_disk(l, dir)));
+    match on_host
+        .map(host_disk_full)
+        .or_else(|| explain_failure(&tail))
+    {
         Some(why) => format!("failed to {action}: {why}\n{stderr}"),
         None => format!("failed to {action}:\n{stderr}"),
     }
+}
+
+/// `line` is a full disk while writing under `dir` on this computer. The
+/// docker CLI writes what it copies out itself, and names the file it was
+/// writing (`write <dir>/.aincient-….part: no space left on device`, docker
+/// 28 / compose 2.40 on macOS, 2026-11-14); anything written inside a
+/// container names a path in there.
+fn fills_host_disk(line: &str, dir: &Path) -> bool {
+    let dir = dir.to_string_lossy();
+    !dir.is_empty()
+        && line
+            .to_ascii_lowercase()
+            .contains("no space left on device")
+        && line.contains(dir.as_ref())
+}
+
+/// What a full disk on this computer says: which disk, and the way forward.
+pub fn host_disk_full(dir: &Path) -> String {
+    format!(
+        "This computer's disk is full, so the backup couldn't be saved in {}. Delete files you \
+         don't need on this computer, or move older backups elsewhere, then try again.",
+        dir.display()
+    )
 }
 
 /// Run, capture stdout, and return the *reason* on failure instead of discarding
@@ -1289,6 +1339,55 @@ mod tests {
         assert_eq!(
             super::capture_failure("dump the database", "drush: boom"),
             "failed to dump the database:\ndrush: boom"
+        );
+    }
+
+    /// `docker compose cp app:<archive> <backups>/.part` into a full 4 MB disk
+    /// image on macOS (docker 28, compose 2.40, OrbStack), 2026-11-14: the CLI
+    /// writes the copy itself and names the host file.
+    const NO_SPACE_HOST_CP: &str = "write /Users/me/.atelier/backups/\
+        .aincient-before-update-20261114-222400-123-456.part: no space left on device";
+
+    #[test]
+    fn a_full_disk_on_this_computer_is_told_from_dockers() {
+        let backups = std::path::Path::new("/Users/me/.atelier/backups");
+        let said = super::capture_failure_at(
+            "copy the snapshot out of the container",
+            NO_SPACE_HOST_CP,
+            Some(backups),
+        );
+        assert!(
+            said.starts_with(
+                "failed to copy the snapshot out of the container: This computer's disk is \
+                 full, so the backup couldn't be saved in /Users/me/.atelier/backups."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("Docker has run out"), "{said}");
+        assert!(
+            said.ends_with(NO_SPACE_HOST_CP),
+            "Docker's words kept: {said}"
+        );
+        // A full disk inside the container on the same step names Docker's.
+        for inside in [NO_SPACE_PG_DUMP, NO_SPACE, NO_SPACE_MKDIR] {
+            let said = super::capture_failure_at("x", inside, Some(backups));
+            assert!(
+                said.starts_with("failed to x: Docker has run out of disk space"),
+                "{said}"
+            );
+        }
+        // Without a host folder, every full disk reads as Docker's, as before.
+        let said = super::capture_failure("x", NO_SPACE_HOST_CP);
+        assert!(
+            said.starts_with("failed to x: Docker has run out of disk space"),
+            "{said}"
+        );
+        // Another folder on this computer isn't the one written to.
+        let other = std::path::Path::new("/Users/me/elsewhere");
+        let said = super::capture_failure_at("x", NO_SPACE_HOST_CP, Some(other));
+        assert!(
+            said.starts_with("failed to x: Docker has run out"),
+            "{said}"
         );
     }
 

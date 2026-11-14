@@ -3252,7 +3252,13 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
             |_| {
                 let mut cp = compose(stack);
                 cp.args(["cp", &format!("app:{archive}"), &part.to_string_lossy()]);
-                run_capture(cp, "copy the snapshot out of the container")?;
+                // The docker CLI writes this copy on this computer: a full
+                // disk here is the computer's, not Docker's.
+                crate::docker::run_capture_writing_to(
+                    cp,
+                    "copy the snapshot out of the container",
+                    &stack.backups_dir(),
+                )?;
                 // A backup that isn't on disk in full is no backup: never report one.
                 let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
                 if size == 0 {
