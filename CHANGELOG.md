@@ -11,9 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Before every update, Atelier backs up your site first (a "before-update" backup), so a one-step
   update can be undone from **Backups** like a multi-step one. Before a restore, it saves your site
-  as it is now ("before-restore"); if the restore fails, the error names that file.
-- Atelier keeps the newest 3 of the backups it takes by itself and removes older ones. Backups you
-  make are never removed.
+  as it is now ("before-restore"); if the restore fails, the error names that file. If that backup
+  can't be taken (a full disk, a read-only backups folder), the restore stops and your site is left
+  as it was; `atelier data restore --no-safety-backup` restores without one.
+- Atelier keeps the newest 3 of the backups it takes by itself and removes older ones, but only
+  after an update or restore has worked: a failed attempt, and every retry, keeps them all. The
+  backup you just restored is never removed. Backups you make are never removed.
 - **Home** always says whether you're up to date and when it last checked, with **Check now**.
   When an update is ready, it shows both versions and a **What's new** link. **System → Updates**
   says how often Atelier checks.
@@ -35,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Backups now include the images attached in chat, and a restore puts them back. Restoring a
+  backup taken before this version leaves the current ones as they are.
 - Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker
   Desktop has left a stale network entry behind (after a sleep, restart or crash). Atelier removes
   that leftover entry and starts once more; no container or data is touched. If that also fails, it

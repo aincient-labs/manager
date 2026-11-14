@@ -1822,13 +1822,15 @@ const BACKUP_LABELS = {
 };
 
 // "14 Nov 2026, 10:15 · 12 MB", led by why it was taken when the name says
-// ("Before update · …"). Names are `[label-]YYYYMMDD-HHMMSS[-N].tar.gz`; any
-// other file (an imported one) keeps its name so it can still be told apart.
+// ("Before update · …"). Names are `aincient-[label-]YYYYMMDD-HHMMSS[-N].tar.gz`
+// (the `aincient-` prefix is not part of the label: it read "Aincient before
+// update"); any other file (an imported one) keeps its name so it can still be
+// told apart.
 function backupText(b) {
   const d = new Date(b.modified_unix * 1000);
   const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const parts = [`${fmtDay(d)}, ${time}`, fmtBytes(b.size_bytes)];
-  const m = /^(?:(.+?)-)?\d{8}-\d{6}(?:-\d+)?\.(?:tar\.gz|tgz)$/i.exec(b.name);
+  const m = /^(?:aincient-)?(?:(.+?)-)?\d{8}-\d{6}(?:-\d+)?\.(?:tar\.gz|tgz)$/i.exec(b.name);
   if (!m) parts.push(b.name);
   else if (m[1]) {
     const words = m[1].replace(/-/g, " ");

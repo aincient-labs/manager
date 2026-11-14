@@ -532,6 +532,11 @@ enum DataCommand {
         /// backup is refused.
         #[arg(long)]
         other_site: bool,
+        /// Restore without first backing up the site as it is now. Without
+        /// it, a restore whose backup fails (a full disk, a read-only backups
+        /// folder) stops before anything is changed.
+        #[arg(long)]
+        no_safety_backup: bool,
         /// Remote sites: FILE is a path on the server, even if a file by that
         /// name exists here.
         #[arg(long)]
@@ -1610,6 +1615,7 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             file,
             yes,
             other_site,
+            no_safety_backup,
             ..
         } => {
             if !file.is_file() {
@@ -1638,9 +1644,23 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             ops::restore_with(
                 stack,
                 &file,
-                &ops::RestoreOptions { other_site },
+                &ops::RestoreOptions {
+                    other_site,
+                    no_safety_backup,
+                },
                 &mut StepLines::default(),
-            )?;
+            )
+            .inspect_err(|e| {
+                if e.is::<ops::SafetyBackupFailed>() {
+                    println!(
+                        "{}",
+                        style::warn(
+                            "Fix what stopped the backup and try again, or pass \
+                             --no-safety-backup to restore without one."
+                        )
+                    );
+                }
+            })?;
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
@@ -2182,7 +2202,7 @@ enum Route {
     Restore {
         file: String,
         yes: bool,
-        other_site: bool,
+        opts: ops::RestoreOptions,
         on_server: bool,
     },
     /// `data backup`: on the server, then (unless `copy` is off) home.
@@ -2442,6 +2462,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
                 file,
                 yes,
                 other_site,
+                no_safety_backup,
                 on_server,
             } => Route::Restore {
                 file: file
@@ -2449,7 +2470,10 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
                     .context("the backup path isn't valid UTF-8")?
                     .to_string(),
                 yes,
-                other_site,
+                opts: ops::RestoreOptions {
+                    other_site,
+                    no_safety_backup,
+                },
                 on_server,
             },
         },
@@ -2641,7 +2665,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
         Route::Restore {
             file,
             yes,
-            other_site,
+            opts,
             on_server,
         } => {
             let local = PathBuf::from(&file);
@@ -2649,7 +2673,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                 // A backup on this machine (m2-6): refused before a byte moves
                 // if it is another site's; then uploaded, verified, restored.
                 if let Some(note) = session
-                    .check_restore_identity(&local, other_site)?
+                    .check_restore_identity(&local, opts.other_site)?
                     .message()
                 {
                     println!("{}", style::warn(note));
@@ -2663,7 +2687,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                     return Ok(());
                 }
                 // The server's restore prints its own "Restore complete.".
-                session.restore_upload(&local, other_site, &mut relay)?;
+                session.restore_upload(&local, &opts, &mut relay)?;
                 return Ok(());
             }
             println!(
@@ -2677,7 +2701,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            session.run_action(&remote::Action::Restore { file, other_site }, &mut relay)
+            session.run_action(&remote::Action::Restore { file, opts }, &mut relay)
         }
         Route::Change {
             action,
@@ -3226,16 +3250,25 @@ mod tests {
             Route::Restore {
                 file,
                 yes,
-                other_site,
+                opts,
                 on_server,
             } => {
                 assert_eq!(file, "/srv/b.tar.gz");
-                assert!(yes && !other_site && !on_server);
+                assert!(yes && !opts.other_site && !opts.no_safety_backup && !on_server);
                 // What the server then runs: always non-interactive.
-                let sent = remote::Action::Restore { file, other_site }
-                    .argv()
-                    .join(" ");
+                let sent = remote::Action::Restore { file, opts }.argv().join(" ");
                 assert_eq!(sent, "data restore --yes -- /srv/b.tar.gz");
+            }
+            other => panic!("{other:?}"),
+        }
+        match route(&["data", "restore", "/srv/b.tar.gz", "--no-safety-backup"]).unwrap() {
+            Route::Restore { file, opts, .. } => {
+                assert!(opts.no_safety_backup && !opts.other_site);
+                let sent = remote::Action::Restore { file, opts }.argv().join(" ");
+                assert_eq!(
+                    sent,
+                    "data restore --yes --no-safety-backup -- /srv/b.tar.gz"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -3480,10 +3513,8 @@ mod tests {
         ));
         match route(&["data", "restore", "b.tar.gz", "--other-site", "--on-server"]).unwrap() {
             Route::Restore {
-                other_site,
-                on_server,
-                ..
-            } => assert!(other_site && on_server),
+                opts, on_server, ..
+            } => assert!(opts.other_site && on_server),
             other => panic!("{other:?}"),
         }
         assert!(matches!(route(&["app", "open"]).unwrap(), Route::Open));

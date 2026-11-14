@@ -989,6 +989,9 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
     let ready = run_upgrade(stack, plan, r)?;
     if ready {
+        // Only after the site answered on the new version: a failed attempt
+        // keeps every backup, so retrying can never prune the last good one.
+        prune_automatic_backups(stack, None, r);
         tidy_after_update(r);
     }
     Ok(ready)
@@ -1027,15 +1030,20 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
         // nothing to go back to. Best effort, like the stepped route's snapshot;
         // skipped when the channel move above just took one.
         if !snapshot_taken {
-            safety_backup(
+            if let Err(e) = safety_backup(
                 stack,
                 "before-update",
                 "Backing up before the update…",
                 0.03,
                 PULL_FROM - 0.04,
-                None,
                 r,
-            );
+            ) {
+                r.stage(
+                    Stage::Working,
+                    &format!("Couldn't take a backup first ({e:#}). Continuing."),
+                    Some(PULL_FROM - 0.01),
+                );
+            }
         }
         retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
@@ -2036,19 +2044,14 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     })?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let stem = match label {
-        Some(l) if !l.is_empty() => format!("{}-{ts}", sanitize(l)),
-        _ => ts.clone(),
-    };
+    let stem = backup_stem(label, &ts);
     // Per-run paths: two backups at once (the GUI and the CLI, or a stepped
     // upgrade's own snapshot) must never pack each other's staging or write the
     // same file. The copy lands in a hidden `.part` the backup list ignores; the
     // final name is only claimed once the archive is complete (see [`claim_name`]).
     let run = run_id();
     let stage = format!("/tmp/aincient-snapshot-{run}");
-    let part = stack
-        .backups_dir()
-        .join(format!(".aincient-{stem}-{run}.part"));
+    let part = stack.backups_dir().join(format!(".{stem}-{run}.part"));
     let archive = format!("{stage}.tar.gz");
 
     let drush = DRUSH.join(" ");
@@ -2119,12 +2122,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
                 if size == 0 {
                     bail!("the backup copied out of the container came out empty");
                 }
-                claim_name(
-                    &part,
-                    &stack.backups_dir(),
-                    &format!("aincient-{stem}"),
-                    ".tar.gz",
-                )
+                claim_name(&part, &stack.backups_dir(), &stem, ".tar.gz")
             },
         )
         .inspect_err(|_| {
@@ -2139,6 +2137,15 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     r.log(&format!("Snapshot written to {}", host_path.display()));
     plan.finish(r, "Backup saved.");
     Ok(host_path)
+}
+
+/// A backup's file name without its extension: `aincient-[<label>-]<ts>`, the
+/// label sanitized. [`claim_name`] adds `-N` when the name is taken.
+fn backup_stem(label: Option<&str>, ts: &str) -> String {
+    match label {
+        Some(l) if !l.is_empty() => format!("aincient-{}-{ts}", sanitize(l)),
+        _ => format!("aincient-{ts}"),
+    }
 }
 
 /// Best-effort removal of an op's temp paths inside the `app` container. Every
@@ -2945,6 +2952,41 @@ pub fn restore_identity(stack: &Stack, file: &Path, other_site: bool) -> Result<
 pub struct RestoreOptions {
     /// Restore another site's archive anyway (`--other-site`).
     pub other_site: bool,
+    /// Restore without first backing up the site as it is now
+    /// (`--no-safety-backup`). Without it, a backup that fails stops the restore.
+    pub no_safety_backup: bool,
+}
+
+/// A restore was refused because the backup of the site as it is now failed:
+/// the restore drops the database, and without that copy nothing could undo it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyBackupFailed {
+    /// Why the backup failed, as its error chain reads.
+    pub cause: String,
+}
+
+impl std::fmt::Display for SafetyBackupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "couldn't back up your site as it is now, so nothing was restored and your \
+             site is unchanged. The backup failed: {}",
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for SafetyBackupFailed {}
+
+/// The restore's safety backup must have worked, or been skipped because the
+/// site isn't running (no running database to lose): a failure stops the
+/// restore before anything is dropped.
+fn require_safety_backup(outcome: Result<Option<PathBuf>>) -> Result<Option<PathBuf>> {
+    outcome.map_err(|e| {
+        anyhow::Error::new(SafetyBackupFailed {
+            cause: format!("{e:#}"),
+        })
+    })
 }
 
 /// [`restore`] behind the site-identity check (m2-6, D-04): another site's
@@ -2964,40 +3006,49 @@ pub fn restore_with(
     }
     // A restore drops the database before loading the backup: without a copy of
     // the site as it is now, a wrong pick or a failed load loses the work since.
-    let before = safety_backup(
-        stack,
-        "before-restore",
-        "Backing up your site as it is now…",
-        0.0,
-        0.0,
-        Some(file),
-        r,
-    );
+    // So a backup that fails stops the restore (review 2026-11-14), unless the
+    // owner said to go without one.
+    let before = if opts.no_safety_backup {
+        r.log("Restoring without backing up your site as it is now (--no-safety-backup).");
+        None
+    } else {
+        require_safety_backup(safety_backup(
+            stack,
+            "before-restore",
+            "Backing up your site as it is now…",
+            0.0,
+            0.0,
+            r,
+        ))?
+    };
     restore(stack, file, r).map_err(|e| match &before {
         Some(path) => e.context(format!(
             "the restore didn't finish. Your site as it was just before is saved in {}; restore that to go back",
             path.display()
         )),
         None => e,
-    })
+    })?;
+    // Only after the restore worked, and never the backup just restored.
+    prune_automatic_backups(stack, Some(file), r);
+    Ok(())
 }
 
-/// A best-effort backup before a change the owner can't undo by running the old
-/// image again (a one-step update, a restore). Skipped when the site isn't
-/// running (there is nothing new to save); a failure is reported and the change
-/// goes ahead, as with the stepped route's snapshot. `base`/`span` place the
-/// backup's own progress inside the caller's bar (`span` 0 = indeterminate).
+/// A backup before a change the owner can't undo by running the old image again
+/// (a one-step update, a restore). `Ok(None)` when the site isn't running (there
+/// is nothing new to save); a failure is returned for the caller to weigh (an
+/// update goes ahead, a restore stops). Prunes nothing: older automatic backups
+/// go only after the change succeeded. `base`/`span` place the backup's own
+/// progress inside the caller's bar (`span` 0 = indeterminate).
 fn safety_backup(
     stack: &Stack,
     label: &str,
     headline: &str,
     base: f32,
     span: f32,
-    protect: Option<&Path>,
     r: &mut dyn Reporter,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     if !status(stack).running {
-        return None;
+        return Ok(None);
     }
     let at = |f: f32| (span > 0.0).then_some(f);
     r.stage(Stage::Working, headline, at(base));
@@ -3007,25 +3058,13 @@ fn safety_backup(
         span,
         prefix: String::new(),
     };
-    match backup(stack, Some(label), &mut snap) {
-        Ok(path) => {
-            r.stage(
-                Stage::Working,
-                &format!("Backup saved: {}", path.display()),
-                at(base + span),
-            );
-            prune_automatic_backups(stack, protect, r);
-            Some(path)
-        }
-        Err(e) => {
-            r.stage(
-                Stage::Working,
-                &format!("Couldn't take a backup first ({e:#}). Continuing."),
-                at(base + span),
-            );
-            None
-        }
-    }
+    let path = backup(stack, Some(label), &mut snap)?;
+    r.stage(
+        Stage::Working,
+        &format!("Backup saved: {}", path.display()),
+        at(base + span),
+    );
+    Ok(Some(path))
 }
 
 /// Describe a backup archive the way `data backup --json` reports it: size and
@@ -3182,7 +3221,12 @@ fn backup_dump_script(drush: &str, manifest: &str, stage: &str) -> String {
 }
 
 /// The second half of the snapshot: pack the staged dump + manifest with the
-/// files tree and frozen snapshots (see [`backup_dump_script`]).
+/// files tree, frozen snapshots and chat attachments (see [`backup_dump_script`]).
+///
+/// Chat attachments live in `private/atelier-context` (cms `ContextStore`, one
+/// ledger row each in the database): a backup without them restored chats whose
+/// images were gone. Packed only when the folder exists (a site that never had
+/// an attachment has none), so it is not created here as root.
 fn backup_pack_script(stage: &str) -> String {
     // The last two lines read the archive back: a truncated or unreadable archive,
     // or one missing the dump or manifest, fails the backup instead of being
@@ -3192,9 +3236,11 @@ fn backup_pack_script(stage: &str) -> String {
          STAGE={stage}\n\
          ARCHIVE={stage}.tar.gz\n\
          mkdir -p /opt/drupal/private/frozen\n\
+         CONTEXT=\n\
+         if [ -d /opt/drupal/private/atelier-context ]; then CONTEXT=atelier-context; fi\n\
          tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
          -C /opt/drupal/web/sites/default files \
-         -C /opt/drupal/private frozen\n\
+         -C /opt/drupal/private frozen $CONTEXT\n\
          tar tzf \"$ARCHIVE\" > \"$STAGE/members\"\n\
          grep -qx database.sql.gz \"$STAGE/members\" && grep -qx manifest.json \"$STAGE/members\"\n"
     )
@@ -3242,6 +3288,11 @@ fn restore_bundle_scripts(drush: &str, work: &str) -> [String; 3] {
          \x20 cp -a \"$WORK/frozen\" /opt/drupal/private/frozen\n\
          \x20 chown -R www-data:www-data /opt/drupal/private/frozen\n\
          fi\n\
+         if [ -d \"$WORK/atelier-context\" ]; then\n\
+         \x20 rm -rf /opt/drupal/private/atelier-context\n\
+         \x20 cp -a \"$WORK/atelier-context\" /opt/drupal/private/atelier-context\n\
+         \x20 chown -R www-data:www-data /opt/drupal/private/atelier-context\n\
+         fi\n\
          {drush} cache:rebuild || true\n\
          rm -rf \"$WORK\" \"$ARCHIVE\" || true\n"
     );
@@ -3273,41 +3324,69 @@ const AUTOMATIC_BACKUP_LABELS: [&str; 4] = [
 /// How many automatic backups to keep (owner, 2026-11-14).
 const AUTOMATIC_BACKUPS_KEPT: usize = 3;
 
+/// True for a backup Atelier took by itself, as [`backup`] names it:
+/// `aincient-<label>-<YYYYMMDD>-<HHMMSS>[-N].tar.gz`. The `aincient-` prefix
+/// comes first (review 2026-11-14: matching the label against the whole name
+/// meant nothing was ever pruned).
+fn is_automatic_backup(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("aincient-") else {
+        return false;
+    };
+    AUTOMATIC_BACKUP_LABELS.iter().any(|l| {
+        rest.strip_prefix(l)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|stamp| {
+                let b = stamp.as_bytes();
+                b.len() >= 15
+                    && b[..8].iter().all(u8::is_ascii_digit)
+                    && b[8] == b'-'
+                    && b[9..15].iter().all(u8::is_ascii_digit)
+            })
+    })
+}
+
+/// The same file, however each path spells it (a relative path, `..`, a
+/// symlinked folder such as macOS's `/tmp` → `/private/tmp`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
 /// The automatic backups beyond the newest `keep`, oldest last — what a prune
-/// removes. A name counts as automatic only as `<label>-<YYYYMMDD>-<HHMMSS>…`.
-fn automatic_backups_to_prune(backups: &[Backup], keep: usize) -> Vec<&Backup> {
+/// removes. `protect` (the backup a restore just loaded) is never among them,
+/// however its path is spelled.
+fn automatic_backups_to_prune<'a>(
+    backups: &'a [Backup],
+    keep: usize,
+    protect: Option<&Path>,
+) -> Vec<&'a Backup> {
     let mut auto: Vec<&Backup> = backups
         .iter()
-        .filter(|b| {
-            AUTOMATIC_BACKUP_LABELS.iter().any(|l| {
-                b.name
-                    .strip_prefix(l)
-                    .and_then(|rest| rest.strip_prefix('-'))
-                    .is_some_and(|rest| {
-                        rest.len() >= 15 && rest.as_bytes()[..8].iter().all(u8::is_ascii_digit)
-                    })
-            })
-        })
+        .filter(|b| is_automatic_backup(&b.name))
         .collect();
     auto.sort_by(|a, b| {
         b.modified_unix
             .cmp(&a.modified_unix)
             .then_with(|| b.name.cmp(&a.name))
     });
-    auto.into_iter().skip(keep).collect()
+    auto.into_iter()
+        .skip(keep)
+        // Never the backup a restore loaded (review 2026-11-14: a prune after
+        // the before-restore backup could delete the owner's pick).
+        .filter(|b| !protect.is_some_and(|p| same_file(Path::new(&b.path), p)))
+        .collect()
 }
 
 /// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] automatic backups; delete older
-/// ones. Runs only after a new automatic backup succeeded, so there are always
-/// at least that many to go back to. A file that won't delete is logged, not fatal.
+/// ones. Runs only after the update or restore that took one succeeded, so a
+/// failed attempt (and its retries) never costs a backup. A file that won't
+/// delete is logged, not fatal.
 fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Reporter) {
     let backups = list_backups(stack);
-    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT) {
-        // Never the backup a restore is about to load (review 2026-11-14: a
-        // prune after the before-restore backup could delete the owner's pick).
-        if protect.is_some_and(|p| Path::new(&b.path) == p) {
-            continue;
-        }
+    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT, protect) {
         match std::fs::remove_file(&b.path) {
             Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
             Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),
@@ -3805,36 +3884,104 @@ mod tests {
 
     #[test]
     fn only_automatic_backups_beyond_the_newest_three_are_pruned() {
-        let b = |name: &str, t: u64| Backup {
-            name: name.into(),
+        // Names exactly as `backup()` writes them (review 2026-11-14: the old
+        // test used names without the `aincient-` prefix, so it passed while
+        // the real prune never matched anything).
+        let name = |label: Option<&str>, ts: &str| format!("{}.tar.gz", backup_stem(label, ts));
+        assert_eq!(
+            name(Some("before-update"), "20261101-100000"),
+            "aincient-before-update-20261101-100000.tar.gz"
+        );
+        let b = |name: String, t: u64| Backup {
             path: format!("/b/{name}"),
+            name,
             size_bytes: 1,
             modified_unix: t,
         };
         let all = vec![
-            b("before-update-20261101-100000.tar.gz", 1),
-            b("before-restore-20261102-100000.tar.gz", 2),
-            b("before-update-20261103-100000.tar.gz", 3),
-            b("before-stepped-upgrade-20261104-100000.tar.gz", 4),
-            b("before-update-20261105-100000.tar.gz", 5),
+            b(name(Some("before-update"), "20261101-100000"), 1),
+            b(name(Some("before-restore"), "20261102-100000"), 2),
+            b(name(Some("before-update"), "20261103-100000"), 3),
+            b(name(Some("before-stepped-upgrade"), "20261104-100000"), 4),
+            // A second backup in the same second, as `claim_name` names it.
+            b("aincient-before-update-20261105-100000-2.tar.gz".into(), 5),
+            b(name(Some("before-channel-switch"), "20261106-100000"), 6),
             // The owner's own: never pruned, however old.
-            b("20261001-090000.tar.gz", 0),
-            b("before-redesign-20261001-090000.tar.gz", 0),
-            b("before-update-notes.tar.gz", 0),
-            b("before-update-éé-20261101.tar.gz", 0),
+            b(name(None, "20261001-090000"), 0),
+            b(name(Some("before-redesign"), "20261001-090000"), 0),
+            b(name(Some("before update notes"), "20261001-090000"), 0),
+            b("aincient-before-update-notes.tar.gz".into(), 0),
+            b("aincient-before-update-éé-20261101.tar.gz".into(), 0),
+            // A file brought in from elsewhere, named like ours without the prefix.
+            b("before-update-20261001-090000.tar.gz".into(), 0),
         ];
-        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3)
+        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3, None)
             .iter()
             .map(|b| b.name.as_str())
             .collect();
         assert_eq!(
             gone,
             [
-                "before-restore-20261102-100000.tar.gz",
-                "before-update-20261101-100000.tar.gz"
+                "aincient-before-update-20261103-100000.tar.gz",
+                "aincient-before-restore-20261102-100000.tar.gz",
+                "aincient-before-update-20261101-100000.tar.gz"
             ]
         );
-        assert!(automatic_backups_to_prune(&all[..3], 3).is_empty());
+        assert!(automatic_backups_to_prune(&all[..3], 3, None).is_empty());
+    }
+
+    #[test]
+    fn the_backup_a_restore_loaded_is_never_pruned_however_its_path_is_spelled() {
+        // `data restore ./backups/x` or a path through a symlinked folder names
+        // the same file as the backup list's absolute path.
+        let dir = Scratch::new("prune-protect");
+        let backups = dir.0.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let all: Vec<Backup> = (1..=4)
+            .map(|d| {
+                let name = format!(
+                    "{}.tar.gz",
+                    backup_stem(Some("before-update"), &format!("2026110{d}-100000"))
+                );
+                let path = backups.join(&name);
+                std::fs::write(&path, "x").unwrap();
+                Backup {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes: 1,
+                    modified_unix: d,
+                }
+            })
+            .collect();
+        let oldest = "aincient-before-update-20261101-100000.tar.gz";
+        let spelled = backups.join("..").join("backups").join(oldest);
+        assert_ne!(spelled, Path::new(&all[0].path));
+        assert!(automatic_backups_to_prune(&all, 3, Some(&spelled)).is_empty());
+        assert_eq!(
+            automatic_backups_to_prune(&all, 3, None)[0].name,
+            oldest,
+            "without the protect it is the one pruned"
+        );
+    }
+
+    #[test]
+    fn a_failed_safety_backup_stops_the_restore_and_names_the_cause() {
+        let err = require_safety_backup(Err(anyhow::anyhow!(
+            "failed to save the backup as /home/x/.atelier/backups/aincient-before-restore-20261114-101500.tar.gz: Permission denied (os error 13)"
+        )))
+        .unwrap_err();
+        let typed = err.downcast_ref::<SafetyBackupFailed>().expect("typed");
+        assert!(typed.cause.contains("Permission denied"));
+        let shown = format!("{err:#}");
+        assert!(shown.contains("nothing was restored"), "{shown}");
+        assert!(shown.contains("Permission denied"), "{shown}");
+        // A stopped site has no running database to lose: the restore goes on.
+        assert_eq!(require_safety_backup(Ok(None)).unwrap(), None);
+        let saved = PathBuf::from("/b/aincient-before-restore-20261114-101500.tar.gz");
+        assert_eq!(
+            require_safety_backup(Ok(Some(saved.clone()))).unwrap(),
+            Some(saved)
+        );
     }
 
     #[test]
@@ -3892,6 +4039,7 @@ mod tests {
         waypoint_image, Backup, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
         MAX_WAYPOINTS, REGISTRY_OFFLINE, START_STUCK,
     };
+    use super::{backup_stem, require_safety_backup, SafetyBackupFailed};
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
         IdentityMismatch, RestoreOptions, Silent,
@@ -4299,6 +4447,50 @@ mod tests {
             exclude_at < files_at,
             "exclude comes before the files member"
         );
+        // Chat attachments (cms ContextStore) are packed next to frozen
+        // snapshots when the folder exists, and the folder is never created.
+        assert!(pack.contains(
+            "if [ -d /opt/drupal/private/atelier-context ]; then CONTEXT=atelier-context; fi\n"
+        ));
+        assert!(pack.contains("-C /opt/drupal/private frozen $CONTEXT\n"));
+        assert!(!pack.contains("mkdir -p /opt/drupal/private/atelier-context"));
+    }
+
+    #[test]
+    fn the_pack_command_takes_chat_attachments_only_when_they_exist() {
+        // Run the pack's member logic for real, against a private tree with and
+        // without the attachments folder (paths rewritten into a scratch dir).
+        let dir = Scratch::new("pack-context");
+        let private = dir.0.join("private");
+        let files = dir.0.join("files");
+        let stage = dir.0.join("stage");
+        for d in [private.join("frozen"), files.clone(), stage.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(stage.join("manifest.json"), "{}").unwrap();
+        std::fs::write(stage.join("database.sql.gz"), "x").unwrap();
+        let script = backup_pack_script(&stage.to_string_lossy())
+            .replace("/opt/drupal/private", &private.to_string_lossy())
+            .replace("/opt/drupal/web/sites/default", &dir.0.to_string_lossy());
+        let members = |script: &str| {
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "pack script failed");
+            std::fs::read_to_string(stage.join("members")).unwrap()
+        };
+        assert!(!members(&script)
+            .lines()
+            .any(|l| l.starts_with("atelier-context")));
+        std::fs::create_dir_all(private.join("atelier-context")).unwrap();
+        std::fs::write(private.join("atelier-context/abc.webp"), "img").unwrap();
+        let listed = members(&script);
+        assert!(
+            listed.lines().any(|l| l == "atelier-context/abc.webp"),
+            "{listed}"
+        );
     }
 
     /// A unique scratch directory, removed on drop.
@@ -4684,6 +4876,16 @@ mod tests {
             script.contains("chown -R www-data:www-data"),
             "re-asserts files ownership"
         );
+        // Chat attachments come back the way frozen snapshots do; an archive
+        // without them (taken before 0.17.0) leaves the folder as it is.
+        let files = &parts[2];
+        assert!(files.contains(
+            "if [ -d \"$WORK/atelier-context\" ]; then\n\
+             \x20 rm -rf /opt/drupal/private/atelier-context\n\
+             \x20 cp -a \"$WORK/atelier-context\" /opt/drupal/private/atelier-context\n\
+             \x20 chown -R www-data:www-data /opt/drupal/private/atelier-context\n\
+             fi\n"
+        ));
     }
 
     #[test]

@@ -671,7 +671,10 @@ async fn do_restore(
                 ops::restore_with(
                     &s,
                     std::path::Path::new(&path),
-                    &ops::RestoreOptions { other_site },
+                    &ops::RestoreOptions {
+                        other_site,
+                        ..Default::default()
+                    },
                     &mut EventReporter { app },
                 )
                 .map_err(err)
@@ -681,7 +684,14 @@ async fn do_restore(
         Target::Remote(site) => {
             blocking(move || {
                 session(&site)?
-                    .restore_upload(std::path::Path::new(&path), other_site, &mut feed(&app))
+                    .restore_upload(
+                        std::path::Path::new(&path),
+                        &ops::RestoreOptions {
+                            other_site,
+                            ..Default::default()
+                        },
+                        &mut feed(&app),
+                    )
                     .map_err(err)
             })
             .await
