@@ -25,5 +25,6 @@ mod restore_safety;
 mod settings_applied;
 mod shared_tag;
 mod stale_endpoint;
+mod update_blocked;
 mod update_running_backup_fails;
 mod update_stopped;
