@@ -1733,7 +1733,14 @@ fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
         docker::try_capture(c).is_some()
     });
     match engine_image_need(pinned.as_deref(), present) {
-        EngineImage::Ready => Ok(()),
+        EngineImage::Ready => {
+            // Sites pinned before 0.17.0 have no local name yet: add it, so the
+            // next prune can't take the image.
+            if let Some(p) = pinned.as_deref() {
+                crate::engine::protect_image(stack, p);
+            }
+            Ok(())
+        }
         EngineImage::LocalBuildGone => bail!(LOCAL_ENGINE_GONE),
         EngineImage::Fetch(image) => {
             r.stage(
@@ -1748,7 +1755,9 @@ fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
                     "Couldn't download your site's engine, which is no longer on this computer. \
                      If you're offline, connect and try again. ({e:#})"
                 )
-            })
+            })?;
+            crate::engine::protect_image(stack, &image);
+            Ok(())
         }
     }
 }

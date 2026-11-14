@@ -36,8 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tells you to restart Docker Desktop instead of showing only Docker's error.
 - A site with the experimental engine no longer fails to start with "No such image" when its engine
   image was removed from your computer (an image clean-up or a Docker reset). Atelier downloads the
-  exact pinned version again. An engine built locally can't be downloaded, so it says to turn the
-  engine off and on again.
+  exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
+  image clean-up (`docker image prune`) no longer removes it. Turning the engine off drops that name.
+  An engine built locally can't be downloaded, so it says to turn the engine off and on again.
 
 ## [0.16.0] - 2026-11-12
 

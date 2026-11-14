@@ -848,7 +848,38 @@ pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     ] {
         text.push_str(&format!("{k}={v}\n"));
     }
-    write_atomic(&stack.env_path(), &text, 0o600)
+    write_atomic(&stack.env_path(), &text, 0o600)?;
+    protect_image(stack, image);
+    Ok(())
+}
+
+/// The local name that keeps a site's pinned engine image from being pruned:
+/// `atelier-engine:pinned-<project>`. Tag characters only, at most 128.
+pub fn pinned_tag(project: &str) -> String {
+    let safe: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let tag: String = format!("pinned-{safe}").chars().take(128).collect();
+    format!("{ENGINE_IMAGE_REPO}:{tag}")
+}
+
+/// Give the pinned engine image a local name. Pulled by digest alone it has no
+/// tag, so Docker counts it as dangling and any `docker image prune` deletes it
+/// once no container uses it (2026-11-14: the Engine POC lost its engine that
+/// way). A name doesn't change what runs: it points at the same image, and the
+/// compose file still runs the pin. Best effort: an untagged image only costs a
+/// re-download at the next start.
+pub fn protect_image(stack: &Stack, image: &str) {
+    let mut c = crate::docker::docker();
+    c.args(["tag", image, &pinned_tag(&stack.project_name())]);
+    let _ = crate::docker::try_capture(c);
 }
 
 /// Runs `docker compose -f <files…> config --format json` in the stack
@@ -938,6 +969,11 @@ pub fn disable(stack: &Stack) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("remove {}", p.display())),
         }
     }
+    // Drop the local name protect_image gave the engine, so a prune can clean
+    // the image up once the engine is off. Best effort; only the name goes.
+    let mut c = crate::docker::docker();
+    c.args(["image", "rm", &pinned_tag(&stack.project_name())]);
+    let _ = crate::docker::try_capture(c);
     Ok(())
 }
 
@@ -967,6 +1003,20 @@ fn write_atomic(path: &Path, contents: &str, _mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pinned_tag_is_a_valid_local_name_per_site() {
+        assert_eq!(
+            super::pinned_tag("atelier-engine-poc"),
+            "ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"
+        );
+        assert_eq!(
+            super::pinned_tag("my site/x"),
+            "ghcr.io/aincient-labs/atelier-engine:pinned-my-site-x"
+        );
+        let long = super::pinned_tag(&"a".repeat(300));
+        assert_eq!(long.rsplit(':').next().unwrap().len(), 128);
+    }
+
     use super::*;
     use crate::stack::{InstallOptions, COMPOSE_TEMPLATE};
     use std::sync::atomic::{AtomicU32, Ordering};
