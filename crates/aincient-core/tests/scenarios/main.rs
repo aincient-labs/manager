@@ -14,3 +14,4 @@
 mod harness;
 
 mod detached_db;
+mod stale_endpoint;

@@ -244,6 +244,15 @@ impl Site {
         std::fs::write(self.stack.compose_path(), with_scn_db(compose)).expect("compose.yaml");
     }
 
+    /// Add `name` with `body` next to compose.yaml and have compose read both
+    /// (`COMPOSE_FILE` in `.env`, as the engine overlay is read).
+    pub fn overlay(&self, name: &str, body: &str) {
+        std::fs::write(self.stack.home.join(name), body).expect("overlay");
+        let mut env = std::fs::read_to_string(self.stack.env_path()).expect(".env");
+        env.push_str(&format!("COMPOSE_FILE=compose.yaml:{name}\n"));
+        std::fs::write(self.stack.env_path(), env).expect(".env");
+    }
+
     /// `docker compose <args>` for this site, through the Manager's own builder.
     pub fn compose(&self, args: &[&str]) -> String {
         refuse_foreign(&self.stack.project_name());
