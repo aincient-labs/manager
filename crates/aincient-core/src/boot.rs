@@ -570,18 +570,55 @@ pub fn half_attached_now(stack: &Stack) -> Option<Vec<(String, String)>> {
 }
 
 /// The app's log since its container last started, stdout and stderr
-/// together (`converge.sh` reports FATAL on stderr). `None` when it can't be
-/// read.
+/// together in the order the container wrote them ([`interleave`]:
+/// `converge.sh` reports FATAL on stderr and `converge OK` on stdout). `None`
+/// when it can't be read.
 fn app_log(app: &AppRun) -> Option<String> {
     let mut c = docker::docker();
-    c.args(["logs", "--since", &app.started_at, &app.name]);
+    c.args([
+        "logs",
+        "--timestamps",
+        "--since",
+        &app.started_at,
+        &app.name,
+    ]);
     let out = docker::output_within(&mut c, LOCAL_PROBE_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }
-    let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
-    log.push_str(&String::from_utf8_lossy(&out.stderr));
-    Some(log)
+    Some(interleave(
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    ))
+}
+
+/// `docker logs --timestamps` output, its stdout and stderr (Docker hands them
+/// back on separate pipes), as one log in the order the lines were written,
+/// timestamps removed. Each line starts with Docker's fixed-width RFC 3339
+/// time, so the two streams merge by comparing it; a tie keeps stdout first.
+/// Reading one stream after the other put a later `converge OK` (stdout) before
+/// the FATAL (stderr) it settled, so the site failed again on the old FATAL
+/// (scenario `boot_fatal`).
+pub(crate) fn interleave(stdout: &str, stderr: &str) -> String {
+    fn split(line: &str) -> (&str, &str) {
+        line.split_once(' ').unwrap_or(("", line))
+    }
+    let mut out = stdout.lines().map(split).peekable();
+    let mut err = stderr.lines().map(split).peekable();
+    let mut log = String::new();
+    loop {
+        let next = match (out.peek(), err.peek()) {
+            (Some(o), Some(e)) if e.0 < o.0 => err.next(),
+            (Some(_), _) => out.next(),
+            (None, Some(_)) => err.next(),
+            (None, None) => break,
+        };
+        if let Some((_, line)) = next {
+            log.push_str(line);
+            log.push('\n');
+        }
+    }
+    log
 }
 
 /// Look at the site. With `network`, also at how Docker attached its
@@ -648,6 +685,31 @@ mod tests {
             r#"[{"Name":"atelier-review-tmp_default","Containers":{"x":{"Name":"atelier-review-tmp-app-1"}}}]"#,
         );
         assert!(half_attached(&net, &containers).is_empty());
+    }
+
+    #[test]
+    fn both_streams_merge_in_the_order_they_were_written() {
+        // `docker logs --timestamps` of a site whose converge failed, then a
+        // later converge (doctor's re-converge) succeeded in the same run.
+        let stdout = "2026-11-14T20:00:01.000000000Z [entrypoint] starting\n\
+                      2026-11-14T20:05:00.000000000Z [converge] converge OK — site is on 11.2.5\n";
+        let stderr =
+            "2026-11-14T20:00:02.000000000Z [converge] FATAL: post-update health check failed\n\
+                      2026-11-14T20:00:02.000000000Z [entrypoint] converge FAILED\n";
+        let log = interleave(stdout, stderr);
+        assert_eq!(
+            log,
+            "[entrypoint] starting\n\
+             [converge] FATAL: post-update health check failed\n\
+             [entrypoint] converge FAILED\n\
+             [converge] converge OK — site is on 11.2.5\n"
+        );
+        assert_eq!(boot_failure(&log), None, "the later success settles it");
+        // Read one stream after the other, the old FATAL came last.
+        assert!(boot_failure(&format!("{stdout}{stderr}")).is_some());
+        // A tie keeps stdout first; one stream alone is itself.
+        assert_eq!(interleave("T a\n", "T b\n"), "a\nb\n");
+        assert_eq!(interleave("", "T b\nT c\n"), "b\nc\n");
     }
 
     #[test]
