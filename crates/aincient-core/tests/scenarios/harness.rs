@@ -7,9 +7,11 @@
 //!
 //! - `db`: the template's `db` with its image swapped for `postgres:16-alpine`
 //!   (smaller than pgvector; the same `pg_isready` healthcheck).
-//! - `app`: [`APP_DOCKERFILE`], a busybox image built per test. Its entrypoint
-//!   waits for `db` by name, prints the real converge lines and serves 200 on
-//!   `/user/login`, so the Manager's readiness wait judges it like the real app.
+//! - `app`: [`APP_DOCKERFILE`], a small Alpine image built per test. Its
+//!   entrypoint waits for `db` by name, prints the real converge lines (or
+//!   FATAL, see [`Site::fail_boot`]) and serves 200 on `/user/login`, so the
+//!   Manager's readiness wait judges it like the real app. Its `drush` does only
+//!   what the Manager's backup and restore scripts call, on the real database.
 //! - `edge`: the template's `nginx:1.30-alpine-slim` with the shipped
 //!   `edge.conf`, published on a free port.
 //!
@@ -17,11 +19,16 @@
 //! else is ever addressed ([`project_name`] refuses any other); on drop (pass or
 //! panic) the project is taken down with its volumes and every image tag and
 //! image this site built is removed. Images it did not build are never removed.
+//!
+//! The Manager's user home (where it finds `~/.atelier/sites.toml`, which
+//! clean-up reads) is a temp dir for the whole run ([`user_home`]): no scenario
+//! reads or writes the owner's real registry.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use aincient_core::docker;
@@ -34,21 +41,41 @@ pub const PREFIX: &str = "atelier-scn-";
 /// The small Postgres the scenario `db` runs instead of pgvector.
 pub const SCN_DB_IMAGE: &str = "postgres:16-alpine";
 
+/// The compose overlay [`Site::local_images`] adds: `app` is never pulled
+/// (its tag exists only on this computer, like a local or fork build), `db`
+/// and `edge` only when missing. The Manager's update still runs its real
+/// `compose pull`, then compares the image the tag names with the one `app`
+/// runs; compose just doesn't ask a registry for a tag it can't have.
+pub const LOCAL_IMAGES: &str = "services:\n  app:\n    pull_policy: never\n  db:\n    pull_policy: missing\n  edge:\n    pull_policy: missing\n";
+
 /// The image repository every app image the harness builds is tagged in.
 pub const APP_REPO: &str = "atelier-scn-app";
 
 /// The test app: waits for `db` by name like `converge.sh` does, then prints
 /// converge's own success (or FATAL) lines and serves `/user/login`, as the
-/// real entrypoint starts the web server after a failed converge too.
-const APP_DOCKERFILE: &str = r#"FROM busybox:1.37
+/// real entrypoint starts the web server after a failed converge too. Alpine
+/// with the Postgres client, so [`APP_DRUSH`] can work on the real database,
+/// and GNU tar as the real image has (the backup packs with several `-C`).
+/// `ARG MARK` comes after the package layer, so every build shares it.
+const APP_DOCKERFILE: &str = r#"FROM alpine:3.22
+RUN apk add --no-cache busybox-extras postgresql16-client tar \
+ && adduser -D -H -u 82 -G www-data -s /sbin/nologin www-data
 ARG MARK=a
 ENV SCN_MARK=$MARK
 RUN mkdir -p /www/user /opt/drupal/web/sites/default/files /opt/drupal/private \
+    /opt/drupal/vendor/bin \
  && echo "login $MARK" > /www/user/login
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY drush /opt/drupal/vendor/bin/drush
+RUN chmod +x /entrypoint.sh /opt/drupal/vendor/bin/drush
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/entrypoint.sh"]
 "#;
+
+/// [`fail_boot`](Site::fail_boot) leaves this flag (with the build's mark
+/// appended) in the `private` volume: that build then fails its converge, as
+/// a release that can't migrate a site does. Another build ignores it.
+pub const BOOT_FAILS_FLAG: &str = "/opt/drupal/private/scn-boot-fails-";
 
 const APP_ENTRYPOINT: &str = r#"#!/bin/sh
 # converge.sh's database wait: `db` by name on the site's network.
@@ -63,13 +90,56 @@ until nc -z -w 2 db 5432; do
   sleep 1
 done
 if [ "$tries" -lt 20 ]; then
-  echo "[converge] converge OK — scenario app $SCN_MARK"
-  echo "[entrypoint] converge succeeded"
+  if [ -e "/opt/drupal/private/scn-boot-fails-$SCN_MARK" ]; then
+    echo "[converge] FATAL: post-update health check failed (scenario build $SCN_MARK)" >&2
+    echo "[entrypoint] converge FAILED — starting server on the rolled-back state for inspection" >&2
+  else
+    echo "[converge] converge OK — scenario app $SCN_MARK"
+    echo "[entrypoint] converge succeeded"
+  fi
 fi
 httpd -f -p 80 -h /www &
 pid=$!
 trap 'kill $pid; exit 0' TERM INT
 wait $pid
+"#;
+
+/// Not Drupal: only the drush calls the Manager's backup and restore scripts
+/// make (`sql:dump --gzip --result-file`, `sql:drop`, `sql:cli`,
+/// `cache:rebuild`), done on the site's real database (`DATABASE_URL`) with
+/// the Postgres tools. Anything else fails loudly.
+const APP_DRUSH: &str = r#"#!/bin/sh
+set -e
+cmd=
+result=
+gz=
+for a in "$@"; do
+  case "$a" in
+    --root=*|-y) ;;
+    --gzip) gz=1 ;;
+    --result-file=*) result="${a#--result-file=}" ;;
+    -*) ;;
+    *) [ -n "$cmd" ] || cmd="$a" ;;
+  esac
+done
+url="${DATABASE_URL#pgsql://}"
+export PGUSER="${url%%:*}"
+rest="${url#*:}"
+export PGPASSWORD="${rest%%@*}"
+rest="${rest#*@}"
+export PGHOST="${rest%%/*}"
+export PGDATABASE="${rest#*/}"
+case "$cmd" in
+  sql:dump)
+    [ -n "$result" ] || { echo "drush (scenario): sql:dump needs --result-file" >&2; exit 1; }
+    pg_dump --no-owner --no-privileges > "$result"
+    if [ -n "$gz" ]; then gzip -f "$result"; fi
+    ;;
+  sql:drop) psql -v ON_ERROR_STOP=1 -q -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' ;;
+  sql:cli) exec psql -v ON_ERROR_STOP=1 -q ;;
+  cache:rebuild|cr) echo "[drush] caches rebuilt (scenario)" ;;
+  *) echo "drush (scenario): $cmd is not one of the calls the Manager's backup/restore make" >&2; exit 1 ;;
+esac
 "#;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -98,8 +168,83 @@ pub fn refuse_foreign(project: &str) {
     );
 }
 
+/// The user home the Manager sees for the whole run: a temp dir, so its
+/// registry (`<home>/.atelier/sites.toml`) is the scenario's own, never the
+/// owner's. Set once as `HOME` (what `dirs::home_dir` and so
+/// `sites::user_home` read); `DOCKER_CONFIG` is pinned to the real Docker
+/// config first, so the docker CLI keeps its context and plugins.
+pub fn user_home() -> PathBuf {
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let real = std::env::var_os("HOME").map(PathBuf::from);
+        if std::env::var_os("DOCKER_CONFIG").is_none() {
+            if let Some(cfg) = real.map(|h| h.join(".docker")).filter(|d| d.is_dir()) {
+                std::env::set_var("DOCKER_CONFIG", cfg);
+            }
+        }
+        let tmp = std::env::temp_dir();
+        sweep_dead_homes(&tmp);
+        let home = tmp.join(format!("{PREFIX}home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scenario user home");
+        // The tests run one at a time (`--test-threads=1`); nothing else in
+        // this process reads the environment while it changes.
+        std::env::set_var("HOME", &home);
+        home
+    })
+    .clone()
+}
+
+/// Remove the user homes earlier runs left (`atelier-scn-home-<pid>` of a
+/// process that is gone): a run can't clean its own up at exit.
+fn sweep_dead_homes(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(&format!("{PREFIX}home-")) else {
+            continue;
+        };
+        let alive = Command::new("kill")
+            .args(["-0", pid])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !alive && pid.chars().all(|c| c.is_ascii_digit()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// An update that ends Ready runs the automatic clean-up on this computer
+/// (`cleanup::free(AfterUpdate)`), which only ever takes Atelier's own
+/// downloads and the old base tags Atelier shipped: never anything a scenario
+/// builds. So before such an update, refuse to run unless that clean-up would
+/// remove nothing here (with the scenario's empty registry), so a scenario
+/// never removes an image the owner has. CI runners have none.
+pub fn assert_cleanup_removes_nothing() {
+    user_home();
+    let found = aincient_core::cleanup::find(aincient_core::cleanup::Scope::AfterUpdate)
+        .expect("ask what the automatic clean-up would remove");
+    assert!(
+        found.images.is_empty(),
+        "this computer has unused Atelier downloads the update's automatic clean-up would \
+         remove ({:?}); the scenario won't run an update that removes images it didn't make",
+        found
+            .images
+            .iter()
+            .map(|i| if i.names.is_empty() {
+                &i.id
+            } else {
+                &i.names[0]
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Docker is here and answering; otherwise the scenario can't run at all.
 pub fn require_docker() {
+    user_home();
     let p = aincient_core::preflight();
     assert!(
         p.ok(),
@@ -209,6 +354,7 @@ impl Site {
         std::fs::create_dir_all(&ctx).expect("build context");
         std::fs::write(ctx.join("Dockerfile"), APP_DOCKERFILE).expect("Dockerfile");
         std::fs::write(ctx.join("entrypoint.sh"), APP_ENTRYPOINT).expect("entrypoint");
+        std::fs::write(ctx.join("drush"), APP_DRUSH).expect("drush");
         let ctx_s = ctx.to_string_lossy().to_string();
         let mark_arg = format!("MARK={mark}");
         let id = docker(&[
@@ -335,6 +481,69 @@ impl Site {
     pub fn network(&self, key: &str) -> String {
         format!("{}_{key}", self.project)
     }
+
+    /// This site's compose project (`atelier-scn-…`).
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+
+    /// Have compose use the images on this computer ([`LOCAL_IMAGES`]). Call
+    /// after [`scaffold`](Self::scaffold), before the first boot.
+    pub fn local_images(&self) {
+        self.overlay("scn-local-images.yaml", LOCAL_IMAGES);
+    }
+
+    /// Set `key=value` in the site's `.env`, replacing the key's line if it
+    /// has one, as the owner editing their settings does.
+    pub fn set_env(&self, key: &str, value: &str) {
+        let path = self.stack.env_path();
+        let text = std::fs::read_to_string(&path).expect(".env");
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|l| l.split_once('=').map(|(k, _)| k.trim()) != Some(key))
+            .map(str::to_string)
+            .collect();
+        lines.push(format!("{key}={value}"));
+        std::fs::write(&path, lines.join("\n") + "\n").expect(".env");
+    }
+
+    /// From now on build `mark` fails its converge on this site's data
+    /// ([`BOOT_FAILS_FLAG`] in the `private` volume), as a release that can't
+    /// migrate the site does; other builds boot. Needs a running `app`.
+    pub fn fail_boot(&self, mark: &str) {
+        docker(&[
+            "exec",
+            &self.container("app"),
+            "touch",
+            &format!("{BOOT_FAILS_FLAG}{mark}"),
+        ]);
+    }
+
+    /// `query` run by `psql` in `db` as the site's user: the rows, unaligned.
+    pub fn sql(&self, query: &str) -> String {
+        docker(&[
+            "exec",
+            &self.container("db"),
+            "psql",
+            "-U",
+            "aincient",
+            "-d",
+            "aincient",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-tAc",
+            query,
+        ])
+    }
+
+    /// Remove `tag` with this site (a tag the test put on an image it
+    /// built). Refuses a name without [`PREFIX`] in it.
+    pub fn owns_tag(&mut self, tag: &str) {
+        assert!(tag.contains(PREFIX), "not a scenario tag: {tag:?}");
+        if !self.tags.iter().any(|t| t == tag) {
+            self.tags.push(tag.to_string());
+        }
+    }
 }
 
 /// `template` with the scenario db image in place of the shipped one. The
@@ -359,7 +568,7 @@ impl Drop for Site {
             eprintln!("cleanup: compose down of {}: {e}", self.project);
         }
         for tag in &self.tags {
-            if tag.starts_with(APP_REPO) {
+            if tag.contains(PREFIX) {
                 let _ = try_docker(&["image", "rm", tag]);
             }
         }
@@ -379,6 +588,26 @@ fn remove_site_dir(home: &Path) {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with(PREFIX))
     {
+        // A scenario may have made its backups folder read-only.
+        writable(&home.join("backups"));
         let _ = std::fs::remove_dir_all(home);
     }
+}
+
+/// Give `dir` back its owner's write permission (best effort).
+pub fn writable(dir: &Path) {
+    set_mode(dir, 0o755);
+}
+
+/// Set `dir`'s Unix permission bits (best effort; nothing elsewhere).
+pub fn set_mode(dir: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if dir.is_dir() {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (dir, mode);
 }
