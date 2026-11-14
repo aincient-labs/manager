@@ -9,9 +9,9 @@
 //! Docker's clock, from the moment the container last started, and looks at the
 //! containers themselves every few seconds ([`look`] + [`judge`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -64,6 +64,13 @@ impl BootFailed {
     pub fn needs_docker_restart(&self) -> bool {
         self.0.contains(NETWORK_STUCK) || self.0.contains(DOCKER_STOPPED)
     }
+
+    /// Docker stopped part of the site for lack of memory ([`out_of_memory`]),
+    /// or likely did ([`likely_out_of_memory`]): the owner's step is giving
+    /// Docker more memory, not a checkup.
+    pub fn out_of_memory(&self) -> bool {
+        self.0.contains(RAN_OUT_OF_MEMORY) || self.0.contains(LIKELY_FOR_LACK_OF_MEMORY)
+    }
 }
 
 /// How often the wait looks at the containers and the app's log.
@@ -84,6 +91,75 @@ pub(crate) const DOCKER_STOPPED: &str = "Docker stopped while your site was star
 
 const SITE_STOPPED: &str = "Your site stopped while it was starting. Start it again; if it \
      stops again, run a checkup (System → Troubleshoot, or `atelier doctor`).";
+
+/// The words every out-of-memory reason carries ([`BootFailed::out_of_memory`]).
+const RAN_OUT_OF_MEMORY: &str = "ran out of memory, so Docker stopped part of it";
+const LIKELY_FOR_LACK_OF_MEMORY: &str = "likely for lack of memory";
+
+/// What the owner calls each compose service.
+fn part_name(service: &str) -> &str {
+    match service {
+        "db" => "the database",
+        "app" => "the app",
+        "edge" => "the web server",
+        other => other,
+    }
+}
+
+fn parts(services: &BTreeSet<String>) -> String {
+    // db first: it is the one whose data the owner worries about.
+    let mut names: Vec<&str> = services.iter().map(String::as_str).collect();
+    names.sort_by_key(|s| (*s != "db", *s != "app", *s));
+    names
+        .iter()
+        .map(|s| part_name(s))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// Docker stopped `services` because the site ran out of memory: seen as
+/// `State.OOMKilled` or an `oom` event, never from exit code 137 alone (our
+/// own stops give 137 too). `remedy` is [`crate::docker_runtime::memory_remedy`].
+pub(crate) fn out_of_memory(services: &BTreeSet<String>, remedy: &str) -> String {
+    let safe = if services.contains("db") {
+        " Your site's data is safe."
+    } else {
+        ""
+    };
+    format!(
+        "Your site {RAN_OUT_OF_MEMORY} ({}).{safe} {remedy}, or stop other sites, then start \
+         your site again.",
+        parts(services)
+    )
+}
+
+/// Docker killed `services` (exit 137, or Postgres's "terminated by signal 9")
+/// with no out-of-memory flag or event to prove why: said as likely, not as fact.
+pub(crate) fn likely_out_of_memory(services: &BTreeSet<String>, remedy: &str) -> String {
+    format!(
+        "Docker stopped part of your site by force ({}), {LIKELY_FOR_LACK_OF_MEMORY}. \
+         {remedy}, or stop other sites, then start your site again. If it happens again, \
+         {}",
+        parts(services),
+        lowercase_first(CHECKUP)
+    )
+}
+
+/// `services` restarted during the wait with no sign of memory trouble.
+pub(crate) fn crash_loop(services: &BTreeSet<String>) -> String {
+    format!(
+        "Part of your site ({}) keeps stopping and starting again, so it couldn't finish \
+         starting. {CHECKUP}",
+        parts(services)
+    )
+}
+
+fn lowercase_first(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_lowercase().chain(c).collect())
+        .unwrap_or_default()
+}
 
 /// The lines that say a converge finished well: `converge.sh`'s own last line
 /// (`log "converge OK — …"`, which a converge run by `docker exec` prints too)
@@ -151,13 +227,35 @@ pub(crate) struct Look {
     pub log: Option<String>,
     /// `(network, container)` pairs Docker has half attached ([`half_attached`]).
     pub half_attached: Vec<(String, String)>,
+    /// Every service's container (db, app, edge) as Docker sees it now.
+    pub services: Vec<ServiceRun>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppRun {
     pub name: String,
+    /// Running, and not between two runs of a restart policy (Docker says
+    /// `Running: true` while it waits to restart a container that died).
     pub running: bool,
     pub started_at: String,
+}
+
+/// One service's container at a look: what says it died or was killed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ServiceRun {
+    /// The container's ID: `docker events` name it by this.
+    pub id: String,
+    pub service: String,
+    pub name: String,
+    /// `State.OOMKilled`: a process in it was killed for lack of memory since
+    /// it last started. Set for a killed child too (the container keeps
+    /// running), and reset by every start, a restart policy's included.
+    pub oom_killed: bool,
+    /// `State.Restarting`: died, and Docker restarts it after a pause.
+    pub restarting: bool,
+    pub exit_code: i64,
+    /// `RestartCount`: how often its restart policy restarted it.
+    pub restart_count: u64,
 }
 
 /// What the looks so far add up to. Docker not answering, stopping and a
@@ -169,6 +267,48 @@ pub(crate) struct Strikes {
     docker: u8,
     stopped: u8,
     network: u8,
+    /// Looks in a row where a service was OOM-killed or had restarted.
+    trouble: u8,
+    /// Each container's `RestartCount` when the wait started ([`Self::from_baseline`]),
+    /// or at the first look that saw it.
+    baseline: HashMap<String, u64>,
+    /// Services seen with `State.OOMKilled` during this wait.
+    pub oom_killed: BTreeSet<String>,
+    /// Services whose restart policy restarted them during this wait.
+    pub restarted: BTreeSet<String>,
+}
+
+impl Strikes {
+    /// Strikes counted against `services` as they were when the wait started.
+    pub(crate) fn from_baseline(services: &[ServiceRun]) -> Self {
+        Strikes {
+            baseline: services
+                .iter()
+                .map(|s| (s.name.clone(), s.restart_count))
+                .collect(),
+            ..Strikes::default()
+        }
+    }
+
+    /// Record what `look` says about memory and restarts; whether it saw any.
+    fn note(&mut self, look: &Look) -> bool {
+        let mut trouble = false;
+        for s in &look.services {
+            let base = *self
+                .baseline
+                .entry(s.name.clone())
+                .or_insert(s.restart_count);
+            if s.oom_killed {
+                self.oom_killed.insert(s.service.clone());
+                trouble = true;
+            }
+            if s.restart_count > base || s.restarting {
+                self.restarted.insert(s.service.clone());
+                trouble = true;
+            }
+        }
+        trouble
+    }
 }
 
 /// Whether this look ends the wait, and why.
@@ -179,6 +319,7 @@ pub(crate) fn judge(look: &Look, strikes: &mut Strikes) -> Option<String> {
         return (strikes.docker >= 2).then(|| DOCKER_STOPPED.to_string());
     }
     strikes.docker = 0;
+    let trouble = strikes.note(look);
     if let Some(why) = look.log.as_deref().and_then(boot_failure) {
         // The database is out of reach because the network is half attached:
         // the owner's step is restarting Docker, not a checkup.
@@ -186,6 +327,16 @@ pub(crate) fn judge(look: &Look, strikes: &mut Strikes) -> Option<String> {
             return Some(NETWORK_STUCK.to_string());
         }
         return Some(why);
+    }
+    // A service OOM-killed (its container may well keep running: a killed
+    // child, or a restart policy that already started it again) or restarted
+    // since the wait started. Its own words come from [`memory_verdict`] once
+    // the wait ends; without memory trouble it is a crash loop.
+    strikes.trouble = if trouble { strikes.trouble + 1 } else { 0 };
+    if strikes.trouble >= 2 {
+        let mut services = strikes.restarted.clone();
+        services.extend(strikes.oom_killed.iter().cloned());
+        return Some(crash_loop(&services));
     }
     let stopped = !look.app.as_ref().is_some_and(|a| a.running) || look.log.is_none();
     strikes.stopped = if stopped { strikes.stopped + 1 } else { 0 };
@@ -204,8 +355,10 @@ pub(crate) fn judge(look: &Look, strikes: &mut Strikes) -> Option<String> {
 }
 
 /// `docker inspect` of one container, the fields a look reads.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Inspected {
+    #[serde(rename = "Id", default)]
+    id: String,
     #[serde(rename = "Name", default)]
     name: String,
     #[serde(rename = "State", default)]
@@ -216,36 +369,44 @@ pub(crate) struct Inspected {
     host_config: InspectedHostConfig,
     #[serde(rename = "Config", default)]
     config: InspectedConfig,
+    #[serde(rename = "RestartCount", default)]
+    restart_count: u64,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InspectedHostConfig {
     /// The network the container was created on (compose: `<project>_default`).
     #[serde(rename = "NetworkMode", default)]
     network_mode: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InspectedConfig {
     #[serde(rename = "Labels", default)]
     labels: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InspectedState {
     #[serde(rename = "Running", default)]
     running: bool,
     #[serde(rename = "StartedAt", default)]
     started_at: String,
+    #[serde(rename = "Restarting", default)]
+    restarting: bool,
+    #[serde(rename = "OOMKilled", default)]
+    oom_killed: bool,
+    #[serde(rename = "ExitCode", default)]
+    exit_code: i64,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InspectedNetworks {
     #[serde(rename = "Networks", default)]
     networks: Option<HashMap<String, InspectedEndpoint>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct InspectedEndpoint {
     #[serde(rename = "IPAddress", default)]
     ip_address: String,
@@ -261,7 +422,7 @@ impl Inspected {
         self.name.trim_start_matches('/')
     }
 
-    /// The networks this container has an address on.
+    /// The compose service this container runs.
     fn service(&self) -> Option<&str> {
         self.config
             .labels
@@ -270,6 +431,19 @@ impl Inspected {
             .map(String::as_str)
     }
 
+    fn run(&self) -> ServiceRun {
+        ServiceRun {
+            id: self.id.clone(),
+            service: self.service().unwrap_or_default().to_string(),
+            name: self.name().to_string(),
+            oom_killed: self.state.oom_killed,
+            restarting: self.state.restarting,
+            exit_code: self.state.exit_code,
+            restart_count: self.restart_count,
+        }
+    }
+
+    /// The networks this container has an address on.
     fn addressed(&self) -> Vec<&str> {
         self.network_settings
             .networks
@@ -506,16 +680,22 @@ pub(crate) fn half_attached(
     out
 }
 
-/// The site's running `db` and `app` containers by `compose ps` (`name`,
-/// `service`), or `None` when Docker didn't answer.
+/// The site's `db` and `app` containers by `compose ps` (`name`, `service`),
+/// or `None` when Docker didn't answer.
 fn service_containers(stack: &Stack) -> Option<Vec<(String, String)>> {
+    containers_of(stack, &["db", "app"])
+}
+
+/// The site's containers of `services` by `compose ps -a` (`name`, `service`),
+/// or `None` when Docker didn't answer.
+fn containers_of(stack: &Stack, services: &[&str]) -> Option<Vec<(String, String)>> {
     let mut ps = compose(stack);
     ps.args(["ps", "-a", "--format", "json"]);
     let out = docker::try_capture_empty_ok(ps)?;
     Some(
         crate::ops::parse_ps(&out)
             .into_iter()
-            .filter(|e| matches!(e.service.as_str(), "db" | "app") && !e.name.is_empty())
+            .filter(|e| services.contains(&e.service.as_str()) && !e.name.is_empty())
             .map(|e| (e.name, e.service))
             .collect(),
     )
@@ -624,7 +804,7 @@ pub(crate) fn interleave(stdout: &str, stderr: &str) -> String {
 /// Look at the site. With `network`, also at how Docker attached its
 /// containers (a few more `docker` calls).
 pub(crate) fn look(stack: &Stack, network: bool) -> Look {
-    let Some(services) = service_containers(stack) else {
+    let Some(services) = containers_of(stack, &SERVICES) else {
         return Look {
             docker: preflight().ok(),
             ..Look::default()
@@ -638,14 +818,19 @@ pub(crate) fn look(stack: &Stack, network: bool) -> Look {
         .and_then(|(n, _)| inspected.iter().find(|i| i.name() == n))
         .map(|i| AppRun {
             name: i.name().to_string(),
-            running: i.state.running,
+            running: i.state.running && !i.state.restarting,
             started_at: i.state.started_at.clone(),
         });
     let log = app.as_ref().and_then(app_log);
     // A failed read is Docker going away, or the container with it.
     let docker = log.is_some() || preflight().ok();
     let half_attached = if network && docker {
-        half_attached_among(stack, &inspected)
+        let db_app: Vec<Inspected> = inspected
+            .iter()
+            .filter(|i| matches!(i.service(), Some("db" | "app")))
+            .cloned()
+            .collect();
+        half_attached_among(stack, &db_app)
     } else {
         Vec::new()
     };
@@ -654,7 +839,210 @@ pub(crate) fn look(stack: &Stack, network: bool) -> Look {
         app,
         log,
         half_attached,
+        services: inspected.iter().map(Inspected::run).collect(),
     }
+}
+
+/// The services a look inspects.
+const SERVICES: [&str; 3] = ["db", "app", "edge"];
+
+/// Every service's container now, for the [`Strikes`] baseline when a wait
+/// starts. Empty when Docker didn't answer.
+pub(crate) fn services_now(stack: &Stack) -> Vec<ServiceRun> {
+    let Some(services) = containers_of(stack, &SERVICES) else {
+        return Vec::new();
+    };
+    let names: Vec<&str> = services.iter().map(|(n, _)| n.as_str()).collect();
+    inspect(&names).iter().map(Inspected::run).collect()
+}
+
+/// Seconds since the Unix epoch, as `docker events --since` takes them.
+pub(crate) fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One `docker events --format '{{json .}}'` line, the fields read here.
+#[derive(Debug, Deserialize)]
+struct Event {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "Action", default)]
+    action: String,
+    #[serde(rename = "Actor", default)]
+    actor: EventActor,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EventActor {
+    #[serde(rename = "Attributes", default)]
+    attributes: HashMap<String, String>,
+}
+
+/// What `docker events` (oom + die) said about each service.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Events {
+    /// Services with an `oom` event: proof that survives the restart.
+    pub oom: BTreeSet<String>,
+    /// Services that died with exit code 137 (SIGKILL: memory, or a stop).
+    pub killed: BTreeSet<String>,
+}
+
+/// The events of the containers `current` lists (by ID; all of them when
+/// `None`): a container an update replaced just before the wait died with 137
+/// when it was stopped, and that says nothing about memory.
+pub(crate) fn parse_events(out: &str, current: Option<&[ServiceRun]>) -> Events {
+    let mut events = Events::default();
+    for e in out
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Event>(l.trim()).ok())
+        .filter(|e| current.is_none_or(|c| c.iter().any(|s| s.id == e.id)))
+    {
+        let Some(service) = e.actor.attributes.get("com.docker.compose.service") else {
+            continue;
+        };
+        match e.action.as_str() {
+            "oom" => {
+                events.oom.insert(service.clone());
+            }
+            "die" if e.actor.attributes.get("exitCode").map(String::as_str) == Some("137") => {
+                events.killed.insert(service.clone());
+            }
+            _ => {}
+        }
+    }
+    events
+}
+
+/// The site's `oom` and `die` events from `since` (a `docker events --since`
+/// value: Unix seconds or a duration like `24h`) until now. Docker keeps its
+/// last 256 events in memory, so this outlives the restart that cleared
+/// `State.OOMKilled`. Empty when Docker didn't answer.
+pub(crate) fn events_since(stack: &Stack, since: &str, current: Option<&[ServiceRun]>) -> Events {
+    let mut c = docker::docker();
+    c.args([
+        "events",
+        "--since",
+        since,
+        "--until",
+        &unix_secs(SystemTime::now()).saturating_add(1).to_string(),
+        "--filter",
+        &format!("label=com.docker.compose.project={}", stack.project_name()),
+        "--filter",
+        "event=oom",
+        "--filter",
+        "event=die",
+        "--format",
+        "{{json .}}",
+    ]);
+    docker::try_capture(c)
+        .map(|out| parse_events(&out, current))
+        .unwrap_or_default()
+}
+
+/// Postgres's own line when the kernel killed one of its processes
+/// (`postmaster.c`: "server process (PID n) was terminated by signal 9:
+/// Killed"). The database then restarts itself inside a running container.
+pub(crate) fn postgres_killed(log: &str) -> bool {
+    log.lines()
+        .any(|l| l.contains("was terminated by signal 9"))
+}
+
+/// The db container's log since `since` (Unix seconds); empty when unreadable.
+fn db_log_since(stack: &Stack, since: u64) -> String {
+    let Some(db) = containers_of(stack, &["db"]).and_then(|c| c.into_iter().next()) else {
+        return String::new();
+    };
+    let mut c = docker::docker();
+    c.args(["logs", "--since", &since.to_string(), &db.0]);
+    match docker::output_within(&mut c, LOCAL_PROBE_TIMEOUT) {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(_) => String::new(),
+    }
+}
+
+/// Everything that says memory stopped part of the site.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemoryEvidence {
+    /// `State.OOMKilled` seen, or an `oom` event: out of memory for certain.
+    pub oom: BTreeSet<String>,
+    /// Killed (exit 137, or Postgres's signal-9 line) with no proof of why.
+    pub killed: BTreeSet<String>,
+}
+
+impl MemoryEvidence {
+    /// What the evidence says, in plain words; `None` when it says nothing.
+    pub(crate) fn reason(&self, remedy: impl FnOnce() -> String) -> Option<String> {
+        if !self.oom.is_empty() {
+            return Some(out_of_memory(&self.oom, &remedy()));
+        }
+        if !self.killed.is_empty() {
+            return Some(likely_out_of_memory(&self.killed, &remedy()));
+        }
+        None
+    }
+}
+
+/// Put together what the looks saw (`seen`), the containers now, the site's
+/// events since `since` and, for the database, Postgres's own log.
+pub(crate) fn memory_evidence(
+    seen: &BTreeSet<String>,
+    now: &[ServiceRun],
+    events: Events,
+    db_log: &str,
+) -> MemoryEvidence {
+    let mut oom = seen.clone();
+    oom.extend(
+        now.iter()
+            .filter(|s| s.oom_killed)
+            .map(|s| s.service.clone()),
+    );
+    oom.extend(events.oom);
+    let mut killed = events.killed;
+    if postgres_killed(db_log) {
+        killed.insert("db".into());
+    }
+    killed.retain(|s| !oom.contains(s));
+    MemoryEvidence { oom, killed }
+}
+
+/// After a wait that failed or ran out: did memory stop part of the site?
+/// Asks Docker once (inspect, `docker events` since the wait started, the
+/// db's log) and names the runtime's memory setting only when it did.
+pub(crate) fn memory_verdict(
+    stack: &Stack,
+    started: SystemTime,
+    strikes: &Strikes,
+) -> Option<String> {
+    // A couple of seconds early: Docker's clock and ours may differ a little.
+    let since = unix_secs(started).saturating_sub(2);
+    let now = services_now(stack);
+    let evidence = memory_evidence(
+        &strikes.oom_killed,
+        &now,
+        events_since(stack, &since.to_string(), Some(&now)),
+        &db_log_since(stack, since),
+    );
+    evidence.reason(crate::docker_runtime::memory_remedy_here)
+}
+
+/// Services OOM-killed now (`State.OOMKilled`) or by an `oom` event in the
+/// last day, for doctor. `None` when Docker didn't answer.
+pub fn out_of_memory_now(stack: &Stack) -> Option<BTreeSet<String>> {
+    let services = containers_of(stack, &SERVICES)?;
+    let names: Vec<&str> = services.iter().map(|(n, _)| n.as_str()).collect();
+    let mut oom: BTreeSet<String> = inspect(&names)
+        .iter()
+        .filter(|i| i.state.oom_killed)
+        .map(|i| i.service().unwrap_or_default().to_string())
+        .collect();
+    oom.extend(events_since(stack, "24h", None).oom);
+    Some(oom)
 }
 
 #[cfg(test)]
@@ -1023,6 +1411,7 @@ mod tests {
             app: running_app(),
             log: Some(DB_UNREACHABLE.into()),
             half_attached: Vec::new(),
+            services: Vec::new(),
         };
         let why = judge(&look, &mut Strikes::default()).unwrap();
         assert!(why.contains("can't reach its database"));
@@ -1035,6 +1424,7 @@ mod tests {
             app: running_app(),
             log: Some(DB_UNREACHABLE.into()),
             half_attached: vec![("n".into(), "atelier-hardening-test-db-1".into())],
+            services: Vec::new(),
         };
         assert_eq!(
             judge(&look, &mut Strikes::default()).as_deref(),
@@ -1061,6 +1451,7 @@ mod tests {
             app: running_app(),
             log: Some("[converge] waiting for database… (0s)\n".into()),
             half_attached: Vec::new(),
+            services: Vec::new(),
         };
         for _ in 0..3 {
             assert_eq!(judge(&Look::default(), &mut strikes), None);
@@ -1079,6 +1470,7 @@ mod tests {
             }),
             log: Some(String::new()),
             half_attached: Vec::new(),
+            services: Vec::new(),
         };
         assert_eq!(judge(&stopped, &mut strikes), None);
         assert_eq!(judge(&stopped, &mut strikes).as_deref(), Some(SITE_STOPPED));
@@ -1100,6 +1492,7 @@ mod tests {
             app: running_app(),
             log: Some("[converge] waiting for database… (0s)\n".into()),
             half_attached: Vec::new(),
+            services: Vec::new(),
         };
         let odd = Look {
             docker: true,
@@ -1109,6 +1502,7 @@ mod tests {
             }),
             log: Some(String::new()),
             half_attached: vec![("n".into(), "c".into())],
+            services: Vec::new(),
         };
         for _ in 0..3 {
             assert_eq!(judge(&odd, &mut strikes), None);
@@ -1134,5 +1528,190 @@ mod tests {
             e.downcast_ref::<BootFailed>().map(|b| b.0.as_str()),
             Some("Your site can't reach its database")
         );
+    }
+
+    fn svc(service: &str, oom: bool, restarting: bool, count: u64) -> ServiceRun {
+        ServiceRun {
+            id: format!("id-{service}"),
+            service: service.into(),
+            name: format!("atelier-x-{service}-1"),
+            oom_killed: oom,
+            restarting,
+            exit_code: if oom { 137 } else { 0 },
+            restart_count: count,
+        }
+    }
+
+    fn booting(services: Vec<ServiceRun>) -> Look {
+        Look {
+            docker: true,
+            app: running_app(),
+            log: Some("[converge] waiting for database… (0s)\n".into()),
+            half_attached: Vec::new(),
+            services,
+        }
+    }
+
+    /// `docker inspect` of a container whose restart policy is about to start
+    /// it again after an OOM kill (OrbStack, Docker 29.4.0, 2026-11-14): Docker
+    /// says `Running: true` while it waits.
+    const INSPECT_OOM_RESTARTING: &str = r#"[{"Name":"/atelier-scn-oom-app-1","RestartCount":5,"State":{"Status":"restarting","Running":true,"Restarting":true,"OOMKilled":true,"ExitCode":137,"StartedAt":"2026-11-14T20:56:00.1Z"},"Config":{"Labels":{"com.docker.compose.service":"app"}}}]"#;
+
+    #[test]
+    fn a_container_between_restarts_is_not_running_and_carries_its_oom_flag() {
+        let i = parse_inspect(INSPECT_OOM_RESTARTING);
+        let run = i[0].run();
+        assert_eq!(
+            run,
+            ServiceRun {
+                id: String::new(),
+                service: "app".into(),
+                name: "atelier-scn-oom-app-1".into(),
+                oom_killed: true,
+                restarting: true,
+                exit_code: 137,
+                restart_count: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn a_service_killed_or_restarted_twice_in_a_row_ends_the_wait() {
+        let base = vec![svc("db", false, false, 0), svc("app", false, false, 2)];
+        // OOMKilled on a running container: a killed child process.
+        let mut strikes = Strikes::from_baseline(&base);
+        let child = booting(vec![svc("db", false, false, 0), svc("app", true, false, 2)]);
+        assert_eq!(judge(&child, &mut strikes), None, "one look is not enough");
+        let why = judge(&child, &mut strikes).unwrap();
+        assert!(
+            why.contains("(the app) keeps stopping and starting again"),
+            "{why}"
+        );
+        assert!(strikes.oom_killed.contains("app"));
+        // RestartCount above the baseline, the flag already reset by the restart.
+        let mut strikes = Strikes::from_baseline(&base);
+        let looping = booting(vec![
+            svc("db", false, false, 1),
+            svc("app", false, false, 2),
+        ]);
+        assert_eq!(judge(&looping, &mut strikes), None);
+        assert!(judge(&looping, &mut strikes)
+            .unwrap()
+            .contains("(the database)"));
+        assert!(strikes.oom_killed.is_empty());
+        assert_eq!(strikes.restarted, BTreeSet::from(["db".to_string()]));
+        // Restart counts a site had before the wait never count.
+        let mut strikes = Strikes::from_baseline(&base);
+        let calm = booting(base.clone());
+        for _ in 0..3 {
+            assert_eq!(judge(&calm, &mut strikes), None);
+        }
+        // A container the baseline missed starts its own baseline.
+        let mut strikes = Strikes::default();
+        let late = booting(vec![svc("edge", false, false, 4)]);
+        for _ in 0..3 {
+            assert_eq!(judge(&late, &mut strikes), None);
+        }
+    }
+
+    /// `docker events --format '{{json .}}'` of an OOM-killed scenario app
+    /// (OrbStack, Docker 29.4.0, 2026-11-14), the compose labels Docker copies
+    /// into the attributes, trimmed.
+    const EVENTS: &str = r#"{"status":"oom","id":"bc41","Type":"container","Action":"oom","Actor":{"ID":"bc41","Attributes":{"com.docker.compose.project":"atelier-scn-oom","com.docker.compose.service":"app","image":"atelier-scn-app:x","name":"atelier-scn-oom-app-1"}},"scope":"local","time":1794689000}
+{"status":"die","id":"bc41","Type":"container","Action":"die","Actor":{"ID":"bc41","Attributes":{"com.docker.compose.project":"atelier-scn-oom","com.docker.compose.service":"app","execDuration":"0","exitCode":"137","name":"atelier-scn-oom-app-1"}},"scope":"local","time":1794689000}
+{"status":"die","id":"ed9e","Type":"container","Action":"die","Actor":{"ID":"ed9e","Attributes":{"com.docker.compose.project":"atelier-scn-oom","com.docker.compose.service":"edge","exitCode":"137","name":"atelier-scn-oom-edge-1"}},"scope":"local","time":1794689001}
+{"status":"die","id":"ed9f","Type":"container","Action":"die","Actor":{"ID":"ed9f","Attributes":{"com.docker.compose.service":"db","exitCode":"0"}},"time":1794689002}
+not json"#;
+
+    #[test]
+    fn docker_events_name_the_oom_killed_and_the_killed_services() {
+        // Only the containers there now: edge's 137 came from one replaced
+        // before the wait.
+        let now = [ServiceRun {
+            id: "bc41".into(),
+            ..svc("app", false, false, 0)
+        }];
+        let e = parse_events(EVENTS, Some(&now));
+        assert_eq!(e.oom, BTreeSet::from(["app".to_string()]));
+        assert_eq!(e.killed, BTreeSet::from(["app".to_string()]));
+        let e = parse_events(EVENTS, None);
+        assert_eq!(e.oom, BTreeSet::from(["app".to_string()]));
+        assert_eq!(
+            e.killed,
+            BTreeSet::from(["app".to_string(), "edge".to_string()])
+        );
+    }
+
+    const PG_KILLED: &str = "2026-11-14 20:56:53.894 UTC [1] LOG:  server process (PID 63) was terminated by signal 9: Killed\n\
+        2026-11-14 20:56:53.894 UTC [1] LOG:  terminating any other active server processes\n";
+
+    #[test]
+    fn out_of_memory_is_said_only_with_the_flag_or_an_oom_event() {
+        let remedy = || {
+            "Give Docker more memory in OrbStack's settings (Settings → System → Memory limit)"
+                .to_string()
+        };
+        // Exit 137 alone (our own stops give it too): hedged.
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &[],
+            parse_events(
+                &EVENTS.replace("\"Action\":\"oom\"", "\"Action\":\"x\""),
+                None,
+            ),
+            "",
+        );
+        let why = e.reason(remedy).unwrap();
+        assert!(why.starts_with("Docker stopped part of your site by force (the app and the web server), likely for lack of memory."), "{why}");
+        assert!(BootFailed(why).out_of_memory());
+        // The oom event: certain, and the 137 of the same service isn't repeated.
+        let e = memory_evidence(&BTreeSet::new(), &[], parse_events(EVENTS, None), "");
+        assert_eq!(e.oom, BTreeSet::from(["app".to_string()]));
+        assert_eq!(e.killed, BTreeSet::from(["edge".to_string()]));
+        assert_eq!(
+            e.reason(remedy).unwrap(),
+            "Your site ran out of memory, so Docker stopped part of it (the app). Give Docker \
+             more memory in OrbStack's settings (Settings → System → Memory limit), or stop \
+             other sites, then start your site again."
+        );
+        // The database: the flag on a running db plus Postgres's own line.
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &[svc("db", true, false, 0)],
+            Events::default(),
+            PG_KILLED,
+        );
+        let why = e.reason(remedy).unwrap();
+        assert!(
+            why.contains("stopped part of it (the database). Your site's data is safe."),
+            "{why}"
+        );
+        assert!(BootFailed(why).out_of_memory());
+        // Postgres's line alone: killed, cause unproven.
+        let e = memory_evidence(&BTreeSet::new(), &[], Events::default(), PG_KILLED);
+        assert!(e
+            .reason(remedy)
+            .unwrap()
+            .contains("(the database), likely for lack of memory"));
+        // What the looks saw counts after the restart reset the flag.
+        let e = memory_evidence(
+            &BTreeSet::from(["app".to_string()]),
+            &[svc("app", false, false, 3)],
+            Events::default(),
+            "",
+        );
+        assert!(e.reason(remedy).unwrap().contains("(the app)"));
+        // Nothing: no memory reason, the wait's own reason stands.
+        assert_eq!(
+            memory_evidence(
+                &BTreeSet::new(),
+                &[svc("app", false, false, 3)],
+                Events::default(),
+                "x"
+            )
+            .reason(remedy),
+            None
+        );
+        assert!(!BootFailed(crash_loop(&BTreeSet::from(["app".to_string()]))).out_of_memory());
     }
 }

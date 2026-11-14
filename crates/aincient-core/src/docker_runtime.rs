@@ -75,6 +75,58 @@ impl Runtime {
     }
 }
 
+/// How the owner gives the containers more memory on `runtime`, as the start
+/// of a sentence ("…, or stop other sites"). `profile` is a non-default Colima
+/// profile ([`colima_profile`]).
+///
+/// Settings paths, checked against each vendor's docs on 2026-11-14:
+/// - Docker Desktop: "Settings > VM resources > Advanced > Memory limit"
+///   (<https://docs.docker.com/desktop/settings-and-maintenance/settings/>);
+///   older Desktop releases call the tab "Resources" (not re-checked).
+/// - OrbStack: "Settings > System > Memory limit", key `memory_mib`
+///   (<https://docs.orbstack.dev/settings>).
+/// - Colima: `colima start --memory <GiB>`, default VM 2 GiB
+///   (<https://github.com/abiosoft/colima#customizing-the-vm>); a running VM
+///   must be stopped first.
+/// - Rancher Desktop: "Preferences > Virtual Machine > Hardware" → Memory
+///   (<https://docs.rancherdesktop.io/ui/preferences/virtual-machine/hardware>;
+///   the path is read off the page's breadcrumbs, not a written step).
+pub fn memory_remedy(runtime: Runtime, profile: Option<&str>) -> String {
+    match runtime {
+        Runtime::DockerDesktop => "Give Docker more memory in Docker Desktop's settings \
+             (Settings → VM resources → Advanced → Memory limit)"
+            .into(),
+        Runtime::OrbStack => {
+            "Give Docker more memory in OrbStack's settings (Settings → System → Memory limit)"
+                .into()
+        }
+        Runtime::Colima => {
+            let p = profile
+                .map(|p| format!(" --profile {p}"))
+                .unwrap_or_default();
+            format!("Give Docker more memory (`colima stop{p}`, then `colima start{p} --memory 4`)")
+        }
+        Runtime::RancherDesktop => "Give Docker more memory in Rancher Desktop's preferences \
+             (Preferences → Virtual Machine → Hardware → Memory)"
+            .into(),
+        // No VM in between: the computer itself is out of memory.
+        Runtime::LinuxEngine => "Close other programs to free memory on this computer".into(),
+        Runtime::Unknown => "Give Docker more memory in its settings".into(),
+    }
+}
+
+/// [`memory_remedy`] for the runtime here: one `docker info` and one `docker
+/// context inspect` ([`gather`]), nothing else. For a reason already known to
+/// be about memory.
+pub fn memory_remedy_here() -> String {
+    let signals = gather();
+    let runtime = detect_from(&signals, HostOs::current());
+    let profile = (runtime == Runtime::Colima)
+        .then(|| colima_profile(&signals))
+        .flatten();
+    memory_remedy(runtime, profile.as_deref())
+}
+
 /// The operating system this Manager runs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostOs {

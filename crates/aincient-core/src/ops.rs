@@ -580,7 +580,11 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
     let started = Instant::now();
     let deadline = started + timeout;
     let mut next_look = started + boot::LOOK_EVERY;
-    let mut strikes = boot::Strikes::default();
+    // What every service's restart count was before the wait: a restart
+    // policy that starts a killed container again within a second hides the
+    // death from a look that only asks "is it running?".
+    let wait_started = std::time::SystemTime::now();
+    let mut strikes = boot::Strikes::from_baseline(&boot::services_now(stack));
     r.stage(
         Stage::Booting,
         "Waiting for the console to finish booting…",
@@ -590,6 +594,7 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
         if http_ready(port) {
             let look = boot::look(stack, false);
             if let Some(why) = look.log.as_deref().and_then(boot::boot_failure) {
+                let why = memory_or(stack, wait_started, &strikes, why, r);
                 return boot_failed(r, &look, why);
             }
             r.stage(Stage::Ready, "The console is up.", Some(1.0));
@@ -599,11 +604,17 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
         if now >= next_look {
             let look = boot::look(stack, true);
             if let Some(why) = boot::judge(&look, &mut strikes) {
+                let why = memory_or(stack, wait_started, &strikes, why, r);
                 return boot_failed(r, &look, why);
             }
             next_look = Instant::now() + boot::LOOK_EVERY;
         }
         if Instant::now() >= deadline {
+            // Ran out of time: memory may be why (a container Docker keeps
+            // restarting between looks), and that is worth saying.
+            if let Some(why) = boot::memory_verdict(stack, wait_started, &strikes) {
+                return Boot::Failed(why);
+            }
             r.stage(
                 Stage::Booting,
                 "Still booting — this is taking longer than usual.",
@@ -620,6 +631,31 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
             Some(frac.min(0.95)),
         );
         std::thread::sleep(Duration::from_millis(750));
+    }
+}
+
+/// The reason a failed wait gives: out of memory when Docker's own record
+/// says so ([`boot::memory_verdict`]: the flag, an `oom` event, a killed
+/// Postgres process), since a converge that failed or a service that stopped
+/// is then only the symptom; `why` otherwise. Docker going away and a
+/// half-attached network keep theirs: the owner's step there is restarting
+/// Docker, and Docker's record can't be read.
+fn memory_or(
+    stack: &Stack,
+    started: std::time::SystemTime,
+    strikes: &boot::Strikes,
+    why: String,
+    r: &mut dyn Reporter,
+) -> String {
+    if why == boot::NETWORK_STUCK || why == boot::DOCKER_STOPPED {
+        return why;
+    }
+    match boot::memory_verdict(stack, started, strikes) {
+        Some(memory) => {
+            r.log(&format!("The wait saw: {why}"));
+            memory
+        }
+        None => why,
     }
 }
 
