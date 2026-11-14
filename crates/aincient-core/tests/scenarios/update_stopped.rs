@@ -1,6 +1,7 @@
-//! Scenario 6 — update of a stopped site that won't boot (B3, fixed in
-//! 11dd0cc): an update backs the site up first, so a stopped site is started
-//! for its backup. When it won't start (its build fails its converge on this
+//! Scenario 6 — update of a stopped site that won't boot (refused since
+//! 2133546; typed, with the `--no-backup` way past, in 11dd0cc, B3): an
+//! update backs the site up first, so a stopped site is started for its
+//! backup. When it won't start (its build fails its converge on this
 //! data), the update must stop with [`BackupBeforeUpdateFailed`] carrying the
 //! plain reason, and leave the site on its version. Told to go without the
 //! backup (`--no-backup`), the update proceeds and the new build boots.

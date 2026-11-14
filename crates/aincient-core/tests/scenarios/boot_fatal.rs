@@ -1,4 +1,5 @@
-//! Scenario 9 — a boot that logs `[converge] FATAL` (M3, A5 in 4c1b422): the
+//! Scenario 9 — a boot that logs `[converge] FATAL` (M3; A5 in 4c1b422, which
+//! only held once the log was read in order, 60c624a): the
 //! appliance's entrypoint starts its web server even after a failed converge,
 //! so the console answers; Start must still say the boot failed, with
 //! converge's reason in plain words. A later converge in the same container

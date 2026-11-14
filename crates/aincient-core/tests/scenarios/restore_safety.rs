@@ -1,8 +1,9 @@
-//! Scenario 5 — a restore whose safety backup fails (B2, fixed in 11dd0cc): a
-//! restore drops the database before loading the backup, so it first backs up
-//! the site as it is now. When that backup failed (here: the backups folder is
-//! read-only, as on a full or locked-down disk) the restore went ahead anyway,
-//! and the work since the chosen backup was gone for good. It must refuse
+//! Scenario 5 — a restore whose safety backup fails (refused since 820e4bc;
+//! the app's override in 11dd0cc, B2): a restore drops the database before
+//! loading the backup, so it first backs up the site as it is now. When that
+//! backup failed (here: the backups folder is read-only, as on a full or
+//! locked-down disk) the restore went ahead anyway, and the work since the
+//! chosen backup was gone for good. It must refuse
 //! with [`SafetyBackupFailed`] and leave the database as it is; told to go
 //! without the copy (`--no-safety-backup`), it restores.
 //!
