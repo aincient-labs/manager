@@ -842,7 +842,12 @@ fn explain_line(line: &str) -> Option<String> {
     if line.contains("Cannot connect to the Docker daemon") {
         return Some(DOCKER_NOT_ANSWERING.to_string());
     }
-    if line.contains("no space left on device") {
+    // Docker (Go) writes it in lower case, libc's strerror ("pg_dump: error:
+    // could not write to file: No space left on device") capitalised.
+    if line
+        .to_ascii_lowercase()
+        .contains("no space left on device")
+    {
         return Some(
             "Docker has run out of disk space. Free up space (System → Disk space in the app, \
              or `atelier app cleanup`), or give Docker more disk space in its settings, then \
@@ -879,9 +884,20 @@ pub fn run_capture(mut cmd: Command, action: &str) -> Result<String> {
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("failed to {action}:\n{}", stderr.trim());
+        bail!("{}", capture_failure(action, stderr.trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// What a failed [`run_capture`] says: the plain sentence for a cause the
+/// owner can fix ([`explain_failure`]: a full disk inside a backup's dump, say)
+/// first, then the step's own words for a bug report.
+fn capture_failure(action: &str, stderr: &str) -> String {
+    let tail: Vec<String> = stderr.lines().map(str::to_string).collect();
+    match explain_failure(&tail) {
+        Some(why) => format!("failed to {action}: {why}\n{stderr}"),
+        None => format!("failed to {action}:\n{stderr}"),
+    }
 }
 
 /// Run, capture stdout, and return the *reason* on failure instead of discarding
@@ -1252,6 +1268,28 @@ mod tests {
             let why = super::explain_failure(&lines(&[raw])).unwrap();
             assert!(why.starts_with("Docker has run out of disk space"), "{why}");
         }
+    }
+
+    /// `pg_dump` inside the app container of scenario 13 (`/tmp` full),
+    /// 2026-11-14: libc's spelling, capitalised.
+    const NO_SPACE_PG_DUMP: &str =
+        "pg_dump: error: could not write to file: No space left on device";
+
+    #[test]
+    fn a_full_disk_inside_a_container_is_named_and_its_words_kept() {
+        let why = super::explain_failure(&lines(&[NO_SPACE_PG_DUMP])).unwrap();
+        assert!(why.starts_with("Docker has run out of disk space"), "{why}");
+        let said = super::capture_failure("dump the database", NO_SPACE_PG_DUMP);
+        assert!(
+            said.starts_with("failed to dump the database: Docker has run out of disk space."),
+            "{said}"
+        );
+        assert!(said.ends_with(NO_SPACE_PG_DUMP), "{said}");
+        // Anything else reads as before.
+        assert_eq!(
+            super::capture_failure("dump the database", "drush: boom"),
+            "failed to dump the database:\ndrush: boom"
+        );
     }
 
     #[test]
