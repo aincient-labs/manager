@@ -58,6 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An update no longer goes ahead when the backup it takes first fails (a full disk, a read-only
+  backups folder): it stops and your site stays on its version. **Update without a backup**
+  (`atelier app update --no-backup`) goes on without one.
+
 - A site whose database had lost its connection to the site's network (left behind by Docker, or by
   an earlier start that cleared Docker's leftovers) no longer stays stuck on "can't reach its
   database", even after restarting Docker. Start, update and **Run a checkup** now reconnect it and

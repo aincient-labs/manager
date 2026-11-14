@@ -227,6 +227,7 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 4 | `settings_applied.rs` | changed `.env`, same image: Update recreates without a backup, then is up to date |
 | 5 | `restore_safety.rs` | unwritable backups folder: restore refused, database untouched; `no_safety_backup` restores |
 | 6 | `update_stopped.rs` | stopped site that won't boot: update refused (`BackupBeforeUpdateFailed`); `no_backup` updates |
+| 6b | `update_running_backup_fails.rs` | running site whose before-update backup fails (read-only backups folder): update refused, site on its build; `no_backup` updates |
 | 7 | `cleanup_needed.rs` | a stopped site's image, a digest pin and an engine pin count as needed (selection only) |
 | 8 | `erased_db.rs` | erased db volume: Start and `doctor --fix` refuse, create nothing; a restore brings it back |
 | 9 | `boot_fatal.rs` | a FATAL boot fails Start in plain words; a later `converge OK` clears it |

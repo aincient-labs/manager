@@ -1225,6 +1225,19 @@ impl std::fmt::Display for BackupBeforeUpdateFailed {
 
 impl std::error::Error for BackupBeforeUpdateFailed {}
 
+/// The before-update backup of a running site, or the refusal: an update that
+/// migrates with no way back is worse than no update (a full disk is the usual
+/// cause, and the same disk would fail the migration's own snapshot). The owner
+/// can go on without one ([`UpdateOptions::no_backup`]). Was "Continuing" until
+/// the prior-art review (2026-11-14).
+fn backup_or_refuse<T>(outcome: Result<T>) -> Result<T> {
+    outcome.map_err(|e| {
+        anyhow::Error::new(BackupBeforeUpdateFailed {
+            cause: format!("Couldn't back up your site first ({e:#})"),
+        })
+    })
+}
+
 /// [`update`] with [`UpdateOptions`].
 pub fn update_with(stack: &Stack, opts: &UpdateOptions, r: &mut dyn Reporter) -> Result<Updated> {
     let plan = plan_upgrade(stack, None);
@@ -1341,20 +1354,14 @@ fn run_upgrade(
             // skipped when the channel move above just took one, or when the owner
             // said to go without.
             if !snapshot_taken && !opts.no_backup {
-                if let Err(e) = safety_backup(
+                backup_or_refuse(safety_backup(
                     stack,
                     "before-update",
                     "Backing up before the update…",
                     0.03,
                     PULL_FROM - 0.04,
                     r,
-                ) {
-                    r.stage(
-                        Stage::Working,
-                        &format!("Couldn't take a backup first ({e:#}). Continuing."),
-                        Some(PULL_FROM - 0.01),
-                    );
-                }
+                ))?;
             }
             up(stack, r)?;
             let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
@@ -1388,21 +1395,12 @@ fn run_upgrade(
                 span: ROUTE_START - 0.03,
                 prefix: String::new(),
             };
-            match backup(stack, Some("before-stepped-upgrade"), &mut snap) {
-                Ok(path) => r.stage(
-                    Stage::Working,
-                    &format!("Snapshot saved: {}", path.display()),
-                    Some(0.05),
-                ),
-                Err(e) => r.stage(
-                    Stage::Working,
-                    &format!(
-                        "Couldn't take a snapshot first ({e:#}) — continuing; each step \
-                         rolls its own database back if it fails."
-                    ),
-                    Some(0.05),
-                ),
-            }
+            let path = backup_or_refuse(backup(stack, Some("before-stepped-upgrade"), &mut snap))?;
+            r.stage(
+                Stage::Working,
+                &format!("Snapshot saved: {}", path.display()),
+                Some(0.05),
+            );
         }
 
         // Each hop rewrites `.env` to the version it lands on, so a route that
@@ -5634,6 +5632,20 @@ mod tests {
             woke_without_start(container_state_from_ps(&running), Some("awake")),
             Woke::No
         );
+    }
+
+    #[test]
+    fn a_running_site_whose_backup_fails_is_not_updated() {
+        let e = super::backup_or_refuse::<()>(Err(anyhow::anyhow!(
+            "failed to copy the snapshot out of the container: write /backups/x.part: no space left on device"
+        )))
+        .unwrap_err();
+        let refusal = e
+            .downcast_ref::<super::BackupBeforeUpdateFailed>()
+            .expect("a typed refusal the app offers \"Update without a backup\" for");
+        assert!(refusal.cause.contains("no space left on device"));
+        assert!(e.to_string().ends_with("so it wasn't updated"));
+        assert_eq!(super::backup_or_refuse(Ok(7)).unwrap(), 7);
     }
 
     #[test]
