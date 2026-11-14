@@ -88,6 +88,20 @@ impl Outcome {
         state: "ready",
         reason: None,
     };
+    /// An update that found the site already on the newest build: nothing was
+    /// downloaded, backed up or restarted, and the window says so.
+    const CURRENT: Outcome = Outcome {
+        state: "current",
+        reason: None,
+    };
+}
+
+/// [`outcome`] for an update, keeping "already up to date" apart from "updated".
+fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, String> {
+    match result {
+        Ok(ops::Updated::AlreadyCurrent) => Ok(Outcome::CURRENT),
+        other => outcome(other.map(ops::Updated::ready)),
+    }
 }
 
 fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
@@ -574,16 +588,13 @@ async fn do_install(
 async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || {
-                outcome(ops::update(&s, &mut EventReporter { app }).map(ops::Updated::ready))
-            })
-            .await
+            blocking(move || update_outcome(ops::update(&s, &mut EventReporter { app }))).await
         }
         Target::Remote(site) => {
             blocking(move || {
                 let session = session(&site)?;
                 if session.check_update().map_err(err)?.update_available == Some(false) {
-                    return Ok(Outcome::READY);
+                    return Ok(Outcome::CURRENT);
                 }
                 session
                     .run_action(

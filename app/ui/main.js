@@ -780,6 +780,8 @@ function setProgressOpen(open) {
   }
 }
 
+const ALREADY_CURRENT_TEXT = "Already up to date. Nothing was downloaded or restarted.";
+
 async function runProgressOp(title, fn, opts = {}) {
   const me = ++progressOwner;
   // A new attempt supersedes the previous failure — leaving the old banner up
@@ -799,8 +801,11 @@ async function runProgressOp(title, fn, opts = {}) {
   // A start, setup or update says how it came out: {state: ready|booting|failed,
   // reason}. Failed gets the failure panel (Close / Copy / Details) with its
   // reason; booting is the "not answering yet" notice, already past the point
-  // where "a few seconds" would be true.
+  // where "a few seconds" would be true; current is an update that found the
+  // site already on the newest build (nothing downloaded, backed up or restarted).
+  let current = false;
   if (result && typeof result === "object" && typeof result.state === "string") {
+    current = result.state === "current";
     if (result.state === "failed") {
       failure = result.reason || "Your website couldn't finish starting.";
     } else if (result.state === "booting") {
@@ -829,6 +834,7 @@ async function runProgressOp(title, fn, opts = {}) {
     if (opts.lifecycle) setHomeNotice(result === false ? NOT_READY_TEXT : null);
     const settled = progressFinish();
     if (opts.lifecycle && result === false) $("progress-stage").textContent = NOT_READY_TEXT;
+    else if (current) $("progress-stage").textContent = ALREADY_CURRENT_TEXT;
     else if (pm.tidied) $("progress-stage").textContent = `Done. ${pm.tidied}`;
     try {
       await refresh();
@@ -837,7 +843,7 @@ async function runProgressOp(title, fn, opts = {}) {
     }
     await settled; // let the blocks finish their run before the panel closes
     // Long enough to read the clean-up line before the panel goes.
-    if (pm.tidied && result !== false) await new Promise((r) => setTimeout(r, 2500));
+    if ((current || pm.tidied) && result !== false) await new Promise((r) => setTimeout(r, 2500));
     // An update, setup or channel switch changes what "up to date" means: ask
     // again rather than leave the line on a stale or empty answer.
     if (opts.lifecycle === "update" || opts.lifecycle === "setup") backgroundUpdateRefresh(false);

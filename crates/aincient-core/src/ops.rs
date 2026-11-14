@@ -2097,7 +2097,7 @@ fn stack_database_erased(stack: &Stack) -> bool {
 }
 
 /// Refuse with [`DatabaseErased`] when this site's database volume is gone.
-fn refuse_erased_database(stack: &Stack) -> Result<()> {
+pub(crate) fn refuse_erased_database(stack: &Stack) -> Result<()> {
     if stack_database_erased(stack) {
         return Err(DatabaseErased {
             latest_backup: list_backups(stack).into_iter().next(),

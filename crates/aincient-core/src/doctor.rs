@@ -346,6 +346,9 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // A locked engine site stays down until its owner unlocks it.
             ops::refuse_locked(ops::engine_state_of(stack).as_deref())
                 .map_err(|e| format!("{e:#}"))?;
+            // `up` would create an empty database and install a fresh site over
+            // an erased one; the way back is a restore, as Start says.
+            ops::refuse_erased_database(stack).map_err(|e| format!("{e:#}"))?;
             // No deadline: `up` may pull and recreate. Recovers once from
             // Docker's leftovers (a stale network endpoint), like Start and Update.
             ops::run_recovering(stack, &["up", "-d"], "start the appliance", r)

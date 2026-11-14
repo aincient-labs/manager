@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rest of the site without it. A web-server or engine container that Docker left half connected is
   cleared like the database's.
 - A site whose database was removed from Docker no longer starts as a new, empty site. Start
-  refuses and names your latest backup; restoring it (**Backups**, which allows it while the site is
+  (and the checkup's fix, `atelier doctor --fix`) refuses and names your latest backup; restoring it (**Backups**, which allows it while the site is
   stopped, or `atelier data restore`) brings the site back. A database you erased yourself
   (**Remove and erase**, `atelier app down --wipe`) still starts as a fresh site.
 - Start and Stop say "Start Docker" when Docker isn't running, instead of a Docker error.
