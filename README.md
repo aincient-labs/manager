@@ -203,16 +203,34 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about half a minute each; CI runs them on Linux (`check.yml`, job
-`scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
+plugin, and take about four minutes together (20–40 s each); CI runs them on Linux (`check.yml`,
+job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
-  temp dir: the shipped template with `postgres:16-alpine` as `db`, a busybox `app` built per
-  test that waits for `db` by name, prints converge's own lines and serves `/user/login`, and
-  the shipped `edge` on a free port. Tests then call the real `ops`/`doctor` functions.
+  temp dir: the shipped template with `postgres:16-alpine` as `db`, a small Alpine `app` built per
+  test that waits for `db` by name, prints converge's own lines (or a FATAL, on a flag in its
+  `private` volume) and serves `/user/login`, and the shipped `edge` on a free port. Its `drush`
+  does only the four calls the Manager's backup/restore scripts make, on the real database, so
+  real backups and restores run. Tests then call the real `ops`/`doctor`/`cleanup` functions.
+- gives the Manager a temp user home for the whole run, so `~/.atelier/sites.toml` (which
+  clean-up reads) is the scenario's own, never yours.
 - only ever addresses compose projects named `atelier-scn-<test>-<n>`, and refuses any other.
 - cleans up when the test ends, passed or failed: `compose down -v`, then every image tag and
-  image the test built. Images it did not build are never touched.
+  image the test built. Images it did not build are never touched; a scenario whose update would
+  run the automatic clean-up refuses to run if that clean-up would remove anything here.
+
+| Scenario | File | What it holds |
+|---|---|---|
+| 1 | `stale_endpoint.rs` | Start recovers a db the stale-endpoint clear left on no network; every network kept |
+| 2 | `detached_db.rs` | checkup names a detached db; Start reconnects it |
+| 3 | `shared_tag.rs` | Start after a shared tag moved keeps the site's image |
+| 4 | `settings_applied.rs` | changed `.env`, same image: Update recreates without a backup, then is up to date |
+| 5 | `restore_safety.rs` | unwritable backups folder: restore refused, database untouched; `no_safety_backup` restores |
+| 6 | `update_stopped.rs` | stopped site that won't boot: update refused (`BackupBeforeUpdateFailed`); `no_backup` updates |
+| 7 | `cleanup_needed.rs` | a stopped site's image, a digest pin and an engine pin count as needed (selection only) |
+| 8 | `erased_db.rs` | erased db volume: Start and `doctor --fix` refuse, create nothing; a restore brings it back |
+| 9 | `boot_fatal.rs` | a FATAL boot fails Start in plain words; a later `converge OK` clears it |
+| 10 | `prune_backups.rs` | a restore keeps the 3 newest counted automatic backups, never a pre-0.17 one |
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
