@@ -8,7 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, engine_admin, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions, Stack,
+    doctor, engine_admin, gate, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions,
+    Stack,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -631,10 +632,14 @@ fn main() {
 
 /// What `atelier` exits with for `err`: a remote command's own code (the answer
 /// a script wants, m2-7), a refusal the Manager can override
-/// ([`ops::Overridable::exit_code`]), else 1.
+/// ([`ops::Overridable::exit_code`]: 3, 4), an update refused because the site
+/// isn't ready ([`gate::UpdateBlocked::EXIT_CODE`]: 5), else 1.
 fn exit_code(err: &anyhow::Error) -> i32 {
     if let Some(exit) = err.downcast_ref::<remote::RemoteExit>() {
         return exit.code;
+    }
+    if err.is::<gate::UpdateBlocked>() {
+        return gate::UpdateBlocked::EXIT_CODE;
     }
     ops::Overridable::of(err).map_or(1, ops::Overridable::exit_code)
 }
@@ -4078,6 +4083,10 @@ mod tests {
         });
         assert_eq!(exit_code(&e), 3);
         assert_eq!(exit_code(&anyhow::anyhow!("anything else")), 1);
+        let blocked = anyhow::Error::new(gate::UpdateBlocked {
+            blockers: vec![gate::Blocker::DockerNotAnswering],
+        });
+        assert_eq!(exit_code(&blocked), 5);
         // A server's own code passes through, these included.
         let remote = anyhow::Error::new(remote::RemoteExit {
             host: "deploy@example.com".into(),

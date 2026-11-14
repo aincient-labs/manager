@@ -19,6 +19,7 @@ pub mod doctor;
 pub mod engine;
 pub mod engine_admin;
 pub mod engine_client;
+pub mod gate;
 pub mod guard;
 pub mod mcp;
 pub mod ops;

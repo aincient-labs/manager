@@ -1324,12 +1324,24 @@ fn run_upgrade(
     // report into (review 2026-11-12: these were computed twice).
     let route = upgrade_plan(plan);
     route.announce(r);
-    r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
-    preflight().require()?;
-    // A locked engine site stays down until its owner unlocks it: an update
-    // must not start it behind the engine's back.
-    let engine_state = engine_state_of(stack);
-    refuse_locked(engine_state.as_deref())?;
+    r.stage(
+        Stage::Preflight,
+        "Checking your site is ready to update…",
+        Some(0.02),
+    );
+    // Docker missing, or its compose plugin: preflight's own words (an install
+    // problem, not a site that isn't ready).
+    let pf = preflight();
+    if !pf.docker_installed || !pf.compose_available {
+        pf.require()?;
+    }
+    // Refuse before any work while the site isn't ready (M2c, the HA model):
+    // Docker not answering, too little disk, an erased database, a container
+    // off its network, a service out of memory or crash-looping, a locked
+    // engine site. Nothing below repairs those mid-update.
+    let facts = crate::gate::gather(stack, &pf);
+    crate::gate::require_ready(&facts)?;
+    let engine_state = facts.engine_state;
     let files_before = stack_files(stack);
     let snapshot_taken = announce_legacy_migrations(stack, r)?;
     refresh_edge_conf(stack);
@@ -1372,7 +1384,7 @@ fn run_upgrade(
                     "Already up to date. Applying your changed settings…",
                     Some(UP_FROM),
                 );
-                up(stack, r)?;
+                up_updating(stack, r)?;
                 let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
                 if ready {
                     r.stage(Stage::Ready, SETTINGS_APPLIED, Some(1.0));
@@ -1399,7 +1411,7 @@ fn run_upgrade(
                     r,
                 ))?;
             }
-            up(stack, r)?;
+            up_updating(stack, r)?;
             let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
             if ready {
                 stack.clear_update_target();
@@ -1468,7 +1480,7 @@ fn run_upgrade(
             );
             stack.set_image(&step.image)?;
             pull(stack, &mut hop)?;
-            up(stack, &mut hop)?;
+            up_updating(stack, &mut hop)?;
             let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
                 Boot::Ready => true,
                 Boot::Booting => false,
@@ -1858,10 +1870,12 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         ),
         Some(0.9),
     );
-    run_recovering(
+    // Only ever inside an update, after its gate ([`Reattach::GatedAway`]).
+    run_recovering_with(
         stack,
         &["up", "-d", "--force-recreate", "db", "app"],
         "move the database server",
+        Reattach::GatedAway,
         r,
     )?;
     wait_until_ready(stack, READY_TIMEOUT, r).ready()
@@ -2378,6 +2392,24 @@ fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     up_unguarded(stack, r)
 }
 
+/// [`up`] inside an update, after [`crate::gate`] said the site was ready: it
+/// doesn't reconnect a detached container first ([`Reattach::GatedAway`]).
+/// The erased-database refusal stays: a refusal changes nothing, and it is
+/// the last word before `up` would create an empty database.
+fn up_updating(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
+    r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
+    run_recovering_with(
+        stack,
+        &["up", "-d"],
+        "start the appliance",
+        Reattach::GatedAway,
+        r,
+    )?;
+    clear_database_wiped(stack);
+    Ok(())
+}
+
 /// `docker compose up -d`, for the paths that may start an empty database: an
 /// install, and a restore into a site whose database was erased.
 fn up_unguarded(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
@@ -2435,7 +2467,7 @@ fn database_erased(site_id: Option<&str>, db_volume: Option<bool>, wiped: bool) 
 
 /// [`database_erased`] for `stack`, asking Docker. A database volume that
 /// exists again also clears a leftover owner's-wipe marker.
-fn stack_database_erased(stack: &Stack) -> bool {
+pub(crate) fn stack_database_erased(stack: &Stack) -> bool {
     let volume = docker::db_volume_exists(stack);
     if volume == Some(true) {
         clear_database_wiped(stack);
@@ -2486,10 +2518,35 @@ pub(crate) fn run_recovering(
     action: &str,
     r: &mut dyn Reporter,
 ) -> Result<()> {
+    run_recovering_with(stack, args, action, Reattach::First, r)
+}
+
+/// Whether [`run_recovering_with`] reconnects a container that lost its
+/// network before it runs the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reattach {
+    /// Every start, repair and channel move: compose never reconnects one.
+    First,
+    /// An update's `up`: [`crate::gate`] refused the update while any container
+    /// was detached, and nothing the update does before `up` detaches one, so
+    /// it never repairs that mid-update (M2c).
+    GatedAway,
+}
+
+fn run_recovering_with(
+    stack: &Stack,
+    args: &[&str],
+    action: &str,
+    reattach: Reattach,
+    r: &mut dyn Reporter,
+) -> Result<()> {
     ensure_engine_image(stack, r)?;
-    // Every start, up and update: a container that lost its network gets it
-    // back first (compose never reconnects one).
-    reattach_detached(stack, r);
+    if reattach == Reattach::First {
+        reattach_detached(stack, r);
+    }
+    // Docker's stale endpoint (the 2026-11-14 incident) appears only when
+    // the step itself fails to start a container, so no gate can see it
+    // first: this recovery stays on every path, the update's included.
     let mut cmd = compose(stack);
     cmd.args(args);
     let first = match run_step(cmd, action, r) {
