@@ -1494,7 +1494,10 @@ let updateAttempted = false; // a check has run for this site since it was opene
 // until a newer answer lands.
 let updateCheckProblem = null;
 
-const RELEASE_NOTES = "https://github.com/aincient-labs/atelier-cms/releases/tag/v";
+// Release tags are `v<semver>`; the image label may or may not carry the `v`.
+const releaseNotesUrl = (version) =>
+  "https://github.com/aincient-labs/atelier-cms/releases/tag/" +
+  encodeURIComponent(version.startsWith("v") ? version : `v${version}`);
 
 // Paint Home's update banner and line, and the System tab's "Last checked",
 // from a cache status. Nothing shows for a site on a server: its check is the
@@ -1522,7 +1525,7 @@ function renderUpdateBanner(cached) {
     }
     parts.push(esc(ago));
     if (check.latest_version) {
-      const url = RELEASE_NOTES + encodeURIComponent(check.latest_version);
+      const url = releaseNotesUrl(check.latest_version);
       parts.push(`<a href="${esc(url)}">What's new</a>`);
     }
     $("update-banner-meta").innerHTML = parts.join(" · ");
