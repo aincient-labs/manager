@@ -25,8 +25,6 @@
 //! Deliberately NOT in the ladder, at any flag: `down -v`, reinstall, restore.
 //! Those destroy data, so doctor only ever *names* them as the next step.
 
-use std::process::Command;
-
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
@@ -527,6 +525,7 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
 
     out.push(check_port(stack, pf.docker_running));
     out.push(check_disk(stack));
+    out.push(check_docker_disk(stack, pf.docker_running));
     out.push(check_docker_memory(pf.docker_running));
 
     pf.ok()
@@ -683,38 +682,57 @@ fn port_verdict(
     Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port}"))
 }
 
-/// Free space where the stack (and Docker's volumes, on Linux) lives. The image
-/// is ~1 GB and a converge takes a database snapshot, so a nearly-full disk is a
-/// real and confusing failure mode — an upgrade dies mid-migration.
-fn check_disk(stack: &Stack) -> Check {
-    const ID: &str = "host.disk";
-    const LABEL: &str = "Free disk space";
-    const NEEDED_MB: u64 = 4096;
+const DISK_LABEL: &str = "Free disk space on this computer";
+const DOCKER_DISK_LABEL: &str = "Free disk space for Docker";
 
-    let Some(free_mb) = free_space_mb(&stack.home) else {
-        return Check::skipped(
-            ID,
-            Tier::Host,
-            LABEL,
-            "Couldn't read free space on this platform.",
-        );
-    };
-    let detail = format!("{:.1} GB free", free_mb as f64 / 1024.0);
-    if free_mb >= NEEDED_MB {
-        return Check::ok(ID, Tier::Host, LABEL).detail(detail);
-    }
-    Check::bad(
-        ID,
-        Tier::Host,
-        LABEL,
-        Severity::Warn,
-        format!(
-            "Less than {} GB free. The appliance image plus a pre-upgrade database snapshot need \
-             room — free some space before updating.",
-            NEEDED_MB / 1024
-        ),
+/// Free space in the two places a site writes (M2c): this computer's disk
+/// where its backups are saved (`host.disk`), and Docker's own disk
+/// (`host.docker_disk`: on a Mac a virtual machine's disk, which a roomy
+/// computer disk says nothing about). Warn below [`disk::WARN_BELOW`], fail
+/// below [`disk::BLOCK_BELOW`], where an update is refused.
+fn check_disk(stack: &Stack) -> Check {
+    disk_verdict(
+        "host.disk",
+        DISK_LABEL,
+        crate::disk::host_free(stack),
+        || "Couldn't read free space on this platform.".into(),
     )
-    .detail(detail)
+}
+
+fn check_docker_disk(stack: &Stack, docker_running: bool) -> Check {
+    if !docker_running {
+        return Check::skipped(
+            "host.docker_disk",
+            Tier::Host,
+            DOCKER_DISK_LABEL,
+            "Docker isn't answering.",
+        );
+    }
+    disk_verdict(
+        "host.docker_disk",
+        DOCKER_DISK_LABEL,
+        crate::disk::docker_free(stack),
+        || "Unknown: it is read inside a running container, and this site isn't running.".into(),
+    )
+}
+
+fn disk_verdict(
+    id: &'static str,
+    label: &'static str,
+    free: Option<crate::disk::Free>,
+    unknown: impl FnOnce() -> String,
+) -> Check {
+    use crate::disk::Level;
+    let Some(free) = free else {
+        return Check::skipped(id, Tier::Host, label, unknown());
+    };
+    let detail = format!("{} free", crate::disk::human(free.bytes));
+    let severity = match free.level() {
+        Level::Ok => return Check::ok(id, Tier::Host, label).detail(detail),
+        Level::Low => Severity::Warn,
+        Level::TooLow => Severity::Fail,
+    };
+    Check::bad(id, Tier::Host, label, severity, free.remedy(false)).detail(detail)
 }
 
 const DOCKER_MEMORY_ID: &str = "host.docker_memory";
@@ -840,38 +858,6 @@ fn memory_verdict(
         ),
     )
     .detail(format!("out of memory: {}", parts.join(", ")))
-}
-
-/// Free megabytes on the filesystem holding `path`, via POSIX `df -Pk`. Walks up
-/// to the nearest existing ancestor, since the stack directory may not exist yet.
-#[cfg(unix)]
-fn free_space_mb(path: &std::path::Path) -> Option<u64> {
-    let mut probe_path = path;
-    while !probe_path.exists() {
-        probe_path = probe_path.parent()?;
-    }
-    let out = Command::new("df")
-        .arg("-Pk")
-        .arg(probe_path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_df_available_kb(&String::from_utf8_lossy(&out.stdout)).map(|kb| kb / 1024)
-}
-
-#[cfg(not(unix))]
-fn free_space_mb(_path: &std::path::Path) -> Option<u64> {
-    None
-}
-
-/// The "Available" column (4th) of `df -Pk`'s data row, in KB. POSIX output mode
-/// guarantees one row per filesystem on a single line, so no continuation
-/// handling is needed.
-fn parse_df_available_kb(out: &str) -> Option<u64> {
-    let row = out.lines().nth(1)?;
-    row.split_whitespace().nth(3)?.parse().ok()
 }
 
 // --- tier 2: the stack -------------------------------------------------------
@@ -2215,17 +2201,32 @@ mod tests {
     }
 
     #[test]
-    fn df_available_column_is_the_fourth() {
-        // Verbatim `df -Pk /` on macOS 15.
-        let out = "Filesystem 1024-blocks      Used Available Capacity  Mounted on\n\
-                   /dev/disk3s1s1 971350180 10485760 123456789    8%    /\n";
-        assert_eq!(parse_df_available_kb(out), Some(123_456_789));
-    }
-
-    #[test]
-    fn df_garbage_is_not_a_number() {
-        assert_eq!(parse_df_available_kb(""), None);
-        assert_eq!(parse_df_available_kb("Filesystem 1024-blocks\n"), None);
+    fn disk_space_warns_below_five_and_fails_below_two() {
+        use crate::disk::{Free, Place, BLOCK_BELOW, WARN_BELOW};
+        let free = |bytes| {
+            Some(Free {
+                place: Place::Docker,
+                bytes,
+            })
+        };
+        let unknown = || "unknown".to_string();
+        let ok = disk_verdict("host.docker_disk", "x", free(WARN_BELOW), unknown);
+        assert_eq!(ok.severity, Severity::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("5.0 GB free"));
+        let low = disk_verdict("host.docker_disk", "x", free(WARN_BELOW - 1), unknown);
+        assert_eq!(low.severity, Severity::Warn);
+        assert!(low.remedy.unwrap().contains("below 2.0 GB it is refused"));
+        let too_low = disk_verdict("host.docker_disk", "x", free(BLOCK_BELOW - 1), unknown);
+        assert_eq!(too_low.severity, Severity::Fail);
+        let remedy = too_low.remedy.unwrap();
+        assert!(
+            remedy.contains("updates are refused below 2.0 GB")
+                && remedy.contains("Free up space (System → Disk space"),
+            "{remedy}"
+        );
+        let skipped = disk_verdict("host.docker_disk", "x", None, unknown);
+        assert_eq!(skipped.severity, Severity::Skipped);
+        assert_eq!(skipped.detail.as_deref(), Some("unknown"));
     }
 
     #[test]

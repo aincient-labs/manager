@@ -12,6 +12,7 @@
 
 pub mod boot;
 pub mod cleanup;
+pub mod disk;
 pub mod docker;
 pub mod docker_runtime;
 pub mod doctor;

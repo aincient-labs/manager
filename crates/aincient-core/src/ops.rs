@@ -499,7 +499,7 @@ pub(crate) struct PsEntry {
     #[serde(rename = "Service", default)]
     pub(crate) service: String,
     #[serde(rename = "State", default)]
-    state: String,
+    pub(crate) state: String,
 }
 
 /// Current appliance status. Cheap probes only; never mutates the stack.
