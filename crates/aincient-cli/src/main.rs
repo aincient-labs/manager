@@ -2070,7 +2070,7 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     // definite answer, short-circuit; fall through when the check is inconclusive.
     // A pinned `--to` always proceeds — the operator named a specific image. So does a
     // pending edge-image move: "no new Atelier" must not keep an unpatched web server
-    // (the same image re-pulls; only `edge` is recreated).
+    // (the same image re-pulls; only `edge` is recreated), and so do changed settings.
     let plan = match &to {
         Some(target) => ops::plan_upgrade(stack, Some(target)),
         None => {
@@ -2084,8 +2084,11 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
                     ))
                 );
             }
+            // Changed settings (.env, compose.yaml) are applied on the same
+            // version by the run below ("Applied your changed settings").
             if check.update_available == Some(false)
                 && stack.pending_edge_image_migration().is_none()
+                && !ops::settings_pending(stack)
             {
                 let at = check.current_version.unwrap_or_else(|| stack.image());
                 println!("{}", style::success(&format!("Already up to date ({at}).")));
@@ -2165,8 +2168,9 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
             "Update applied — still finishing boot.",
             &stack.console_url(),
         ),
-        // The run itself said "Already up to date" as its last step.
-        ops::Updated::AlreadyCurrent => {}
+        // The run itself said "Already up to date" (and, with changed
+        // settings, that they were applied) as its last step.
+        ops::Updated::AlreadyCurrent | ops::Updated::SettingsApplied => {}
     }
     if pinned_to {
         println!(

@@ -629,7 +629,7 @@ fn boot_failed(r: &mut dyn Reporter, look: &boot::Look, why: String) -> Boot {
     for line in look
         .log
         .iter()
-        .flat_map(|l| l.lines())
+        .flat_map(|l| boot::after_last_success(l).lines())
         .filter(|l| l.contains("[converge] FATAL") || l.contains("converge FAILED"))
     {
         r.log(line);
@@ -1013,6 +1013,11 @@ pub enum Updated {
     /// The download was the build the site already runs and nothing else was
     /// due: no backup was taken and nothing restarted.
     AlreadyCurrent,
+    /// The download was the build the site already runs, but its settings
+    /// (`.env`, `compose.yaml`) had changed since its containers were made: the
+    /// containers were made again on the same build, without a backup (the
+    /// version didn't change), and the site answered.
+    SettingsApplied,
 }
 
 impl Updated {
@@ -1168,12 +1173,14 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
         // when the download brought something new.
         let running = running_image_id(stack);
         pull(stack, r)?;
-        if nothing_to_update(
+        let need = update_need(
             running.as_deref(),
             image_id(&stack.image()).as_deref(),
+            settings_changed_now(stack),
             files_changed,
             stack.pending_db_image_migration().is_some(),
-        ) {
+        );
+        if need == UpdateNeed::Nothing {
             // The site runs the route's target: nothing is unfinished.
             stack.clear_update_target();
             r.stage(
@@ -1183,6 +1190,25 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
                 Some(1.0),
             );
             return Ok(Updated::AlreadyCurrent);
+        }
+        if need == UpdateNeed::Settings {
+            stack.clear_update_target();
+            // A stopped site starts (a resting one wakes, and rests again
+            // after), as for an update; there is nothing to back up for.
+            let woke = start_for_backup(stack, engine_state.as_deref(), r)?;
+            r.stage(
+                Stage::Starting,
+                "Already up to date. Applying your changed settings…",
+                Some(UP_FROM),
+            );
+            up(stack, r)?;
+            let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+            rest_again(stack, woke, ready, r);
+            if ready {
+                r.stage(Stage::Ready, SETTINGS_APPLIED, Some(1.0));
+                return Ok(Updated::SettingsApplied);
+            }
+            return Ok(Updated::Booting);
         }
         let woke = start_for_backup(stack, engine_state.as_deref(), r)?;
         // The banner promises "Updating keeps all your pages and settings": a
@@ -1328,17 +1354,100 @@ fn run_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Resul
     Ok(Updated::from_ready(ready))
 }
 
-/// Whether an update has nothing to do: the image just pulled is the one the
-/// site's `app` container was made from, and no stack file or database move
-/// waits for an `up`. Unknown on either side is "something to do", the way it
-/// always was.
-fn nothing_to_update(
+/// What an update found to do once the download was in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNeed {
+    /// The site runs the download, with the settings it has now.
+    Nothing,
+    /// The site runs the download, but its containers were made from other
+    /// settings: `up` on the same build, no backup.
+    Settings,
+    /// A new build, or a database move: the full update.
+    Update,
+}
+
+/// What the owner reads when an update only applied changed settings.
+pub const SETTINGS_APPLIED: &str = "Already up to date. Applied your changed settings.";
+
+/// [`UpdateNeed`]: an update unless the image just pulled is the one the site's
+/// `app` container was made from and no database move is due (unknown on
+/// either side is an update, the way it always was). On the same build,
+/// `settings_changed` ([`settings_changed`]) decides; when that couldn't be
+/// read, whether this run rewrote `compose.yaml`/`.env` does.
+fn update_need(
     running: Option<&str>,
     pulled: Option<&str>,
+    settings_changed: Option<bool>,
     files_changed: bool,
     db_move_pending: bool,
-) -> bool {
-    matches!((running, pulled), (Some(a), Some(b)) if a == b) && !files_changed && !db_move_pending
+) -> UpdateNeed {
+    let same = matches!((running, pulled), (Some(a), Some(b)) if a == b);
+    if !same || db_move_pending {
+        UpdateNeed::Update
+    } else if settings_changed.unwrap_or(files_changed) {
+        UpdateNeed::Settings
+    } else {
+        UpdateNeed::Nothing
+    }
+}
+
+/// `service hash` lines (`docker compose config --hash '*'`, or the
+/// [`RUNNING_HASHES`] inspect) as a map.
+fn service_hashes(out: &str) -> std::collections::HashMap<&str, &str> {
+    out.lines()
+        .filter_map(|l| l.trim().split_once(' '))
+        .map(|(s, h)| (s.trim(), h.trim()))
+        .filter(|(s, _)| !s.is_empty())
+        .collect()
+}
+
+/// Whether any service's settings differ from the container it runs as: the
+/// container's `com.docker.compose.config-hash` label (what compose itself
+/// compares to decide on a recreate) against `docker compose config --hash
+/// '*'` now. A declared service with no container counts as changed. `None`
+/// when the declared hashes couldn't be read.
+fn settings_changed(declared: &str, running: &str) -> Option<bool> {
+    let declared = service_hashes(declared);
+    if declared.is_empty() {
+        return None;
+    }
+    let running = service_hashes(running);
+    Some(
+        declared
+            .iter()
+            .any(|(service, hash)| running.get(service) != Some(hash)),
+    )
+}
+
+/// Whether the site's containers were made from other settings than its
+/// `.env`/`compose.yaml` hold now ([`settings_changed`]): an update with no
+/// newer version still has something to apply. `false` when it can't be told.
+pub fn settings_pending(stack: &Stack) -> bool {
+    settings_changed_now(stack) == Some(true)
+}
+
+/// `docker inspect` format: each container's service and config hash.
+const RUNNING_HASHES: &str = "{{index .Config.Labels \"com.docker.compose.service\"}} \
+     {{index .Config.Labels \"com.docker.compose.config-hash\"}}";
+
+/// [`settings_changed`] for `stack`, asking compose and Docker; `None` when
+/// either didn't answer.
+fn settings_changed_now(stack: &Stack) -> Option<bool> {
+    let mut declared = compose(stack);
+    declared.args(["config", "--hash", "*"]);
+    let declared = try_capture(declared)?;
+    let mut ids = compose(stack);
+    ids.args(["ps", "-aq"]);
+    let ids = docker::try_capture_empty_ok(ids)?;
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    let running = if ids.is_empty() {
+        String::new()
+    } else {
+        let mut c = docker::docker();
+        c.args(["inspect", "-f", RUNNING_HASHES]).args(&ids);
+        try_capture(c)?
+    };
+    settings_changed(&declared, &running)
 }
 
 /// The image ID (`sha256:…`) `image` names on this computer, if it is here.
@@ -2173,13 +2282,22 @@ pub(crate) fn run_recovering(
 }
 
 /// Force-disconnect each `(network, container)` leftover [`stale_endpoints`]
-/// found, saying so. No container, volume or data is touched.
+/// found, saying so, then connect each one back as a fresh endpoint under the
+/// names it had there. No container, volume or data is touched.
 fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn Reporter) {
     r.stage(
         Stage::Starting,
         "Docker left part of your site half-started. Clearing that and starting again (your data stays)…",
         None,
     );
+    // Read before the disconnect, which drops the network (and its aliases)
+    // from a stopped container's own settings: it would start without it, and
+    // stay that way. Every network counts, not only the one it was created on
+    // (an engine site's edge is on two).
+    let mut names: Vec<&str> = stale.iter().map(|(_, c)| c.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let restore = crate::boot::endpoints_to_restore(stale, &crate::boot::inspect(&names));
     for (network, container) in stale {
         let mut c = docker::docker();
         c.args(["network", "disconnect", "-f", network, container]);
@@ -2190,10 +2308,35 @@ fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn 
             Err(e) => r.log(&format!("Couldn't clear {container} from {network}: {e}")),
         }
     }
-    // Disconnecting a stopped container also drops the network from its own
-    // settings: it would start with no network at all, and stay that way.
-    // Put it back now, as a fresh endpoint.
+    for back in &restore {
+        let mut c = docker::docker();
+        c.args(reconnect_args(back));
+        match docker::probe_unbounded(c) {
+            Ok(_) => r.log(&format!(
+                "Reconnected {} to {}",
+                back.container, back.network
+            )),
+            // Still connected (the disconnect failed): nothing lost.
+            Err(e) => r.log(&format!(
+                "Couldn't reconnect {} to {}: {e}",
+                back.container, back.network
+            )),
+        }
+    }
+    // Anything else that lost a network it declares.
     reattach_detached(stack, r);
+}
+
+/// `docker network connect` for `back`, under each name it had there.
+fn reconnect_args(back: &crate::boot::Reconnect) -> Vec<String> {
+    let mut args = vec!["network".to_string(), "connect".to_string()];
+    for alias in &back.aliases {
+        args.push("--alias".into());
+        args.push(alias.clone());
+    }
+    args.push(back.network.clone());
+    args.push(back.container.clone());
+    args
 }
 
 /// Reconnect each of the site's containers that lost its network
@@ -2269,7 +2412,8 @@ trait WakeSteps {
     fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter);
     /// The containers as `compose ps -a` sees them ([`observe_container`]).
     fn containers(&mut self) -> ContainerState;
-    /// `compose up -d`, recovering once ([`up`]).
+    /// Create the missing containers, recovering once ([`up_missing`]: never
+    /// recreates an existing one).
     fn up(&mut self, r: &mut dyn Reporter) -> Result<()>;
 }
 
@@ -2278,7 +2422,8 @@ trait WakeSteps {
 /// - Refused while locked down: nothing is recovered, the refusal stands.
 /// - Docker kept a stopped container's endpoint: clear it, Wake once more.
 /// - A container is gone (`compose start`, the engine's Wake, can't create
-///   one): `compose up -d` creates it, then Wake once more. The failed Wake
+///   one): `compose up -d --no-recreate` creates it (and only it), then Wake
+///   once more. The failed Wake
 ///   put the engine's resting mark back on, so edge would keep serving the
 ///   resting copy over a running site; the Wake now (the containers exist)
 ///   takes the mark off, and the engine's state is the site's again.
@@ -2346,7 +2491,7 @@ impl WakeSteps for LocalWake<'_> {
         observe_container(self.stack)
     }
     fn up(&mut self, r: &mut dyn Reporter) -> Result<()> {
-        up(self.stack, r)
+        up_missing(self.stack, r)
     }
 }
 
@@ -2562,8 +2707,81 @@ pub enum ContainerState {
 pub enum StartAction {
     /// `compose start` — revive existing containers.
     Start,
-    /// `compose up -d` — (re)create the containers from the compose file.
+    /// `compose up -d --no-recreate` — create the missing containers and leave
+    /// the existing ones as they are ([`start_args`]).
     Up,
+}
+
+/// The `compose` arguments for `action`. A Start never recreates a container:
+/// sites share moving tags (`atelier-cms:latest`), so after another site's
+/// update a plain `up` would recreate this site's app on the new image — an
+/// update with no backup and no stepped route. Only an update does that.
+pub fn start_args(action: StartAction) -> &'static [&'static str] {
+    match action {
+        StartAction::Start => &["start"],
+        StartAction::Up => &["up", "-d", "--no-recreate"],
+    }
+}
+
+/// What a Start does: the compose verb, and whether the existing `db`
+/// container is handed the restart policy of a `compose.yaml` this start just
+/// rewrote ([`refresh_compose`]) with `docker update`, since neither verb
+/// recreates it to pick the new file up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartPlan {
+    pub action: StartAction,
+    pub set_db_restart: bool,
+}
+
+/// [`StartPlan`] from the containers as found and whether the compose file was
+/// just rewritten. The rewrite never turns a start into an `up` (it once did,
+/// and recreated containers on whatever image the shared tag named by then).
+pub fn start_plan(state: ContainerState, compose_refreshed: bool) -> StartPlan {
+    StartPlan {
+        action: start_action(state),
+        set_db_restart: compose_refreshed,
+    }
+}
+
+/// The restart policy the current [`crate::stack::COMPOSE_TEMPLATE`] gives `db`.
+const DB_RESTART: &str = "unless-stopped";
+
+/// Give the site's existing `db` container [`DB_RESTART`] in place (`docker
+/// update`): no restart, no recreate. Best effort: without it the database
+/// only doesn't come back by itself after Docker restarts, as before.
+fn apply_db_restart_policy(stack: &Stack, r: &mut dyn Reporter) {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let Some(out) = docker::try_capture_empty_ok(ps) else {
+        return;
+    };
+    let Some(db) = parse_ps(&out)
+        .into_iter()
+        .find(|e| e.service == "db" && !e.name.is_empty())
+    else {
+        return;
+    };
+    let mut c = docker::docker();
+    c.args(["update", "--restart", DB_RESTART, &db.name]);
+    match docker::probe(c) {
+        Ok(_) => r.log(&format!(
+            "The database now restarts with Docker ({} → {DB_RESTART}).",
+            db.name
+        )),
+        Err(e) => r.log(&format!(
+            "Couldn't set the database's restart policy ({e}); it applies at the next update."
+        )),
+    }
+}
+
+/// [`StartAction::Up`]: create the containers that are missing, refused when
+/// the site's database was erased ([`refuse_erased_database`]).
+fn up_missing(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
+    r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
+    run_recovering(stack, start_args(StartAction::Up), "start the appliance", r)?;
+    clear_database_wiped(stack);
+    Ok(())
 }
 
 /// Pure decision: `compose start` only works on containers that exist (and
@@ -2651,17 +2869,18 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     }
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
     // An untouched older compose.yaml gets this manager's (the db restart
-    // policy); only `up` hands the containers the new file.
-    let action = if refresh_compose(stack, r) {
-        StartAction::Up
-    } else {
-        start_action(observe_container(stack))
-    };
-    match action {
+    // policy). The containers keep running what they were made from: the new
+    // file reaches them at the next update, and the one setting it adds is
+    // handed to `db` in place ([`start_plan`]).
+    let plan = start_plan(observe_container(stack), refresh_compose(stack, r));
+    match plan.action {
         StartAction::Start => {
-            run_recovering(stack, &["start"], "start the appliance", r)?;
+            run_recovering(stack, start_args(plan.action), "start the appliance", r)?;
         }
-        StartAction::Up => up(stack, r)?,
+        StartAction::Up => up_missing(stack, r)?,
+    }
+    if plan.set_db_restart {
+        apply_db_restart_policy(stack, r);
     }
     wait_until_ready(stack, START_READY_TIMEOUT, r).ready()
 }
@@ -4612,6 +4831,35 @@ mod tests {
         assert_eq!(start_action(ContainerState::Unknown), StartAction::Start);
     }
 
+    #[test]
+    fn a_start_never_recreates_a_container_even_after_a_compose_refresh() {
+        // A refreshed compose.yaml once turned every Start into `up -d`, which
+        // recreated app on whatever image the shared tag named by then.
+        for state in [
+            ContainerState::Running,
+            ContainerState::Stopped,
+            ContainerState::Unknown,
+        ] {
+            assert_eq!(
+                start_plan(state, true),
+                StartPlan {
+                    action: StartAction::Start,
+                    set_db_restart: true
+                },
+                "{state:?}"
+            );
+            assert!(!start_plan(state, false).set_db_restart);
+        }
+        // Only a missing container makes it an `up`, and that `up` creates the
+        // missing ones only.
+        assert_eq!(
+            start_plan(ContainerState::Missing, true).action,
+            StartAction::Up
+        );
+        assert_eq!(start_args(StartAction::Start), ["start"]);
+        assert_eq!(start_args(StartAction::Up), ["up", "-d", "--no-recreate"]);
+    }
+
     /// `docker compose ps -a --format json` lines as Compose 5.1 prints them
     /// (hardening-test, 2026-11-14; labels trimmed).
     const PS_DB: &str = r#"{"Command":"\"docker-entrypoint.s…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"healthy","ID":"561110aa7976","Image":"pgvector/pgvector:pg16-trixie","LocalVolumes":"1","Name":"atelier-hardening-test-db-1","Names":"atelier-hardening-test-db-1","Networks":"atelier-hardening-test_default","Ports":"5432/tcp","Project":"atelier-hardening-test","Service":"db","State":"running","Status":"Up 6 minutes (healthy)"}"#;
@@ -5113,9 +5361,10 @@ mod tests {
         UP_FROM,
     };
     use super::{
-        nothing_to_update, pull_then_move_db, refuse_locked, registry_refused, route_target,
-        start_for_backup_needed, switch_channel, UpdateCheck,
+        pull_then_move_db, refuse_locked, registry_refused, route_target, settings_changed,
+        start_for_backup_needed, switch_channel, update_need, UpdateCheck,
     };
+    use super::{start_args, start_plan, StartPlan};
     use crate::stack::Stack;
     use crate::stack::{Channel, InstallOptions};
     use anyhow::{bail, Result};
@@ -6458,14 +6707,83 @@ mod tests {
 
     #[test]
     fn an_update_whose_download_is_the_running_build_does_nothing() {
-        assert!(nothing_to_update(Some(ID_OLD), Some(ID_OLD), false, false));
+        use super::UpdateNeed::{Nothing, Settings, Update};
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), false, false),
+            Nothing
+        );
         // A new build, or a side that can't be read, is an update as before.
-        assert!(!nothing_to_update(Some(ID_OLD), Some(ID_NEW), false, false));
-        assert!(!nothing_to_update(None, Some(ID_NEW), false, false));
-        assert!(!nothing_to_update(Some(ID_OLD), None, false, false));
-        // Same build, but compose.yaml/.env changed or the db move is due: `up`.
-        assert!(!nothing_to_update(Some(ID_OLD), Some(ID_OLD), true, false));
-        assert!(!nothing_to_update(Some(ID_OLD), Some(ID_OLD), false, true));
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_NEW), Some(false), false, false),
+            Update
+        );
+        assert_eq!(update_need(None, Some(ID_NEW), None, false, false), Update);
+        assert_eq!(update_need(Some(ID_OLD), None, None, false, false), Update);
+        // A new build with changed settings too: the full update.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_NEW), Some(true), true, false),
+            Update
+        );
+        // The db move is due: the full update.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), false, true),
+            Update
+        );
+        // Same build, settings changed since the containers were made: `up`
+        // on that build, no backup.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(true), false, false),
+            Settings
+        );
+        // The hashes decide over the rewritten files: a rewrite compose sees no
+        // difference in changes nothing.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), true, false),
+            Nothing
+        );
+        // Unreadable hashes: the rewritten files decide.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), None, true, false),
+            Settings
+        );
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), None, false, false),
+            Nothing
+        );
+    }
+
+    /// `docker compose -p atelier-hardening-test config --hash '*'`
+    /// (Compose v5.1.2, 2026-11-14), right after install.
+    const DECLARED_HASHES: &str =
+        "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+         db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n\
+         edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b\n";
+
+    #[test]
+    fn settings_compare_each_service_s_config_hash_to_its_container() {
+        // `docker inspect -f RUNNING_HASHES` of the three containers that
+        // install made (another order than compose's).
+        let running = "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+             edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b\n\
+             db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n";
+        assert_eq!(settings_changed(DECLARED_HASHES, running), Some(false));
+        // HTTP_PORT changed in .env: edge's hash moves, the others don't.
+        let port_changed = running.replace(
+            "edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b",
+            "edge 1f0e37b4b44f3c6c8a3b0e3a8b4f2b0d9b8c5a7e6d4f3e2d1c0b9a8f7e6d5c4b",
+        );
+        assert_eq!(settings_changed(DECLARED_HASHES, &port_changed), Some(true));
+        // A service with no container (or a container without the label).
+        let no_edge = "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+             db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n\
+             edge \n";
+        assert_eq!(settings_changed(DECLARED_HASHES, no_edge), Some(true));
+        assert_eq!(settings_changed(DECLARED_HASHES, ""), Some(true));
+        // Compose said nothing usable: unknown.
+        assert_eq!(settings_changed("", running), None);
+        assert!(super::SETTINGS_APPLIED.starts_with("Already up to date."));
+        // Settings-only counts as a site that answered.
+        assert!(super::Updated::SettingsApplied.ready());
     }
 
     #[test]

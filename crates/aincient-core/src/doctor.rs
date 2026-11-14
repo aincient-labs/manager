@@ -362,10 +362,18 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // A container that lost its network: reconnect it (and reboot the
             // app that booted without it); `up` alone never would.
             ops::reconnect_site(stack, r).map_err(|e| format!("{e:#}"))?;
+            // `--no-recreate`: a repair creates what is missing and starts what is
+            // stopped, never rebuilds a container on whatever image a shared tag
+            // now names (that would be an update without its backup).
             // No deadline: `up` may pull and recreate. Recovers once from
             // Docker's leftovers (a stale network endpoint), like Start and Update.
-            ops::run_recovering(stack, &["up", "-d"], "start the appliance", r)
-                .map_err(|e| format!("{e:#}"))?;
+            ops::run_recovering(
+                stack,
+                &["up", "-d", "--no-recreate"],
+                "start the appliance",
+                r,
+            )
+            .map_err(|e| format!("{e:#}"))?;
             // Containers report "running" the instant they start, but the
             // entrypoint then runs converge (site install or migrations) for up
             // to minutes. Re-diagnosing immediately would ask a half-booted
@@ -401,7 +409,7 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // health gate) — relay it line by line rather than leaving the user
             // staring at nothing.
             let mut c = compose(stack);
-            c.args(["exec", "-T", "app", CONVERGE]);
+            c.args(converge_args());
             docker::run_streaming(c, "re-converge the site", |line| r.log(line))
                 .map(|_| None)
                 .map_err(|e| format!("{e:#}"))
@@ -1404,6 +1412,30 @@ impl ContainerState {
 const CONVERGE: &str = "/usr/local/bin/converge.sh";
 const HEALTHCHECK: &str = "/usr/local/bin/healthcheck.sh";
 
+/// The re-converge repair's `compose` arguments. Its output also goes into the
+/// app's own log (PID 1's stdout, what `docker logs` reads), so the log the
+/// next Start reads ends on this run's `converge OK` rather than on the FATAL
+/// of the boot it repaired ([`crate::boot`] reads failures after the last
+/// success). `pipefail` keeps converge's own exit code; a log that can't be
+/// written to only loses the copy.
+fn converge_args() -> Vec<String> {
+    let mut args: Vec<String> = ["exec", "-T", "app", "bash", "-c"]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+    args.push(mirrored(CONVERGE));
+    args
+}
+
+/// The shell line that runs `script` with its output mirrored into PID 1's
+/// stdout ([`converge_args`]).
+fn mirrored(script: &str) -> String {
+    format!(
+        "set -o pipefail; log=/proc/1/fd/1; [ -w \"$log\" ] || log=/dev/null; \
+         {script} 2>&1 | tee -a \"$log\""
+    )
+}
+
 fn check_site(stack: &Stack, app_up: bool, out: &mut Vec<Check>) {
     const SKIP: &str = "The appliance isn't running, so Drupal can't be asked.";
 
@@ -1677,6 +1709,35 @@ fn health_detail(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reconverge_repair_keeps_converge_s_exit_code_and_output() {
+        // A stand-in for converge.sh that fails the way it does (`die`).
+        let dir = std::env::temp_dir().join(format!("atelier-mirror-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("converge.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\nprintf '[converge] database is reachable\\n'\n\
+             printf '[converge] FATAL: post-install health check failed\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-c", &mirrored(&format!("bash {}", script.display()))])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.status.success(), "converge's failure is the repair's");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("[converge] database is reachable"), "{said}");
+        assert!(
+            said.contains("[converge] FATAL: post-install"),
+            "stderr relayed too: {said}"
+        );
+        let args = converge_args();
+        assert_eq!(&args[..5], ["exec", "-T", "app", "bash", "-c"]);
+        assert!(args[5].contains("/usr/local/bin/converge.sh 2>&1 | tee -a"));
+    }
 
     #[test]
     fn docker_not_answering_is_fixed_by_a_restart_only_when_installed() {

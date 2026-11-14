@@ -795,6 +795,9 @@ function setProgressOpen(open) {
 }
 
 const ALREADY_CURRENT_TEXT = "Already up to date. Nothing was downloaded or restarted.";
+// The same build, but its settings (.env, compose.yaml) had changed: the
+// containers were made again on it, nothing was backed up.
+const SETTINGS_APPLIED_TEXT = "Already up to date. Applied your changed settings.";
 
 async function runProgressOp(title, fn, opts = {}) {
   const me = ++progressOwner;
@@ -817,10 +820,12 @@ async function runProgressOp(title, fn, opts = {}) {
   // reason}. Failed gets the failure panel (Close / Copy / Details) with its
   // reason; booting is the "not answering yet" notice, already past the point
   // where "a few seconds" would be true; current is an update that found the
-  // site already on the newest build (nothing downloaded, backed up or restarted).
-  let current = false;
+  // site already on the newest build (nothing downloaded, backed up or restarted),
+  // or on it with changed settings it then applied (state "settings").
+  let current = null;
   if (result && typeof result === "object" && typeof result.state === "string") {
-    current = result.state === "current";
+    if (result.state === "current") current = ALREADY_CURRENT_TEXT;
+    else if (result.state === "settings") current = SETTINGS_APPLIED_TEXT;
     if (result.state === "failed") {
       failure = result.reason || "Your website couldn't finish starting.";
       // The core marked it (a typed error, not this text): restarting Docker
@@ -854,7 +859,7 @@ async function runProgressOp(title, fn, opts = {}) {
     if (opts.lifecycle) setHomeNotice(result === false ? NOT_READY_TEXT : null);
     const settled = progressFinish();
     if (opts.lifecycle && result === false) $("progress-stage").textContent = NOT_READY_TEXT;
-    else if (current) $("progress-stage").textContent = ALREADY_CURRENT_TEXT;
+    else if (current) $("progress-stage").textContent = current;
     else if (pm.tidied) $("progress-stage").textContent = `Done. ${pm.tidied}`;
     try {
       await refresh();

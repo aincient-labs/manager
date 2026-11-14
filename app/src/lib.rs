@@ -102,6 +102,14 @@ impl Outcome {
         docker_restart: false,
     };
 
+    /// An update that found the site on the newest build with changed
+    /// settings: its containers were made again on that build, and it answered.
+    const SETTINGS: Outcome = Outcome {
+        state: "settings",
+        reason: None,
+        docker_restart: false,
+    };
+
     fn failed(reason: String, docker_restart: bool) -> Outcome {
         Outcome {
             state: "failed",
@@ -115,6 +123,7 @@ impl Outcome {
 fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, String> {
     match result {
         Ok(ops::Updated::AlreadyCurrent) => Ok(Outcome::CURRENT),
+        Ok(ops::Updated::SettingsApplied) => Ok(Outcome::SETTINGS),
         other => outcome(other.map(ops::Updated::ready)),
     }
 }

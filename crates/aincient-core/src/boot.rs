@@ -85,10 +85,33 @@ pub(crate) const DOCKER_STOPPED: &str = "Docker stopped while your site was star
 const SITE_STOPPED: &str = "Your site stopped while it was starting. Start it again; if it \
      stops again, run a checkup (System → Troubleshoot, or `atelier doctor`).";
 
+/// The lines that say a converge finished well: `converge.sh`'s own last line
+/// (`log "converge OK — …"`, which a converge run by `docker exec` prints too)
+/// and the entrypoint's `[entrypoint] converge succeeded`.
+const CONVERGE_SUCCEEDED: [&str; 2] = ["[converge] converge OK", "[entrypoint] converge succeeded"];
+
+/// The part of the app's log after the last converge that succeeded: a later
+/// converge (doctor's re-converge repair, run inside the running container)
+/// settles an earlier failure, so its FATAL must not keep failing every later
+/// wait on the same container. The whole log when none succeeded.
+pub(crate) fn after_last_success(log: &str) -> &str {
+    let mut from = 0;
+    let mut at = 0;
+    for line in log.split_inclusive('\n') {
+        at += line.len();
+        if CONVERGE_SUCCEEDED.iter().any(|m| line.contains(m)) {
+            from = at;
+        }
+    }
+    &log[from..]
+}
+
 /// The reason a converge gave, in plain words, when the app's log says it
 /// failed: `[converge] FATAL: …` (`converge.sh`'s `die`) or the entrypoint's
-/// `converge FAILED` line. `None` when neither is there.
+/// `converge FAILED` line, after the last converge that succeeded
+/// ([`after_last_success`]). `None` when neither is there.
 pub(crate) fn boot_failure(log: &str) -> Option<String> {
+    let log = after_last_success(log);
     let fatal = log
         .lines()
         .find_map(|l| l.split_once("[converge] FATAL:").map(|(_, why)| why.trim()));
@@ -137,11 +160,13 @@ pub(crate) struct AppRun {
     pub started_at: String,
 }
 
-/// What the looks so far add up to. Stopping and a half-attached network have
-/// to be seen twice in a row (one [`LOOK_EVERY`] apart) before they end the
-/// wait, so a container caught mid-start never fails a healthy boot.
+/// What the looks so far add up to. Docker not answering, stopping and a
+/// half-attached network have to be seen twice in a row (one [`LOOK_EVERY`]
+/// apart) before they end the wait, so a container caught mid-start, or one
+/// slow answer from a busy Docker, never fails a healthy boot.
 #[derive(Debug, Default)]
 pub(crate) struct Strikes {
+    docker: u8,
     stopped: u8,
     network: u8,
 }
@@ -149,8 +174,11 @@ pub(crate) struct Strikes {
 /// Whether this look ends the wait, and why.
 pub(crate) fn judge(look: &Look, strikes: &mut Strikes) -> Option<String> {
     if !look.docker {
-        return Some(DOCKER_STOPPED.to_string());
+        // Nothing else in this look is worth reading: every probe failed.
+        strikes.docker += 1;
+        return (strikes.docker >= 2).then(|| DOCKER_STOPPED.to_string());
     }
+    strikes.docker = 0;
     if let Some(why) = look.log.as_deref().and_then(boot_failure) {
         // The database is out of reach because the network is half attached:
         // the owner's step is restarting Docker, not a checkup.
@@ -221,15 +249,27 @@ struct InspectedNetworks {
 struct InspectedEndpoint {
     #[serde(rename = "IPAddress", default)]
     ip_address: String,
+    /// The names the others reach this container by on this network
+    /// (compose: the container name and the service).
+    #[serde(rename = "Aliases", default)]
+    aliases: Option<Vec<String>>,
 }
 
 impl Inspected {
     /// The container name without `docker inspect`'s leading `/`.
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         self.name.trim_start_matches('/')
     }
 
     /// The networks this container has an address on.
+    fn service(&self) -> Option<&str> {
+        self.config
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("com.docker.compose.service"))
+            .map(String::as_str)
+    }
+
     fn addressed(&self) -> Vec<&str> {
         self.network_settings
             .networks
@@ -241,13 +281,15 @@ impl Inspected {
     }
 }
 
-/// A container that lost its network: it was created on `network` (its
-/// `HostConfig.NetworkMode`) but holds no endpoint on it, so nothing on the
-/// site can reach it by name. `docker network disconnect` on a stopped
+/// A container that lost a network: one its compose service declares (or,
+/// when the declared ones can't be read, the one it was created on, its
+/// `HostConfig.NetworkMode`) holds no endpoint of it, so nothing on that
+/// network can reach it by name. `docker network disconnect` on a stopped
 /// container leaves exactly this (it drops the network from the container's
 /// own settings), and neither `compose start`, `compose up` nor a Docker
 /// restart puts it back (review-tmp, 2026-11-14: db running with no network,
-/// the app "can't reach its database").
+/// the app "can't reach its database"). On an engine site edge declares two
+/// (`<project>_default` and `<project>_engine`) and can lose either.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detached {
     pub network: String,
@@ -257,39 +299,136 @@ pub struct Detached {
     pub running: bool,
 }
 
-/// The [`Detached`] containers among `containers`. Docker's built-in modes
+/// Each compose service's networks by their Docker names, from `docker
+/// compose config --format json`: `services.<s>.networks` keys resolved
+/// through the top-level `networks.<key>.name`. Read from the files compose
+/// reads (engine overlay included), so it needs no container to remember
+/// them; a container keeps no record of a network it was disconnected from.
+/// `None` when the answer doesn't parse.
+pub(crate) fn declared_networks(config_json: &str) -> Option<HashMap<String, Vec<String>>> {
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(default)]
+        services: HashMap<String, Service>,
+        #[serde(default)]
+        networks: HashMap<String, Option<Network>>,
+    }
+    #[derive(Deserialize)]
+    struct Service {
+        #[serde(default)]
+        networks: Option<HashMap<String, serde_json::Value>>,
+    }
+    #[derive(Deserialize)]
+    struct Network {
+        #[serde(default)]
+        name: Option<String>,
+    }
+    let config: Config = serde_json::from_str(config_json.trim()).ok()?;
+    let name = |key: &str| {
+        config
+            .networks
+            .get(key)
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.name.clone())
+    };
+    Some(
+        config
+            .services
+            .iter()
+            .map(|(service, s)| {
+                let mut nets: Vec<String> = s
+                    .networks
+                    .iter()
+                    .flatten()
+                    .filter_map(|(key, _)| name(key))
+                    .collect();
+                nets.sort();
+                (service.clone(), nets)
+            })
+            .collect(),
+    )
+}
+
+/// The [`Detached`] containers among `containers`, against the networks each
+/// service declares (`declared`, [`declared_networks`]), or each container's
+/// `NetworkMode` for a service it doesn't list. Docker's built-in modes
 /// (`default`, `bridge`, `host`, `none`, `container:…`) aren't a network a
 /// container can lose this way.
-pub(crate) fn detached(containers: &[Inspected]) -> Vec<Detached> {
-    containers
-        .iter()
-        .filter_map(|c| {
-            let network = c.host_config.network_mode.as_str();
+pub(crate) fn detached(
+    containers: &[Inspected],
+    declared: Option<&HashMap<String, Vec<String>>>,
+) -> Vec<Detached> {
+    let mut out = Vec::new();
+    for c in containers {
+        let Some(service) = c.service() else {
+            continue;
+        };
+        let expected: Vec<&str> = match declared.and_then(|d| d.get(service)) {
+            Some(nets) if !nets.is_empty() => nets.iter().map(String::as_str).collect(),
+            _ => vec![c.host_config.network_mode.as_str()],
+        };
+        for network in expected {
             if matches!(network, "" | "default" | "bridge" | "host" | "none")
                 || network.starts_with("container:")
             {
-                return None;
+                continue;
             }
             let attached = c
                 .network_settings
                 .networks
                 .as_ref()
                 .is_some_and(|n| n.contains_key(network));
-            if attached {
-                return None;
+            if !attached {
+                out.push(Detached {
+                    network: network.to_string(),
+                    container: c.name().to_string(),
+                    service: service.to_string(),
+                    running: c.state.running,
+                });
             }
-            let service = c
-                .config
-                .labels
-                .as_ref()
-                .and_then(|l| l.get("com.docker.compose.service"))
-                .cloned()?;
-            Some(Detached {
-                network: network.to_string(),
-                container: c.name().to_string(),
-                service,
-                running: c.state.running,
-            })
+        }
+    }
+    out
+}
+
+/// One endpoint to put back after a stale-endpoint clear: the container, the
+/// network, and the names it answered to there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reconnect {
+    pub network: String,
+    pub container: String,
+    pub aliases: Vec<String>,
+}
+
+/// For each `(network, container)` about to be force-disconnected, what puts it
+/// back: that endpoint's own `Aliases` as `docker inspect` lists them before
+/// the disconnect, or the compose service name when it lists none. Every
+/// network, not only the one the container was created on: an engine site's
+/// edge is on two, and cut off the engine's it can't reach the engine.
+pub(crate) fn endpoints_to_restore(
+    stale: &[(String, String)],
+    inspected: &[Inspected],
+) -> Vec<Reconnect> {
+    stale
+        .iter()
+        .map(|(network, container)| {
+            let c = inspected.iter().find(|c| c.name() == container);
+            let mut aliases: Vec<String> = c
+                .and_then(|c| c.network_settings.networks.as_ref())
+                .and_then(|n| n.get(network))
+                .and_then(|e| e.aliases.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| !a.is_empty())
+                .collect();
+            if aliases.is_empty() {
+                aliases.extend(c.and_then(Inspected::service).map(str::to_string));
+            }
+            Reconnect {
+                network: network.clone(),
+                container: container.clone(),
+                aliases,
+            }
         })
         .collect()
 }
@@ -306,7 +445,11 @@ pub fn detached_now(stack: &Stack) -> Option<Vec<Detached>> {
         .filter(|n| !n.is_empty())
         .collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    Some(detached(&inspect(&names)))
+    // Unreadable: each container's own NetworkMode, as before.
+    let mut config = compose(stack);
+    config.args(["config", "--format", "json"]);
+    let declared = docker::try_capture(config).and_then(|j| declared_networks(&j));
+    Some(detached(&inspect(&names), declared.as_ref()))
 }
 
 pub(crate) fn parse_inspect(json: &str) -> Vec<Inspected> {
@@ -378,7 +521,7 @@ fn service_containers(stack: &Stack) -> Option<Vec<(String, String)>> {
     )
 }
 
-fn inspect(names: &[&str]) -> Vec<Inspected> {
+pub(crate) fn inspect(names: &[&str]) -> Vec<Inspected> {
     if names.is_empty() {
         return Vec::new();
     }
@@ -492,7 +635,7 @@ mod tests {
         let containers = parse_inspect(REVIEW_TMP_DB_DETACHED);
         assert_eq!(containers.len(), 2, "both parse");
         assert_eq!(
-            detached(&containers),
+            detached(&containers, None),
             vec![Detached {
                 network: "atelier-review-tmp_default".into(),
                 container: "atelier-review-tmp-db-1".into(),
@@ -513,8 +656,106 @@ mod tests {
             let json = format!(
                 r#"[{{"Name":"/x","State":{{"Running":true}},"HostConfig":{{"NetworkMode":"{mode}"}},"Config":{{"Labels":{{"com.docker.compose.service":"db"}}}},"NetworkSettings":{{"Networks":{{}}}}}}]"#
             );
-            assert!(detached(&parse_inspect(&json)).is_empty(), "{mode}");
+            assert!(detached(&parse_inspect(&json), None).is_empty(), "{mode}");
         }
+    }
+
+    /// `docker inspect atelier-hardening-test-db-1 atelier-hardening-test-edge-1`
+    /// of the stopped site (2026-11-14), the keys this module reads (env left
+    /// out). A stopped container keeps each endpoint's `Aliases`.
+    const STOPPED_DB_EDGE: &str = r#"[{"Name": "/atelier-hardening-test-db-1", "State": {"Running": false, "StartedAt": "2026-11-14T18:31:17.703037277Z"}, "HostConfig": {"NetworkMode": "atelier-hardening-test_default"}, "Config": {"Labels": {"com.docker.compose.project": "atelier-hardening-test", "com.docker.compose.service": "db"}}, "NetworkSettings": {"Networks": {"atelier-hardening-test_default": {"IPAddress": "", "Aliases": ["atelier-hardening-test-db-1", "db"], "DNSNames": ["atelier-hardening-test-db-1", "db", "4232a084c221"], "NetworkID": "7e7b5181fa0717cda34445873c35d89ada0974307719253720fe09ff5cf09b78"}}}},
+    {"Name": "/atelier-hardening-test-edge-1", "State": {"Running": false, "StartedAt": "2026-11-14T18:31:28.472232817Z"}, "HostConfig": {"NetworkMode": "atelier-hardening-test_default"}, "Config": {"Labels": {"com.docker.compose.project": "atelier-hardening-test", "com.docker.compose.service": "edge"}}, "NetworkSettings": {"Networks": {"atelier-hardening-test_default": {"IPAddress": "", "Aliases": ["atelier-hardening-test-edge-1", "edge"], "DNSNames": ["atelier-hardening-test-edge-1", "edge", "af644983b511"], "NetworkID": "7e7b5181fa0717cda34445873c35d89ada0974307719253720fe09ff5cf09b78"}}}}]"#;
+
+    /// The services' `networks` and the top-level `networks` of `docker compose
+    /// config --format json` over compose.yaml + the engine overlay
+    /// (`ENGINE_COMPOSE_TEMPLATE`), project `atelier-hardening-test`, Compose
+    /// v5.1.2 (everything else, environment included, left out).
+    const ENGINE_CONFIG: &str = r#"{"services": {"app": {"networks": {"default": null}}, "db": {"networks": {"default": null}}, "edge": {"networks": {"default": null, "engine": null}}, "engine": {"networks": {"engine": null}}},
+      "networks": {"default": {"name": "atelier-hardening-test_default", "ipam": {}}, "engine": {"name": "atelier-hardening-test_engine", "ipam": {}, "internal": true}}}"#;
+
+    /// [`STOPPED_DB_EDGE`]'s edge as on an engine site: on the engine network
+    /// too, with the aliases compose gives every endpoint.
+    fn engine_edge() -> String {
+        STOPPED_DB_EDGE.replace(
+            r#""Aliases": ["atelier-hardening-test-edge-1", "edge"], "DNSNames": ["atelier-hardening-test-edge-1", "edge", "af644983b511"], "NetworkID": "7e7b5181fa0717cda34445873c35d89ada0974307719253720fe09ff5cf09b78"}"#,
+            r#""Aliases": ["atelier-hardening-test-edge-1", "edge"], "DNSNames": ["atelier-hardening-test-edge-1", "edge", "af644983b511"], "NetworkID": "7e7b5181fa0717cda34445873c35d89ada0974307719253720fe09ff5cf09b78"}, "atelier-hardening-test_engine": {"IPAddress": "", "Aliases": ["atelier-hardening-test-edge-1", "edge"], "NetworkID": "2b1f0c9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c"}"#,
+        )
+    }
+
+    #[test]
+    fn a_cleared_container_is_put_back_on_every_network_under_its_own_names() {
+        let inspected = parse_inspect(&engine_edge());
+        let stale = [
+            (
+                "atelier-hardening-test_default".to_string(),
+                "atelier-hardening-test-edge-1".to_string(),
+            ),
+            (
+                "atelier-hardening-test_engine".to_string(),
+                "atelier-hardening-test-edge-1".to_string(),
+            ),
+            (
+                "atelier-hardening-test_default".to_string(),
+                "atelier-hardening-test-db-1".to_string(),
+            ),
+        ];
+        let names = |n: &str| Reconnect {
+            network: n.split('|').next().unwrap().into(),
+            container: n.split('|').nth(1).unwrap().into(),
+            aliases: vec![
+                n.split('|').nth(1).unwrap().into(),
+                n.split('|').nth(2).unwrap().into(),
+            ],
+        };
+        assert_eq!(
+            endpoints_to_restore(&stale, &inspected),
+            [
+                names("atelier-hardening-test_default|atelier-hardening-test-edge-1|edge"),
+                // Before 0.17.0's fix only NetworkMode came back: edge lost
+                // the engine for good.
+                names("atelier-hardening-test_engine|atelier-hardening-test-edge-1|edge"),
+                names("atelier-hardening-test_default|atelier-hardening-test-db-1|db"),
+            ]
+        );
+        // An endpoint that lists no aliases goes back under its service name.
+        let bare =
+            STOPPED_DB_EDGE.replace(r#""Aliases": ["atelier-hardening-test-db-1", "db"], "#, "");
+        assert_eq!(
+            endpoints_to_restore(&stale[2..], &parse_inspect(&bare))[0].aliases,
+            ["db"]
+        );
+    }
+
+    #[test]
+    fn a_container_missing_any_network_its_service_declares_is_detached() {
+        let declared = declared_networks(ENGINE_CONFIG).unwrap();
+        assert_eq!(
+            declared["edge"],
+            [
+                "atelier-hardening-test_default",
+                "atelier-hardening-test_engine"
+            ]
+        );
+        assert_eq!(declared["engine"], ["atelier-hardening-test_engine"]);
+        // Edge after a clear that only put NetworkMode back: still on default,
+        // gone from the engine network. NetworkMode alone can't see it.
+        let only_default = parse_inspect(STOPPED_DB_EDGE);
+        assert!(detached(&only_default, None).is_empty());
+        assert_eq!(
+            detached(&only_default, Some(&declared)),
+            [Detached {
+                network: "atelier-hardening-test_engine".into(),
+                container: "atelier-hardening-test-edge-1".into(),
+                service: "edge".into(),
+                running: false,
+            }]
+        );
+        // Both networks there: nothing to do.
+        assert!(detached(&parse_inspect(&engine_edge()), Some(&declared)).is_empty());
+        // A service the config doesn't list falls back to its NetworkMode.
+        let unlisted = declared_networks(r#"{"services": {}, "networks": {}}"#).unwrap();
+        assert!(detached(&only_default, Some(&unlisted)).is_empty());
+        assert_eq!(declared_networks("not json"), None);
     }
 
     /// `docker inspect atelier-hardening-test-app-1 atelier-hardening-test-db-1`,
@@ -673,6 +914,38 @@ mod tests {
         assert_eq!(boot_failure(ok), None);
     }
 
+    #[test]
+    fn a_later_successful_converge_settles_an_earlier_failure() {
+        // The app booted with its database out of reach; doctor's re-converge
+        // (`docker exec … converge.sh`, its output mirrored into the app's log)
+        // then fixed it without restarting the container.
+        let fixed = format!(
+            "{DB_UNREACHABLE}\
+            [converge] database is reachable\n\
+            [converge] pgvector extension present\n\
+            [converge] database is populated\n\
+            [converge] this build already converged this database → restart (no snapshot, updates, import, rebuild or health gate)\n\
+            [converge] converge OK — restart of the build that converged this site\n"
+        );
+        assert_eq!(boot_failure(&fixed), None);
+        // A fresh install's last line, then the entrypoint's.
+        let installed = format!(
+            "{DB_UNREACHABLE}[converge] converge OK — site is on 11.2.5\n\
+             [entrypoint] converge succeeded\n"
+        );
+        assert_eq!(boot_failure(&installed), None);
+        // A failure after the success still counts.
+        let failed_again = format!("{fixed}[converge] FATAL: database not reachable after 60s\n");
+        assert!(boot_failure(&failed_again)
+            .unwrap()
+            .starts_with("Your site can't reach its database"));
+        // No trailing newline on the success line: nothing after it.
+        assert_eq!(
+            boot_failure("[converge] FATAL: x\n[entrypoint] converge succeeded"),
+            None
+        );
+    }
+
     fn running_app() -> Option<AppRun> {
         Some(AppRun {
             name: "atelier-hardening-test-app-1".into(),
@@ -711,12 +984,26 @@ mod tests {
     }
 
     #[test]
-    fn docker_going_away_ends_the_wait_and_says_so() {
-        let look = Look::default();
-        assert_eq!(
-            judge(&look, &mut Strikes::default()).as_deref(),
-            Some(DOCKER_STOPPED)
-        );
+    fn docker_going_away_ends_the_wait_on_the_second_look_and_says_so() {
+        let gone = Look::default();
+        let mut strikes = Strikes::default();
+        assert_eq!(judge(&gone, &mut strikes), None, "one slow answer");
+        assert_eq!(judge(&gone, &mut strikes).as_deref(), Some(DOCKER_STOPPED));
+    }
+
+    #[test]
+    fn one_slow_docker_answer_between_good_looks_never_fails_a_boot() {
+        let mut strikes = Strikes::default();
+        let good = Look {
+            docker: true,
+            app: running_app(),
+            log: Some("[converge] waiting for database… (0s)\n".into()),
+            half_attached: Vec::new(),
+        };
+        for _ in 0..3 {
+            assert_eq!(judge(&Look::default(), &mut strikes), None);
+            assert_eq!(judge(&good, &mut strikes), None);
+        }
     }
 
     #[test]

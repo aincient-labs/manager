@@ -70,8 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup taken before this version leaves the current ones as they are.
 - Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker
   Desktop has left a stale network entry behind (after a sleep, restart or crash). Atelier removes
-  that leftover entry and starts once more; no container or data is touched. If that also fails, it
-  tells you to restart Docker instead of showing only Docker's error.
+  that leftover entry, connects the container again under the same names on every network it was on
+  (the web server of a site with the experimental engine stays connected to the engine), and starts
+  once more; no container or data is touched. If that also fails, it tells you to restart Docker
+  instead of showing only Docker's error.
 - A site with the experimental engine no longer fails to start with "No such image" when its engine
   image was removed from your computer (an image clean-up or a Docker reset). Atelier downloads the
   exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
@@ -82,7 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   includes a failed update that put your site back the way it was: the site answers, but the update
   didn't happen. The app shows the failure panel with **Copy report**, `atelier` exits with an error,
   and a failed update keeps your backups and old versions and stops a multi-step update. If Docker or
-  the site stops during the wait, it says that.
+  the site stops during the wait, it says that (one slow answer from a busy Docker doesn't count). A
+  failure that **Run a checkup** has since repaired is not reported again on the next start.
 - When Docker has left your site's network half connected, so the site can't reach its database,
   starting it says to restart Docker, and **Run a checkup** (`atelier doctor`) reports it.
 - Switching to released versions in the app now says when the site hasn't answered yet, like an
@@ -103,6 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finish), and the next update carries on to the version it was heading for.
 - An update downloads first. When the download is the version your site already runs, it says
   "Already up to date" and takes no backup and restarts nothing, in the app as on the command line.
+  If you changed the site's settings since it started (its `.env`, such as the port or trusted
+  hosts), `atelier app update` applies them on the same version, with no backup, and says "Already
+  up to date. Applied your changed settings."
 - Updating a stopped site starts it first, so the before-update backup can be taken; if it won't
   start, the update stops and says why. A site with the experimental engine that is resting is woken
   for the update and put back to rest afterwards. A locked site is not updated or started by
