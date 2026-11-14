@@ -138,12 +138,21 @@ pub fn docker() -> Command {
     c
 }
 
+/// Another program that ships with a Docker runtime (`orbctl`, `colima`,
+/// `rdctl`, `osascript`), found the way [`docker`] finds `docker`: on the
+/// inherited `PATH` plus the well-known install dirs.
+pub fn tool(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env("PATH", augmented_path());
+    c
+}
+
 /// The process `PATH` with the well-known Docker install dirs appended.
 ///
 /// Existing entries keep priority (so a terminal launch resolves `docker` from the
 /// user's own `PATH` unchanged); the extras only help when a dir is otherwise
 /// missing. Non-existent dirs are harmless — the OS skips them during lookup.
-fn augmented_path() -> String {
+pub(crate) fn augmented_path() -> String {
     let mut parts: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -661,7 +670,7 @@ pub fn run_inherited(mut cmd: Command, action: &str) -> Result<()> {
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
     let tail = tee.and_then(|h| h.join().ok()).unwrap_or_default();
     if !status.success() {
-        bail!(exit_message(action, &status, &tail));
+        return Err(exit_error(action, &status, &tail));
     }
     Ok(())
 }
@@ -729,7 +738,7 @@ pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str))
         .wait()
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
     if !status.success() {
-        bail!(exit_message(action, &status, &tail.finish()));
+        return Err(exit_error(action, &status, &tail.finish()));
     }
     Ok(())
 }
@@ -804,6 +813,22 @@ pub fn exit_message(action: &str, status: &dyn std::fmt::Display, tail: &[String
     }
 }
 
+/// [`exit_message`] as an error. Docker not answering is a
+/// [`NeedsDockerRestart`](crate::docker_runtime::NeedsDockerRestart), so the
+/// app can offer its Restart button.
+fn exit_error(action: &str, status: &dyn std::fmt::Display, tail: &[String]) -> anyhow::Error {
+    let message = exit_message(action, status, tail);
+    if explain_failure(tail).as_deref() == Some(DOCKER_NOT_ANSWERING) {
+        crate::docker_runtime::NeedsDockerRestart(message).into()
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+/// What a failed step says when Docker didn't answer at all.
+pub const DOCKER_NOT_ANSWERING: &str = "Docker isn't running, or isn't answering. Start Docker, \
+     or restart it if it is already open (`atelier docker restart`), then try again.";
+
 /// A plain sentence for the Docker failures an owner can fix themselves,
 /// read from the step's last stderr lines; `None` for anything else.
 ///
@@ -815,16 +840,12 @@ pub fn explain_failure(tail: &[String]) -> Option<String> {
 
 fn explain_line(line: &str) -> Option<String> {
     if line.contains("Cannot connect to the Docker daemon") {
-        return Some(
-            "Docker isn't running, or isn't answering. Start Docker Desktop (or restart it if \
-             it is already open), then try again."
-                .to_string(),
-        );
+        return Some(DOCKER_NOT_ANSWERING.to_string());
     }
     if line.contains("no space left on device") {
         return Some(
             "Docker has run out of disk space. Free up space (System → Disk space in the app, \
-             or `atelier app cleanup`), or give Docker Desktop more disk in its settings, then \
+             or `atelier app cleanup`), or give Docker more disk space in its settings, then \
              try again."
                 .to_string(),
         );
@@ -1237,6 +1258,22 @@ mod tests {
     fn a_missing_daemon_is_named() {
         let why = super::explain_failure(&lines(&[NO_DAEMON])).unwrap();
         assert!(why.starts_with("Docker isn't running"), "{why}");
+    }
+
+    #[test]
+    fn a_missing_daemon_offers_a_restart_and_nothing_else_does() {
+        let e = super::exit_error(
+            "start the appliance",
+            &"exit status: 1",
+            &lines(&[NO_DAEMON]),
+        );
+        assert!(crate::docker_runtime::needs_docker_restart(&e));
+        assert!(e.to_string().contains("`atelier docker restart`"), "{e}");
+        assert!(!e.to_string().contains("Docker Desktop"), "{e}");
+        for other in [NO_SPACE, PORT_ALLOCATED] {
+            let e = super::exit_error("start the appliance", &"exit status: 1", &lines(&[other]));
+            assert!(!crate::docker_runtime::needs_docker_restart(&e), "{e}");
+        }
     }
 
     #[test]

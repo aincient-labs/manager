@@ -12,11 +12,14 @@
 //! worst case is lost time, never lost data:
 //!
 //! 1. re-scaffold a missing/incomplete `compose.yaml` + `.env`
-//! 2. `docker compose up -d` — bring the containers back
-//! 3. `drush cache:rebuild` — the Drupal reflex, and the floor of any repair
-//! 4. `drush updatedb -y` — finish a half-applied upgrade
-//! 5. re-assert `www-data` ownership of the files tree
-//! 6. re-run `converge.sh` — the appliance's own self-heal, which snapshots
+//! 2. restart Docker, then start the site — when Docker isn't answering or
+//!    left the site's network half attached, and only once the owner said yes
+//!    (it stops everything running in Docker on the computer)
+//! 3. `docker compose up -d` — bring the containers back
+//! 4. `drush cache:rebuild` — the Drupal reflex, and the floor of any repair
+//! 5. `drush updatedb -y` — finish a half-applied upgrade
+//! 6. re-assert `www-data` ownership of the files tree
+//! 7. re-run `converge.sh` — the appliance's own self-heal, which snapshots
 //!    first and rolls back on failure, so even the hammer is reversible
 //!
 //! Deliberately NOT in the ladder, at any flag: `down -v`, reinstall, restore.
@@ -196,6 +199,11 @@ impl Check {
 pub enum Repair {
     /// Write back a missing `compose.yaml` / `.env` key.
     Scaffold,
+    /// Restart Docker (it isn't answering, or left the site's network half
+    /// attached), then start the site. Stops every container on this
+    /// computer, so it is only run once the owner said yes
+    /// ([`Reporter::confirm_docker_restart`]).
+    RestartDocker,
     /// `docker compose up -d`.
     StartContainers,
     /// `drush cache:rebuild` — the Drupal reflex.
@@ -213,6 +221,7 @@ impl Repair {
     pub fn describe(self) -> &'static str {
         match self {
             Repair::Scaffold => "Restore the stack files (compose.yaml + edge.conf + .env)",
+            Repair::RestartDocker => "Restart Docker, then start the site",
             Repair::StartContainers => "Start the appliance containers",
             Repair::CacheRebuild => "Rebuild Drupal's caches",
             Repair::RunUpdates => "Run the pending database updates",
@@ -342,6 +351,7 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             .repair_scaffold()
             .map(|changes| (!changes.is_empty()).then(|| changes.join("; ")))
             .map_err(|e| format!("{e:#}")),
+        Repair::RestartDocker => restart_docker_then_start(stack, r),
         Repair::StartContainers => {
             // A locked engine site stays down until its owner unlocks it.
             ops::refuse_locked(ops::engine_state_of(stack).as_deref())
@@ -396,6 +406,39 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
     }
 }
 
+/// [`Repair::RestartDocker`]: ask first (it stops everything running in
+/// Docker here, not only this site), restart, then start the site the way
+/// Start does. A runtime the Manager can't restart, or a "no", is a failed
+/// action that says how to do it by hand.
+fn restart_docker_then_start(
+    stack: &Stack,
+    r: &mut dyn Reporter,
+) -> Result<Option<String>, String> {
+    use crate::docker_runtime::{self, RestartPlan};
+    let found = docker_runtime::detect();
+    let name = found.runtime.name();
+    if let RestartPlan::Manual { steps, .. } = &found.plan {
+        return Err(format!("Atelier can't restart {name} for you. {steps}"));
+    }
+    let others = docker_runtime::other_running_containers(Some(&stack.project_name()));
+    if !r.confirm_docker_restart(name, &docker_runtime::stops_what(others.as_deref())) {
+        return Err(format!(
+            "Not restarted. Restart {name} when it suits you (`atelier docker restart`)."
+        ));
+    }
+    docker_runtime::restart(&found, r).map_err(|e| format!("{e:#}"))?;
+    if !stack.exists() {
+        return Ok(None);
+    }
+    match ops::start(stack, r) {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(
+            "started, but the console hasn't answered yet — it may still be booting".to_string(),
+        )),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 // --- tier 1: the host --------------------------------------------------------
 
 /// Returns whether the host can run containers at all.
@@ -423,14 +466,7 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
     // (a remote context, OrbStack, colima, or a Desktop mid-upgrade), which is
     // precisely the sort of skew a report needs to name.
     out.push(with_version(
-        flag(
-            "docker.running",
-            Tier::Host,
-            "Docker running",
-            pf.docker_running,
-            Severity::Fail,
-            "Start Docker, then run doctor again.",
-        ),
+        docker_running_verdict(pf.docker_installed, pf.docker_running),
         pf.docker_running.then(docker_engine_version).flatten(),
     ));
     out.push(with_version(
@@ -1005,9 +1041,9 @@ fn stopped_container(
 const NETWORK_LABEL: &str = "Containers attached to the site's network";
 
 /// Docker's half-attached network (review-tmp, 2026-11-14): a running container
-/// the site's network lists has no address on it, or the reverse. Not fixable
-/// here: only restarting Docker cleared it, so the remedy is the owner's, in
-/// the same words a start that runs into it uses.
+/// the site's network lists has no address on it, or the reverse. Only
+/// restarting Docker cleared it, so that is the repair ([`Repair::RestartDocker`],
+/// asked first), in the same words a start that runs into it uses.
 fn network_verdict(half_attached: Option<Vec<(String, String)>>) -> Check {
     match half_attached {
         None => Check::skipped(
@@ -1024,6 +1060,7 @@ fn network_verdict(half_attached: Option<Vec<(String, String)>>) -> Check {
             Severity::Fail,
             crate::boot::NETWORK_STUCK,
         )
+        .fixable(Repair::RestartDocker)
         .detail(
             found
                 .iter()
@@ -1557,6 +1594,25 @@ fn flag(
     }
 }
 
+/// Docker answering. Installed but not answering is fixable: a restart starts
+/// a stopped runtime and unsticks a wedged one.
+fn docker_running_verdict(installed: bool, running: bool) -> Check {
+    let check = flag(
+        "docker.running",
+        Tier::Host,
+        "Docker running",
+        running,
+        Severity::Fail,
+        "Start Docker, or restart it if it is already open (`atelier docker restart`), then run \
+         doctor again.",
+    );
+    if installed && !running {
+        check.fixable(Repair::RestartDocker)
+    } else {
+        check
+    }
+}
+
 /// `Some(s)` unless it's blank — so a tool that answered with nothing reads as
 /// "no version", not as an empty label.
 fn non_empty(s: &str) -> Option<String> {
@@ -1587,13 +1643,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn docker_not_answering_is_fixed_by_a_restart_only_when_installed() {
+        let c = docker_running_verdict(true, false);
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(c.fix, Some(Repair::RestartDocker));
+        assert!(c.remedy.unwrap().contains("`atelier docker restart`"));
+        assert_eq!(docker_running_verdict(false, false).fix, None);
+        assert_eq!(docker_running_verdict(true, true).severity, Severity::Ok);
+        assert_eq!(docker_running_verdict(true, true).fix, None);
+    }
+
+    /// A reporter that answers the restart question and records it.
+    struct Declines(Vec<String>);
+    impl Reporter for Declines {
+        fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+            self.0.push(format!("{runtime}: {detail}"));
+            false
+        }
+    }
+
+    #[test]
+    fn the_restart_repair_is_never_run_without_a_yes() {
+        // Silent (and any reporter that can't ask, e.g. a remote doctor) says no.
+        assert!(!crate::ops::Silent.confirm_docker_restart("OrbStack", "x"));
+        let mut r = Declines(Vec::new());
+        assert!(!r.confirm_docker_restart("OrbStack", "This stops everything…"));
+        assert_eq!(r.0, ["OrbStack: This stops everything…"]);
+    }
+
+    #[test]
     fn a_half_attached_network_fails_the_checkup_with_the_restart_docker_remedy() {
         let c = network_verdict(Some(vec![(
             "atelier-review-tmp_default".into(),
             "atelier-review-tmp-db-1".into(),
         )]));
         assert_eq!(c.severity, Severity::Fail);
-        assert!(c.fix.is_none(), "detected, never repaired");
+        assert_eq!(
+            c.fix,
+            Some(Repair::RestartDocker),
+            "repaired by a restart, asked first"
+        );
         assert_eq!(c.remedy.as_deref(), Some(crate::boot::NETWORK_STUCK));
         assert_eq!(
             c.detail.as_deref(),

@@ -338,6 +338,7 @@ pub fn route(command: Command, site: &Site) -> Result<Route> {
         Command::Ai { .. } => return Err(refuse("ai")),
         Command::Pack { .. } => return Err(refuse("pack")),
         Command::Mcp => return Err(refuse("mcp")),
+        Command::Docker { .. } => unreachable!("handled before a paired site's dispatch"),
         Command::Sites { .. } => unreachable!("handled before resolving a site"),
         #[cfg(unix)]
         Command::Engine { command } => {

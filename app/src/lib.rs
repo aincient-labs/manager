@@ -81,19 +81,34 @@ struct Outcome {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The way out of this failure is restarting Docker
+    /// ([`aincient_core::needs_docker_restart`]): the window offers its
+    /// Restart button next to the reason.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    docker_restart: bool,
 }
 
 impl Outcome {
     const READY: Outcome = Outcome {
         state: "ready",
         reason: None,
+        docker_restart: false,
     };
     /// An update that found the site already on the newest build: nothing was
     /// downloaded, backed up or restarted, and the window says so.
     const CURRENT: Outcome = Outcome {
         state: "current",
         reason: None,
+        docker_restart: false,
     };
+
+    fn failed(reason: String, docker_restart: bool) -> Outcome {
+        Outcome {
+            state: "failed",
+            reason: Some(reason),
+            docker_restart,
+        }
+    }
 }
 
 /// [`outcome`] for an update, keeping "already up to date" apart from "updated".
@@ -110,12 +125,17 @@ fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
         Ok(false) => Ok(Outcome {
             state: "booting",
             reason: None,
+            docker_restart: false,
         }),
         Err(e) => match e.downcast::<aincient_core::BootFailed>() {
-            Ok(failed) => Ok(Outcome {
-                state: "failed",
-                reason: Some(failed.0),
-            }),
+            Ok(failed) => {
+                let restart = failed.needs_docker_restart();
+                Ok(Outcome::failed(failed.0, restart))
+            }
+            // Not a failed boot, but restarting Docker is the way out (a start
+            // still stuck after clearing Docker's leftovers, Docker not
+            // answering): an answer too, so the panel can offer the button.
+            Err(e) if aincient_core::needs_docker_restart(&e) => Ok(Outcome::failed(err(e), true)),
             Err(e) => Err(err(e)),
         },
     }
@@ -285,6 +305,20 @@ impl Reporter for EventReporter {
             .buttons(MessageDialogButtons::OkCancelCustom(
                 "Switch to releases".into(),
                 "Not now".into(),
+            ))
+            .blocking_show()
+    }
+
+    /// The checkup's repair asking to restart Docker: a native modal,
+    /// defaulting to Cancel, blocking for the reason [`confirm`](Self::confirm) is.
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        self.app
+            .dialog()
+            .message(detail)
+            .title(format!("Restart {runtime}?"))
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                format!("Restart {runtime}"),
+                "Cancel".into(),
             ))
             .blocking_show()
     }
@@ -845,6 +879,80 @@ async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, S
             .await
             .map(|()| Outcome::READY),
     }
+}
+
+/// Which program runs Docker here, for the Restart button and its
+/// confirmation (a restart stops everything in Docker, not only the site, so the
+/// window says what else is running first).
+#[derive(Serialize)]
+struct DockerRuntimeInfo {
+    /// "OrbStack", "Docker Desktop", … ("Docker" when we can't tell).
+    name: &'static str,
+    /// The Manager can restart it (else `manual_steps` say how).
+    can_restart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_steps: Option<String>,
+    /// The command to copy, for a manual restart that has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy: Option<String>,
+    /// Running containers that aren't the selected site's; `None` when
+    /// Docker didn't answer.
+    others: Option<Vec<String>>,
+    /// The confirmation's text, naming `others`.
+    stops: String,
+}
+
+/// The selected site's compose project, when it is a site on this computer.
+fn own_project(sel: &Selected) -> Option<String> {
+    match target(sel).ok()? {
+        Target::Local(s) => Some(s.project_name()),
+        Target::Remote(_) => None,
+    }
+}
+
+#[tauri::command]
+async fn docker_runtime(sel: State<'_, Selected>) -> Result<DockerRuntimeInfo, String> {
+    use aincient_core::docker_runtime::{self as rt, RestartPlan};
+    let own = own_project(&sel);
+    blocking(move || {
+        let found = rt::detect();
+        let others = rt::other_running_containers(own.as_deref());
+        let stops = rt::stops_what(others.as_deref());
+        let (manual_steps, copy) = match found.plan {
+            RestartPlan::Steps(_) => (None, None),
+            RestartPlan::Manual { steps, copy } => (Some(steps), copy),
+        };
+        Ok(DockerRuntimeInfo {
+            name: found.runtime.name(),
+            can_restart: manual_steps.is_none(),
+            manual_steps,
+            copy,
+            others,
+            stops,
+        })
+    })
+    .await
+}
+
+/// Restart Docker, then start the selected site (one on this computer, set
+/// up) the way Start does; the same answer as [`do_start`]. The window asked
+/// first ([`docker_runtime`]'s `stops`).
+#[tauri::command]
+async fn do_restart_docker(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
+    let stack = match target(&sel)? {
+        Target::Local(s) => Some(s),
+        Target::Remote(_) => None,
+    };
+    blocking(move || {
+        let mut r = EventReporter { app };
+        let found = aincient_core::docker_runtime::detect();
+        aincient_core::docker_runtime::restart(&found, &mut r).map_err(err)?;
+        match stack.filter(Stack::exists) {
+            Some(s) => outcome(ops::start(&s, &mut r)),
+            None => Ok(Outcome::READY),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1837,6 +1945,8 @@ pub fn run() {
         .manage(paired::Joining::default())
         .manage(ConsoleTunnel::default())
         .invoke_handler(tauri::generate_handler![
+            docker_runtime,
+            do_restart_docker,
             find_cleanup,
             do_cleanup,
             check_preflight,

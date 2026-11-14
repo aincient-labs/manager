@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sites' data, your backups and other programs' images are never touched; anything removed downloads
   again when a site needs it.
 
+- **Restart Docker** for you: when a start, update or checkup ends with "Restart Docker", the app
+  shows a **Restart** button named for what runs Docker on your computer (Docker Desktop, OrbStack,
+  Colima or Rancher Desktop), and `atelier docker restart` does the same in a terminal. It first
+  lists the other containers the restart stops and asks, then restarts Docker, waits for it to
+  answer and starts your site again. **Run a checkup**'s repair (`atelier doctor --fix`) offers it
+  too, asking first. Docker Engine on Linux is restarted by hand: you get the command to copy.
+
 ### Changed
 
 - A site that is still starting after 3 minutes says "This is taking longer than usual" and offers
@@ -59,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker
   Desktop has left a stale network entry behind (after a sleep, restart or crash). Atelier removes
   that leftover entry and starts once more; no container or data is touched. If that also fails, it
-  tells you to restart Docker Desktop instead of showing only Docker's error.
+  tells you to restart Docker instead of showing only Docker's error.
 - A site with the experimental engine no longer fails to start with "No such image" when its engine
   image was removed from your computer (an image clean-up or a Docker reset). Atelier downloads the
   exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
@@ -72,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a failed update keeps your backups and old versions and stops a multi-step update. If Docker or
   the site stops during the wait, it says that.
 - When Docker has left your site's network half connected, so the site can't reach its database,
-  starting it says to restart Docker Desktop, and **Run a checkup** (`atelier doctor`) reports it.
+  starting it says to restart Docker, and **Run a checkup** (`atelier doctor`) reports it.
 - Switching to released versions in the app now says when the site hasn't answered yet, like an
   update.
 - A site's database now comes back by itself when Docker restarts, like the rest of the site.

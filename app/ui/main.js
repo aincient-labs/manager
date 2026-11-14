@@ -29,6 +29,11 @@ let startingSince = null; // when this "Starting up…" began (ms), for the slow
 // The last start/update in words when it didn't finish (or finished without
 // the site answering) — one Home line until the next successful one. In memory.
 let homeNotice = null;
+// Which program runs Docker here (docker_runtime: name, can_restart,
+// manual_steps, copy, others, stops) — for the Restart button's label, or the
+// steps when the Manager can't restart it. Asked when a failure first offers it.
+let dockerRt = null;
+let dockerRtAsked = false;
 // Sites on a server (M2): what each one's server last said (probe_site /
 // get_status), by slug — {state: running|frozen|stopped|unreachable, …}.
 const remoteStates = {};
@@ -69,8 +74,10 @@ function showTab(tab) {
   if (tab === "settings") loadSettings();
 }
 
-function showError(msg) {
+// `opts.dockerRestart`: the way out is restarting Docker — the banner offers it.
+function showError(msg, opts = {}) {
   $("error-text").textContent = msg;
+  showDockerSlot($("error-docker"), !!opts.dockerRestart);
   $("error").classList.remove("hidden");
 }
 
@@ -86,6 +93,8 @@ function confirmModal(msg, opts = {}) {
   return new Promise((resolve) => {
     const requireText = opts.requireText || null;
     const yes = $("confirm-yes");
+    // { yes } names the confirm button ("Restart").
+    yes.textContent = opts.yes || "Confirm";
     const input = $("confirm-input");
     if (opts.title) $("confirm-site").classList.add("hidden");
     else showSiteLine($("confirm-site"));
@@ -111,6 +120,7 @@ function confirmModal(msg, opts = {}) {
     if (requireText) setTimeout(() => input.focus(), 0);
     const done = (val) => {
       $("confirm").classList.add("hidden");
+      yes.textContent = "Confirm";
       yes.onclick = null;
       $("confirm-no").onclick = null;
       input.oninput = null;
@@ -275,6 +285,8 @@ function progressReset(title) {
   setDetails(false);
   $("progress-copy").classList.add("hidden");
   $("progress-close").classList.add("hidden");
+  showDockerSlot($("progress-docker"), false);
+  pm.afterClose = null;
   resetPull();
   buildBusy();
 }
@@ -678,7 +690,9 @@ function progressUpdate(p) {
 
 // Keep the panel open on the step that broke: brick block, the error in the
 // stage line, the log open, and a report to copy. Resolves on Close / Escape.
-function progressFail(message) {
+// `dockerRestart`: the way out is restarting Docker — the panel offers it.
+function progressFail(message, dockerRestart = false) {
+  showDockerSlot($("progress-docker"), dockerRestart);
   pm.failed = true;
   pm.error = message;
   pm.failedAt = Date.now();
@@ -792,6 +806,7 @@ async function runProgressOp(title, fn, opts = {}) {
   startMatrixLoop();
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
   let failure = null;
+  let dockerRestart = false;
   let result;
   try {
     result = await fn();
@@ -808,6 +823,9 @@ async function runProgressOp(title, fn, opts = {}) {
     current = result.state === "current";
     if (result.state === "failed") {
       failure = result.reason || "Your website couldn't finish starting.";
+      // The core marked it (a typed error, not this text): restarting Docker
+      // is the way out, so every place showing it offers the button.
+      dockerRestart = !!result.docker_restart;
     } else if (result.state === "booting") {
       result = false;
       startingSince = Date.now() - STARTING_SLOW_MS;
@@ -817,11 +835,13 @@ async function runProgressOp(title, fn, opts = {}) {
   }
   try {
     if (failure !== null) {
-      if (DIDNT_FINISH[opts.lifecycle]) setHomeNotice(DIDNT_FINISH[opts.lifecycle]);
-      await progressFail(failure);
+      if (DIDNT_FINISH[opts.lifecycle]) {
+        setHomeNotice(DIDNT_FINISH[opts.lifecycle], { dockerRestart });
+      }
+      await progressFail(failure, dockerRestart);
       // Closing the panel must not erase the failure: the banner stays until the
       // next action (unless a newer op already took over the screen).
-      if (progressOwner === me) showError(failure);
+      if (progressOwner === me) showError(failure, { dockerRestart });
       // The failed op may have left the site somewhere new (stopped, half
       // updated): show where it is now, not where it was.
       try {
@@ -853,8 +873,90 @@ async function runProgressOp(title, fn, opts = {}) {
     if (progressOwner === me) {
       cancelAnimationFrame(pm.raf);
       setProgressOpen(false);
+      // The failure panel's Restart button closed it: run that once it's gone.
+      const next = pm.afterClose;
+      pm.afterClose = null;
+      if (next) setTimeout(next, 0);
     }
   }
+}
+
+// --- restart Docker ---------------------------------------------------------
+// Several failures end with "Restart Docker" (a half-attached network, a start
+// still stuck after clearing Docker's leftovers, Docker not answering). The core
+// marks them (docker_restart on the answer); each place that shows one carries a
+// slot ([data-docker-slot]) for the button, or — for a runtime the Manager can't
+// restart (Docker Engine on Linux) — the steps and a Copy button.
+
+function dockerSlotHtml(kind) {
+  const name = dockerRt ? dockerRt.name : "Docker";
+  if (dockerRt && !dockerRt.can_restart) {
+    let html = `<span class="docker-manual">${esc(dockerRt.manual_steps || "")}</span>`;
+    if (dockerRt.copy) {
+      html +=
+        `<button type="button" class="btn ghost small" data-action="copy-docker-cmd">` +
+        `<svg class="ic" aria-hidden="true"><use href="#i-copy" /></svg><span>Copy the command</span></button>`;
+    }
+    return html;
+  }
+  if (kind === "text") {
+    return `<button type="button" class="text-btn" data-action="restart-docker">Restart ${esc(name)}</button>`;
+  }
+  return (
+    `<button type="button" class="btn small" data-action="restart-docker">` +
+    `<svg class="ic" aria-hidden="true"><use href="#i-refresh" /></svg><span>Restart ${esc(name)}</span></button>`
+  );
+}
+
+// Fill every slot with the button (or the steps) for what we know so far.
+function fillDockerSlots() {
+  for (const el of document.querySelectorAll("[data-docker-slot]")) {
+    el.innerHTML = dockerSlotHtml(el.dataset.dockerSlot);
+  }
+}
+
+// Show (or hide) one slot; the first one shown asks which runtime this is, so
+// the button can name it ("Restart OrbStack").
+function showDockerSlot(el, on) {
+  el.classList.toggle("hidden", !on);
+  if (!on) return;
+  el.innerHTML = dockerSlotHtml(el.dataset.dockerSlot);
+  if (dockerRtAsked) return;
+  dockerRtAsked = true;
+  invoke("docker_runtime")
+    .then((info) => {
+      dockerRt = info;
+      fillDockerSlots();
+    })
+    .catch(() => {
+      dockerRtAsked = false; // ask again next time; the plain label stands
+    });
+}
+
+// The button: ask afresh (what else is running changes), confirm naming it,
+// then restart and start the site again in the progress panel.
+async function restartDockerFlow() {
+  let info;
+  document.body.classList.add("busy");
+  try {
+    info = await invoke("docker_runtime");
+  } catch (e) {
+    return showError(String(e));
+  } finally {
+    document.body.classList.remove("busy");
+  }
+  dockerRt = info;
+  dockerRtAsked = true;
+  fillDockerSlots();
+  if (!info.can_restart) return; // the slots now show the steps instead
+  const ok = await confirmModal(info.stops, {
+    title: `Restart ${info.name}?`,
+    yes: "Restart",
+  });
+  if (!ok) return;
+  await runProgressOp(`Restarting ${info.name}`, () => invoke("do_restart_docker"), {
+    lifecycle: "start",
+  });
 }
 
 // --- status -----------------------------------------------------------------
@@ -1509,10 +1611,11 @@ function renderStatus(status) {
 const STARTING_SLOW_MS = 3 * 60 * 1000;
 
 // The Home line about the last start or update (null clears it).
-function setHomeNotice(text) {
+function setHomeNotice(text, opts = {}) {
   homeNotice = text || null;
   $("home-notice-text").textContent = homeNotice || "";
   $("home-notice").classList.toggle("hidden", !homeNotice);
+  showDockerSlot($("home-notice-docker"), !!(homeNotice && opts.dockerRestart));
   syncCheckupButtons();
 }
 
@@ -2384,7 +2487,14 @@ function renderDoctor(report) {
       html += `<span class="doctor-mark" aria-hidden="true">${DOCTOR_MARK[c.severity] || "?"}</span>`;
       html += `<span class="doctor-body"><span class="doctor-label">${esc(c.label)}</span>`;
       if (c.detail) html += `<span class="doctor-detail">${esc(firstLine(c.detail))}</span>`;
-      if (c.remedy) html += `<span class="doctor-remedy">${esc(c.remedy)}</span>`;
+      if (c.remedy) {
+        html += `<span class="doctor-remedy">${esc(c.remedy)}`;
+        // Restarting Docker is the repair: offer it here too, asked first.
+        if (c.fix === "restart_docker" && c.severity === "fail") {
+          html += `<span class="docker-slot" data-docker-slot="text"></span>`;
+        }
+        html += "</span>";
+      }
       html += "</span></li>";
     }
     html += "</ul>";
@@ -2407,6 +2517,8 @@ function renderDoctor(report) {
 
   results.innerHTML = html;
   results.classList.remove("hidden");
+  const slot = results.querySelector("[data-docker-slot]");
+  if (slot) showDockerSlot(slot, true);
 
   if (failures === 0) {
     summary.textContent = warnings
@@ -2477,6 +2589,18 @@ const actions = {
     invoke("open_url", { url: MANAGER_RELEASES_PAGE }).catch((e) => showError(String(e))),
 
   "dismiss-error": () => hideError(),
+
+  // From the failure panel: close it first, then ask (runProgressOp runs
+  // pm.afterClose once the panel is gone).
+  "restart-docker": () => {
+    if (pm.release) {
+      pm.afterClose = restartDockerFlow;
+      pm.release();
+      return;
+    }
+    restartDockerFlow();
+  },
+  "copy-docker-cmd": (el) => copyText(dockerRt && dockerRt.copy, el),
 
   // "Edit my site" — drop the operator into the console signed in. A fresh
   // appliance's admin password is never shown, so a plain /atelier link would

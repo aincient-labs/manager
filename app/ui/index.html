@@ -276,6 +276,8 @@
           <p id="home-notice" class="hint home-notice hidden" role="status">
             <span id="home-notice-text"></span>
             <button id="home-notice-checkup" class="text-btn" data-action="checkup-now">Run a checkup</button>
+            <!-- Restarting Docker is the way out (main.js fillDockerSlots). -->
+            <span id="home-notice-docker" class="docker-slot hidden" data-docker-slot="text"></span>
           </p>
           <!-- Where updates stand, always (a site on this computer): up to date,
                couldn't check, or checking. "Update available" lives in the
@@ -746,6 +748,7 @@
     <!-- Error toast -->
     <div id="error" class="error hidden">
       <span id="error-text"></span>
+      <span id="error-docker" class="docker-slot hidden" data-docker-slot="text"></span>
       <button class="x" data-action="dismiss-error" aria-label="Dismiss">×</button>
     </div>
 
@@ -761,6 +764,9 @@
             <div id="pm-labels" class="pm-labels" aria-hidden="true"></div>
           </div>
           <p id="progress-stage" class="progress-stage">Starting…</p>
+          <!-- A failure whose way out is restarting Docker: the button, or how
+               to do it by hand (main.js fillDockerSlots). -->
+          <div id="progress-docker" class="docker-slot progress-docker hidden" role="status" data-docker-slot="button"></div>
           <div class="progress-actions">
             <button type="button" id="progress-details" class="btn ghost" aria-expanded="false" aria-controls="progress-more">Details</button>
             <span class="progress-actions-gap"></span>

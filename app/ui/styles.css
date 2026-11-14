@@ -1565,6 +1565,10 @@ select {
   margin-top: 7px;
   background: var(--danger);
 }
+.error .docker-slot {
+  flex: none;
+  color: var(--text-2);
+}
 .error .x {
   margin-left: auto;
   border: 0;
@@ -1595,4 +1599,26 @@ select {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* ------------------------------------------------------ restart docker ---- */
+
+/* The Restart button (or, for a runtime the Manager can't restart, the steps
+   and a Copy button) next to a failure whose way out is restarting Docker. */
+.docker-slot {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.home-notice .docker-slot,
+.doctor-remedy .docker-slot {
+  margin-left: 8px;
+}
+.progress-docker {
+  display: flex;
+  margin-top: 12px;
+}
+.docker-slot .docker-manual {
+  color: var(--text-2);
 }

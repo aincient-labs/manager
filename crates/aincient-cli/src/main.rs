@@ -105,12 +105,33 @@ enum Command {
     /// Serve the pack developer's MCP tools over stdio (for Claude Code,
     /// Cursor, …). Needs a running dev stack (`atelier pack dev`).
     Mcp,
+    /// Docker on this computer: restart it when it is stuck.
+    Docker {
+        #[command(subcommand)]
+        command: DockerCommand,
+    },
     /// The engine sidecar: EXPERIMENTAL, opt-in only (DECISIONS 0483).
     #[cfg(unix)]
     #[command(hide = true)]
     Engine {
         #[command(subcommand)]
         command: engine::EngineCommand,
+    },
+}
+
+/// `atelier docker …` — the Docker runtime on this computer.
+#[derive(Subcommand)]
+enum DockerCommand {
+    /// Restart Docker (Docker Desktop, OrbStack, Colima or Rancher Desktop),
+    /// then start the site again.
+    ///
+    /// Says which program runs Docker here and which other containers the
+    /// restart stops, and asks first. Docker Engine on Linux is restarted by
+    /// hand (`sudo systemctl restart docker`): this prints how.
+    Restart {
+        /// Don't ask. Required when not run in a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -752,6 +773,28 @@ impl ops::Reporter for CliReporter {
         }
         confirm(&format!("\n{question}"), false).unwrap_or(false)
     }
+
+    /// `doctor --fix`'s restart: asked in a terminal, defaulting to no; never
+    /// in a script (a restart stops every container on the computer).
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        use std::io::IsTerminal;
+        if self.open_line {
+            println!();
+            self.open_line = false;
+        }
+        println!("\n{detail}");
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "{}",
+                style::warn(
+                    "Not asking — this isn't an interactive terminal. Nothing was restarted; \
+                     run `atelier docker restart --yes` when you want it."
+                )
+            );
+            return false;
+        }
+        confirm(&format!("Restart {runtime} now?"), false).unwrap_or(false)
+    }
 }
 
 fn run() -> Result<()> {
@@ -790,6 +833,14 @@ fn run() -> Result<()> {
     };
 
     let resolution = sites::locate(cli.site.as_deref())?;
+    // Docker is this computer's, whatever the site: handled before a remote
+    // site's dispatch.
+    if let Command::Docker {
+        command: DockerCommand::Restart { yes },
+    } = cli.command
+    {
+        return docker_restart(resolution, yes);
+    }
     if let Some(site) = remote_site(&resolution) {
         if site.engine_url().is_some() {
             return paired::run(cli.command, site, cli.experimental);
@@ -801,6 +852,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Sites { .. } => unreachable!("handled above"),
+        Command::Docker { .. } => unreachable!("handled above"),
         Command::Doctor { fix, json } => doctor(&stack, fix, json),
         Command::App { command } => run_app(command, &stack),
         Command::Site { command } => run_site(command, &stack),
@@ -1747,6 +1799,73 @@ fn model_list(stack: &Stack, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `atelier docker restart [--yes]`: name the runtime and what else stops, ask,
+/// restart, wait for Docker, then start the site (a local, installed one) the
+/// way `app start` does and say how it came out. A runtime the Manager can't
+/// restart prints the steps and exits non-zero.
+fn docker_restart(resolution: sites::Resolution, yes: bool) -> Result<()> {
+    use aincient_core::docker_runtime::{self, RestartPlan, Runtime};
+    use std::io::IsTerminal;
+    let found = docker_runtime::detect();
+    let name = found.runtime.name();
+    if found.runtime == Runtime::Unknown {
+        println!("Docker on this computer: couldn't tell which program runs it.");
+    } else {
+        println!("Docker on this computer runs in {}.", style::heading(name));
+    }
+    if let RestartPlan::Manual { steps, copy } = &found.plan {
+        println!("Atelier can't restart {name} for you. {steps}");
+        if let Some(cmd) = copy {
+            println!("\n  {cmd}\n");
+        }
+        anyhow::bail!("{name} was not restarted");
+    }
+    let remote = remote_site(&resolution).cloned();
+    let stack = remote.is_none().then(|| resolution.into_stack());
+    let own = stack.as_ref().map(Stack::project_name);
+    let others = docker_runtime::other_running_containers(own.as_deref());
+    println!("{}", docker_runtime::stops_what(others.as_deref()));
+    if !yes && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "not restarting {name} — this isn't an interactive terminal. Pass --yes to restart \
+             it. Nothing was changed."
+        );
+    }
+    if !confirm(&format!("Restart {name} now?"), yes)? {
+        println!("{}", style::warn("Aborted. Nothing was restarted."));
+        return Ok(());
+    }
+    docker_runtime::restart(&found, &mut CliReporter::default())?;
+    println!(
+        "{}",
+        style::success(&format!("{name} restarted; Docker is answering."))
+    );
+    if let Some(site) = remote {
+        println!(
+            "Not starting {}: it runs on {}, not on this computer.",
+            site.label,
+            site.remote
+                .as_ref()
+                .map(|r| r.host.as_str())
+                .unwrap_or("a server")
+        );
+        return Ok(());
+    }
+    let Some(stack) = stack.filter(Stack::exists) else {
+        return Ok(());
+    };
+    if ops::start(&stack, &mut CliReporter::default())? {
+        println!(
+            "{} Console: {}",
+            style::success("Started."),
+            style::url(&stack.console_url())
+        );
+    } else {
+        pending_banner("Started — still finishing boot.", &stack.console_url());
+    }
+    Ok(())
+}
+
 /// `atelier doctor [--fix] [--json]` — the diagnose/repair front door.
 ///
 /// Exits non-zero when something is still failing after the run, so it works as
@@ -2389,6 +2508,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
     };
     Ok(match command {
         Command::Sites { .. } => unreachable!("handled before resolving a site"),
+        Command::Docker { .. } => unreachable!("handled before a remote site's dispatch"),
         Command::Doctor { fix, json } => Route::Doctor { fix, json },
         Command::App { command } => match command {
             AppCommand::Status { json } => Route::Status { json },
@@ -3767,6 +3887,28 @@ mod tests {
         .unwrap();
         assert_eq!(cli.confirm_slug.as_deref(), Some("prod"));
         assert!(restore_detail("/srv/b.tar.gz").contains("/srv/b.tar.gz"));
+    }
+
+    #[test]
+    fn docker_restart_takes_yes() {
+        for (argv, want) in [
+            (&["atelier", "docker", "restart"][..], false),
+            (&["atelier", "docker", "restart", "--yes"], true),
+            (&["atelier", "docker", "restart", "-y"], true),
+            (
+                &["atelier", "--site", "blog", "docker", "restart", "--yes"],
+                true,
+            ),
+        ] {
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Docker {
+                    command: DockerCommand::Restart { yes },
+                } => assert_eq!(yes, want, "{argv:?}"),
+                _ => panic!("{argv:?}: not docker restart"),
+            }
+        }
+        assert!(Cli::try_parse_from(["atelier", "docker"]).is_err());
+        assert!(Cli::try_parse_from(["atelier", "docker", "restart", "now"]).is_err());
     }
 
     #[test]

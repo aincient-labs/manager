@@ -56,6 +56,16 @@ impl fmt::Display for BootFailed {
 
 impl std::error::Error for BootFailed {}
 
+impl BootFailed {
+    /// The owner's step is restarting Docker: its network is half attached,
+    /// or Docker went away during the wait. Matched against our own wording
+    /// (a multi-step update quotes it inside its own sentence), so the app
+    /// can offer its Restart button.
+    pub fn needs_docker_restart(&self) -> bool {
+        self.0.contains(NETWORK_STUCK) || self.0.contains(DOCKER_STOPPED)
+    }
+}
+
 /// How often the wait looks at the containers and the app's log.
 pub(crate) const LOOK_EVERY: Duration = Duration::from_secs(5);
 
@@ -65,11 +75,12 @@ const CHECKUP: &str = "Run a checkup (System → Troubleshoot, or `atelier docto
 /// a running container the network lists has no address on it, or the reverse.
 /// Detected, never repaired: only restarting Docker cleared it.
 pub const NETWORK_STUCK: &str = "Docker's network for your site is only half connected, so \
-     its parts can't reach each other. Restart Docker Desktop, then start your site again. \
-     Your site's data is safe.";
+     its parts can't reach each other. Restart Docker (`atelier docker restart`), then start \
+     your site again. Your site's data is safe.";
 
-const DOCKER_STOPPED: &str = "Docker stopped while your site was starting. Start Docker \
-     Desktop, then start your site again. Your site's data is safe.";
+pub(crate) const DOCKER_STOPPED: &str = "Docker stopped while your site was starting. Start \
+     Docker again (`atelier docker restart`), then start your site again. Your site's data is \
+     safe.";
 
 const SITE_STOPPED: &str = "Your site stopped while it was starting. Start it again; if it \
      stops again, run a checkup (System → Troubleshoot, or `atelier doctor`).";
@@ -573,7 +584,9 @@ mod tests {
             judge(&look, &mut Strikes::default()).as_deref(),
             Some(NETWORK_STUCK)
         );
-        assert!(NETWORK_STUCK.contains("Restart Docker Desktop"));
+        assert!(NETWORK_STUCK.contains("Restart Docker (`atelier docker restart`)"));
+        assert!(!NETWORK_STUCK.contains("Docker Desktop"));
+        assert!(BootFailed(NETWORK_STUCK.into()).needs_docker_restart());
     }
 
     #[test]

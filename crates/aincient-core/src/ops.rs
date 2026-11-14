@@ -95,6 +95,15 @@ pub trait Reporter {
     fn confirm(&mut self, _question: &str) -> bool {
         false
     }
+
+    /// Ask the owner whether to restart Docker (`runtime` names it, "OrbStack")
+    /// — `detail` says what else that stops. `true` means go ahead. The default
+    /// is NO for the same reason as [`confirm`](Self::confirm): a restart stops
+    /// every container on the computer, and a reporter that can't ask (a script,
+    /// a remote doctor) must not answer for the owner.
+    fn confirm_docker_restart(&mut self, _runtime: &str, _detail: &str) -> bool {
+        false
+    }
 }
 
 /// A [`Reporter`] that drops everything — for callers that don't show progress.
@@ -1606,6 +1615,10 @@ impl Reporter for ScaledReporter<'_> {
     fn confirm(&mut self, question: &str) -> bool {
         self.inner.confirm(question)
     }
+
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        self.inner.confirm_docker_restart(runtime, detail)
+    }
 }
 
 /// Run the one-time repairs an install made under an older manager needs — the
@@ -2111,7 +2124,15 @@ pub(crate) fn refuse_erased_database(stack: &Stack) -> Result<()> {
 /// leftovers: the one step they can always take, and that their data is safe.
 /// Docker's own lines follow in brackets for a bug report.
 const START_STUCK: &str = "Docker couldn't start your site, even after clearing what it had left \
-     behind and trying again. Restart Docker Desktop, then try again. Your site's data is safe.";
+     behind and trying again. Restart Docker (`atelier docker restart`), then try again. Your \
+     site's data is safe.";
+
+/// [`START_STUCK`] with what Docker said each time, as the error the app
+/// offers its Restart button for.
+fn start_stuck(first: &anyhow::Error, then: &anyhow::Error) -> anyhow::Error {
+    crate::docker_runtime::NeedsDockerRestart(format!("{START_STUCK} ({first:#}; then {then:#})"))
+        .into()
+}
 
 /// Run a compose start step (`up …`, `start`), and recover once from Docker's
 /// own leftovers.
@@ -2145,7 +2166,7 @@ pub(crate) fn run_recovering(
     clear_stale_endpoints(&stale, r);
     let mut again = compose(stack);
     again.args(args);
-    run_step(again, action, r).map_err(|e| anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})"))
+    run_step(again, action, r).map_err(|e| start_stuck(&first, &e))
 }
 
 /// Force-disconnect each `(network, container)` leftover [`stale_endpoints`]
@@ -2231,7 +2252,7 @@ fn wake_recovering(steps: &mut dyn WakeSteps, r: &mut dyn Reporter) -> Result<()
         return Ok(());
     }
     match last {
-        Some(e) => Err(anyhow::anyhow!("{START_STUCK} ({first:#}; then {e:#})")),
+        Some(e) => Err(start_stuck(&first, &e)),
         None => Err(first),
     }
 }
@@ -4789,7 +4810,8 @@ mod tests {
         ));
         assert!(!holds_endpoint("atelier-edge-1\n", "atelier-db-1"));
         assert!(!holds_endpoint("atelier-db-10\n", "atelier-db-1"));
-        assert!(START_STUCK.contains("Restart Docker Desktop"));
+        assert!(START_STUCK.contains("Restart Docker (`atelier docker restart`)"));
+        assert!(!START_STUCK.contains("Docker Desktop"));
         assert!(START_STUCK.contains("data is safe"));
     }
 
@@ -4893,6 +4915,13 @@ mod tests {
         );
         assert!(e.starts_with(START_STUCK), "{e}");
         assert!(e.contains("already exists in network"), "{e}");
+        let mut again = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_STALE)], resting_ps());
+        again.stale = f.stale.clone();
+        let typed = super::wake_recovering(&mut again, &mut Silent).unwrap_err();
+        assert!(
+            crate::docker_runtime::needs_docker_restart(&typed),
+            "{typed:#}"
+        );
         // One retry, never a loop; the containers all exist, so no `up`.
         assert_eq!(f.calls.iter().filter(|c| *c == "wake").count(), 2);
         assert!(!f.calls.contains(&"up -d".to_string()));
