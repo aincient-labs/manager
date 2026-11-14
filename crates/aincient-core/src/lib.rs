@@ -22,6 +22,7 @@ pub mod engine_client;
 pub mod gate;
 pub mod guard;
 pub mod mcp;
+pub mod oplock;
 pub mod ops;
 pub mod pack;
 pub mod pairing;

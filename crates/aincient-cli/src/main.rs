@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, engine_admin, gate, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions,
-    Stack,
+    doctor, engine_admin, gate, oplock, ops, remote, sites, ssh_key, ChangeGuard, Channel,
+    InstallOptions, Stack,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -633,13 +633,17 @@ fn main() {
 /// What `atelier` exits with for `err`: a remote command's own code (the answer
 /// a script wants, m2-7), a refusal the Manager can override
 /// ([`ops::Overridable::exit_code`]: 3, 4), an update refused because the site
-/// isn't ready ([`gate::UpdateBlocked::EXIT_CODE`]: 5), else 1.
+/// isn't ready ([`gate::UpdateBlocked::EXIT_CODE`]: 5), the site busy with
+/// another operation ([`oplock::SiteBusy::EXIT_CODE`]: 6), else 1.
 fn exit_code(err: &anyhow::Error) -> i32 {
     if let Some(exit) = err.downcast_ref::<remote::RemoteExit>() {
         return exit.code;
     }
     if err.is::<gate::UpdateBlocked>() {
         return gate::UpdateBlocked::EXIT_CODE;
+    }
+    if err.is::<oplock::SiteBusy>() {
+        return oplock::SiteBusy::EXIT_CODE;
     }
     ops::Overridable::of(err).map_or(1, ops::Overridable::exit_code)
 }
@@ -1638,6 +1642,16 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
 
 /// `atelier site …` — publish the site you built.
 fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
+    // The engine's lifecycle verbs change the site: one operation at a time.
+    let _op = matches!(
+        command,
+        SiteCommand::Lockdown { .. }
+            | SiteCommand::Unlock { .. }
+            | SiteCommand::Rest { .. }
+            | SiteCommand::Wake
+    )
+    .then(|| oplock::hold(stack, oplock::Operation::Engine))
+    .transpose()?;
     match command {
         SiteCommand::Lockdown { yes } => engine_lifecycle(
             &engine_admin::LocalDocker,
@@ -1961,7 +1975,7 @@ fn doctor(stack: &Stack, fix: bool, json: bool) -> Result<()> {
     let report = if fix {
         // The repair ladder is chatty (a converge run streams docker output), so
         // it goes through the same reporter the lifecycle ops use.
-        doctor::fix(stack, &mut CliReporter::default())
+        doctor::fix(stack, &mut CliReporter::default())?
     } else {
         doctor::diagnose(stack)
     };
@@ -4087,6 +4101,12 @@ mod tests {
             blockers: vec![gate::Blocker::DockerNotAnswering],
         });
         assert_eq!(exit_code(&blocked), 5);
+        let busy = anyhow::Error::new(oplock::SiteBusy {
+            operation: Some("an update".into()),
+            since: None,
+            pid: None,
+        });
+        assert_eq!(exit_code(&busy), 6);
         // A server's own code passes through, these included.
         let remote = anyhow::Error::new(remote::RemoteExit {
             host: "deploy@example.com".into(),

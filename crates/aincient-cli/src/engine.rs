@@ -188,6 +188,13 @@ pub fn run_on_host(
     confirm: Confirm,
 ) -> Result<()> {
     check_experimental(&cmd, experimental)?;
+    // Enable, disable and remove change the site: one operation at a time.
+    let _op = matches!(
+        cmd,
+        EngineCommand::Enable | EngineCommand::Disable | EngineCommand::Remove { .. }
+    )
+    .then(|| aincient_core::oplock::hold(stack, aincient_core::oplock::Operation::Engine))
+    .transpose()?;
     match cmd {
         EngineCommand::Enable => enable(stack),
         EngineCommand::Disable => disable(stack),

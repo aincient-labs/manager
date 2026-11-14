@@ -65,7 +65,7 @@ fn start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back() {
     nothing_made(&site, "Start");
 
     // The checkup's repair ladder: Start the containers, refused the same way.
-    let report = doctor::fix(&site.stack, &mut Feed::default());
+    let report = doctor::fix(&site.stack, &mut Feed::default()).expect("not busy");
     let start = report
         .actions
         .iter()

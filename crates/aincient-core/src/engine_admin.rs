@@ -448,6 +448,7 @@ pub fn compose_config_json(
 /// `engine install-code` makes one later). The caller has the user's opt-in
 /// (the CLI's `--experimental`, the GUI's setting).
 pub fn enable_local(stack: &Stack) -> Result<Option<FirstPairing>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Engine)?;
     let image = engine_image()?;
     let keep = keeps_app_and_db(stack);
     engine::enable(stack, &image.pin, &|files, env| {

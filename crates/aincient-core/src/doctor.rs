@@ -303,7 +303,12 @@ pub fn diagnose(stack: &Stack) -> Report {
 /// achieve: the returned report is a fresh reading of the state the user is
 /// actually left in, not an assumption that the repairs worked. `actions`
 /// records every attempt either way, including the ones that failed.
-pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> Report {
+///
+/// Repairs change the site, so they hold it ([`crate::oplock`]): while another
+/// operation runs, the checkup's repairs are refused with
+/// [`crate::oplock::SiteBusy`] (a diagnosis alone needs no lock).
+pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> anyhow::Result<Report> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Repair)?;
     let mut report = diagnose(stack);
     let mut actions = Vec::new();
     // Each repair is attempted at most once, so the loop is bounded by the
@@ -339,7 +344,7 @@ pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> Report {
     }
 
     report.actions = actions;
-    report
+    Ok(report)
 }
 
 /// Perform one repair. `Ok(Some(detail))` carries anything worth showing.

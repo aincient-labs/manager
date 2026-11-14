@@ -1079,6 +1079,7 @@ fn registry_problem(image: &str, error: &str) -> String {
 /// and auto-rolls-back on failure. Returns whether the console came up before
 /// the readiness timeout (`false` = started but still booting).
 pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Install)?;
     lifecycle_plan().announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
     preflight().require()?;
@@ -1107,6 +1108,7 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
 /// itself and walks every hop it needs; see [`apply_upgrade`] to show the operator
 /// the route first. Says how it came out ([`Updated`]).
 pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
     let plan = plan_upgrade(stack, None);
     apply_upgrade(stack, &plan, r)
 }
@@ -1230,6 +1232,7 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
 }
 
 pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
     apply_upgrade_with(stack, plan, &UpdateOptions::default(), r)
 }
 
@@ -1276,6 +1279,7 @@ fn backup_or_refuse<T>(outcome: Result<T>) -> Result<T> {
 
 /// [`update`] with [`UpdateOptions`].
 pub fn update_with(stack: &Stack, opts: &UpdateOptions, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
     let plan = plan_upgrade(stack, None);
     apply_upgrade_with(stack, &plan, opts, r)
 }
@@ -1287,6 +1291,7 @@ pub fn apply_upgrade_with(
     opts: &UpdateOptions,
     r: &mut dyn Reporter,
 ) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
     let done = run_upgrade(stack, plan, opts, r)?;
     if done == Updated::Ready {
         // Only after the site answered on the new version: a failed attempt
@@ -2109,6 +2114,7 @@ pub fn switch_channel(
     apply: bool,
     r: &mut dyn Reporter,
 ) -> Result<(String, Option<bool>)> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::ChannelSwitch)?;
     ensure_installed(stack)?;
     let image = stack.set_channel(channel)?;
     // Another stream of images: an unfinished route to the old one is moot.
@@ -2923,6 +2929,7 @@ fn holds_endpoint(members: &str, name: &str) -> bool {
 /// freeze, then stop `app` and `db`, edge serving the snapshot; returns the
 /// engine's answer. Without it, [`stop_containers`].
 pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Stop)?;
     ensure_installed(stack)?;
     // Docker first: without it, the engine probe and `compose stop` fail with
     // Docker's own words instead of "Start Docker".
@@ -2941,6 +2948,7 @@ pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
 /// keep data. For freeing the port (a site leaving the list), not the owner's
 /// Stop ([`stop`]).
 pub fn stop_containers(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Stop)?;
     ensure_installed(stack)?;
     r.stage(Stage::Working, "Stopping the appliance…", None);
     let mut c = compose(stack);
@@ -3115,6 +3123,7 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// `docker compose up -d` when none exist (after `pack down`). Returns whether
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Start)?;
     ensure_installed(stack)?;
     // Docker first, so a stopped Docker reads "Start Docker", not a probe's error.
     preflight().require()?;
@@ -3179,6 +3188,7 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
 /// Runs through [`run_step`] like stop and start, so the GUI gets Docker's
 /// output in its feed and a failure says why.
 pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Remove)?;
     ensure_installed(stack)?;
     let mut c = compose(stack);
     c.arg("down");
@@ -3202,6 +3212,7 @@ fn mark_database_wiped(stack: &Stack) -> Result<()> {
 /// Wipe everything and install from scratch. Destructive — confirm first.
 /// Returns whether the console came up before the readiness timeout.
 pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Reinstall)?;
     preflight().require()?;
     if stack.exists() {
         lifecycle_plan().announce(r);
@@ -3221,6 +3232,7 @@ pub(crate) const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
 /// archive can be shared over the wire and [`restore`]d onto another host.
 /// Returns the path to the created archive.
 pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Result<PathBuf> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Backup)?;
     let plan = Plan::weighted(&[
         ("check", "Check", 1.0),
         ("dump", "Database", 4.0),
@@ -3717,6 +3729,7 @@ pub struct SnapshotList {
 /// snapshot inside the appliance and serve it to anonymous visitors; the
 /// appliance's web server does the switching, so nothing restarts.
 pub fn freeze(stack: &Stack, opts: &FreezeOptions, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Freezing the site…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -3787,6 +3800,7 @@ pub fn snapshots(stack: &Stack) -> Result<SnapshotList> {
 
 /// Serve a snapshot id, or `"live"`. The appliance validates the id.
 pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Switching what visitors see…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -3800,6 +3814,7 @@ pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()>
 
 /// Delete old snapshots; returns the ids removed.
 pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result<Vec<String>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Pruning snapshots…", None);
     ensure_running(stack)?;
     let before = snapshots(stack)?;
@@ -3826,6 +3841,7 @@ pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result
 /// database only. Both mirror converge's `restore_snapshot` for the DB: drop,
 /// load, rebuild caches.
 pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Restore)?;
     ensure_running(stack)?;
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
@@ -4251,6 +4267,7 @@ pub fn restore_with(
     opts: &RestoreOptions,
     r: &mut dyn Reporter,
 ) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Restore)?;
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
     }
@@ -4807,6 +4824,7 @@ pub fn admin_password(stack: &Stack) -> Option<String> {
 
 /// Set a new admin password.
 pub fn set_admin_password(stack: &Stack, password: &str, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Settings)?;
     r.stage(Stage::Working, "Setting the admin password…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -4837,6 +4855,7 @@ pub fn model_list(stack: &Stack) -> Result<Vec<ModelRole>> {
 /// Shells `drush aincient:model-set <role> <provider> <model>`; drush validates
 /// the role + provider and returns a non-zero exit on a bad binding.
 pub fn model_set(stack: &Stack, role: &str, provider: &str, model: &str) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Settings)?;
     ensure_running(stack)?;
     let mut c = compose(stack);
     c.args(["exec", "-T", "app"])

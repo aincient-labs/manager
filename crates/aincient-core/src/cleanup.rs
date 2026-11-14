@@ -480,19 +480,31 @@ pub fn older_backups_everywhere() -> Result<Vec<OlderBackups>> {
 /// Remove the older automatic backups of `stacks` whose paths are in `only`
 /// (what the owner was shown and ticked). Asked afresh: a file that is no
 /// longer an older automatic backup is never removed, whatever `only` says.
+///
+/// Each site is held while its backups go ([`crate::oplock`]): a site busy
+/// with another operation (a restore reading one of them, an update about to
+/// prune) keeps its backups, each listed in `failed` with the reason.
 pub fn remove_older_backups(stacks: &[Stack], only: &HashSet<String>) -> BackupsRemoved {
     let mut done = BackupsRemoved::default();
-    for b in stacks
-        .iter()
-        .flat_map(crate::ops::older_backups)
-        .filter(|b| only.contains(&b.path))
-    {
-        match std::fs::remove_file(&b.path) {
-            Ok(()) => {
-                done.total_bytes += b.size_bytes;
-                done.removed.push(b.name);
+    for stack in stacks {
+        let ticked = crate::ops::older_backups(stack)
+            .into_iter()
+            .filter(|b| only.contains(&b.path));
+        let held = crate::oplock::hold(stack, crate::oplock::Operation::CleanUp);
+        if let Err(busy) = &held {
+            for b in ticked {
+                done.failed.push(format!("{} ({busy:#})", b.name));
             }
-            Err(e) => done.failed.push(format!("{} ({e})", b.name)),
+            continue;
+        }
+        for b in ticked {
+            match std::fs::remove_file(&b.path) {
+                Ok(()) => {
+                    done.total_bytes += b.size_bytes;
+                    done.removed.push(b.name);
+                }
+                Err(e) => done.failed.push(format!("{} ({e})", b.name)),
+            }
         }
     }
     done

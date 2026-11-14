@@ -101,6 +101,11 @@ struct Outcome {
     /// of the window's button for it, when the app has one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     blockers: Vec<BlockerView>,
+    /// Refused because another operation holds the site
+    /// ([`aincient_core::oplock::SiteBusy`]): nothing was attempted, so the
+    /// window leaves no "didn't finish" line on Home. Waiting is the way out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    site_busy: bool,
 }
 
 /// One [`aincient_core::gate::Blocker`] for the window.
@@ -120,6 +125,7 @@ impl Outcome {
         safety_backup_failed: false,
         backup_failed: false,
         blockers: Vec::new(),
+        site_busy: false,
     };
     /// An update that found the site already on the newest build: nothing was
     /// downloaded, backed up or restarted, and the window says so.
@@ -130,6 +136,7 @@ impl Outcome {
         safety_backup_failed: false,
         backup_failed: false,
         blockers: Vec::new(),
+        site_busy: false,
     };
 
     /// An update that found the site on the newest build with changed
@@ -141,6 +148,7 @@ impl Outcome {
         safety_backup_failed: false,
         backup_failed: false,
         blockers: Vec::new(),
+        site_busy: false,
     };
 
     fn failed(reason: String, docker_restart: bool) -> Outcome {
@@ -151,7 +159,21 @@ impl Outcome {
             safety_backup_failed: false,
             backup_failed: false,
             blockers: Vec::new(),
+            site_busy: false,
         }
+    }
+
+    /// Another operation holds the site ([`aincient_core::oplock::SiteBusy`],
+    /// or a server's `atelier` that ended with its exit code): a failed
+    /// answer with its words; any other error stays an error.
+    fn busy(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !aincient_core::oplock::SiteBusy::is(&e) {
+            return Err(e);
+        }
+        Ok(Outcome {
+            site_busy: true,
+            ..Outcome::failed(err_ref(&e), false)
+        })
     }
 
     /// An update refused because the site isn't ready: the reasons, each
@@ -207,7 +229,10 @@ fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, Strin
         Ok(ops::Updated::SettingsApplied) => Ok(Outcome::SETTINGS),
         // Before a failed boot: a site that wouldn't start for its backup is
         // refused with the boot's failure inside.
-        Err(e) => match Outcome::blocked(e).or_else(Outcome::overridable) {
+        Err(e) => match Outcome::busy(e)
+            .or_else(Outcome::blocked)
+            .or_else(Outcome::overridable)
+        {
             Ok(refused) => Ok(refused),
             Err(e) => outcome(Err(e)),
         },
@@ -216,6 +241,13 @@ fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, Strin
 }
 
 fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
+    let result = match result {
+        Err(e) => match Outcome::busy(e) {
+            Ok(busy) => return Ok(busy),
+            Err(e) => Err(e),
+        },
+        ok => ok,
+    };
     match result {
         Ok(true) => Ok(Outcome::READY),
         Ok(false) => Ok(Outcome {
@@ -773,7 +805,8 @@ async fn do_update(
                 );
                 match ran {
                     Ok(()) => Ok(Outcome::READY),
-                    Err(e) => Outcome::blocked(e)
+                    Err(e) => Outcome::busy(e)
+                        .or_else(Outcome::blocked)
                         .or_else(Outcome::overridable)
                         .map_err(err),
                 }
@@ -906,7 +939,7 @@ async fn do_restore(
         };
         match done {
             Ok(()) => Ok(Outcome::READY),
-            Err(e) => Outcome::overridable(e).map_err(err),
+            Err(e) => Outcome::busy(e).or_else(Outcome::overridable).map_err(err),
         }
     })
     .await
@@ -1327,6 +1360,8 @@ async fn engine_remove(app: AppHandle, sel: State<'_, Selected>) -> Result<(), S
                         },
                     );
                 };
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 engine_admin::remove(&mut engine_admin::LocalRemove::new(&s), &mut say)
                     .map(|_| ())
                     .map_err(err)
@@ -1371,6 +1406,8 @@ async fn engine_lockdown(
         }
         Target::Local(s) => {
             blocking(move || {
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 let info = engine_admin::probe(&s);
                 EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), verb.word())
                     .and_then(|a| a.run(verb))
@@ -1426,6 +1463,8 @@ async fn engine_rest(
         }
         Target::Local(s) => {
             blocking(move || {
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 let info = engine_admin::probe(&s);
                 EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), word)
                     .and_then(|a| a.run(verb))
@@ -1648,7 +1687,9 @@ async fn run_doctor_fix(
     sel: State<'_, Selected>,
 ) -> Result<doctor::Report, String> {
     match target(&sel)? {
-        Target::Local(s) => blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await,
+        Target::Local(s) => {
+            blocking(move || doctor::fix(&s, &mut EventReporter { app }).map_err(err)).await
+        }
         Target::Remote(site) => {
             blocking(move || remote::doctor(&site, true, &mut feed(&app)).map_err(err)).await
         }

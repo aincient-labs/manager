@@ -928,7 +928,9 @@ async function runProgressOp(title, fn, opts = {}) {
   }
   try {
     if (failure !== null) {
-      if (DIDNT_FINISH[opts.lifecycle]) {
+      // A busy site (another operation holds it, oplock.rs) attempted
+      // nothing: no "didn't finish" line, the panel says to wait.
+      if (DIDNT_FINISH[opts.lifecycle] && !(lastOpOutcome && lastOpOutcome.site_busy)) {
         setHomeNotice(DIDNT_FINISH[opts.lifecycle], { dockerRestart });
       }
       await progressFail(failure, dockerRestart);

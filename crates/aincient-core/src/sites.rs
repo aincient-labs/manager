@@ -1617,10 +1617,14 @@ fn registered<'a>(registry: &'a Registry, slug: &str) -> Result<&'a Site> {
     })
 }
 
-/// Whether `dir` exists and holds anything. Absent is `false`.
+/// Whether `dir` exists and holds anything. Absent is `false`. An operation
+/// lock file alone ([`crate::oplock::LOCK_FILE`], left by a setup that failed
+/// before it wrote anything) doesn't count.
 fn dir_has_entries(dir: &Path) -> Result<bool> {
     match std::fs::read_dir(dir) {
-        Ok(mut entries) => Ok(entries.next().is_some()),
+        Ok(entries) => Ok(entries
+            .flatten()
+            .any(|e| e.file_name() != crate::oplock::LOCK_FILE)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("could not read {}", dir.display())),
     }
