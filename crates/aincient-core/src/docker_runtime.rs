@@ -242,6 +242,7 @@ pub fn colima_profile(signals: &Signals) -> Option<String> {
 
 /// `colima restart`, with `--profile` for any profile but the default one.
 fn colima_restart(profile: Option<&str>) -> Vec<String> {
+    // scenario: none — restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
     let mut args = vec!["colima".to_string(), "restart".to_string()];
     if let Some(p) = profile {
         args.extend(["--profile".to_string(), p.to_string()]);
@@ -287,8 +288,10 @@ pub fn restart_plan(
     profile: Option<&str>,
 ) -> RestartPlan {
     match runtime {
+        // scenario: none — restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
         Runtime::OrbStack => RestartPlan::Steps(vec![Step::run(&["orbctl", "restart", "docker"])]),
         Runtime::DockerDesktop if desktop_cli => {
+            // scenario: none — restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
             RestartPlan::Steps(vec![Step::run(&["docker", "desktop", "restart"])])
         }
         Runtime::DockerDesktop if os == HostOs::Mac => RestartPlan::Steps(vec![
@@ -298,7 +301,9 @@ pub fn restart_plan(
         ]),
         Runtime::Colima => RestartPlan::Steps(vec![Step::Run(colima_restart(profile))]),
         Runtime::RancherDesktop => RestartPlan::Steps(vec![
+            // scenario: none — restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
             Step::run(&["rdctl", "shutdown"]),
+            // scenario: none — restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
             Step::run(&["rdctl", "start"]),
         ]),
         _ => {

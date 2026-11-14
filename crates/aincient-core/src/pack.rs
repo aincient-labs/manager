@@ -361,6 +361,7 @@ pub fn dev_up(stack: &Stack, pack: &Pack) -> Result<()> {
         );
     }
     let mut c = dev_compose(stack, pack);
+    // scenario: none — the theme-pack dev stack (atelier pack dev) has no scenario
     c.args(["up", "-d", "--wait"]);
     run_inherited(c, "bring the pack dev stack up")?;
     Ok(())
@@ -370,6 +371,7 @@ pub fn dev_up(stack: &Stack, pack: &Pack) -> Result<()> {
 /// caller's choice; this stops the whole compose project.
 pub fn dev_down(stack: &Stack, pack: &Pack) -> Result<()> {
     let mut c = dev_compose(stack, pack);
+    // scenario: none — the theme-pack dev stack (atelier pack dev) has no scenario
     c.args(["down"]);
     run_inherited(c, "stop the pack dev stack")
 }
@@ -379,6 +381,7 @@ pub fn dev_down(stack: &Stack, pack: &Pack) -> Result<()> {
 /// must never point it at the real appliance, whose volumes are the site.
 pub fn dev_down_purge(stack: &Stack, pack: &Pack) -> Result<()> {
     let mut c = dev_compose(stack, pack);
+    // scenario: none — the theme-pack dev stack (atelier pack dev) has no scenario; deletes the dev overlay's volumes
     c.args(["down", "-v"]);
     run_inherited(c, "stop the pack dev stack and delete its volumes")
 }

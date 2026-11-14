@@ -83,6 +83,7 @@ pub fn save(stack: &Stack) -> Result<PathBuf> {
         path = dir.join(format!("update-{stamp}-{n}.log"));
         n += 1;
     }
+    // scenario: a_failed_update_saves_every_services_log_without_secrets
     std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
     private(&path, 0o600);
     prune(&dir, KEEP);
@@ -166,6 +167,7 @@ fn prune(dir: &Path, keep: usize) {
     logs.sort();
     let extra = logs.len().saturating_sub(keep);
     for old in &logs[..extra] {
+        // scenario: none — keeping the newest 10 saved logs; no scenario saves more than one (unit-tested only)
         let _ = std::fs::remove_file(old);
     }
 }

@@ -832,7 +832,9 @@ pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     if !trusted.is_empty() {
         refuse_unless_loopback_only(stack, &compose_text, &home, image, config)?;
     }
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     write_atomic(&edge_path(stack), &edge_conf(&trusted), 0o644)?;
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     write_atomic(&compose_path(stack), &compose_text, 0o644)?;
     let mut text = env_without_ours(stack);
     if !text.is_empty() && !text.ends_with('\n') {
@@ -848,6 +850,7 @@ pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     ] {
         text.push_str(&format!("{k}={v}\n"));
     }
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     write_atomic(&stack.env_path(), &text, 0o600)?;
     protect_image(stack, image);
     Ok(())
@@ -878,6 +881,7 @@ pub fn pinned_tag(project: &str) -> String {
 /// re-download at the next start.
 pub fn protect_image(stack: &Stack, image: &str) {
     let mut c = crate::docker::docker();
+    // scenario: clean_up_counts_every_image_a_registered_site_needs
     c.args(["tag", image, &pinned_tag(&stack.project_name())]);
     let _ = crate::docker::try_capture(c);
 }
@@ -901,6 +905,7 @@ fn refuse_unless_loopback_only(
         ".{ENGINE_COMPOSE_FILE}.check-{}",
         std::process::id()
     ));
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (loopback check writes a candidate file)
     write_atomic(&candidate, compose_text, 0o644)?;
     let merged = config(
         &[stack.compose_path(), candidate.clone()],
@@ -910,6 +915,7 @@ fn refuse_unless_loopback_only(
             ("ATELIER_PROJECT", stack.project_name()),
         ],
     );
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (loopback check removes its candidate file)
     let _ = std::fs::remove_file(&candidate);
     let refuse = |why: String| {
         anyhow::anyhow!(
@@ -960,9 +966,11 @@ pub fn disable(stack: &Stack) -> Result<()> {
     }
     let text = env_without_ours(stack);
     if read(&stack.env_path()).as_deref() != Some(text.as_str()) {
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         write_atomic(&stack.env_path(), &text, 0o600)?;
     }
     for p in [compose_path(stack), edge_path(stack)] {
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -979,6 +987,7 @@ pub fn disable(stack: &Stack) -> Result<()> {
         match pinned_name_can_go(&json) {
             Ok(()) => {
                 let mut c = crate::docker::docker();
+                // scenario: none — engine mode (the experimental engine sidecar) has no scenario (disable removes the pinned engine tag)
                 c.args(["image", "rm", &tag]);
                 let _ = crate::docker::try_capture(c);
             }

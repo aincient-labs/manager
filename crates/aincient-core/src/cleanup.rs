@@ -384,6 +384,7 @@ pub fn free(scope: Scope, only: Option<&HashSet<String>>) -> Result<Report> {
         .collect();
     Ok(remove_each(images, images_in_use, |target| {
         let mut c = docker::docker();
+        // scenario: none — Free up space removing images is never run for real: scenario 7 checks the selection (cleanup::find) only, updates assert the automatic clean-up removes nothing
         c.args(["image", "rm", target]);
         docker::try_capture(c).is_some()
     }))
@@ -498,6 +499,7 @@ pub fn remove_older_backups(stacks: &[Stack], only: &HashSet<String>) -> Backups
             continue;
         }
         for b in ticked {
+            // scenario: none — Free up space removing older backups; no scenario runs cleanup::free
             match std::fs::remove_file(&b.path) {
                 Ok(()) => {
                     done.total_bytes += b.size_bytes;

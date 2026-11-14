@@ -1902,6 +1902,7 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     // Only ever inside an update, after its gate ([`Reattach::GatedAway`]).
     run_recovering_with(
         stack,
+        // scenario: none — the database server move runs only when the shipped db image changes; no scenario moves it
         &["up", "-d", "--force-recreate", "db", "app"],
         "move the database server",
         Reattach::GatedAway,
@@ -1935,6 +1936,7 @@ fn pull_then_move_db(
 /// `docker pull <image>` for the database move, relayed like the app pull.
 fn pull_db_image(image: &str, r: &mut dyn Reporter) -> Result<()> {
     let mut c = docker::docker();
+    // scenario: none — the database server move runs only when the shipped db image changes; no scenario moves it
     c.args(["pull", image]);
     run_step(c, "download the database server", r)
 }
@@ -2172,6 +2174,7 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     if structured {
         c.args(["--progress", "json"]);
     }
+    // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
     c.arg("pull");
     // What Docker said, when it passes through here (the terminal's own output
     // goes straight to the screen, where the operator reads it anyway).
@@ -2431,6 +2434,7 @@ fn up_updating(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
     run_recovering_with(
         stack,
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
         &["up", "-d"],
         "start the appliance",
         Reattach::GatedAway,
@@ -2444,6 +2448,7 @@ fn up_updating(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
 /// install, and a restore into a site whose database was erased.
 fn up_unguarded(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
+    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
     run_recovering(stack, &["up", "-d"], "start the appliance", r)?;
     // The database exists again, so an owner's wipe has been acted on.
     clear_database_wiped(stack);
@@ -2454,6 +2459,7 @@ fn up_unguarded(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
 /// the database is back, so a later accidental loss is refused again.
 fn clear_database_wiped(stack: &Stack) {
     // Best effort: a marker left behind only lets one more fresh start through.
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
     let _ = std::fs::remove_file(stack.database_wiped_path());
 }
 
@@ -2612,6 +2618,7 @@ fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn 
     let restore = crate::boot::endpoints_to_restore(stale, &crate::boot::inspect(&names));
     for (network, container) in stale {
         let mut c = docker::docker();
+        // scenario: none — the stale-endpoint clear itself: scenario 1 builds the state it leaves, nothing makes Docker report a stale endpoint
         c.args(["network", "disconnect", "-f", network, container]);
         match docker::probe_unbounded(c) {
             Ok(_) => r.log(&format!(
@@ -2641,6 +2648,7 @@ fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn 
 
 /// `docker network connect` for `back`, under each name it had there.
 fn reconnect_args(back: &crate::boot::Reconnect) -> Vec<String> {
+    // scenario: none — reconnecting a network without an alias; the scenarios reconnect db, which always has one
     let mut args = vec!["network".to_string(), "connect".to_string()];
     for alias in &back.aliases {
         args.push("--alias".into());
@@ -2679,6 +2687,7 @@ pub(crate) fn reattach_detached(stack: &Stack, r: &mut dyn Reporter) -> Vec<crat
 /// `docker network connect` for `d`: by its service name, the alias compose
 /// gave it, so `db` resolves again.
 fn reattach_args(d: &crate::boot::Detached) -> Vec<String> {
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
     [
         "network",
         "connect",
@@ -2707,6 +2716,7 @@ pub(crate) fn reconnect_site(stack: &Stack, r: &mut dyn Reporter) -> Result<bool
             None,
         );
         let mut c = compose(stack);
+        // scenario: none — restarting app after a reconnect; no scenario reaches it
         c.args(["restart", "app"]);
         run_step(c, "restart the site", r)?;
     }
@@ -2881,6 +2891,7 @@ fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
                 None,
             );
             let mut c = docker::docker();
+            // scenario: none — engine sites only; engine mode (the experimental engine sidecar) has no scenario
             c.args(["pull", &image]);
             run_step(c, "download the site's engine", r).map_err(|e| {
                 anyhow::anyhow!(
@@ -2976,6 +2987,7 @@ pub fn stop_containers(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     ensure_installed(stack)?;
     r.stage(Stage::Working, "Stopping the appliance…", None);
     let mut c = compose(stack);
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
     c.arg("stop");
     run_step(c, "stop the appliance", r)
 }
@@ -3032,7 +3044,9 @@ pub enum StartAction {
 /// update with no backup and no stepped route. Only an update does that.
 pub fn start_args(action: StartAction) -> &'static [&'static str] {
     match action {
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         StartAction::Start => &["start"],
+        // scenario: none — Start of a site whose containers are gone; scenarios start existing containers
         StartAction::Up => &["up", "-d", "--no-recreate"],
     }
 }
@@ -3076,6 +3090,7 @@ fn apply_db_restart_policy(stack: &Stack, r: &mut dyn Reporter) {
         return;
     };
     let mut c = docker::docker();
+    // scenario: start_after_the_shared_tag_moved_keeps_the_sites_image
     c.args(["update", "--restart", DB_RESTART, &db.name]);
     match docker::probe(c) {
         Ok(_) => r.log(&format!(
@@ -3215,6 +3230,7 @@ pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> 
     let _op = crate::oplock::hold(stack, crate::oplock::Operation::Remove)?;
     ensure_installed(stack)?;
     let mut c = compose(stack);
+    // scenario: none — removing a site (atelier app down); no scenario
     c.arg("down");
     if wipe_data {
         mark_database_wiped(stack)?;
@@ -3226,6 +3242,7 @@ pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> 
 /// Leave the owner's-wipe marker in `stack`'s directory.
 fn mark_database_wiped(stack: &Stack) -> Result<()> {
     let path = stack.database_wiped_path();
+    // scenario: none — the marker of an owner wipe (app down --wipe); no scenario
     std::fs::write(
         &path,
         "The database was wiped on purpose; the next start sets up a fresh site.\n",
@@ -3363,6 +3380,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
         .inspect_err(|_| {
             remove_in_container(stack, &[&stage, &archive]);
             // Never leave a partial archive behind.
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
             let _ = std::fs::remove_file(&part);
         })?;
 
@@ -3397,6 +3415,7 @@ fn backup_stem(label: Option<&str>, ts: &str) -> String {
 /// leftover would otherwise stay (a multi-GB archive, once per failed attempt).
 fn remove_in_container(stack: &Stack, paths: &[&str]) {
     let mut rm = compose(stack);
+    // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
     rm.args(["exec", "-T", "app", "rm", "-rf"]).args(paths);
     let _ = rm.output();
 }
@@ -3433,6 +3452,7 @@ fn sweep_stale_parts(dir: &Path) {
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > STALE_PART);
         if stale {
+            // scenario: none — removes .part files older than the stale age; no scenario leaves one
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -3450,11 +3470,13 @@ fn claim_name(part: &Path, dir: &Path, stem: &str, ext: &str) -> Result<PathBuf>
     for name in candidates {
         match std::fs::hard_link(part, &name) {
             Ok(()) => {
+                // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
                 let _ = std::fs::remove_file(part);
                 return Ok(name);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) if !name.exists() => {
+                // scenario: none — the fallback when claiming the backup name by hard link fails; not reached
                 std::fs::rename(part, &name)
                     .with_context(|| format!("failed to save the backup as {}", name.display()))?;
                 return Ok(name);
@@ -3527,6 +3549,7 @@ fn install_export(staged: &Path, target: &Path) -> Result<()> {
     }
     check_export_target(target)?;
     if target.exists() {
+        // scenario: none — static export (atelier export) has no scenario; replaces the export target
         std::fs::remove_dir_all(target).with_context(|| {
             format!(
                 "failed to replace the previous export at {}",
@@ -3534,6 +3557,7 @@ fn install_export(staged: &Path, target: &Path) -> Result<()> {
             )
         })?;
     }
+    // scenario: none — static export (atelier export) has no scenario
     std::fs::rename(staged, target)
         .with_context(|| format!("failed to move the export into {}", target.display()))
 }
@@ -3689,10 +3713,12 @@ fn export_static_in(
             let mut cp = compose(stack);
             cp.args(["cp", &format!("app:{stage}"), &staged.to_string_lossy()]);
             if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
+                // scenario: none — static export (atelier export) has no scenario
                 let _ = std::fs::remove_dir_all(&staged);
                 return Err(e);
             }
             if let Err(e) = install_export(&staged, host_out) {
+                // scenario: none — static export (atelier export) has no scenario
                 let _ = std::fs::remove_dir_all(&staged);
                 return Err(e);
             }
@@ -3933,6 +3959,7 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         "Copying the backup into the container…",
         |_| {
             let mut cp = compose(stack);
+            // scenario: none — restoring a plain .sql dump; the scenarios restore backup bundles
             cp.args([
                 "cp",
                 &file.to_string_lossy(),
@@ -4022,6 +4049,7 @@ fn restore_bundle_in(
         "Copying the snapshot into the container…",
         |_| {
             let mut cp = compose(stack);
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
             cp.args(["cp", &file.to_string_lossy(), &format!("app:{archive}")]);
             run_capture(cp, "copy the snapshot into the container")
         },
@@ -4694,6 +4722,7 @@ pub fn automatic_backups_since(stack: &Stack) -> Option<String> {
 /// has a start already. Best effort: without it nothing is pruned.
 fn note_automatic_backups_since(stack: &Stack, stamp: &str) {
     if automatic_backups_since(stack).is_none() {
+        // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
         let _ = std::fs::write(stack.home.join(AUTOMATIC_SINCE_FILE), format!("{stamp}\n"));
     }
 }
@@ -4791,6 +4820,7 @@ fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Re
     };
     let backups = list_backups(stack);
     for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT, protect, Some(&since)) {
+        // scenario: a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
         match std::fs::remove_file(&b.path) {
             Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
             Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),

@@ -632,6 +632,7 @@ impl Stack {
         if !SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&current.as_str()) {
             return Ok(false);
         }
+        // scenario: none — refreshing a superseded edge.conf; no scenario ships an old edge.conf
         std::fs::write(&path, EDGE_CONF_TEMPLATE)
             .with_context(|| format!("could not write {}", path.display()))?;
         Ok(true)
@@ -649,6 +650,7 @@ impl Stack {
         let Some(refreshed) = refreshed_compose(&current) else {
             return Ok(false);
         };
+        // scenario: start_after_the_shared_tag_moved_keeps_the_sites_image
         std::fs::write(&path, refreshed)
             .with_context(|| format!("could not write {}", path.display()))?;
         Ok(true)
@@ -743,6 +745,7 @@ impl Stack {
     /// Record the image a stepped update is heading for, before its first hop.
     pub fn set_update_target(&self, image: &str) -> Result<()> {
         let path = self.update_target_path();
+        // scenario: none — a stepped (multi-hop) update; no scenario has hops
         std::fs::write(&path, format!("{image}\n"))
             .with_context(|| format!("could not write {}", path.display()))
     }
@@ -750,6 +753,7 @@ impl Stack {
     /// The route is finished (or abandoned for another channel): forget it.
     /// Best effort: a leftover only makes the next update head for it again.
     pub fn clear_update_target(&self) {
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
         let _ = std::fs::remove_file(self.update_target_path());
     }
 
@@ -771,9 +775,12 @@ impl Stack {
         let tmp = self
             .home
             .join(format!(".{SITE_ID_FILE}.tmp-{}", std::process::id()));
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         std::fs::write(&tmp, format!("{id}\n"))
             .with_context(|| format!("could not write {}", tmp.display()))?;
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         if let Err(e) = std::fs::rename(&tmp, &path) {
+            // scenario: none — cleanup after a failed site-id rename; not reached
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("could not write {}", path.display()));
         }
@@ -974,6 +981,7 @@ impl Stack {
                 _ => line.to_string(),
             })
             .collect();
+        // scenario: none — rewriting compose.yaml's image line (db image move); no scenario moves it
         std::fs::write(&path, rewritten)
             .with_context(|| format!("could not write {}", path.display()))
     }
@@ -1049,6 +1057,7 @@ impl Stack {
     /// Serialize the env map back to `.env`, keeping its `0600` perms.
     fn write_env(&self, env: &BTreeMap<String, String>) -> Result<()> {
         let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
         write_private(&self.env_path(), &body)
     }
 
@@ -1099,12 +1108,14 @@ impl Stack {
 
         let compose = self.compose_path();
         if !compose.is_file() {
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             std::fs::write(&compose, COMPOSE_TEMPLATE)
                 .with_context(|| format!("could not write {}", compose.display()))?;
         }
         // compose.yaml mounts it: a stack without it cannot start `edge`.
         let edge = self.edge_conf_path();
         if !edge.is_file() {
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             std::fs::write(&edge, EDGE_CONF_TEMPLATE)
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
@@ -1138,6 +1149,7 @@ impl Stack {
                 Some(true) => done.existing_db_without_env = true,
                 None => {}
             }
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             write_private(&env_path, &contents)?;
         } else {
             // Reconcile only the tunables the caller explicitly chose this run;
@@ -1210,9 +1222,11 @@ impl Stack {
                         "{name}.replaced-{}",
                         chrono::Local::now().format("%Y%m%d-%H%M%S")
                     ));
+                    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
                     std::fs::rename(&path, &aside).with_context(|| {
                         format!("could not move the old {name} to {}", aside.display())
                     })?;
+                    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
                     std::fs::write(&path, template)
                         .with_context(|| format!("could not write {}", path.display()))?;
                     changes.push(format!(
@@ -1221,6 +1235,7 @@ impl Stack {
                     ));
                 }
             } else {
+                // scenario: none — repair_scaffold writing a missing file; scenario 8 repairs a changed one
                 std::fs::write(&path, template)
                     .with_context(|| format!("could not write {}", path.display()))?;
                 changes.push(format!("wrote a fresh {name}"));

@@ -343,6 +343,7 @@ fn disable(stack: &Stack) -> Result<()> {
     // The engine container is now an orphan, and edge's config changed back
     // to edge.conf, so `up` removes the one and recreates the other.
     let mut c = compose(stack);
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (disable brings the plain stack back up)
     c.args(["up", "-d", "--remove-orphans"]);
     run_inherited(c, "restart the stack without the engine")?;
     println!(

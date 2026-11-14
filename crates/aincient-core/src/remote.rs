@@ -277,6 +277,7 @@ impl Transport for Ssh {
 /// whole site's database.
 fn create_private(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
+    // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -1267,10 +1268,12 @@ pub fn fetch_backup<T: Transport>(transport: &T, info: &BackupInfo, dir: &Path) 
                 info.path
             );
         }
+        // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("could not move the copy into {}", dest.display()))
     })();
     if result.is_err() {
+        // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
         let _ = std::fs::remove_file(&tmp);
     }
     result.map(|()| dest)
@@ -1778,6 +1781,7 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
+        // scenario: none — server sites: removes its own private temp dir after a transfer; no scenario has an SSH server
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }

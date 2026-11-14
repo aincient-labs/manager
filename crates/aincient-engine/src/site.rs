@@ -101,12 +101,14 @@ impl Site for ComposeSite {
 
     fn stop_app_and_db(&self, cut: Cut) -> Result<()> {
         let mut c = self.compose();
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario (the sidecar stops a server site to freeze it)
         c.args(["stop", "app", "db"]);
         run_bounded(c, "stop the site", COMPOSE_DEADLINE, cut).map(|_| ())
     }
 
     fn start_db_and_app(&self, cut: Cut) -> Result<()> {
         let mut c = self.compose();
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario (the sidecar starts a frozen server site)
         c.args(["start", "db", "app"]);
         run_bounded(c, "start the site", COMPOSE_DEADLINE, cut).map(|_| ())
     }
