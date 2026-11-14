@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Before every update, Atelier backs up your site first (a "before-update" backup), so a one-step
+  update can be undone from **Backups** like a multi-step one. Before a restore, it saves your site
+  as it is now ("before-restore"); if the restore fails, the error names that file.
+- Atelier keeps the newest 3 of the backups it takes by itself and removes older ones. Backups you
+  make are never removed.
+
 ### Fixed
 
 - Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker

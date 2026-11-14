@@ -996,6 +996,17 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     refresh_edge_conf(stack);
 
     if !plan.is_stepped() {
+        // The banner promises "Updating keeps all your pages and settings": a
+        // one-step update took no backup until 0.17.0, so a failed migration had
+        // nothing to go back to. Best effort, like the stepped route's snapshot.
+        safety_backup(
+            stack,
+            "before-update",
+            "Backing up before the update…",
+            0.03,
+            PULL_FROM - 0.04,
+            r,
+        );
         retarget_single_hop(stack, plan)?;
         pull(stack, r)?;
         up(stack, r)?;
@@ -2787,7 +2798,68 @@ pub fn restore_with(
     if let Some(note) = restore_identity(stack, file, opts.other_site)?.message() {
         r.log(note);
     }
-    restore(stack, file, r)
+    // A restore drops the database before loading the backup: without a copy of
+    // the site as it is now, a wrong pick or a failed load loses the work since.
+    let before = safety_backup(
+        stack,
+        "before-restore",
+        "Backing up your site as it is now…",
+        0.0,
+        0.0,
+        r,
+    );
+    restore(stack, file, r).map_err(|e| match &before {
+        Some(path) => e.context(format!(
+            "the restore didn't finish. Your site as it was just before is saved in {}; restore that to go back",
+            path.display()
+        )),
+        None => e,
+    })
+}
+
+/// A best-effort backup before a change the owner can't undo by running the old
+/// image again (a one-step update, a restore). Skipped when the site isn't
+/// running (there is nothing new to save); a failure is reported and the change
+/// goes ahead, as with the stepped route's snapshot. `base`/`span` place the
+/// backup's own progress inside the caller's bar (`span` 0 = indeterminate).
+fn safety_backup(
+    stack: &Stack,
+    label: &str,
+    headline: &str,
+    base: f32,
+    span: f32,
+    r: &mut dyn Reporter,
+) -> Option<PathBuf> {
+    if !status(stack).running {
+        return None;
+    }
+    let at = |f: f32| (span > 0.0).then_some(f);
+    r.stage(Stage::Working, headline, at(base));
+    let mut snap = ScaledReporter {
+        inner: r,
+        base,
+        span,
+        prefix: String::new(),
+    };
+    match backup(stack, Some(label), &mut snap) {
+        Ok(path) => {
+            r.stage(
+                Stage::Working,
+                &format!("Backup saved: {}", path.display()),
+                at(base + span),
+            );
+            prune_automatic_backups(stack, r);
+            Some(path)
+        }
+        Err(e) => {
+            r.stage(
+                Stage::Working,
+                &format!("Couldn't take a backup first ({e:#}). Continuing."),
+                at(base + span),
+            );
+            None
+        }
+    }
 }
 
 /// Describe a backup archive the way `data backup --json` reports it: size and
@@ -3021,6 +3093,55 @@ fn is_snapshot_bundle(name: &str) -> bool {
 fn is_backup_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     is_snapshot_bundle(name) || n.ends_with(".sql.gz") || n.ends_with(".sql")
+}
+
+/// Labels Atelier gives the backups it takes by itself. Only these are ever
+/// pruned; a backup the owner made (no label, or their own) is never touched.
+const AUTOMATIC_BACKUP_LABELS: [&str; 4] = [
+    "before-update",
+    "before-restore",
+    "before-stepped-upgrade",
+    "before-channel-switch",
+];
+
+/// How many automatic backups to keep (owner, 2026-11-14).
+const AUTOMATIC_BACKUPS_KEPT: usize = 3;
+
+/// The automatic backups beyond the newest `keep`, oldest last — what a prune
+/// removes. A name counts as automatic only as `<label>-<YYYYMMDD>-<HHMMSS>…`.
+fn automatic_backups_to_prune(backups: &[Backup], keep: usize) -> Vec<&Backup> {
+    let mut auto: Vec<&Backup> = backups
+        .iter()
+        .filter(|b| {
+            AUTOMATIC_BACKUP_LABELS.iter().any(|l| {
+                b.name
+                    .strip_prefix(l)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(|rest| {
+                        rest.len() >= 15 && rest[..8].bytes().all(|c| c.is_ascii_digit())
+                    })
+            })
+        })
+        .collect();
+    auto.sort_by(|a, b| {
+        b.modified_unix
+            .cmp(&a.modified_unix)
+            .then_with(|| b.name.cmp(&a.name))
+    });
+    auto.into_iter().skip(keep).collect()
+}
+
+/// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] automatic backups; delete older
+/// ones. Runs only after a new automatic backup succeeded, so there are always
+/// at least that many to go back to. A file that won't delete is logged, not fatal.
+fn prune_automatic_backups(stack: &Stack, r: &mut dyn Reporter) {
+    let backups = list_backups(stack);
+    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT) {
+        match std::fs::remove_file(&b.path) {
+            Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
+            Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),
+        }
+    }
 }
 
 /// List host backups, newest first.
@@ -3512,6 +3633,39 @@ mod tests {
     }
 
     #[test]
+    fn only_automatic_backups_beyond_the_newest_three_are_pruned() {
+        let b = |name: &str, t: u64| Backup {
+            name: name.into(),
+            path: format!("/b/{name}"),
+            size_bytes: 1,
+            modified_unix: t,
+        };
+        let all = vec![
+            b("before-update-20261101-100000.tar.gz", 1),
+            b("before-restore-20261102-100000.tar.gz", 2),
+            b("before-update-20261103-100000.tar.gz", 3),
+            b("before-stepped-upgrade-20261104-100000.tar.gz", 4),
+            b("before-update-20261105-100000.tar.gz", 5),
+            // The owner's own: never pruned, however old.
+            b("20261001-090000.tar.gz", 0),
+            b("before-redesign-20261001-090000.tar.gz", 0),
+            b("before-update-notes.tar.gz", 0),
+        ];
+        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3)
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(
+            gone,
+            [
+                "before-restore-20261102-100000.tar.gz",
+                "before-update-20261101-100000.tar.gz"
+            ]
+        );
+        assert!(automatic_backups_to_prune(&all[..3], 3).is_empty());
+    }
+
+    #[test]
     fn a_start_is_retried_only_when_docker_left_the_site_half_started() {
         // The 0.29.0 update on 2026-11-14: a stale network endpoint stopped db
         // (exited 1) and left the new app container created, not running.
@@ -3531,12 +3685,13 @@ mod tests {
     }
 
     use super::{
-        backup_dump_script, backup_pack_script, container_state_from_ps, half_started,
-        is_backup_file, is_snapshot_bundle, list_backups, parse_extension_list, parse_http_status,
-        parse_local_probe, parse_remote_probe, parse_serialized_extensions, plan_route,
-        plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts, start_action,
-        waypoint_image, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
-        MAX_WAYPOINTS, REGISTRY_OFFLINE, START_STUCK,
+        automatic_backups_to_prune, backup_dump_script, backup_pack_script,
+        container_state_from_ps, half_started, is_backup_file, is_snapshot_bundle, list_backups,
+        parse_extension_list, parse_http_status, parse_local_probe, parse_remote_probe,
+        parse_serialized_extensions, plan_route, plan_route_with, registry_problem,
+        remote_probe_with, restore_bundle_scripts, start_action, waypoint_image, Backup,
+        ContainerState, ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS,
+        REGISTRY_OFFLINE, START_STUCK,
     };
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
