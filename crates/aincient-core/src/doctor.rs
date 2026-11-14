@@ -527,6 +527,7 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
 
     out.push(check_port(stack, pf.docker_running));
     out.push(check_disk(stack));
+    out.push(check_docker_memory(pf.docker_running));
 
     pf.ok()
 }
@@ -714,6 +715,131 @@ fn check_disk(stack: &Stack) -> Check {
         ),
     )
     .detail(detail)
+}
+
+const DOCKER_MEMORY_ID: &str = "host.docker_memory";
+const DOCKER_MEMORY_LABEL: &str = "Memory for Docker";
+
+/// How much memory Docker has (`docker info` MemTotal: the VM's on a Mac or
+/// Windows, the computer's on Linux), with the runtime's own words for where
+/// to raise it. Colima's VM has 2 GiB unless told otherwise.
+fn check_docker_memory(docker_running: bool) -> Check {
+    if !docker_running {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker isn't answering.",
+        );
+    }
+    let mut c = docker::docker();
+    c.args([
+        "info",
+        "--format",
+        "{{.MemTotal}}|{{.CgroupVersion}}|{{.OperatingSystem}}|{{.Name}}",
+    ]);
+    let info = probe(c).ok();
+    docker_memory_verdict(info.as_deref(), crate::docker_runtime::HostOs::current())
+}
+
+/// The floor below which a site's converge (Drupal + Postgres + nginx) is
+/// likely to be killed for lack of memory. A starting point, not a measured
+/// peak (the M3 state set measures it).
+const DOCKER_MEMORY_FLOOR_MIB: u64 = 4096;
+
+/// [`check_docker_memory`] on `docker info`'s answer
+/// (`MemTotal|CgroupVersion|OperatingSystem|Name`).
+fn docker_memory_verdict(info: Option<&str>, os: crate::docker_runtime::HostOs) -> Check {
+    use crate::docker_runtime::{colima_profile, detect_from, memory_remedy, Signals};
+    let Some(info) = info else {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker didn't say how much memory it has.",
+        );
+    };
+    let mut parts = info.trim().splitn(4, '|');
+    let bytes = parts.next().and_then(|b| b.trim().parse::<u64>().ok());
+    let cgroup = parts.next().unwrap_or("").trim().to_string();
+    let signals = Signals {
+        operating_system: parts.next().map(str::to_string),
+        name: parts.next().map(str::to_string),
+        ..Signals::default()
+    };
+    let Some(bytes) = bytes else {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker didn't say how much memory it has.",
+        );
+    };
+    let runtime = detect_from(&signals, os);
+    let mib = bytes / (1024 * 1024);
+    let mut detail = format!("{:.1} GiB", mib as f64 / 1024.0);
+    // cgroup v1: whether a kill by the VM's own out-of-memory killer sets
+    // Docker's flag is unverified, so a start may miss saying why.
+    if cgroup == "1" {
+        detail.push_str(
+            "; cgroup v1, so Atelier may not see when Docker stops a site for lack of memory",
+        );
+    }
+    if mib >= DOCKER_MEMORY_FLOOR_MIB {
+        return Check::ok(DOCKER_MEMORY_ID, Tier::Host, DOCKER_MEMORY_LABEL).detail(detail);
+    }
+    let profile = colima_profile(&signals);
+    Check::bad(
+        DOCKER_MEMORY_ID,
+        Tier::Host,
+        DOCKER_MEMORY_LABEL,
+        Severity::Warn,
+        format!(
+            "Docker has less than {} GiB of memory, so a site may run out while it starts or \
+             updates. {} (4 GiB or more), or run fewer sites at once.",
+            DOCKER_MEMORY_FLOOR_MIB / 1024,
+            memory_remedy(runtime, profile.as_deref())
+        ),
+    )
+    .detail(detail)
+}
+
+/// A service Docker stopped for lack of memory: `State.OOMKilled` now, or an
+/// `oom` event in the last day (Docker keeps its last 256 events, and a
+/// restart clears the flag). `None`: Docker didn't answer.
+fn memory_verdict(
+    oom: Option<std::collections::BTreeSet<String>>,
+    remedy: impl FnOnce() -> String,
+) -> Check {
+    const ID: &str = "stack.memory";
+    const LABEL: &str = "Enough memory for the site";
+    let Some(oom) = oom else {
+        return Check::skipped(ID, Tier::Stack, LABEL, "Docker didn't answer.");
+    };
+    if oom.is_empty() {
+        return Check::ok(ID, Tier::Stack, LABEL);
+    }
+    let parts: Vec<&str> = oom
+        .iter()
+        .map(|s| match s.as_str() {
+            "db" => "the database",
+            "app" => "the app",
+            "edge" => "the web server",
+            other => other,
+        })
+        .collect();
+    Check::bad(
+        ID,
+        Tier::Stack,
+        LABEL,
+        Severity::Warn,
+        format!(
+            "Docker stopped part of your site because it ran out of memory. {}, or stop \
+             other sites.",
+            remedy()
+        ),
+    )
+    .detail(format!("out of memory: {}", parts.join(", ")))
 }
 
 /// Free megabytes on the filesystem holding `path`, via POSIX `df -Pk`. Walks up
@@ -938,6 +1064,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             ("stack.db", "Database container healthy"),
             ("stack.app", "Appliance container running"),
             ("stack.network", NETWORK_LABEL),
+            ("stack.memory", "Enough memory for the site"),
         ] {
             out.push(Check::skipped(id, Tier::Stack, label, why));
         }
@@ -1014,6 +1141,10 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
     out.push(network_verdict(
         crate::boot::half_attached_now(stack),
         crate::boot::detached_now(stack),
+    ));
+    out.push(memory_verdict(
+        crate::boot::out_of_memory_now(stack),
+        crate::docker_runtime::memory_remedy_here,
     ));
     app_up
 }
@@ -1708,6 +1839,72 @@ fn health_detail(stderr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dockers_memory_is_checked_against_the_floor_with_the_runtimes_words() {
+        use crate::docker_runtime::HostOs;
+        // OrbStack on the owner's Mac, 2026-11-14.
+        let ok = super::docker_memory_verdict(Some("10490122240|2|OrbStack|orbstack"), HostOs::Mac);
+        assert_eq!(ok.severity, Severity::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("9.8 GiB"));
+        // Colima's default VM: 2 GiB.
+        let colima =
+            super::docker_memory_verdict(Some("2063835136|2|Ubuntu 24.04 LTS|colima"), HostOs::Mac);
+        assert_eq!(colima.severity, Severity::Warn);
+        let remedy = colima.remedy.unwrap();
+        assert!(
+            remedy.contains("`colima stop`, then `colima start --memory 4`"),
+            "{remedy}"
+        );
+        let desktop = super::docker_memory_verdict(
+            Some("3000000000|2|Docker Desktop|docker-desktop"),
+            HostOs::Mac,
+        );
+        assert!(desktop
+            .remedy
+            .unwrap()
+            .contains("Settings → VM resources → Advanced → Memory limit"));
+        let linux =
+            super::docker_memory_verdict(Some("2000000000|1|Ubuntu 24.04 LTS|box"), HostOs::Linux);
+        assert!(linux.remedy.unwrap().contains("this computer"));
+        assert!(linux.detail.unwrap().contains("cgroup v1"));
+        for bad in [None, Some(""), Some("x|2|OrbStack|orbstack")] {
+            assert_eq!(
+                super::docker_memory_verdict(bad, HostOs::Mac).severity,
+                Severity::Skipped
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_stopped_for_lack_of_memory_is_reported() {
+        use std::collections::BTreeSet;
+        let remedy = || "Give Docker more memory in OrbStack's settings".to_string();
+        assert_eq!(
+            super::memory_verdict(Some(BTreeSet::new()), remedy).severity,
+            Severity::Ok
+        );
+        assert_eq!(
+            super::memory_verdict(None, remedy).severity,
+            Severity::Skipped
+        );
+        let hit = super::memory_verdict(
+            Some(BTreeSet::from(["db".to_string(), "app".to_string()])),
+            remedy,
+        );
+        assert_eq!(hit.severity, Severity::Warn);
+        assert_eq!(
+            hit.detail.as_deref(),
+            Some("out of memory: the app, the database")
+        );
+        assert_eq!(
+            hit.remedy.as_deref(),
+            Some(
+                "Docker stopped part of your site because it ran out of memory. Give Docker more \
+                  memory in OrbStack's settings, or stop other sites."
+            )
+        );
+    }
     use super::*;
 
     #[test]
