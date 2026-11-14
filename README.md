@@ -203,7 +203,7 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about eight minutes together (18 scenarios, 475 s on OrbStack; 20–40 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about nine minutes together (21 scenarios, 536 s on OrbStack; 15–40 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
