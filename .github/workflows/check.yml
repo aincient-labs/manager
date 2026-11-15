@@ -74,10 +74,24 @@ jobs:
   # that changes the owner's Docker, reproduced on a tiny real compose project.
   # Linux runners ship Docker + compose; macOS runners have none, and the
   # owner's Mac covers OrbStack/Docker Desktop.
+  #
+  # Run once per image store: Docker reads image origin differently on each
+  # (a local build lists `RepoDigests` on the containerd store, not on the
+  # classic one; `aincient_core::image_origin`). The containerd store is the
+  # default of a fresh Docker Engine 29 and of Docker Desktop; the classic
+  # (overlay2) store is OrbStack's and an upgraded engine's. Each leg sets its
+  # store explicitly, on this runner only, so a runner image changing its
+  # default can't silently drop one.
   scenarios:
-    name: scenarios (real Docker)
+    name: scenarios (real Docker, ${{ matrix.store }} image store)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        store:
+          - containerd
+          - classic
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -89,8 +103,26 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Docker
-        run: docker version && docker compose version
+      - name: Docker on the ${{ matrix.store }} image store
+        env:
+          SNAPSHOTTER: ${{ matrix.store == 'containerd' }}
+        run: |
+          sudo mkdir -p /etc/docker
+          current=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          echo "$current" | jq --argjson on "$SNAPSHOTTER" '.features["containerd-snapshotter"] = $on' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version && docker compose version
+          echo "image store: $(docker info --format '{{.Driver}} {{json .DriverStatus}}')"
+          driver_status=$(docker info --format '{{json .DriverStatus}}')
+          case "$driver_status" in
+            *io.containerd.snapshotter*) got=containerd ;;
+            *) got=classic ;;
+          esac
+          if [ "$got" != "${{ matrix.store }}" ]; then
+            echo "::error::Docker is on the $got image store, not ${{ matrix.store }}"
+            exit 1
+          fi
 
       - name: cargo test --test scenarios
         run: cargo test -p aincient-core --test scenarios --locked -- --ignored --test-threads=1
