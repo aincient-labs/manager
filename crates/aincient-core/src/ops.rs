@@ -3046,7 +3046,7 @@ pub fn start_args(action: StartAction) -> &'static [&'static str] {
     match action {
         // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         StartAction::Start => &["start"],
-        // scenario: start_recreates_only_the_removed_container_and_keeps_the_others
+        // scenario: start_recreates_only_the_removed_container_and_keeps_the_others, app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
         StartAction::Up => &["up", "-d", "--no-recreate"],
     }
 }
@@ -3230,7 +3230,7 @@ pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> 
     let _op = crate::oplock::hold(stack, crate::oplock::Operation::Remove)?;
     ensure_installed(stack)?;
     let mut c = compose(stack);
-    // scenario: none — removing a site (atelier app down); no scenario
+    // scenario: app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
     c.arg("down");
     if wipe_data {
         mark_database_wiped(stack)?;
@@ -3242,7 +3242,7 @@ pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> 
 /// Leave the owner's-wipe marker in `stack`'s directory.
 fn mark_database_wiped(stack: &Stack) -> Result<()> {
     let path = stack.database_wiped_path();
-    // scenario: none — the marker of an owner wipe (app down --wipe); no scenario
+    // scenario: app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
     std::fs::write(
         &path,
         "The database was wiped on purpose; the next start sets up a fresh site.\n",

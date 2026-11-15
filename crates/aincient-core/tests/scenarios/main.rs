@@ -13,6 +13,7 @@
 
 mod harness;
 
+mod app_down;
 mod boot_fatal;
 mod cleanup_needed;
 mod container_gone;
