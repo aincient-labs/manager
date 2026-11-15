@@ -2722,6 +2722,7 @@ mod tests {
                     opts: RestoreOptions {
                         other_site: true,
                         no_safety_backup: false,
+                        ..RestoreOptions::default()
                     },
                 },
                 "data restore --yes --other-site -- /tmp/x.tar.gz",
@@ -2733,6 +2734,7 @@ mod tests {
                     opts: RestoreOptions {
                         other_site: false,
                         no_safety_backup: true,
+                        ..RestoreOptions::default()
                     },
                 },
                 "data restore --yes --no-safety-backup -- /tmp/x.tar.gz",
@@ -3406,6 +3408,7 @@ mod tests {
                 &RestoreOptions {
                     other_site: true,
                     no_safety_backup: false,
+                    ..RestoreOptions::default()
                 },
                 &mut |_, _| {},
             )

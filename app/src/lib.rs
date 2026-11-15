@@ -940,6 +940,7 @@ async fn do_restore(
     let opts = ops::RestoreOptions {
         other_site: other_site.unwrap_or(false),
         no_safety_backup: no_safety_backup.unwrap_or(false),
+        ..ops::RestoreOptions::default()
     };
     let target = target(&sel)?;
     blocking(move || {

@@ -1831,6 +1831,8 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
                 &ops::RestoreOptions {
                     other_site,
                     no_safety_backup,
+                    // Printed above, before the confirmation.
+                    identity_shown: true,
                 },
                 &mut StepLines::default(),
             )
@@ -2766,6 +2768,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
                 opts: ops::RestoreOptions {
                     other_site,
                     no_safety_backup,
+                    ..ops::RestoreOptions::default()
                 },
                 on_server,
             },

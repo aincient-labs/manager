@@ -4432,6 +4432,10 @@ pub struct RestoreOptions {
     /// Restore without first backing up the site as it is now
     /// (`--no-safety-backup`). Without it, a backup that fails stops the restore.
     pub no_safety_backup: bool,
+    /// The caller already showed the archive's identity note ([`restore_identity`]):
+    /// the CLI prints it before its confirmation, so the restore doesn't say
+    /// it a second time ("Restoring a backup of another site — …" twice).
+    pub identity_shown: bool,
 }
 
 /// A restore was refused because the backup of the site as it is now failed:
@@ -4524,7 +4528,9 @@ pub fn restore_with(
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
     }
-    if let Some(note) = restore_identity(stack, file, opts.other_site)?.message() {
+    // Checked either way: the refusal of another site's archive is here.
+    let identity = restore_identity(stack, file, opts.other_site)?;
+    if let Some(note) = identity.message().filter(|_| !opts.identity_shown) {
         r.log(note);
     }
     let erased = restore_into_erased(stack, r)?;
@@ -7236,6 +7242,46 @@ mod tests {
         let err =
             restore_with(&stack, &theirs, &RestoreOptions::default(), &mut Silent).unwrap_err();
         assert!(err.downcast_ref::<IdentityMismatch>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn the_other_site_note_is_said_once() {
+        #[derive(Default)]
+        struct Logged(Vec<String>);
+        impl Reporter for Logged {
+            fn log(&mut self, line: &str) {
+                self.0.push(line.to_string());
+            }
+        }
+        let dir = Scratch::new("restore-note");
+        // Not installed: the restore stops right after the identity check,
+        // before Docker is asked anything.
+        let stack = Stack::at(dir.0.join("site"));
+        std::fs::create_dir_all(&stack.home).unwrap();
+        std::fs::write(stack.site_id_path(), format!("{ID_B}\n")).unwrap();
+        let theirs = bundle_with(
+            &dir.0,
+            "theirs.tar.gz",
+            &format!(
+                r#"{{"format":"aincient-snapshot","version":3,"site_id":"{ID_A}","site_slug":"blog"}}"#
+            ),
+        );
+        let notes = |identity_shown| {
+            let mut r = Logged::default();
+            let opts = RestoreOptions {
+                other_site: true,
+                identity_shown,
+                ..RestoreOptions::default()
+            };
+            let _ = restore_with(&stack, &theirs, &opts, &mut r);
+            r.0.iter()
+                .filter(|l| l.starts_with("Restoring a backup of another site"))
+                .count()
+        };
+        // The app: the restore says it.
+        assert_eq!(notes(false), 1);
+        // The CLI printed it before its confirmation: not again.
+        assert_eq!(notes(true), 0);
     }
 
     #[test]
