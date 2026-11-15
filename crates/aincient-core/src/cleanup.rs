@@ -499,7 +499,7 @@ pub fn remove_older_backups(stacks: &[Stack], only: &HashSet<String>) -> Backups
             continue;
         }
         for b in ticked {
-            // scenario: none — Free up space removing older backups; no scenario runs cleanup::free
+            // scenario: free_up_space_removes_only_the_ticked_older_backups
             match std::fs::remove_file(&b.path) {
                 Ok(()) => {
                     done.total_bytes += b.size_bytes;

@@ -2,7 +2,6 @@
 # <path> | <fn> | <what> | <reason>
 crates/aincient-cli/src/engine.rs | disable | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario (disable brings the plain stack back up)
 crates/aincient-core/src/cleanup.rs | free | docker: image rm | Free up space removing images is never run for real: scenario 7 checks the selection (cleanup::find) only, updates assert the automatic clean-up removes nothing
-crates/aincient-core/src/cleanup.rs | remove_older_backups | fs: remove_file | Free up space removing older backups; no scenario runs cleanup::free
 crates/aincient-core/src/docker_runtime.rs | colima_restart | runtime: colima restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | docker: docker desktop restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: orbctl restart docker | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)

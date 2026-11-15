@@ -22,6 +22,7 @@ mod disk_full;
 mod doctor_start;
 mod endpoint_clear;
 mod erased_db;
+mod older_backups;
 mod oom_app;
 mod oom_db;
 mod prune_backups;
