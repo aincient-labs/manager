@@ -321,6 +321,10 @@ scripts/state-zoo.sh down                 # remove every zoo site completely
 each full output in `zoo-logs/<state>-<command>.log` (gitignored). It always runs
 `target/debug/atelier` (built first), never the `atelier` on your PATH.
 
+A changing check consumes the state it ran on (`app start` reconnects `detached-db` and starts
+`stopped`), so run read-only checks (`doctor`) first, or remake one state with
+`down <state>` + `up <state>` and check only it with `ZOO_ONLY="<state> …"`.
+
 | State (site `zoo-…`) | How it is made | The real history it imitates |
 |---|---|---|
 | `old-template` | installed, stopped, then `compose.yaml` and `edge.conf` replaced by the last superseded shipped templates (`templates/compose-0.14.1.yaml`, `edge-0.14.0.conf`) and the containers recreated from them with `docker compose up -d` | a site installed by Manager ≤ 0.14.1: db has no restart policy, files the next start/update refreshes |
