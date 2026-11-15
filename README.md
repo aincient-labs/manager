@@ -203,7 +203,7 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about nine minutes together (21 scenarios, 542 s on OrbStack; 15–40 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about thirteen minutes together (28 scenarios, 29 tests, 765 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
@@ -258,6 +258,13 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 17 | `site_busy.rs` | an update holds the site (slow boot, on another thread): a restore and a start asked meanwhile are refused (`SiteBusy`, "an update started …"); after it ends, start, backup and restore run |
 | 17b | `site_busy.rs` | another process takes the site's lock and is killed: its lock went with it, the next start runs |
 | 18 | `update_failed_logs.rs` | a failed update (`no_backup`, converge FATAL) saves `logs/update-*.log` with compose ps, each service's State and timestamped logs incl. the FATAL; the error names it; no `DB_PASSWORD` value, no env |
+| 19 | `reconnect_restart.rs` | db of a running site on no network: Start reconnects it **and restarts the app** (new `StartedAt`, same container), Ready, app reaches `db` |
+| 20 | `container_gone.rs` | a stopped site's db, then edge, container removed, the shared tag moved: Start creates only that one (`up -d --no-recreate`); the others keep their containers, app its image, db its data |
+| 21 | `doctor_start.rs` | edge removed, app stopped, the shared tag moved: `doctor --fix` StartContainers creates edge, starts app in place on its image; no Scaffold rewrite (compose.yaml is the template, the scenario db comes from an overlay) |
+| 22 | `endpoint_clear.rs` | a step fails while db (paused: the one not-running state a network still lists) holds endpoints on two networks: Start force-disconnects and reconnects it under `db` on both, retries, then says restart Docker (`NeedsDockerRestart`); after unpause Start is Ready with the data |
+| 23 | `db_image_move.rs` | the db image move through `ops::update_with`, between two scenario Postgres builds (feature `scenario-seams`), the new one served by a local `registry:2`: download fails → Ready, compose.yaml untouched; pushed → the next update pulls, rewrites compose.yaml, recreates db + app, data kept |
+| 24 | `older_backups.rs` | Free up space's older automatic backups: only the ticked older ones removed; an unticked older one, counted ones and the owner's backup stay even when named in the list |
+| 25 | `app_down.rs` | `app down` keeps the volumes and the next Start recreates the containers on the same data; `down --wipe` writes the marker, removes every volume, and the next Start sets up a fresh site and clears the marker |
 
 **Guard: every changing call names its scenario** (`crates/aincient-core/tests/docker_guard.rs`,
 runs in plain `cargo test`). It scans `crates/*/src` (not test code) for calls that change the
@@ -279,6 +286,14 @@ call, a name that is no test, an unlisted `none`, or a stale allowlist line fail
 scanner reads string literals, so it can't see command words built at run time or a script
 run inside a container; the file's header lists its limits. To list every call it finds:
 `ATELIER_GUARD_LIST=1 cargo test -p aincient-core --test docker_guard -- --exact list --nocapture`.
+
+**Seams.** The one place a scenario can't use the product's real names is the database server
+move (its images are the real `pgvector/pgvector` tags, which a scenario never pulls or tags):
+the crate's feature `scenario-seams` (`stack::scenario_seams`, turned on only for its own tests by
+a dev-dependency on itself; the CLI and app never have it) lets scenario 23 stand two
+`atelier-scn-` images in for that pair. Everything else runs as shipped. A scenario that runs
+`doctor --fix` writes compose.yaml as the template and the scenario db in an overlay
+(`Site::db_image_by_overlay`), or the checkup's Scaffold rewrite would put the real db image back.
 
 Adding one: one scenario per incident or regression, in its own file under
 `tests/scenarios/`. Build the state the real site was in with Docker's own commands, call the
