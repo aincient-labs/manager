@@ -2199,6 +2199,13 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool, no_backup: bool) -> 
         }
     };
 
+    // A build made on this computer has nothing to download: say so before the
+    // plan's own registry lookup ("Couldn't reach the registry … pull access
+    // denied") is printed. The update itself refuses it too.
+    if let Some(local) = ops::plan_local_build(stack, &plan) {
+        return Err(local.into());
+    }
+
     // A site's database only migrates forward: an older release run against a schema
     // a newer one already migrated breaks the site with no visible cause. Refuse a
     // PROVEN backwards move outright — the way back to an older version is a restore,

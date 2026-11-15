@@ -1372,6 +1372,22 @@ fn local_build(stack: &Stack, image: &str) -> Option<LocalBuild> {
     })
 }
 
+/// [`LocalBuild`] when applying `plan` would download a build only this
+/// computer has (a single hop onto it: a stepped route's hops are registry
+/// releases). Reads only; the CLI asks before printing the plan, whose
+/// registry lookup of such an image fails with Docker's own words.
+pub fn plan_local_build(stack: &Stack, plan: &UpgradePlan) -> Option<LocalBuild> {
+    if plan.is_stepped() {
+        return None;
+    }
+    let pulls = if plan.explicit_target {
+        plan.target_image.clone()
+    } else {
+        stack.image()
+    };
+    local_build(stack, &pulls)
+}
+
 /// The before-update backup of a running site, or the refusal: an update that
 /// migrates with no way back is worse than no update (a full disk is the usual
 /// cause, and the same disk would fail the migration's own snapshot). The owner
@@ -1461,15 +1477,8 @@ fn run_upgrade(
     // would fail with Docker's "pull access denied". Refused before anything
     // is touched (the zoo's shared-tag sites, a developer build). A stepped
     // route's hops are registry releases.
-    if !plan.is_stepped() {
-        let pulls = if plan.explicit_target {
-            plan.target_image.clone()
-        } else {
-            stack.image()
-        };
-        if let Some(local) = local_build(stack, &pulls) {
-            return Err(anyhow::Error::new(local));
-        }
+    if let Some(local) = plan_local_build(stack, plan) {
+        return Err(anyhow::Error::new(local));
     }
     // Refuse before any work while the site isn't ready (M2c, the HA model):
     // Docker not answering, too little disk, an erased database, a container
