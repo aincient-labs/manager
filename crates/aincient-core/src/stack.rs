@@ -222,7 +222,58 @@ pub const LEGACY_DB_IMAGE: &str = "pgvector/pgvector:pg16";
 /// the tag a manager or `install.sh` wrote. A digest, another tag or another image
 /// is the operator's choice and stays.
 pub fn db_image_upgrade(image: &str) -> Option<String> {
+    #[cfg(feature = "scenario-seams")]
+    if let Some(to) = scenario_seams::db_image_upgrade(image) {
+        return Some(to);
+    }
     (image == LEGACY_DB_IMAGE).then(|| DB_IMAGE.to_string())
+}
+
+/// Seams for the real-Docker scenario tests (umbrella DECISIONS 0528), compiled
+/// only with the `scenario-seams` feature, which nothing but this crate's own
+/// tests turns on (its dev-dependency on itself): the CLI and the app never
+/// have it.
+#[cfg(feature = "scenario-seams")]
+pub mod scenario_seams {
+    use std::sync::Mutex;
+
+    /// Only scenario images may stand in.
+    const PREFIX: &str = "atelier-scn-";
+
+    static DB_MOVE: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+    /// While held, [`super::db_image_upgrade`] also moves `legacy` to `current`,
+    /// as it moves [`super::LEGACY_DB_IMAGE`] to [`super::DB_IMAGE`]. A
+    /// scenario can't pull or tag the real pgvector images, so it moves a site
+    /// between two images it built and serves from its own registry; the rest of
+    /// the move (the download, the `compose.yaml` rewrite, the recreate) is the
+    /// product's. Both names must be scenario images.
+    #[must_use = "the stand-in ends when the guard drops"]
+    pub fn stand_in_db_move(legacy: &str, current: &str) -> DbMove {
+        assert!(
+            legacy.contains(PREFIX) && current.contains(PREFIX),
+            "only scenario images stand in for the db move: {legacy:?} -> {current:?}"
+        );
+        *DB_MOVE.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((legacy.to_string(), current.to_string()));
+        DbMove(())
+    }
+
+    /// Ends the stand-in on drop.
+    pub struct DbMove(());
+
+    impl Drop for DbMove {
+        fn drop(&mut self) {
+            *DB_MOVE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn db_image_upgrade(image: &str) -> Option<String> {
+        let held = DB_MOVE.lock().unwrap_or_else(|p| p.into_inner());
+        held.as_ref()
+            .filter(|(legacy, _)| legacy == image)
+            .map(|(_, current)| current.clone())
+    }
 }
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
@@ -1990,6 +2041,32 @@ mod tests {
         assert!(now.contains("    # mine\n"), "hand edits survive");
         // Once only.
         assert_eq!(stack.migrate_edge_image().unwrap(), None);
+    }
+
+    #[cfg(feature = "scenario-seams")]
+    #[test]
+    fn a_scenario_db_move_stands_in_only_while_held() {
+        let (legacy, current) = (
+            "atelier-scn-x-db:legacy",
+            "localhost:1/atelier-scn-x-db:new",
+        );
+        assert_eq!(db_image_upgrade(legacy), None);
+        {
+            let _held = scenario_seams::stand_in_db_move(legacy, current);
+            assert_eq!(db_image_upgrade(legacy).as_deref(), Some(current));
+            // The real pair still moves; nothing else does.
+            assert_eq!(db_image_upgrade(LEGACY_DB_IMAGE).as_deref(), Some(DB_IMAGE));
+            assert_eq!(db_image_upgrade(current), None);
+            assert_eq!(db_image_upgrade("postgres:16"), None);
+        }
+        assert_eq!(db_image_upgrade(legacy), None, "dropped: gone");
+    }
+
+    #[cfg(feature = "scenario-seams")]
+    #[test]
+    #[should_panic(expected = "only scenario images")]
+    fn a_scenario_db_move_refuses_real_images() {
+        let _held = scenario_seams::stand_in_db_move(LEGACY_DB_IMAGE, DB_IMAGE);
     }
 
     #[test]

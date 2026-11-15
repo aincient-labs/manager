@@ -36,6 +36,9 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage
 [features]
 # The engine client's real HTTPS transport (`engine_client::Https`).
 engine-client = ["dep:ureq"]
+# Test-only seams for the real-Docker scenarios (`stack::scenario_seams`). Only
+# this crate's own tests turn it on, through the dev-dependency on itself below.
+scenario-seams = []
 
 # Guided per-server SSH keys live in the OS keychain, never on disk (M2, D-05).
 # keyring 3.x: 4.x needs rustc 1.88, above our MSRV. On Linux the pure-Rust zbus
@@ -52,3 +55,5 @@ keyring = { version = "3.6", features = ["windows-native"] }
 
 [dev-dependencies]
 socket2 = "0.6"
+# Itself, with the scenario seams on: for its tests only, never the CLI or app.
+aincient-core = { path = ".", features = ["scenario-seams"] }

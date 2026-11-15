@@ -32,6 +32,7 @@ dependencies = [
 name = "aincient-core"
 version = "0.16.0"
 dependencies = [
+ "aincient-core",
  "anyhow",
  "chrono",
  "dirs 5.0.1",
