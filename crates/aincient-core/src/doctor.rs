@@ -1402,6 +1402,16 @@ fn engine_port_verdict(ports_json: Option<&str>) -> Check {
     }
 }
 
+/// The container `compose ps -a -q <service>` lists, if any: one id per line,
+/// nothing at all when the service has no container (running or stopped).
+fn first_container(ps_out: &str) -> Option<String> {
+    ps_out
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// Inspect one compose service: is its container up, and (if it declares a
 /// healthcheck) healthy? A container stuck in a restart loop reports "running"
 /// on any single glance, so the restart count is read too — that's the state
@@ -1413,21 +1423,25 @@ fn check_container(
     label: &'static str,
     engine_state: Option<&str>,
 ) -> Check {
+    // `-a`: a stopped container is there too. Without it a stopped site read
+    // as "no container" and was told its container isn't there (zoo, 0.17).
     let mut ps = compose(stack);
-    ps.args(["ps", "-q", service]);
+    ps.args(["ps", "-a", "-q", service]);
     let container = match probe(ps) {
-        Ok(out) if !out.trim().is_empty() => out.trim().lines().next().unwrap_or("").to_string(),
-        Ok(_) => {
-            return Check::bad(
-                id,
-                Tier::Stack,
-                label,
-                Severity::Fail,
-                "The container isn't there. Start the appliance with `atelier app start`.",
-            )
-            .detail(format!("no `{service}` container"))
-            .fixable(Repair::StartContainers)
-        }
+        Ok(out) => match first_container(&out) {
+            Some(cid) => cid,
+            None => {
+                return Check::bad(
+                    id,
+                    Tier::Stack,
+                    label,
+                    Severity::Fail,
+                    "The container isn't there. Start the appliance with `atelier app start`.",
+                )
+                .detail(format!("no `{service}` container"))
+                .fixable(Repair::StartContainers)
+            }
+        },
         Err(e) => {
             return Check::bad(
                 id,
@@ -2141,6 +2155,29 @@ mod tests {
             "a crash loop still reports running at any single glance"
         );
         assert!(s.restarts >= RESTART_LOOP_THRESHOLD);
+    }
+
+    #[test]
+    fn a_stopped_container_is_found_and_only_no_container_reads_as_missing() {
+        // `compose ps -a -q app`, verbatim: a stopped site lists its exited
+        // container (the zoo's stopped site read "isn't there" without `-a`);
+        // a service with no container prints nothing at all.
+        let stopped = "3f0c1a9e2b7d4c58a6e1f0b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a\n";
+        assert_eq!(
+            first_container(stopped).as_deref(),
+            Some("3f0c1a9e2b7d4c58a6e1f0b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a")
+        );
+        assert_eq!(first_container(""), None);
+        assert_eq!(first_container("\n"), None);
+        // A stopped one is then inspected and told to start, not "isn't there".
+        let c = stopped_container("stack.app", "Appliance container running", "exited", None);
+        assert!(
+            c.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("isn't running")),
+            "{c:?}"
+        );
+        assert_eq!(c.fix, Some(Repair::StartContainers));
     }
 
     #[test]

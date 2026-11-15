@@ -8,6 +8,10 @@
 //! compose.yaml is exactly the shipped template (the scenario db image comes
 //! from an overlay), so the checkup's first rung, the Scaffold rewrite, has
 //! nothing to do and StartContainers is the repair that runs.
+//!
+//! The checkup's own words first: the stopped app reads "isn't running", not
+//! "isn't there" (zoo 2026-11-15: `compose ps` without `-a` lists no stopped
+//! container).
 
 use std::time::Instant;
 
@@ -37,6 +41,20 @@ fn doctor_fix_creates_the_removed_container_and_keeps_the_sites_image() {
     let app_id = site.id("app");
 
     let before = doctor::diagnose(&site.stack);
+    // The stopped app is there, stopped: "isn't running", not "isn't there"
+    // (the zoo's stopped site, before `compose ps -a`).
+    let app_check = before
+        .checks
+        .iter()
+        .find(|c| c.id == "stack.app")
+        .expect("the app check");
+    let said = app_check.remedy.as_deref().unwrap_or_default();
+    assert!(
+        said.contains("isn't running") && !said.contains("isn't there"),
+        "a stopped container is told to start: {app_check:?}"
+    );
+    assert_eq!(app_check.detail.as_deref(), Some("state: exited"));
+    assert_eq!(app_check.fix, Some(Repair::StartContainers));
     assert!(
         before.available_repairs().first() == Some(&Repair::StartContainers),
         "the checkup offers to start the containers first: {:?}",

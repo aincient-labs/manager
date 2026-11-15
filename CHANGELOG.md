@@ -83,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Run a checkup** on a stopped site now says its containers aren't running, with **Start** as the
+  fix, instead of "The container isn't there".
 - A site that runs out of memory while it starts or updates now says so: "Your site ran out of
   memory, so Docker stopped part of it (the database)…", with where to give Docker more memory, as
   soon as it is seen, instead of "still starting" after two minutes or "couldn't finish starting".
