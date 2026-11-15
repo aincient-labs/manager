@@ -22,6 +22,7 @@ mod detached_db;
 mod disk_full;
 mod doctor_start;
 mod endpoint_clear;
+mod engine_pin_kept;
 mod erased_db;
 mod older_backups;
 mod oom_app;

@@ -7,7 +7,6 @@ crates/aincient-core/src/docker_runtime.rs | restart_plan | docker: docker deskt
 crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: orbctl restart docker | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: rdctl shutdown | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: rdctl start | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
-crates/aincient-core/src/engine.rs | disable | docker: image rm | engine mode (the experimental engine sidecar) has no scenario (disable removes the pinned engine tag)
 crates/aincient-core/src/engine.rs | disable | fs: remove_file | engine mode (the experimental engine sidecar) has no scenario
 crates/aincient-core/src/engine.rs | disable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario
 crates/aincient-core/src/engine.rs | enable | fs: write_atomic | engine mode (the experimental engine sidecar) has no scenario

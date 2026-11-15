@@ -203,8 +203,9 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about thirteen minutes together (28 scenarios, 29 tests, 765 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
-job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
+plugin, and take about thirteen minutes together (30 scenarios, 31 tests, 765 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
+job `scenarios`) twice, once on each of Docker's image stores (containerd, classic), which read an
+image's origin differently (`aincient_core::image_origin`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
   temp dir: the shipped template with `postgres:16-alpine` as `db`, a small Alpine `app` built per
@@ -244,7 +245,7 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 5 | `restore_safety.rs` | unwritable backups folder: a backup is refused before its dump (`BackupsNotWritable`, plain words, no `.part`, nothing staged); restore refused with that cause, database untouched; `no_safety_backup` restores |
 | 6 | `update_stopped.rs` | stopped site that won't boot: update refused (`BackupBeforeUpdateFailed`); `no_backup` updates |
 | 6b | `update_running_backup_fails.rs` | running site whose before-update backup fails (read-only backups folder): update refused with the plain cause, site on its build; stopped, refused before it is started; `no_backup` updates |
-| 7 | `cleanup_needed.rs` | a stopped site's image, a digest pin and an engine pin count as needed (selection only) |
+| 7 | `cleanup_needed.rs` | a stopped site's image, a digest pin and an engine pin count as needed; a local build under Atelier's own repository is never picked (selection only) |
 | 8 | `erased_db.rs` | erased db volume: Start and `doctor --fix` refuse, create nothing; a restore brings it back |
 | 9 | `boot_fatal.rs` | a FATAL boot fails Start in plain words; a later `converge OK` clears it |
 | 10 | `prune_backups.rs` | a restore keeps the 3 newest counted automatic backups, never a pre-0.17 one |
@@ -266,6 +267,7 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 24 | `older_backups.rs` | Free up space's older automatic backups: only the ticked older ones removed; an unticked older one, counted ones and the owner's backup stay even when named in the list |
 | 25 | `app_down.rs` | `app down` keeps the volumes and the next Start recreates the containers on the same data; `down --wipe` writes the marker, removes every volume, and the next Start sets up a fresh site and clears the marker |
 | 26 | `update_local_build.rs` | a site on a harness-built local tag (no `pull_policy: never` overlay), tag moved to a second build: update refused before anything (`LocalBuild`, "nothing to download", `atelier app channel stable`), no pull; `.env`, compose.yaml, containers, image unchanged, no backup; `check_update` offers no update |
+| 27 | `engine_pin_kept.rs` | `image_origin` on real Docker (a local build never downloadable, the pulled db image is); engine off (`engine::disable`) keeps a local engine build known only by its `pinned-<project>` name |
 
 **Guard: every changing call names its scenario** (`crates/aincient-core/tests/docker_guard.rs`,
 runs in plain `cargo test`). It scans `crates/*/src` (not test code) for calls that change the

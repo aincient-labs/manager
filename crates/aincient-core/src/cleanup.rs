@@ -107,18 +107,37 @@ const SHIPPED_SUPERSEDED_BASES: [&str; 3] =
 ///
 /// - no container uses it (`in_use`) and no registered site needs it
 ///   (`needed`: by ID, `repo:tag` or `repo@digest`, see [`needed_images`]);
-/// - it can be downloaded again: at least one row has a registry digest. A
-///   local or fork build has none, and removing it would lose it for good;
+/// - it can be downloaded again (`downloadable`, asked last: see
+///   [`find`]). A local or fork build can't, and removing it would lose it for
+///   good;
 /// - every name it has qualifies: an Atelier image (only an untagged one after
 ///   an update), or a database / web-server image Atelier has moved its sites
 ///   off ([`is_superseded_base`]; after an update only
 ///   [`SHIPPED_SUPERSEDED_BASES`]). The current `nginx` and `pgvector` images
 ///   are generic and other projects may use them, so they always stay.
+#[cfg(test)]
 fn select(
     rows: &[Row],
     in_use: &HashSet<String>,
     needed: &HashSet<String>,
     scope: Scope,
+) -> Vec<(String, String, Vec<String>)> {
+    select_by(rows, in_use, needed, scope, |_, same| any_digest(same))
+}
+
+/// The classic image store's "can be downloaded again": at least one row has
+/// a registry digest (a local build has none there).
+fn any_digest(same: &[&Row]) -> bool {
+    same.iter().any(|r| r.by_digest().is_some())
+}
+
+/// [`select`] with `downloadable(id, rows)` deciding "can be downloaded again".
+fn select_by(
+    rows: &[Row],
+    in_use: &HashSet<String>,
+    needed: &HashSet<String>,
+    scope: Scope,
+    downloadable: impl Fn(&str, &[&Row]) -> bool,
 ) -> Vec<(String, String, Vec<String>)> {
     let qualifies = |r: &Row| -> bool {
         if is_atelier_repo(&r.repo) {
@@ -146,8 +165,8 @@ fn select(
         }
         let same: Vec<&Row> = rows.iter().filter(|r| r.id == id).collect();
         if same.iter().any(|r| is_needed(r))
-            || !same.iter().any(|r| r.by_digest().is_some())
             || !same.iter().all(|r| qualifies(r))
+            || !downloadable(id, &same)
         {
             continue;
         }
@@ -355,7 +374,21 @@ pub fn find(scope: Scope) -> Result<Report> {
     let rows = parse_rows(&docker::try_capture_empty_ok(ls).context(NO_DOCKER)?);
     // Without knowing what containers use, nothing is safe to remove.
     let in_use = images_in_use().context(NO_DOCKER)?;
-    let images: Vec<Reclaimable> = select(&rows, &in_use, &needed, scope)
+    // "Can be downloaded again": on the classic image store a local build has
+    // no registry digest, but on the containerd store (Docker Engine 29 on
+    // Linux, Docker Desktop) every name has one, local builds included; there
+    // the image's recorded origin decides ([`crate::image_origin`]), and an
+    // image whose origin Docker can't tell stays.
+    let store = crate::image_origin::store();
+    let containerd = store != Some(crate::image_origin::Store::Classic);
+    let downloadable = |id: &str, same: &[&Row]| {
+        if containerd {
+            crate::image_origin::inspect(id).and_then(|i| i.downloadable(store)) == Some(true)
+        } else {
+            any_digest(same)
+        }
+    };
+    let images: Vec<Reclaimable> = select_by(&rows, &in_use, &needed, scope, downloadable)
         .into_iter()
         .map(|(id, repo, names)| Reclaimable {
             size_bytes: image_size(&id),
@@ -599,6 +632,25 @@ mod tests {
         // A container (any state) using it keeps it.
         let busy: HashSet<String> = [all[1].id.clone()].into();
         assert!(!ids(&select(&all, &busy, &none(), Scope::Everything)).contains(&short(CMS_LATEST)));
+    }
+
+    #[test]
+    fn on_the_containerd_store_a_digest_is_no_proof_of_a_registry() {
+        // Docker 29, containerd store: a local engine build under Atelier's own
+        // repository lists a digest like any pulled image. Only its recorded
+        // origin (`downloadable`) may let it go.
+        const CD_LOCAL_ENGINE: &str = "sha256:4f7e751fef6b0e8b5e97e05cb2003b6bef01aaeb73753df7517e12c40674cea1\tghcr.io/aincient-labs/atelier-engine\tdev\tsha256:4f7e751fef6b0e8b5e97e05cb2003b6bef01aaeb73753df7517e12c40674cea1";
+        let all = rows(&[CD_LOCAL_ENGINE, CMS_LATEST]);
+        let local = all[0].id.clone();
+        let every = select_by(&all, &none(), &none(), Scope::Everything, |id, _| {
+            id != local
+        });
+        assert_eq!(ids(&every), [short(CMS_LATEST)]);
+        // The classic reading would have taken it.
+        assert_eq!(
+            ids(&select(&all, &none(), &none(), Scope::Everything)),
+            [short(CD_LOCAL_ENGINE), short(CMS_LATEST)]
+        );
     }
 
     // Another project's `nginx:1.27-alpine`, which Atelier never shipped

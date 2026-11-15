@@ -9,9 +9,13 @@
 //! owner's. Clean-up is run in selection mode only (`cleanup::find`), never
 //! `free`: it lists every image on this computer, the owner's included.
 //!
-//! Not covered, and why: an image clean-up may REMOVE must carry a registry
-//! digest under Atelier's own repositories (`ghcr.io/aincient-labs/…`); a
-//! local build has none and a test can't make one without publishing there.
+//! A local build tagged under Atelier's own repository must never be picked
+//! either: it can't be downloaded again (on the containerd image store it
+//! lists a registry digest all the same).
+//!
+//! Not covered, and why: an image clean-up may REMOVE must have been pulled
+//! from Atelier's own repositories (`ghcr.io/aincient-labs/…`); a local build
+//! wasn't, and a test can't make one without publishing there.
 //! So the "superseded one is removed" half is left to the unit tests over
 //! parsed `docker image ls` rows (`cleanup::tests`); here every test image is
 //! shown to be needed or not as it should be, and never selected.
@@ -23,6 +27,7 @@ use aincient_core::cleanup::{self, Scope};
 use aincient_core::engine::{pinned_tag, protect_image, IMAGE_ENV};
 use aincient_core::ops;
 use aincient_core::sites::{Registry, Site as RegisteredSite};
+use aincient_core::stack::IMAGE_REPO;
 
 use crate::harness::{docker, try_docker, user_home, Feed, Site, Template, SCN_DB_IMAGE};
 
@@ -93,7 +98,9 @@ fn clean_up_counts_every_image_a_registered_site_needs() {
     stopped.scaffold(&stopped_image, Template::Current);
     stopped.up_ready();
     ops::stop(&stopped.stack, &mut Feed::default()).expect("stop");
-    // Its image as it was before its last update: superseded, dangling now.
+    // Its image as it was before its last update: superseded, dangling now
+    // (the classic image store keeps it untagged; the containerd store
+    // deletes a build that loses its last name, so there it has no rows).
     let (_, superseded) = stopped.build_app("old", "s0");
     stopped.build_app("old", "s1");
     assert!(rows(&superseded)
@@ -125,10 +132,25 @@ fn clean_up_counts_every_image_a_registered_site_needs() {
     assert_eq!(image_id(&pin), engine_id, "the real pin tagged the engine");
     docker(&["image", "rm", &engine_build]);
 
-    // An unrelated generic image, used by nothing.
+    // An unrelated generic image, used by nothing: tagged by name (an image
+    // ID is no name to tag by on the containerd store once its build lost
+    // every name).
+    let (generic_build, _) = engine.build_app("generic", "g");
     let generic = format!("{}-generic:1", engine.project());
-    docker(&["tag", &superseded, &generic]);
+    docker(&["tag", &generic_build, &generic]);
     engine.owns_tag(&generic);
+
+    // A build made on this computer under Atelier's own repository (as a
+    // developer or fork build is), used by nothing and needed by no site.
+    // "Everything" takes unused Atelier images, but only ones that can be
+    // downloaded again: this one can't. On the containerd image store it lists
+    // a registry digest like a pulled image (Linux CI, Docker 29), so a digest
+    // is no proof there.
+    let (atelier_build, atelier_local) = engine.build_app("atelier", "l");
+    let atelier_name = format!("{IMAGE_REPO}:{}", engine.project());
+    docker(&["tag", &atelier_build, &atelier_name]);
+    engine.owns_tag(&atelier_name);
+    docker(&["image", "rm", &atelier_build]);
 
     Registry {
         active: None,
@@ -163,7 +185,7 @@ fn clean_up_counts_every_image_a_registered_site_needs() {
     assert!(!needed.contains(&generic), "nor the generic image");
 
     // Selection only (never `free`): neither pass picks any of them.
-    let ours: Vec<String> = [&stopped_id, &engine_id, &superseded]
+    let ours: Vec<String> = [&stopped_id, &engine_id, &superseded, &atelier_local]
         .into_iter()
         .cloned()
         .chain([image_id(&digest_ref)])

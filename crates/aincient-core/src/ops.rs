@@ -701,7 +701,7 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     // What the registry gets asked about is where an update would *come from*, which
     // on a legacy install is not what `.env` says — see `Stack::prospective_image`.
     // The local probe below keeps using `image`, because that is what is on this
-    // machine. Digests compare across the rename regardless: `parse_local_probe`
+    // machine. Digests compare across the rename regardless: `local_probe`
     // keeps only the `sha256:…`, and the rename moved the package rather than
     // republishing it.
     let mut check = UpdateCheck {
@@ -1299,23 +1299,25 @@ impl LocalBuild {
 
 /// Whether `image` names a build only this computer has: its reference names
 /// no registry host (so a pull asks Docker Hub, which has no Atelier image)
-/// and the local image was never downloaded under that name (no `RepoDigests`
-/// entry for its repository: a retag of a downloaded image, such as
-/// `atelier-cms:zoo-shared`, carries the source's digest under the source's
-/// name only). `pull_policy: never` on `app` is the owner telling compose to
-/// use the local image as it is (the scenario harness's local builds), so a
-/// pull takes nothing and the update goes ahead. An image that isn't here
-/// (`repo_digests` `None`) is left to the pull. A digest reference is never
-/// local-only. Pure: [`local_build`] feeds it what Docker says.
+/// and the local image was never pulled under that name (`pulled_from`, the
+/// repositories it was pulled from: [`crate::image_origin`], which reads them
+/// right under both image stores; a retag of a downloaded image, such as
+/// `atelier-cms:zoo-shared`, was pulled under the source's name only).
+/// `pull_policy: never` on `app` is the owner telling compose to use the local
+/// image as it is (the scenario harness's local builds), so a pull takes
+/// nothing and the update goes ahead. An image that isn't here, or whose
+/// origin Docker can't tell (`pulled_from` `None`), is left to the pull. A
+/// digest reference is never local-only. Pure: [`local_build`] feeds it what
+/// Docker says.
 fn is_local_only(
     image: &str,
     app_pull_policy: Option<&str>,
-    repo_digests: Option<&[String]>,
+    pulled_from: Option<&[String]>,
 ) -> bool {
     if app_pull_policy == Some("never") || image.contains('@') {
         return false;
     }
-    let Some(digests) = repo_digests else {
+    let Some(pulled_from) = pulled_from else {
         return false;
     };
     // The repository: the reference without its tag (a `:` after the last `/`).
@@ -1327,13 +1329,11 @@ fn is_local_only(
     if host.is_some_and(|h| h.contains('.') || h.contains(':') || h == "localhost") {
         return false;
     }
-    let same_repo = |d: &String| {
-        let name = d.split('@').next().unwrap_or_default();
-        name == repo
-            || name == format!("docker.io/{repo}")
-            || name == format!("docker.io/library/{repo}")
+    let same_repo = |r: &String| {
+        let name = r.split('@').next().unwrap_or_default();
+        crate::image_origin::same_repository(name, repo)
     };
-    !digests.iter().any(same_repo)
+    !pulled_from.iter().any(same_repo)
 }
 
 /// `pull_policy` of the `app` service in `compose config --format json`.
@@ -1353,21 +1353,9 @@ fn local_build(stack: &Stack, image: &str) -> Option<LocalBuild> {
     let mut config = compose(stack);
     config.args(["config", "--format", "json"]);
     let policy = docker::try_capture(config).and_then(|j| parse_app_pull_policy(&j));
-    let mut inspect = docker::docker();
-    inspect.args([
-        "image",
-        "inspect",
-        image,
-        "--format",
-        "{{json .RepoDigests}}",
-    ]);
-    let digests: Option<Vec<String>> = docker::try_capture(inspect).map(|j| {
-        serde_json::from_str::<Option<Vec<String>>>(j.trim())
-            .ok()
-            .flatten()
-            .unwrap_or_default()
-    });
-    is_local_only(image, policy.as_deref(), digests.as_deref()).then(|| LocalBuild {
+    let pulled_from = crate::image_origin::inspect(image)
+        .and_then(|i| i.pulled_from(crate::image_origin::store()));
+    is_local_only(image, policy.as_deref(), pulled_from.as_deref()).then(|| LocalBuild {
         image: image.to_string(),
     })
 }
@@ -5326,9 +5314,10 @@ struct ImageProbe {
 }
 
 /// The image id (`sha256:…`) the site's `app` container was created from, running
-/// or stopped. Survives the tag moving on: the old image stays on disk, with its
-/// `RepoDigests`, as long as a container uses it. `None` without an `app`
-/// container.
+/// or stopped. Survives the tag moving on: the old image stays on disk as long as
+/// a container uses it (with its `RepoDigests` on the classic image store; on
+/// the containerd store with none, but with its recorded origin, which
+/// [`local_probe`] reads there). `None` without an `app` container.
 fn running_image_id(stack: &Stack) -> Option<String> {
     let mut ps = compose(stack);
     ps.args(["ps", "-a", "-q", "app"]);
@@ -5366,35 +5355,36 @@ fn site_digest(stack: &Stack) -> Option<String> {
 /// `docker image inspect` — no container start needed, which is why the stamp is
 /// carried as a label and not only as a runtime env var.
 ///
-/// Both fields are guarded with `{{if}}`: a locally built image has an empty
-/// `RepoDigests` (bare `index` on it is a template error, not an empty string)
-/// and may carry no labels at all. Those are missing values, not failures — the
-/// `Err` arm means inspect itself failed, i.e. the image isn't here.
+/// Read as JSON ([`crate::image_origin`]), never with a `--format` template:
+/// the registry digest is read differently under Docker's two image stores
+/// ([`Inspected::registry_digest`](crate::image_origin::Inspected::registry_digest);
+/// on the containerd store `RepoDigests` names local builds too), and a
+/// template naming a field an older Docker lacks is an error there. A locally
+/// built image has no registry digest and may carry no labels at all: missing
+/// values, not failures. The `Err` arm means inspect itself failed, i.e. the
+/// image isn't here.
 fn local_probe(image: &str) -> std::result::Result<ImageProbe, String> {
     let mut c = docker::docker();
-    c.args([
-        "image",
-        "inspect",
-        image,
-        "--format",
-        &format!(
-            "{{{{if .RepoDigests}}}}{{{{index .RepoDigests 0}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{FLOOR_LABEL}\"}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{EXTENSIONS_LABEL}\"}}}}{{{{end}}}}"
-        ),
-    ]);
-    Ok(parse_local_probe(&docker::probe(c)?))
+    c.args(["image", "inspect", image]);
+    let json = docker::probe(c)?;
+    let inspected = crate::image_origin::parse(&json)
+        .map_err(|e| format!("couldn't read `docker image inspect {image}` ({e})"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("`docker image inspect {image}` listed no image"))?;
+    Ok(probe_of(&inspected))
 }
 
-fn parse_local_probe(out: &str) -> ImageProbe {
-    let mut parts = out.split('|');
-    let repo_digest = parts.next().unwrap_or_default();
+/// [`local_probe`]'s reading of one inspected image. The store isn't asked:
+/// only a Docker with `Identity` reads the digest differently, and that
+/// Docker marks its containerd images itself (`Descriptor`).
+fn probe_of(image: &crate::image_origin::Inspected) -> ImageProbe {
+    let label = |key: &str| image.label(key).unwrap_or_default().trim();
     ImageProbe {
-        digest: repo_digest.split('@').nth(1).map(str::to_string),
-        version: non_empty(parts.next().unwrap_or_default().trim()),
-        floor: parts.next().and_then(|f| Version::parse(f.trim())),
-        extensions: parts.next().and_then(parse_extension_list),
+        digest: image.registry_digest(None),
+        version: non_empty(label(VERSION_LABEL)),
+        floor: Version::parse(label(FLOOR_LABEL)),
+        extensions: parse_extension_list(label(EXTENSIONS_LABEL)),
     }
 }
 
@@ -5566,7 +5556,19 @@ mod tests {
             None,
             Some(&["someone/atelier-fork@sha256:aa".to_string()])
         ));
-        // Not here at all: left to the pull. A digest reference never.
+        // The containerd store names the repositories it pulled from in full.
+        assert!(!is_local_only(
+            "nginx:1.30-alpine-slim",
+            None,
+            Some(&["docker.io/library/nginx".to_string()])
+        ));
+        assert!(is_local_only(
+            "atelier-cms:zoo-shared",
+            None,
+            Some(&["ghcr.io/aincient-labs/atelier-cms".to_string()])
+        ));
+        // Not here at all, or a store that can't say: left to the pull. A
+        // digest reference never.
         assert!(!is_local_only("atelier-cms:gone", None, None));
         assert!(!is_local_only(&ghcr, None, Some(&[])));
     }
@@ -6395,11 +6397,11 @@ mod tests {
     use super::{
         automatic_backups_to_prune, backup_dump_script, backup_pack_script,
         container_state_from_ps, holds_endpoint, is_backup_file, is_snapshot_bundle, list_backups,
-        parse_extension_list, parse_http_status, parse_local_probe, parse_remote_probe,
-        parse_serialized_extensions, plan_route, plan_route_with, registry_problem,
-        remote_probe_with, restore_bundle_scripts, start_action, stopped_service_containers,
-        waypoint_image, Backup, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
-        MAX_WAYPOINTS, REGISTRY_OFFLINE, START_STUCK,
+        parse_extension_list, parse_http_status, parse_remote_probe, parse_serialized_extensions,
+        plan_route, plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts,
+        start_action, stopped_service_containers, waypoint_image, Backup, ContainerState,
+        ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        START_STUCK,
     };
     use super::{backup_stem, require_safety_backup, SafetyBackupFailed};
     use super::{
@@ -7444,28 +7446,59 @@ mod tests {
 
     #[test]
     fn local_probe_reads_the_digest_the_version_and_the_floor() {
-        let p = parse_local_probe(
-            "ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2|edge+f8bdcb9|0.3.0",
+        let p = probe_json(
+            r#"[{"Id":"sha256:1111","RepoDigests":["ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2"],"Config":{"Labels":{"org.opencontainers.image.version":"edge+f8bdcb9","dev.atelier.upgrade.min-from":"0.3.0"}}}]"#,
         );
         assert_eq!(p.digest.as_deref(), Some("sha256:413ed726a1a2"));
         assert_eq!(p.version.as_deref(), Some("edge+f8bdcb9"));
         assert_eq!(p.floor, Some(Version(0, 3, 0)));
+        assert!(p.extensions.is_none());
+    }
+
+    fn probe_json(json: &str) -> super::ImageProbe {
+        super::probe_of(&crate::image_origin::parse(json).unwrap()[0])
     }
 
     #[test]
     fn local_probe_tolerates_a_locally_built_unlabelled_image() {
         // Empty RepoDigests and no labels — all three fields blank, not an error.
-        let p = parse_local_probe("||");
-        assert!(p.digest.is_none(), "no registry digest to compare");
-        assert!(p.version.is_none(), "unstamped build claims no version");
-        assert!(p.floor.is_none(), "and declares no floor");
+        for json in [
+            r#"[{"Id":"sha256:1111","RepoDigests":[],"Config":{"Labels":null}}]"#,
+            r#"[{"Id":"sha256:1111","RepoDigests":null,"Config":{}}]"#,
+        ] {
+            let p = probe_json(json);
+            assert!(p.digest.is_none(), "no registry digest to compare");
+            assert!(p.version.is_none(), "unstamped build claims no version");
+            assert!(p.floor.is_none(), "and declares no floor");
+        }
+    }
+
+    #[test]
+    fn local_probe_reads_the_containerd_store_by_origin_not_repo_digests() {
+        // Docker 29, containerd store: a local build lists a RepoDigests entry
+        // under its own name, which no registry has.
+        let built = probe_json(
+            r#"[{"Id":"sha256:4f7e","RepoDigests":["atelier-cms@sha256:4f7e"],"Descriptor":{"digest":"sha256:4f7e"},"Identity":{"Build":[{"Ref":"x"}]}}]"#,
+        );
+        assert!(
+            built.digest.is_none(),
+            "a local build has no registry digest"
+        );
+        // A pulled image whose tag moved on keeps no RepoDigests there; its ID
+        // is the digest it was pulled as.
+        let pulled = probe_json(
+            r#"[{"Id":"sha256:a7db","RepoDigests":[],"Descriptor":{"digest":"sha256:a7db"},"Identity":{"Pull":[{"Repository":"ghcr.io/aincient-labs/atelier-cms"}]}}]"#,
+        );
+        assert_eq!(pulled.digest.as_deref(), Some("sha256:a7db"));
     }
 
     #[test]
     fn a_probe_of_an_image_predating_the_floor_label_declares_no_floor() {
-        // The label is simply absent, which the template renders as empty. Read as
-        // "no floor", never as 0.0.0 — an old image makes no promise either way.
-        let p = parse_local_probe("repo@sha256:abc|v0.1.0|");
+        // The label is simply absent. Read as "no floor", never as 0.0.0 — an
+        // old image makes no promise either way.
+        let p = probe_json(
+            r#"[{"Id":"sha256:1111","RepoDigests":["repo@sha256:abc"],"Config":{"Labels":{"org.opencontainers.image.version":"v0.1.0"}}}]"#,
+        );
         assert_eq!(p.version.as_deref(), Some("v0.1.0"));
         assert!(p.floor.is_none());
     }

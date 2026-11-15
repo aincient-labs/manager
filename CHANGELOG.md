@@ -83,6 +83,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On Docker's containerd image store (the default for a fresh Docker Engine 29 on Linux, and for
+  Docker Desktop), Atelier no longer mistakes a build made on this computer for one it can download
+  again. Turning the engine off kept such an engine build only on the classic store and could delete
+  it here for good; **Free up space** could list a local build tagged under Atelier's own name;
+  updating a site on a local build failed with Docker's "pull access denied" instead of saying there
+  is nothing to download; and **Home** could offer an update for a local build. Where Docker can't
+  say where an image came from (an older Docker on that store), Atelier keeps it.
 - A failure panel closes on the first click of **Close**. It stayed open (with Close already
   spent) while the app re-read the site's status, so it took a second click.
 
