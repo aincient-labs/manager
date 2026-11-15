@@ -934,15 +934,30 @@ async function runProgressOp(title, fn, opts = {}) {
         setHomeNotice(DIDNT_FINISH[opts.lifecycle], { dockerRestart });
       }
       await progressFail(failure, dockerRestart);
+      // Close means closed, now: the refresh below asks Docker about the site
+      // and can take seconds, and a panel left open over it (its Close already
+      // spent) read as "Close needs two clicks". The `finally` below still runs
+      // pm.afterClose once the refresh is done.
+      if (progressOwner === me) {
+        cancelAnimationFrame(pm.raf);
+        setProgressOpen(false);
+      }
       // Closing the panel must not erase the failure: the banner stays until the
       // next action (unless a newer op already took over the screen).
       if (progressOwner === me) showError(failure, { dockerRestart });
       // The failed op may have left the site somewhere new (stopped, half
-      // updated): show where it is now, not where it was.
-      try {
-        await refresh();
-      } catch {
-        /* the failure above is the message that matters */
+      // updated): show where it is now, not where it was. When a panel button
+      // (Restart Docker, a blocker's way forward) closed it, that action runs
+      // straight away from the `finally` below and refreshes when it's done, so
+      // this one runs in the background rather than holding the button for it.
+      if (pm.afterClose) {
+        refresh().catch(() => {});
+      } else {
+        try {
+          await refresh();
+        } catch {
+          /* the failure above is the message that matters */
+        }
       }
       return false;
     }

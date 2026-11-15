@@ -83,6 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A failure panel closes on the first click of **Close**. It stayed open (with Close already
+  spent) while the app re-read the site's status, so it took a second click.
+
 - A backup into a backups folder Atelier can't write to now stops before it starts, saying "Atelier
   can't save backups in … : it isn't writable. Fix the folder's permissions (or free it up), then try
   again.", instead of failing after the database dump with Docker's "permission denied". The backup an
