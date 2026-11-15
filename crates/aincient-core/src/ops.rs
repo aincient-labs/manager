@@ -5530,7 +5530,7 @@ mod tests {
         assert!(is_local_only(
             "atelier-cms:zoo-shared",
             None,
-            Some(&[ghcr.clone()])
+            Some(std::slice::from_ref(&ghcr))
         ));
         // A developer build: no digests at all.
         assert!(is_local_only("atelier-cms:dev", None, Some(&[])));
