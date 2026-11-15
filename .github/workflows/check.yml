@@ -83,7 +83,7 @@ jobs:
   # store explicitly, on this runner only, so a runner image changing its
   # default can't silently drop one.
   scenarios:
-    name: scenarios (real Docker, ${{ matrix.store }} image store)
+    name: scenarios (real Docker, ${{ matrix.store }} image store${{ matrix.compose && format(', Compose {0}', matrix.compose) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -92,6 +92,15 @@ jobs:
         store:
           - containerd
           - classic
+        # The runner's own Compose; an include below adds one more leg.
+        compose: ['']
+        # An older Compose (Ubuntu 22.04's Docker 24 ships 2.20): it accepts
+        # `--progress json` on `version` and refuses it on `pull`, which broke
+        # every app update there (found on a real Ubuntu box, 2026-11-15).
+        include:
+          - store: classic
+            compose: 2.20.2
+            compose_sha256: b9385dabb7931636a3afc0aee94625ebff3bb29584493a87804afb6ebaf2d916
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -121,6 +130,20 @@ jobs:
           esac
           if [ "$got" != "${{ matrix.store }}" ]; then
             echo "::error::Docker is on the $got image store, not ${{ matrix.store }}"
+            exit 1
+          fi
+
+      - name: Docker Compose ${{ matrix.compose }}
+        if: matrix.compose
+        run: |
+          mkdir -p ~/.docker/cli-plugins
+          curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+            "https://github.com/docker/compose/releases/download/v${{ matrix.compose }}/docker-compose-linux-x86_64"
+          echo "${{ matrix.compose_sha256 }}  $HOME/.docker/cli-plugins/docker-compose" | sha256sum -c -
+          chmod +x ~/.docker/cli-plugins/docker-compose
+          got=$(docker compose version --short)
+          if [ "$got" != "${{ matrix.compose }}" ]; then
+            echo "::error::docker compose is $got, not ${{ matrix.compose }}"
             exit 1
           fi
 

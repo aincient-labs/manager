@@ -24,6 +24,7 @@ mod doctor_start;
 mod endpoint_clear;
 mod engine_pin_kept;
 mod erased_db;
+mod killed_unreported;
 mod older_backups;
 mod oom_app;
 mod oom_db;

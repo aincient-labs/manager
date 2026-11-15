@@ -203,9 +203,11 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about thirteen minutes together (30 scenarios, 31 tests, 792 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
-job `scenarios`) twice, once on each of Docker's image stores (containerd, classic), which read an
-image's origin differently (`aincient_core::image_origin`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
+plugin, and take about thirteen minutes together (31 scenarios, 32 tests, ~830 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
+job `scenarios`) on each of Docker's image stores (containerd, classic), which read an image's
+origin differently (`aincient_core::image_origin`), and once more on the classic store with an older
+Compose (2.20.2, Ubuntu 22.04's). Before a release, run them on a real Docker 24 box too: Docker 24
+stamps a run's first log lines before its start time, which no CI leg reproduces. The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
 - writes a site the way the Manager does (`compose.yaml`, `edge.conf`, `.env`, `site-id`) in a
   temp dir: the shipped template with `postgres:16-alpine` as `db`, a small Alpine `app` built per
