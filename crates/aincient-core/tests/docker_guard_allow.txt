@@ -21,7 +21,6 @@ crates/aincient-core/src/engine_admin.rs | pull_image | docker: pull --quiet | e
 crates/aincient-core/src/engine_admin.rs | up | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario
 crates/aincient-core/src/engine_admin.rs | wake | docker: start db app | engine mode (the experimental engine sidecar) has no scenario
 crates/aincient-core/src/ops.rs | claim_name | fs: rename | the fallback when claiming the backup name by hard link fails; not reached
-crates/aincient-core/src/ops.rs | clear_stale_endpoints | docker: network disconnect -f | the stale-endpoint clear itself: scenario 1 builds the state it leaves, nothing makes Docker report a stale endpoint
 crates/aincient-core/src/ops.rs | down | docker: down | removing a site (atelier app down); no scenario
 crates/aincient-core/src/ops.rs | ensure_engine_image | docker: pull | engine sites only; engine mode (the experimental engine sidecar) has no scenario
 crates/aincient-core/src/ops.rs | export_static_in | fs: remove_dir_all | static export (atelier export) has no scenario
@@ -31,7 +30,6 @@ crates/aincient-core/src/ops.rs | install_export | fs: rename | static export (a
 crates/aincient-core/src/ops.rs | mark_database_wiped | fs: write | the marker of an owner wipe (app down --wipe); no scenario
 crates/aincient-core/src/ops.rs | move_db_image | docker: up -d --force-recreate db app | the database server move runs only when the shipped db image changes; no scenario moves it
 crates/aincient-core/src/ops.rs | pull_db_image | docker: pull | the database server move runs only when the shipped db image changes; no scenario moves it
-crates/aincient-core/src/ops.rs | reconnect_args | docker: network connect | reconnecting a network without an alias; the scenarios reconnect db, which always has one
 crates/aincient-core/src/ops.rs | restore | docker: cp | restoring a plain .sql dump; the scenarios restore backup bundles
 crates/aincient-core/src/ops.rs | sweep_stale_parts | fs: remove_file | removes .part files older than the stale age; no scenario leaves one
 crates/aincient-core/src/pack.rs | dev_down | docker: down | the theme-pack dev stack (atelier pack dev) has no scenario

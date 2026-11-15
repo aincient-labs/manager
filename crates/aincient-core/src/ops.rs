@@ -2618,7 +2618,7 @@ fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn 
     let restore = crate::boot::endpoints_to_restore(stale, &crate::boot::inspect(&names));
     for (network, container) in stale {
         let mut c = docker::docker();
-        // scenario: none — the stale-endpoint clear itself: scenario 1 builds the state it leaves, nothing makes Docker report a stale endpoint
+        // scenario: start_clears_a_held_endpoint_keeps_every_network_and_then_asks_for_a_docker_restart
         c.args(["network", "disconnect", "-f", network, container]);
         match docker::probe_unbounded(c) {
             Ok(_) => r.log(&format!(
@@ -2648,7 +2648,7 @@ fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn 
 
 /// `docker network connect` for `back`, under each name it had there.
 fn reconnect_args(back: &crate::boot::Reconnect) -> Vec<String> {
-    // scenario: none — reconnecting a network without an alias; the scenarios reconnect db, which always has one
+    // scenario: start_clears_a_held_endpoint_keeps_every_network_and_then_asks_for_a_docker_restart
     let mut args = vec!["network".to_string(), "connect".to_string()];
     for alias in &back.aliases {
         args.push("--alias".into());
