@@ -525,6 +525,23 @@ pub fn assert_cleanup_removes_nothing() {
     );
 }
 
+/// How an out-of-memory stop of `part` ("the app", "the database") begins:
+/// the remedy is the one for the Docker here
+/// ([`aincient_core::docker_runtime::memory_remedy_here`]): a VM's memory
+/// setting on OrbStack or Docker Desktop, the computer's own memory on Docker
+/// Engine for Linux.
+pub fn out_of_memory_said(part: &str) -> String {
+    let safe = if part == "the database" {
+        " Your site's data is safe."
+    } else {
+        ""
+    };
+    format!(
+        "Your site ran out of memory, so Docker stopped part of it ({part}).{safe} {}",
+        aincient_core::docker_runtime::memory_remedy_here()
+    )
+}
+
 /// Docker is here and answering; otherwise the scenario can't run at all.
 pub fn require_docker() {
     user_home();

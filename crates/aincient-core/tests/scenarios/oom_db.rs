@@ -12,7 +12,7 @@ use std::time::Instant;
 use aincient_core::boot::BootFailed;
 use aincient_core::ops;
 
-use crate::harness::{Feed, Site, Template};
+use crate::harness::{out_of_memory_said, Feed, Site, Template};
 
 #[test]
 #[ignore = "real Docker: cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1"]
@@ -32,12 +32,10 @@ fn db_oom_killed_during_boot_says_the_database_ran_out_of_memory() {
         .downcast_ref::<BootFailed>()
         .unwrap_or_else(|| panic!("a BootFailed: {failed:#}"));
     assert!(why.out_of_memory(), "{}", why.0);
+    let said = out_of_memory_said("the database");
     assert!(
-        why.0.starts_with(
-            "Your site ran out of memory, so Docker stopped part of it (the database). Your \
-             site's data is safe. Give Docker more memory"
-        ),
-        "{}",
+        why.0.starts_with(&said),
+        "{}\n  expected to start: {said}",
         why.0
     );
     assert!(site.running("db"), "Postgres restarted itself in place");

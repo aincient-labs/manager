@@ -20,7 +20,9 @@ use aincient_core::doctor::{self, Severity};
 use aincient_core::gate::{Blocker, UpdateBlocked, WayForward, NOT_READY};
 use aincient_core::ops::{self, UpdateOptions, Updated};
 
-use crate::harness::{assert_cleanup_removes_nothing, docker, Feed, Site, Template};
+use crate::harness::{
+    assert_cleanup_removes_nothing, docker, out_of_memory_said, Feed, Site, Template,
+};
 
 /// The update must refuse with [`UpdateBlocked`] and leave the site as it
 /// was: the app on `old`, no backup, nothing pulled or backed up in the feed.
@@ -124,12 +126,10 @@ fn update_while_the_app_is_crash_looping_out_of_memory_is_refused_with_the_memor
         .find(|b| matches!(b, Blocker::OutOfMemory { .. }))
         .unwrap_or_else(|| panic!("an out-of-memory blocker: {blockers:?}"));
     let said = memory.message();
+    let want = out_of_memory_said("the app");
     assert!(
-        said.starts_with(
-            "Your site ran out of memory, so Docker stopped part of it (the app). Give Docker \
-             more memory"
-        ),
-        "{said}"
+        said.starts_with(&want),
+        "{said}\n  expected to start: {want}"
     );
     assert!(said.ends_with("Update once it runs again."), "{said}");
     assert_eq!(

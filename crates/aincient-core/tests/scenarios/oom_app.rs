@@ -19,7 +19,7 @@ use std::time::Instant;
 use aincient_core::boot::BootFailed;
 use aincient_core::ops;
 
-use crate::harness::{Feed, Site, Template};
+use crate::harness::{out_of_memory_said, Feed, Site, Template};
 
 /// Enough for the idle app; the allocation passes it within a second.
 const APP_LIMIT: &str = "48m";
@@ -51,13 +51,8 @@ fn app_oom_killed_during_boot_keeps_restarting_and_start_says_out_of_memory() {
     ops::stop(&site.stack, &mut Feed::default()).expect("stop");
 
     let why = start_fails(&site);
-    assert!(
-        why.starts_with(
-            "Your site ran out of memory, so Docker stopped part of it (the app). Give Docker \
-             more memory"
-        ),
-        "{why}"
-    );
+    let said = out_of_memory_said("the app");
+    assert!(why.starts_with(&said), "{why}\n  expected to start: {said}");
     assert!(
         why.ends_with("or stop other sites, then start your site again."),
         "{why}"
