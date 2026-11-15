@@ -86,6 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updating from the app works again with older Docker Compose versions (such as 2.20, shipped with
   Ubuntu 22.04's Docker 24): the download failed with `unsupported --progress value "json"`. It
   now falls back to Compose's plain progress output.
+- A start that failed in its first moments is no longer called ready: on Docker 24 the first lines
+  a site writes are stamped just before Docker's own start time, and Atelier read the log from that
+  start time, so it missed them.
 - On Docker's containerd image store (the default for a fresh Docker Engine 29 on Linux, and for
   Docker Desktop), Atelier no longer mistakes a build made on this computer for one it can download
   again. Turning the engine off kept such an engine build only on the classic store and could delete

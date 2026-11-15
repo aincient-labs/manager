@@ -238,6 +238,9 @@ pub(crate) struct AppRun {
     /// `Running: true` while it waits to restart a container that died).
     pub running: bool,
     pub started_at: String,
+    /// When its previous run ended (`State.FinishedAt`; Docker's zero time
+    /// for a container that never stopped).
+    pub finished_at: String,
 }
 
 /// One service's container at a look: what says it died or was killed.
@@ -406,6 +409,8 @@ struct InspectedState {
     running: bool,
     #[serde(rename = "StartedAt", default)]
     started_at: String,
+    #[serde(rename = "FinishedAt", default)]
+    finished_at: String,
     #[serde(rename = "Restarting", default)]
     restarting: bool,
     #[serde(rename = "OOMKilled", default)]
@@ -769,13 +774,11 @@ pub fn half_attached_now(stack: &Stack) -> Option<Vec<(String, String)>> {
 /// when it can't be read.
 fn app_log(app: &AppRun) -> Option<String> {
     let mut c = docker::docker();
-    c.args([
-        "logs",
-        "--timestamps",
-        "--since",
-        &app.started_at,
-        &app.name,
-    ]);
+    c.args(["logs", "--timestamps"]);
+    if let Some(since) = log_since(&app.started_at, &app.finished_at) {
+        c.args(["--since", since]);
+    }
+    c.arg(&app.name);
     let out = docker::output_within(&mut c, LOCAL_PROBE_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
@@ -784,6 +787,22 @@ fn app_log(app: &AppRun) -> Option<String> {
         &String::from_utf8_lossy(&out.stdout),
         &String::from_utf8_lossy(&out.stderr),
     ))
+}
+
+/// Where this run's log starts, for `docker logs --since`: when the previous
+/// run ended, not `StartedAt`. Docker stamps `StartedAt` after the process has
+/// begun, so its first lines are older than it (Docker 24.0.5: by about a
+/// millisecond, every time; d34dbuntu 2026-11-15) and `--since StartedAt`
+/// dropped a FATAL written at once, calling a failed boot ready. `None` (the
+/// whole log) for a container that never ran before; `StartedAt` when the
+/// times can't be read or the container died since (restarting).
+pub(crate) fn log_since<'a>(started_at: &'a str, finished_at: &'a str) -> Option<&'a str> {
+    let parse = |t: &str| chrono::DateTime::parse_from_rfc3339(t).ok();
+    match (parse(started_at), parse(finished_at)) {
+        (Some(_), Some(f)) if f.timestamp() <= 0 => None,
+        (Some(st), Some(f)) if f < st => Some(finished_at),
+        _ => Some(started_at),
+    }
 }
 
 /// `docker logs --timestamps` output, its stdout and stderr (Docker hands them
@@ -848,6 +867,7 @@ pub(crate) fn look(stack: &Stack, network: bool) -> Look {
             name: i.name().to_string(),
             running: i.state.running && !i.state.restarting,
             started_at: i.state.started_at.clone(),
+            finished_at: i.state.finished_at.clone(),
         });
     let log = app.as_ref().and_then(app_log);
     // A failed read is Docker going away, or the container with it.
@@ -1437,6 +1457,7 @@ mod tests {
             name: "atelier-hardening-test-app-1".into(),
             running: true,
             started_at: "2026-11-14T12:08:06.529116477Z".into(),
+            finished_at: "2026-11-14T12:07:58.1Z".into(),
         })
     }
 
@@ -1680,6 +1701,32 @@ not json"#;
 
     const PG_KILLED: &str = "2026-11-14 20:56:53.894 UTC [1] LOG:  server process (PID 63) was terminated by signal 9: Killed\n\
         2026-11-14 20:56:53.894 UTC [1] LOG:  terminating any other active server processes\n";
+
+    #[test]
+    fn this_runs_log_starts_where_the_previous_run_ended() {
+        // Docker 24.0.5: StartedAt 13:15:14.692078978, first line 13:15:14.691106535.
+        let started = "2026-11-15T13:15:14.692078978Z";
+        assert_eq!(
+            log_since(started, "2026-11-15T13:15:02.5Z"),
+            Some("2026-11-15T13:15:02.5Z"),
+            "after a stop: from its end"
+        );
+        assert_eq!(
+            log_since(started, "0001-01-01T00:00:00Z"),
+            None,
+            "never ran: all of it"
+        );
+        assert_eq!(
+            log_since(started, "2026-11-15T13:15:20Z"),
+            Some(started),
+            "died since (restarting): its last start"
+        );
+        assert_eq!(
+            log_since(started, ""),
+            Some(started),
+            "unreadable: its start"
+        );
+    }
 
     #[test]
     fn a_container_killed_and_restarting_counts_as_killed_without_the_flag_or_events() {
