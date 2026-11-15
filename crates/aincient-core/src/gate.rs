@@ -257,7 +257,7 @@ fn memory_and_restarts(stack: &Stack) -> (BTreeSet<String>, BTreeSet<String>) {
     let now = boot::services_now(stack);
     let mut out_of_memory: BTreeSet<String> = now
         .iter()
-        .filter(|s| oom_blocks(s.oom_killed, s.restarting))
+        .filter(|s| oom_blocks(s.oom_killed, s.restarting) || boot::killed_and_restarting(s))
         .map(|s| s.service.clone())
         .collect();
     if !now.is_empty() {

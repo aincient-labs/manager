@@ -276,6 +276,8 @@ pub(crate) struct Strikes {
     pub oom_killed: BTreeSet<String>,
     /// Services whose restart policy restarted them during this wait.
     pub restarted: BTreeSet<String>,
+    /// Services seen [`killed_and_restarting`] during this wait.
+    pub killed: BTreeSet<String>,
 }
 
 impl Strikes {
@@ -302,6 +304,9 @@ impl Strikes {
                 self.oom_killed.insert(s.service.clone());
                 trouble = true;
             }
+            if killed_and_restarting(s) {
+                self.killed.insert(s.service.clone());
+            }
             if s.restart_count > base || s.restarting {
                 self.restarted.insert(s.service.clone());
                 trouble = true;
@@ -309,6 +314,15 @@ impl Strikes {
         }
         trouble
     }
+}
+
+/// Killed by SIGKILL (exit 137) and about to be started again by its restart
+/// policy. Our own stops never leave a container restarting, so the kill was
+/// the kernel's: in practice memory. Docker doesn't always say so: when the
+/// container's main process is the one killed, CI's Docker sometimes set
+/// neither `OOMKilled` nor an `oom` event across seven kills (2026-11-15).
+pub(crate) fn killed_and_restarting(s: &ServiceRun) -> bool {
+    s.restarting && s.exit_code == 137
 }
 
 /// Whether this look ends the wait, and why.
@@ -1006,6 +1020,7 @@ impl MemoryEvidence {
 /// events since `since` and, for the database, Postgres's own log.
 pub(crate) fn memory_evidence(
     seen: &BTreeSet<String>,
+    seen_killed: &BTreeSet<String>,
     now: &[ServiceRun],
     events: Events,
     db_log: &str,
@@ -1018,6 +1033,12 @@ pub(crate) fn memory_evidence(
     );
     oom.extend(events.oom);
     let mut killed = events.killed;
+    killed.extend(seen_killed.iter().cloned());
+    killed.extend(
+        now.iter()
+            .filter(|s| killed_and_restarting(s))
+            .map(|s| s.service.clone()),
+    );
     if postgres_killed(db_log) {
         killed.insert("db".into());
     }
@@ -1038,6 +1059,7 @@ pub(crate) fn memory_verdict(
     let now = services_now(stack);
     let evidence = memory_evidence(
         &strikes.oom_killed,
+        &strikes.killed,
         &now,
         events_since(stack, &since.to_string(), Some(&now)),
         &db_log_since(stack, since),
@@ -1660,6 +1682,48 @@ not json"#;
         2026-11-14 20:56:53.894 UTC [1] LOG:  terminating any other active server processes\n";
 
     #[test]
+    fn a_container_killed_and_restarting_counts_as_killed_without_the_flag_or_events() {
+        // CI's Docker, 2026-11-15: seven kills of the app's main process,
+        // `Restarting` with exit 137, and neither `OOMKilled` nor an event.
+        let killed = ServiceRun {
+            exit_code: 137,
+            ..svc("app", false, true, 7)
+        };
+        assert!(killed_and_restarting(&killed));
+        assert!(
+            !killed_and_restarting(&svc("app", false, false, 7)),
+            "our own stop: 137, not restarting"
+        );
+        let mut strikes = Strikes::from_baseline(&[svc("app", false, false, 0)]);
+        assert!(strikes.note(&booting(vec![killed.clone()])));
+        assert_eq!(strikes.killed, BTreeSet::from(["app".to_string()]));
+        let remedy = || "Give Docker more memory".to_string();
+        // Seen during the wait, though restarted by the time the wait ended.
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &strikes.killed,
+            &[svc("app", false, false, 8)],
+            Events::default(),
+            "",
+        );
+        let why = e.reason(remedy).unwrap();
+        assert!(
+            why.contains("(the app), likely for lack of memory"),
+            "{why}"
+        );
+        assert!(BootFailed(why).out_of_memory());
+        // Or seen now.
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[killed],
+            Events::default(),
+            "",
+        );
+        assert_eq!(e.killed, BTreeSet::from(["app".to_string()]));
+    }
+
+    #[test]
     fn out_of_memory_is_said_only_with_the_flag_or_an_oom_event() {
         let remedy = || {
             "Give Docker more memory in OrbStack's settings (Settings → System → Memory limit)"
@@ -1667,6 +1731,7 @@ not json"#;
         };
         // Exit 137 alone (our own stops give it too): hedged.
         let e = memory_evidence(
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &[],
             parse_events(
@@ -1679,7 +1744,13 @@ not json"#;
         assert!(why.starts_with("Docker stopped part of your site by force (the app and the web server), likely for lack of memory."), "{why}");
         assert!(BootFailed(why).out_of_memory());
         // The oom event: certain, and the 137 of the same service isn't repeated.
-        let e = memory_evidence(&BTreeSet::new(), &[], parse_events(EVENTS, None), "");
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+            parse_events(EVENTS, None),
+            "",
+        );
         assert_eq!(e.oom, BTreeSet::from(["app".to_string()]));
         assert_eq!(e.killed, BTreeSet::from(["edge".to_string()]));
         assert_eq!(
@@ -1690,6 +1761,7 @@ not json"#;
         );
         // The database: the flag on a running db plus Postgres's own line.
         let e = memory_evidence(
+            &BTreeSet::new(),
             &BTreeSet::new(),
             &[svc("db", true, false, 0)],
             Events::default(),
@@ -1702,7 +1774,13 @@ not json"#;
         );
         assert!(BootFailed(why).out_of_memory());
         // Postgres's line alone: killed, cause unproven.
-        let e = memory_evidence(&BTreeSet::new(), &[], Events::default(), PG_KILLED);
+        let e = memory_evidence(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+            Events::default(),
+            PG_KILLED,
+        );
         assert!(e
             .reason(remedy)
             .unwrap()
@@ -1710,6 +1788,7 @@ not json"#;
         // What the looks saw counts after the restart reset the flag.
         let e = memory_evidence(
             &BTreeSet::from(["app".to_string()]),
+            &BTreeSet::new(),
             &[svc("app", false, false, 3)],
             Events::default(),
             "",
@@ -1718,6 +1797,7 @@ not json"#;
         // Nothing: no memory reason, the wait's own reason stands.
         assert_eq!(
             memory_evidence(
+                &BTreeSet::new(),
                 &BTreeSet::new(),
                 &[svc("app", false, false, 3)],
                 Events::default(),
