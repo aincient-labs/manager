@@ -8,6 +8,10 @@
 //! The backup fails because the backups folder is read-only (as scenario 5);
 //! the site's tag is moved to a new local build (the "download"), read
 //! through [`Site::local_images`] as in scenario 4.
+//!
+//! The folder is tried before the dump, so the refusal says plainly that
+//! Atelier can't save backups there; stopped, the site isn't even started
+//! for the backup (state zoo, `ro-backups`).
 
 use std::time::Instant;
 
@@ -46,12 +50,39 @@ fn update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_
         Overridable::of(&refused),
         Some(Overridable::UpdateWithoutBackup)
     );
+    let said = format!("{refused:#}");
+    assert!(
+        said.contains("Couldn't back up your site first: Atelier can't save backups in ")
+            && said.contains("it isn't writable")
+            && !said.contains("permission denied"),
+        "the plain cause, found before any dump: {said}"
+    );
     assert_eq!(
         site.inspect("app", "{{.Image}}"),
         old,
         "not updated: still the build it ran"
     );
     assert!(site.running("app"), "the site keeps running");
+
+    // Stopped, the site would be started only to be backed up: refused
+    // before it is started, with the same cause.
+    ops::stop(&site.stack, &mut Feed::default()).expect("stop");
+    let refused = ops::update_with(&site.stack, &UpdateOptions::default(), &mut Feed::default())
+        .expect_err("a stopped site whose backup can't be saved isn't started for it");
+    assert!(
+        format!("{refused:#}").contains("Atelier can't save backups in "),
+        "{refused:#}"
+    );
+    assert_eq!(
+        Overridable::of(&refused),
+        Some(Overridable::UpdateWithoutBackup)
+    );
+    assert!(
+        !site.running("app"),
+        "not started for a backup it can't save"
+    );
+    assert_eq!(site.inspect("app", "{{.Image}}"), old, "still its build");
+    ops::start(&site.stack, &mut Feed::default()).expect("start again");
 
     set_mode(&backups, 0o755);
     assert_cleanup_removes_nothing();

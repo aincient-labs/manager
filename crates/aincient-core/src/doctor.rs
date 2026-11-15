@@ -935,6 +935,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             .fixable(Repair::Scaffold),
         });
         out.push(db_password_verdict(stack.env_get("DB_PASSWORD").as_deref()));
+        out.push(backups_verdict(ops::backups_writable(stack)));
     } else {
         out.push(Check::skipped(
             "stack.env",
@@ -1399,6 +1400,25 @@ fn engine_port_verdict(ports_json: Option<&str>) -> Check {
              container by hand.",
         )
         .detail(format!("{e:#}")),
+    }
+}
+
+const BACKUPS_LABEL: &str = "Backups folder is writable";
+
+/// Whether a backup could be saved now ([`ops::backups_writable`]): found
+/// here rather than by a backup, or the backup an update or restore takes
+/// first, failing after its dump. A warning: the site runs either way.
+fn backups_verdict(writable: Result<(), ops::BackupsNotWritable>) -> Check {
+    match writable {
+        Ok(()) => Check::ok("stack.backups", Tier::Stack, BACKUPS_LABEL),
+        Err(e) => Check::bad(
+            "stack.backups",
+            Tier::Stack,
+            BACKUPS_LABEL,
+            Severity::Warn,
+            e.to_string(),
+        )
+        .detail(e.dir.display().to_string()),
     }
 }
 
@@ -2155,6 +2175,23 @@ mod tests {
             "a crash loop still reports running at any single glance"
         );
         assert!(s.restarts >= RESTART_LOOP_THRESHOLD);
+    }
+
+    #[test]
+    fn an_unwritable_backups_folder_warns_with_the_way_forward() {
+        assert_eq!(backups_verdict(Ok(())).severity, Severity::Ok);
+        let c = backups_verdict(Err(ops::BackupsNotWritable {
+            dir: "/sites/x/backups".into(),
+        }));
+        assert_eq!(c.severity, Severity::Warn);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some(
+                "Atelier can't save backups in /sites/x/backups: it isn't writable. Fix the \
+                 folder's permissions (or free it up), then try again."
+            )
+        );
+        assert_eq!(c.fix, None);
     }
 
     #[test]

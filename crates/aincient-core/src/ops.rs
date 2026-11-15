@@ -1379,9 +1379,15 @@ fn local_build(stack: &Stack, image: &str) -> Option<LocalBuild> {
 /// the prior-art review (2026-11-14).
 fn backup_or_refuse<T>(outcome: Result<T>) -> Result<T> {
     outcome.map_err(|e| {
-        anyhow::Error::new(BackupBeforeUpdateFailed {
-            cause: format!("Couldn't back up your site first ({e:#})"),
-        })
+        let cause = match e.downcast_ref::<BackupsNotWritable>() {
+            Some(folder) => format!(
+                "Couldn't back up your site first: {} (fix the folder's permissions or free \
+                 it up, then try again)",
+                folder.cause()
+            ),
+            None => format!("Couldn't back up your site first ({e:#})"),
+        };
+        anyhow::Error::new(BackupBeforeUpdateFailed { cause })
     })
 }
 
@@ -1864,6 +1870,9 @@ fn start_for_backup(
     if !start_for_backup_needed(observe_container(stack)) {
         return Ok(Woke::No);
     }
+    // A stopped site is started only to be backed up: when the backup can't
+    // be saved, refuse before starting it.
+    backup_or_refuse(backups_writable(stack).map_err(anyhow::Error::new))?;
     let resting = engine_state == Some("resting");
     r.stage(
         Stage::Starting,
@@ -3405,7 +3414,12 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     plan.announce(r);
     let site_id = plan.run(r, "check", "Checking the site…", |_| {
         ensure_running(stack)?;
-        std::fs::create_dir_all(stack.backups_dir())?;
+        // Before the dump: a folder the copy can't land in fails here in
+        // plain words, not as Docker's "permission denied" after the dump.
+        std::fs::create_dir_all(stack.backups_dir()).map_err(|_| BackupsNotWritable {
+            dir: stack.backups_dir(),
+        })?;
+        backups_writable(stack)?;
         sweep_stale_parts(&stack.backups_dir());
         // Which site this is (m2-6, D-04): restore refuses another site's archive.
         stack.ensure_site_id()
@@ -3521,6 +3535,62 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     r.log(&format!("Snapshot written to {}", host_path.display()));
     plan.finish(r, "Backup saved.");
     Ok(host_path)
+}
+
+/// A backup refused before any work: Atelier can't write in the site's backups
+/// folder (its permissions, a read-only or locked-up disk). Found by trying,
+/// before the dump, rather than by the copy out failing with Docker's
+/// "permission denied" once the dump is done (state zoo, `ro-backups`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupsNotWritable {
+    /// The backups folder.
+    pub dir: PathBuf,
+}
+
+impl BackupsNotWritable {
+    /// The cause alone, for a sentence that goes on ([`backup_or_refuse`]).
+    pub fn cause(&self) -> String {
+        format!(
+            "Atelier can't save backups in {}: it isn't writable",
+            self.dir.display()
+        )
+    }
+}
+
+impl std::fmt::Display for BackupsNotWritable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}. Fix the folder's permissions (or free it up), then try again.",
+            self.cause()
+        )
+    }
+}
+
+impl std::error::Error for BackupsNotWritable {}
+
+/// Whether a backup could be saved in `stack`'s backups folder right now: a
+/// file is created there (and removed) as the copy out would. A folder not
+/// made yet is judged by the site's folder it would be made in; nothing is
+/// created then (the checkup calls this, and a diagnosis changes nothing).
+pub fn backups_writable(stack: &Stack) -> std::result::Result<(), BackupsNotWritable> {
+    let dir = stack.backups_dir();
+    let probe_in = if dir.is_dir() { &dir } else { &stack.home };
+    let probe = probe_in.join(format!(".atelier-write-check-{}", std::process::id()));
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match made {
+        Ok(_) => {
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        // Left by a run that died between the two lines: the folder took it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => Err(BackupsNotWritable { dir }),
+    }
 }
 
 /// A backup's file name without its extension: `aincient-[<label>-]<ts>`, the
@@ -6978,6 +7048,56 @@ mod tests {
         assert_eq!(plan.steps()[1].from, PULL_FROM);
         assert_eq!(plan.steps()[2].from, UP_FROM);
         assert_eq!(plan.steps()[3].from, BOOT_FROM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backups_folder_is_tried_before_a_backup_and_nothing_is_left_or_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("backups-writable");
+        let stack = Stack::at(dir.0.clone());
+        // Not made yet: judged by the site's folder, and not created.
+        assert_eq!(super::backups_writable(&stack), Ok(()));
+        assert!(!stack.backups_dir().exists(), "a diagnosis makes nothing");
+        std::fs::create_dir_all(stack.backups_dir()).unwrap();
+        assert_eq!(super::backups_writable(&stack), Ok(()));
+        assert_eq!(
+            std::fs::read_dir(stack.backups_dir()).unwrap().count(),
+            0,
+            "the probe file is removed"
+        );
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(stack.backups_dir(), ro).unwrap();
+        if std::fs::write(stack.backups_dir().join("probe"), "").is_ok() {
+            // Root writes anywhere: nothing to tell apart.
+            std::fs::set_permissions(stack.backups_dir(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            return;
+        }
+        let refused = super::backups_writable(&stack).unwrap_err();
+        assert_eq!(refused.dir, stack.backups_dir());
+        // The update's refusal keeps its type, with the plain cause.
+        let e = super::backup_or_refuse::<()>(Err(anyhow::Error::new(refused))).unwrap_err();
+        let said = e
+            .downcast_ref::<super::BackupBeforeUpdateFailed>()
+            .expect("typed")
+            .to_string();
+        assert!(
+            said.starts_with("Couldn't back up your site first: Atelier can't save backups in ")
+                && said.contains("it isn't writable (fix the folder's permissions")
+                && said.ends_with(", so it wasn't updated"),
+            "{said}"
+        );
+        // And the restore's, through its chain.
+        let e = super::require_safety_backup(Err(anyhow::Error::new(super::BackupsNotWritable {
+            dir: stack.backups_dir(),
+        })))
+        .unwrap_err();
+        assert!(e
+            .to_string()
+            .contains("The backup failed: Atelier can't save backups in "));
+        std::fs::set_permissions(stack.backups_dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     #[test]

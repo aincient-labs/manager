@@ -83,6 +83,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A backup into a backups folder Atelier can't write to now stops before it starts, saying "Atelier
+  can't save backups in … : it isn't writable. Fix the folder's permissions (or free it up), then try
+  again.", instead of failing after the database dump with Docker's "permission denied". The backup an
+  update or restore takes first stops the same way (a stopped site is no longer started for it), and
+  keeps its **Update without a backup** / **Restore without a safety copy** way past. **Run a
+  checkup** warns about such a folder ("Backups folder is writable").
 - Updating a site that runs a build made on this computer (a developer build, or a local tag such as
   `atelier-cms:dev`) no longer tries to download it and fails with Docker's "pull access denied". It
   stops before changing anything and says there is nothing to download, and how to follow released

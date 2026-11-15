@@ -241,9 +241,9 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 2 | `detached_db.rs` | checkup names a detached db; Start reconnects it |
 | 3 | `shared_tag.rs` | Start after a shared tag moved keeps the site's image |
 | 4 | `settings_applied.rs` | changed `.env`, same image: Update recreates without a backup, then is up to date |
-| 5 | `restore_safety.rs` | unwritable backups folder: restore refused, database untouched; `no_safety_backup` restores |
+| 5 | `restore_safety.rs` | unwritable backups folder: a backup is refused before its dump (`BackupsNotWritable`, plain words, no `.part`, nothing staged); restore refused with that cause, database untouched; `no_safety_backup` restores |
 | 6 | `update_stopped.rs` | stopped site that won't boot: update refused (`BackupBeforeUpdateFailed`); `no_backup` updates |
-| 6b | `update_running_backup_fails.rs` | running site whose before-update backup fails (read-only backups folder): update refused, site on its build; `no_backup` updates |
+| 6b | `update_running_backup_fails.rs` | running site whose before-update backup fails (read-only backups folder): update refused with the plain cause, site on its build; stopped, refused before it is started; `no_backup` updates |
 | 7 | `cleanup_needed.rs` | a stopped site's image, a digest pin and an engine pin count as needed (selection only) |
 | 8 | `erased_db.rs` | erased db volume: Start and `doctor --fix` refuse, create nothing; a restore brings it back |
 | 9 | `boot_fatal.rs` | a FATAL boot fails Start in plain words; a later `converge OK` clears it |
@@ -260,7 +260,7 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 18 | `update_failed_logs.rs` | a failed update (`no_backup`, converge FATAL) saves `logs/update-*.log` with compose ps, each service's State and timestamped logs incl. the FATAL; the error names it; no `DB_PASSWORD` value, no env |
 | 19 | `reconnect_restart.rs` | db of a running site on no network: Start reconnects it **and restarts the app** (new `StartedAt`, same container), Ready, app reaches `db` |
 | 20 | `container_gone.rs` | a stopped site's db, then edge, container removed, the shared tag moved: Start creates only that one (`up -d --no-recreate`); the others keep their containers, app its image, db its data |
-| 21 | `doctor_start.rs` | edge removed, app stopped, the shared tag moved: `doctor --fix` StartContainers creates edge, starts app in place on its image; no Scaffold rewrite (compose.yaml is the template, the scenario db comes from an overlay) |
+| 21 | `doctor_start.rs` | edge removed, app stopped, the shared tag moved: the checkup says app "isn't running" (not "isn't there"); `doctor --fix` StartContainers creates edge, starts app in place on its image; no Scaffold rewrite (compose.yaml is the template, the scenario db comes from an overlay) |
 | 22 | `endpoint_clear.rs` | a step fails while db (paused: the one not-running state a network still lists) holds endpoints on two networks: Start force-disconnects and reconnects it under `db` on both, retries, then says restart Docker (`NeedsDockerRestart`); after unpause Start is Ready with the data |
 | 23 | `db_image_move.rs` | the db image move through `ops::update_with`, between two scenario Postgres builds (feature `scenario-seams`), the new one served by a local `registry:2`: download fails → Ready, compose.yaml untouched; pushed → the next update pulls, rewrites compose.yaml, recreates db + app, data kept |
 | 24 | `older_backups.rs` | Free up space's older automatic backups: only the ticked older ones removed; an unticked older one, counted ones and the owner's backup stay even when named in the list |

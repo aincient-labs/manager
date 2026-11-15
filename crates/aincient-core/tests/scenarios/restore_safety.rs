@@ -7,6 +7,11 @@
 //! with [`SafetyBackupFailed`] and leave the database as it is; told to go
 //! without the copy (`--no-safety-backup`), it restores.
 //!
+//! The folder is tried before any dump (state zoo, `ro-backups`): a plain
+//! backup on it is refused at once ([`BackupsNotWritable`]), nothing dumped,
+//! no `.part`; the restore's refusal carries the same plain cause, never
+//! Docker's "permission denied".
+//!
 //! Real `ops::backup` / `ops::restore_with` with their real in-container
 //! scripts; the app's `drush` does those scripts' four calls on the real
 //! Postgres (harness `APP_DRUSH`). Not covered: Drupal's own `sql:dump`
@@ -14,7 +19,9 @@
 
 use std::time::Instant;
 
-use aincient_core::ops::{self, Overridable, RestoreOptions, SafetyBackupFailed};
+use aincient_core::ops::{
+    self, BackupsNotWritable, Overridable, RestoreOptions, SafetyBackupFailed,
+};
 
 use crate::harness::{set_mode, writable, Feed, Site, Template};
 
@@ -39,6 +46,54 @@ fn restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_wit
         "the backups folder must be unwritable for this scenario (running as root?)"
     );
 
+    // A backup on that folder stops before its dump, in plain words: no
+    // Docker "permission denied" from the copy out once the dump is done.
+    let started = Instant::now();
+    let mut backup_feed = Feed::default();
+    let not_saved = ops::backup(&site.stack, None, &mut backup_feed)
+        .expect_err("no backup into a read-only folder");
+    assert!(
+        not_saved.is::<BackupsNotWritable>(),
+        "the typed cause: {not_saved:#}"
+    );
+    assert_eq!(
+        format!("{not_saved:#}"),
+        format!(
+            "Atelier can't save backups in {}: it isn't writable. Fix the folder's \
+             permissions (or free it up), then try again.",
+            backups.display()
+        )
+    );
+    assert!(
+        !backup_feed.lines.iter().any(|l| l.contains("Dumping")),
+        "nothing was dumped: {:?}",
+        backup_feed.lines
+    );
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "refused at once, not after a dump: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        site.compose(&[
+            "exec",
+            "-T",
+            "app",
+            "sh",
+            "-c",
+            "ls -d /tmp/aincient-snapshot-* 2>/dev/null || true"
+        ]),
+        "",
+        "no dump staged in the container"
+    );
+    assert!(
+        std::fs::read_dir(&backups)
+            .expect("backups")
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".part")),
+        "no .part"
+    );
+
     let mut feed = Feed::default();
     let refused = ops::restore_with(&site.stack, &file, &RestoreOptions::default(), &mut feed)
         .expect_err("a restore whose safety backup failed must stop");
@@ -49,6 +104,13 @@ fn restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_wit
     assert_eq!(
         Overridable::of(&refused),
         Some(Overridable::RestoreWithoutSafetyBackup)
+    );
+    let said = format!("{refused:#}");
+    assert!(
+        said.contains("The backup failed: Atelier can't save backups in ")
+            && said.contains("it isn't writable")
+            && !said.contains("permission denied"),
+        "the plain cause: {said}"
     );
     assert_eq!(
         site.sql("SELECT v FROM scn_marker"),
