@@ -33,7 +33,6 @@ crates/aincient-core/src/ops.rs | mark_database_wiped | fs: write | the marker o
 crates/aincient-core/src/ops.rs | move_db_image | docker: up -d --force-recreate db app | the database server move runs only when the shipped db image changes; no scenario moves it
 crates/aincient-core/src/ops.rs | pull_db_image | docker: pull | the database server move runs only when the shipped db image changes; no scenario moves it
 crates/aincient-core/src/ops.rs | reconnect_args | docker: network connect | reconnecting a network without an alias; the scenarios reconnect db, which always has one
-crates/aincient-core/src/ops.rs | reconnect_site | docker: restart app | restarting app after a reconnect; no scenario reaches it
 crates/aincient-core/src/ops.rs | restore | docker: cp | restoring a plain .sql dump; the scenarios restore backup bundles
 crates/aincient-core/src/ops.rs | start_args | docker: up -d --no-recreate | Start of a site whose containers are gone; scenarios start existing containers
 crates/aincient-core/src/ops.rs | sweep_stale_parts | fs: remove_file | removes .part files older than the stale age; no scenario leaves one

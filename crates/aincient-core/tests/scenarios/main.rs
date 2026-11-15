@@ -21,6 +21,7 @@ mod erased_db;
 mod oom_app;
 mod oom_db;
 mod prune_backups;
+mod reconnect_restart;
 mod restore_safety;
 mod settings_applied;
 mod shared_tag;

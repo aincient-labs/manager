@@ -2716,7 +2716,7 @@ pub(crate) fn reconnect_site(stack: &Stack, r: &mut dyn Reporter) -> Result<bool
             None,
         );
         let mut c = compose(stack);
-        // scenario: none — restarting app after a reconnect; no scenario reaches it
+        // scenario: start_reconnects_a_running_db_and_restarts_the_app_that_lost_it
         c.args(["restart", "app"]);
         run_step(c, "restart the site", r)?;
     }

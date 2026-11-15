@@ -758,6 +758,16 @@ impl Site {
         nets
     }
 
+    /// The full container ID of `service` (running or not).
+    pub fn id(&self, service: &str) -> String {
+        self.inspect(service, "{{.Id}}")
+    }
+
+    /// When `service`'s container last started (Docker's `State.StartedAt`).
+    pub fn started_at(&self, service: &str) -> String {
+        self.inspect(service, "{{.State.StartedAt}}")
+    }
+
     pub fn running(&self, service: &str) -> bool {
         self.inspect(service, "{{.State.Running}}") == "true"
     }
