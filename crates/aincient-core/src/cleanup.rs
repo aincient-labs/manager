@@ -384,7 +384,7 @@ pub fn free(scope: Scope, only: Option<&HashSet<String>>) -> Result<Report> {
         .collect();
     Ok(remove_each(images, images_in_use, |target| {
         let mut c = docker::docker();
-        // scenario: none — Free up space removing images is never run for real: scenario 7 checks the selection (cleanup::find) only, updates assert the automatic clean-up removes nothing
+        // scenario: none — Free up space removing images: only images under ghcr.io/aincient-labs/ or the exact base tags Atelier shipped, with a registry digest, qualify; a local registry gives a scenario image a digest only under localhost:<port>/, so no scenario image can qualify, and free would list the owner's own Atelier images too (scenario 7 asserts on cleanup::find only)
         c.args(["image", "rm", target]);
         docker::try_capture(c).is_some()
     }))

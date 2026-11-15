@@ -1,7 +1,7 @@
 # Changing calls no scenario covers yet (see tests/docker_guard.rs).
 # <path> | <fn> | <what> | <reason>
 crates/aincient-cli/src/engine.rs | disable | docker: up -d --remove-orphans | engine mode (the experimental engine sidecar) has no scenario (disable brings the plain stack back up)
-crates/aincient-core/src/cleanup.rs | free | docker: image rm | Free up space removing images is never run for real: scenario 7 checks the selection (cleanup::find) only, updates assert the automatic clean-up removes nothing
+crates/aincient-core/src/cleanup.rs | free | docker: image rm | Free up space removing images: only images under ghcr.io/aincient-labs/ or the exact base tags Atelier shipped, with a registry digest, qualify; a local registry gives a scenario image a digest only under localhost:<port>/, so no scenario image can qualify, and free would list the owner's own Atelier images too (scenario 7 asserts on cleanup::find only)
 crates/aincient-core/src/docker_runtime.rs | colima_restart | runtime: colima restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | docker: docker desktop restart | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
 crates/aincient-core/src/docker_runtime.rs | restart_plan | runtime: orbctl restart docker | restarts the owner's Docker runtime; a scenario never restarts the Docker every other project shares (owner checks it by hand)
