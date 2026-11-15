@@ -219,6 +219,41 @@ pub fn gather(stack: &Stack, pf: &Preflight) -> UpdateFacts {
             ..UpdateFacts::default()
         };
     }
+    let (mut out_of_memory, mut restarting) = memory_and_restarts(stack);
+    // Docker can report a memory kill's exit (`Restarting`) a moment before
+    // its `oom` (the flag and the event): a crash-looping service with no
+    // memory proof yet is looked at again before it is called a crash loop.
+    for _ in 0..UNPROVEN_LOOKS {
+        if restarting.is_subset(&out_of_memory) {
+            break;
+        }
+        std::thread::sleep(UNPROVEN_PAUSE);
+        let (oom, again) = memory_and_restarts(stack);
+        out_of_memory.extend(oom);
+        restarting.extend(again);
+    }
+    let memory_remedy = (!out_of_memory.is_empty()).then(crate::docker_runtime::memory_remedy_here);
+    UpdateFacts {
+        docker_answering: true,
+        engine_state: crate::ops::engine_state_of(stack),
+        database_erased: crate::ops::stack_database_erased(stack),
+        detached: boot::detached_now(stack).unwrap_or_default(),
+        out_of_memory,
+        restarting,
+        memory_remedy,
+        host_disk,
+        docker_disk: disk::docker_free(stack),
+    }
+}
+
+/// Extra looks at a crash-looping service with no memory proof yet, and the
+/// pause before each.
+const UNPROVEN_LOOKS: u32 = 3;
+const UNPROVEN_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One look: services out of memory now (flag while restarting, or a recent
+/// `oom` event of their current container), and services restarting now.
+fn memory_and_restarts(stack: &Stack) -> (BTreeSet<String>, BTreeSet<String>) {
     let now = boot::services_now(stack);
     let mut out_of_memory: BTreeSet<String> = now
         .iter()
@@ -233,18 +268,7 @@ pub fn gather(stack: &Stack, pf: &Preflight) -> UpdateFacts {
         .filter(|s| s.restarting)
         .map(|s| s.service.clone())
         .collect();
-    let memory_remedy = (!out_of_memory.is_empty()).then(crate::docker_runtime::memory_remedy_here);
-    UpdateFacts {
-        docker_answering: true,
-        engine_state: crate::ops::engine_state_of(stack),
-        database_erased: crate::ops::stack_database_erased(stack),
-        detached: boot::detached_now(stack).unwrap_or_default(),
-        out_of_memory,
-        restarting,
-        memory_remedy,
-        host_disk,
-        docker_disk: disk::docker_free(stack),
-    }
+    (out_of_memory, restarting)
 }
 
 /// An update was refused before any work because the site isn't ready

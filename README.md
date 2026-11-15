@@ -203,7 +203,7 @@ cargo test -p aincient-core --test scenarios -- --ignored --test-threads=1
 ```
 
 They are `#[ignore]`d (plain `cargo test` skips them), need a running Docker with the compose
-plugin, and take about thirteen minutes together (30 scenarios, 31 tests, 765 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
+plugin, and take about thirteen minutes together (30 scenarios, 31 tests, 792 s on OrbStack; 15–60 s each); CI runs them on Linux (`check.yml`,
 job `scenarios`) twice, once on each of Docker's image stores (containerd, classic), which read an
 image's origin differently (`aincient_core::image_origin`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`):
 
