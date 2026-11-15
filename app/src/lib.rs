@@ -206,6 +206,16 @@ impl Outcome {
         })
     }
 
+    /// An update refused because the site runs a build made on this computer
+    /// ([`ops::LocalBuild`]): nothing was changed, and the reason names the
+    /// way back to a channel. A failed answer, so the failure panel shows it.
+    fn local_build(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !ops::LocalBuild::is(&e) {
+            return Err(e);
+        }
+        Ok(Outcome::failed(err_ref(&e), false))
+    }
+
     /// A refusal the owner may override ([`ops::Overridable`], told apart by
     /// type or a server's exit code, never by its words) as a failed answer
     /// carrying its flag; any other error stays an error.
@@ -231,6 +241,7 @@ fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, Strin
         // refused with the boot's failure inside.
         Err(e) => match Outcome::busy(e)
             .or_else(Outcome::blocked)
+            .or_else(Outcome::local_build)
             .or_else(Outcome::overridable)
         {
             Ok(refused) => Ok(refused),

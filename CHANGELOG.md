@@ -83,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Updating a site that runs a build made on this computer (a developer build, or a local tag such as
+  `atelier-cms:dev`) no longer tries to download it and fails with Docker's "pull access denied". It
+  stops before changing anything and says there is nothing to download, and how to follow released
+  versions again (`atelier app channel stable`, or **System → Updates → Released versions**).
 - **Run a checkup** on a stopped site now says its containers aren't running, with **Start** as the
   fix, instead of "The container isn't there".
 - A site that runs out of memory while it starts or updates now says so: "Your site ran out of

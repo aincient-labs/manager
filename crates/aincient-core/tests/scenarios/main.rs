@@ -35,5 +35,6 @@ mod site_busy;
 mod stale_endpoint;
 mod update_blocked;
 mod update_failed_logs;
+mod update_local_build;
 mod update_running_backup_fails;
 mod update_stopped;

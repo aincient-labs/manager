@@ -1264,6 +1264,114 @@ impl std::fmt::Display for BackupBeforeUpdateFailed {
 
 impl std::error::Error for BackupBeforeUpdateFailed {}
 
+/// An update refused before anything was done: the image it would download is
+/// a build made on this computer (a developer build, a local tag such as
+/// `atelier-cms:zoo-shared`), which no registry has, so `compose pull` could
+/// only fail with Docker's "pull access denied". The way forward is following
+/// a channel again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBuild {
+    /// The image reference the site names (`AINCIENT_IMAGE`, or `--to`).
+    pub image: String,
+}
+
+impl std::fmt::Display for LocalBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "This site runs a build made on this computer ({}), so there is nothing to \
+             download, and nothing was changed. To follow released versions: `atelier app \
+             channel stable` (in the app: System → Updates → Released versions), then \
+             update again.",
+            self.image
+        )
+    }
+}
+
+impl std::error::Error for LocalBuild {}
+
+impl LocalBuild {
+    /// Whether `e` is this refusal.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.is::<LocalBuild>()
+    }
+}
+
+/// Whether `image` names a build only this computer has: its reference names
+/// no registry host (so a pull asks Docker Hub, which has no Atelier image)
+/// and the local image was never downloaded under that name (no `RepoDigests`
+/// entry for its repository: a retag of a downloaded image, such as
+/// `atelier-cms:zoo-shared`, carries the source's digest under the source's
+/// name only). `pull_policy: never` on `app` is the owner telling compose to
+/// use the local image as it is (the scenario harness's local builds), so a
+/// pull takes nothing and the update goes ahead. An image that isn't here
+/// (`repo_digests` `None`) is left to the pull. A digest reference is never
+/// local-only. Pure: [`local_build`] feeds it what Docker says.
+fn is_local_only(
+    image: &str,
+    app_pull_policy: Option<&str>,
+    repo_digests: Option<&[String]>,
+) -> bool {
+    if app_pull_policy == Some("never") || image.contains('@') {
+        return false;
+    }
+    let Some(digests) = repo_digests else {
+        return false;
+    };
+    // The repository: the reference without its tag (a `:` after the last `/`).
+    let repo = match image.rsplit_once(':') {
+        Some((r, tag)) if !tag.contains('/') => r,
+        _ => image,
+    };
+    let host = repo.split_once('/').map(|(first, _)| first);
+    if host.is_some_and(|h| h.contains('.') || h.contains(':') || h == "localhost") {
+        return false;
+    }
+    let same_repo = |d: &String| {
+        let name = d.split('@').next().unwrap_or_default();
+        name == repo
+            || name == format!("docker.io/{repo}")
+            || name == format!("docker.io/library/{repo}")
+    };
+    !digests.iter().any(same_repo)
+}
+
+/// `pull_policy` of the `app` service in `compose config --format json`.
+fn parse_app_pull_policy(config_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    v.get("services")?
+        .get("app")?
+        .get("pull_policy")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// [`LocalBuild`] when an update would download `image` for `stack` and no
+/// registry has it ([`is_local_only`]). Reads only; `None` when Docker
+/// doesn't answer (the pull says what's wrong then).
+fn local_build(stack: &Stack, image: &str) -> Option<LocalBuild> {
+    let mut config = compose(stack);
+    config.args(["config", "--format", "json"]);
+    let policy = docker::try_capture(config).and_then(|j| parse_app_pull_policy(&j));
+    let mut inspect = docker::docker();
+    inspect.args([
+        "image",
+        "inspect",
+        image,
+        "--format",
+        "{{json .RepoDigests}}",
+    ]);
+    let digests: Option<Vec<String>> = docker::try_capture(inspect).map(|j| {
+        serde_json::from_str::<Option<Vec<String>>>(j.trim())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    });
+    is_local_only(image, policy.as_deref(), digests.as_deref()).then(|| LocalBuild {
+        image: image.to_string(),
+    })
+}
+
 /// The before-update backup of a running site, or the refusal: an update that
 /// migrates with no way back is worse than no update (a full disk is the usual
 /// cause, and the same disk would fail the migration's own snapshot). The owner
@@ -1342,6 +1450,20 @@ fn run_upgrade(
     let pf = preflight();
     if !pf.docker_installed || !pf.compose_available {
         pf.require()?;
+    }
+    // A build made on this computer has nothing to download: `compose pull`
+    // would fail with Docker's "pull access denied". Refused before anything
+    // is touched (the zoo's shared-tag sites, a developer build). A stepped
+    // route's hops are registry releases.
+    if !plan.is_stepped() {
+        let pulls = if plan.explicit_target {
+            plan.target_image.clone()
+        } else {
+            stack.image()
+        };
+        if let Some(local) = local_build(stack, &pulls) {
+            return Err(anyhow::Error::new(local));
+        }
     }
     // Refuse before any work while the site isn't ready (M2c, the HA model):
     // Docker not answering, too little disk, an erased database, a container
@@ -5298,6 +5420,84 @@ fn sanitize(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // `compose config --format json` and `image inspect --format '{{json
+    // .RepoDigests}}'`, verbatim (Docker 28, compose v2).
+    const CONFIG_NEVER: &str = r#"{"name":"atelier-scn-cfgprobe","networks":{"default":{"name":"atelier-scn-cfgprobe_default","ipam":{}}},"services":{"app":{"command":null,"entrypoint":null,"image":"atelier-scn-app:x","networks":{"default":null},"pull_policy":"never"}}}"#;
+    const CONFIG_PLAIN: &str = r#"{"name":"atelier-scn-cfgprobe","networks":{"default":{"name":"atelier-scn-cfgprobe_default","ipam":{}}},"services":{"app":{"command":null,"entrypoint":null,"image":"atelier-cms:zoo","networks":{"default":null}}}}"#;
+
+    #[test]
+    fn the_app_pull_policy_is_read_from_compose_config() {
+        assert_eq!(
+            super::parse_app_pull_policy(CONFIG_NEVER).as_deref(),
+            Some("never")
+        );
+        assert_eq!(super::parse_app_pull_policy(CONFIG_PLAIN), None);
+        assert_eq!(super::parse_app_pull_policy("not json"), None);
+    }
+
+    #[test]
+    fn a_build_made_on_this_computer_has_nothing_to_download() {
+        use super::is_local_only;
+        let ghcr = "ghcr.io/aincient-labs/atelier-cms@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f".to_string();
+        // The zoo's shared tag: a retag of the downloaded release, whose only
+        // digest is under the ghcr name. `docker.io/library/atelier-cms`
+        // has none: refused.
+        assert!(is_local_only(
+            "atelier-cms:zoo-shared",
+            None,
+            Some(&[ghcr.clone()])
+        ));
+        // A developer build: no digests at all.
+        assert!(is_local_only("atelier-cms:dev", None, Some(&[])));
+        assert!(is_local_only("atelier-scn-app:x-app", None, Some(&[])));
+        // Told to never pull (the harness's local builds): the update goes on.
+        assert!(!is_local_only(
+            "atelier-scn-app:x-app",
+            Some("never"),
+            Some(&[])
+        ));
+        // A registry reference is the registry's to answer, digests or not.
+        assert!(!is_local_only(
+            "ghcr.io/aincient-labs/atelier-cms:latest",
+            None,
+            Some(&[])
+        ));
+        assert!(!is_local_only(
+            "localhost:5000/atelier-cms:x",
+            None,
+            Some(&[])
+        ));
+        // Downloaded from Docker Hub under this very name.
+        assert!(!is_local_only(
+            "nginx:1.30-alpine-slim",
+            None,
+            Some(&[
+                "nginx@sha256:e2355aa95529a7999dad94ddcb45a8768abf6fb0b204c93b1a3ffce477d7b893"
+                    .to_string()
+            ])
+        ));
+        assert!(!is_local_only(
+            "someone/atelier-fork:1",
+            None,
+            Some(&["someone/atelier-fork@sha256:aa".to_string()])
+        ));
+        // Not here at all: left to the pull. A digest reference never.
+        assert!(!is_local_only("atelier-cms:gone", None, None));
+        assert!(!is_local_only(&ghcr, None, Some(&[])));
+    }
+
+    #[test]
+    fn the_local_build_refusal_says_why_and_the_way_back_to_a_channel() {
+        let said = super::LocalBuild {
+            image: "atelier-cms:zoo-shared".into(),
+        }
+        .to_string();
+        assert!(said.contains("build made on this computer (atelier-cms:zoo-shared)"));
+        assert!(said.contains("nothing to download"));
+        assert!(said.contains("`atelier app channel stable`"));
+        assert!(said.contains("nothing was changed"));
+    }
+
     #[test]
     fn a_detached_container_is_reconnected_under_its_service_name() {
         let d = crate::boot::Detached {

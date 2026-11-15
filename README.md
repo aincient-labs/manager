@@ -265,6 +265,7 @@ job `scenarios`). The harness (`crates/aincient-core/tests/scenarios/harness.rs`
 | 23 | `db_image_move.rs` | the db image move through `ops::update_with`, between two scenario Postgres builds (feature `scenario-seams`), the new one served by a local `registry:2`: download fails → Ready, compose.yaml untouched; pushed → the next update pulls, rewrites compose.yaml, recreates db + app, data kept |
 | 24 | `older_backups.rs` | Free up space's older automatic backups: only the ticked older ones removed; an unticked older one, counted ones and the owner's backup stay even when named in the list |
 | 25 | `app_down.rs` | `app down` keeps the volumes and the next Start recreates the containers on the same data; `down --wipe` writes the marker, removes every volume, and the next Start sets up a fresh site and clears the marker |
+| 26 | `update_local_build.rs` | a site on a harness-built local tag (no `pull_policy: never` overlay), tag moved to a second build: update refused before anything (`LocalBuild`, "nothing to download", `atelier app channel stable`), no pull; `.env`, compose.yaml, containers, image unchanged, no backup; `check_update` offers no update |
 
 **Guard: every changing call names its scenario** (`crates/aincient-core/tests/docker_guard.rs`,
 runs in plain `cargo test`). It scans `crates/*/src` (not test code) for calls that change the
