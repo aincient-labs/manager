@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The desktop app's checksum files (`.sha256` next to the `.dmg`, `.msi` and `.AppImage`) now name
+  the file you download (`Atelier.Manager_…`), so `shasum -a 256 -c` checks it instead of saying the
+  file could not be read.
+
 ## [0.17.0] - 2026-11-15
 
 ### Added

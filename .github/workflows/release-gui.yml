@@ -222,6 +222,16 @@ jobs:
               ls -la "$(dirname "$f")" 2>/dev/null || true
               continue
             fi
+            # GitHub turns a space in an asset name into a dot ("Atelier
+            # Manager_….dmg" is published as "Atelier.Manager_….dmg"), and the
+            # checksum line must name the file people download, or `shasum -c`
+            # can't find it (0.17.0). Upload under that name ourselves.
+            published="$(basename "$f")"
+            published="${published// /.}"
+            if [ "$published" != "$(basename "$f")" ]; then
+              mv "$f" "$(dirname "$f")/$published"
+              f="$(dirname "$f")/$published"
+            fi
             echo "uploading: $f"
             if gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber; then
               uploaded=$((uploaded + 1))
