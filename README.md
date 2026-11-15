@@ -301,6 +301,55 @@ Manager's function, and assert the end state the owner needs (running, reachable
 Before committing, check it out on the commit before the fix (`git worktree add`) and show it
 fails there.
 
+### State zoo
+
+The scenarios run tiny stand-in sites; the zoo makes **real** Atelier sites (the real
+`atelier-cms` image, real Drupal) on your own computer, in the states real sites end up in, so a
+live check before a release runs the branch's CLI against all of them (DECISIONS 0528). Local
+only: it is what covers OrbStack / Docker Desktop, which CI can't.
+
+```bash
+scripts/state-zoo.sh up [state…]          # all states, or just these
+scripts/state-zoo.sh status               # the zoo sites and their containers
+scripts/state-zoo.sh check app start      # any CLI command, against every zoo site
+scripts/state-zoo.sh check doctor
+scripts/state-zoo.sh check app update --yes
+scripts/state-zoo.sh down                 # remove every zoo site completely
+```
+
+`check` prints one row per state (state, exit code, the output's last line, time) and keeps
+each full output in `zoo-logs/<state>-<command>.log` (gitignored). It always runs
+`target/debug/atelier` (built first), never the `atelier` on your PATH.
+
+| State (site `zoo-…`) | How it is made | The real history it imitates |
+|---|---|---|
+| `old-template` | installed, stopped, then `compose.yaml` and `edge.conf` replaced by the last superseded shipped templates (`templates/compose-0.14.1.yaml`, `edge-0.14.0.conf`) and the containers recreated from them with `docker compose up -d` | a site installed by Manager ≤ 0.14.1: db has no restart policy, files the next start/update refreshes |
+| `shared-tag-a` | installed, `.env` pointed at the zoo tag `atelier-cms:zoo-shared` (tagged from the local `:latest` image ID) and recreated on it; left running | two sites on one tag; this one was running when the tag moved |
+| `shared-tag-b` | same, then stopped; after that the tag is moved to another local `atelier-cms` image (if there is one; the script says so if not) | the 0.17.0 A1 case: a stopped site whose tag moved under it (another site's update) — Start must keep its image |
+| `engine-resting` | `engine enable --experimental`, then `site rest --yes --experimental` | a site with the EXPERIMENTAL engine, resting. **Skipped** unless a local `atelier-engine:dev` exists (a developer build pins it; build it with `engine/build.sh` yourself — the zoo makes no image outside `atelier-cms:zoo-*`) |
+| `stopped` | installed, `app stop --yes` | a site you stopped and came back to |
+| `detached-db` | installed, stopped, `docker network disconnect -f` on db, `docker start` db | the review-tmp incident: db running with no network in its own settings |
+| `ro-backups` | installed, one `data backup`, then `chmod 0555 backups/` | a backups folder that lost write permission (copied as another user, read-only mount) |
+| `digest-pinned` | installed, then `app install --image ghcr.io/aincient-labs/atelier-cms@sha256:…` (the local image's registry digest) | an owner who pinned an exact build |
+| `restored-elsewhere` | installed, then `data restore --other-site --yes` of a backup of another running zoo site (a temporary `zoo-donor` when none runs) | a site restored from another site's / machine's backup (site-id mismatch path) |
+
+**Cost.** About 40 s per site to install (OrbStack, image already here); ≈ 400 MiB RAM and
+≈ 300 MiB of Docker disk each, so ≈ 3.5 GiB / 2.7 GiB for the whole zoo. `up` prints the estimate
+first and refuses when Docker's disk (read inside a container, as the checkup does) or this
+computer's has less than 5 GiB free, or Docker's free memory (total minus what runs now) can't
+hold the sites; `up <state…>` makes a subset.
+
+**Rails.** The script only ever addresses sites `zoo-*`, projects/containers/volumes/networks
+`atelier-zoo-*` and image tags `atelier-cms:zoo-*`, and refuses the known owner sites by name;
+every CLI call passes `--site zoo-…`, and the active site is put back if anything changed it. It
+never prunes, never starts or restarts Docker, and never retags `ghcr.io/…:latest`. The Manager's
+own install/update pulls run, so `up` and `check` first compare the registry's `:latest` with
+the local image and refuse if it would download a new one — pass `--pull` to allow that.
+
+**Cleanup.** `down` runs `app down --wipe --yes` and `sites remove` per site, removes anything
+still labelled with its compose project, deletes `~/.atelier/sites/zoo-*`, and untags
+`atelier-cms:zoo-*` (the images under them stay: they are the ones already here).
+
 ## Release / distribution
 
 **One tag ships everything.** CLI and GUI share the workspace version and ride the **same `v*`
