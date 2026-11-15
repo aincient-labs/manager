@@ -2307,7 +2307,7 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     // What Docker said, when it passes through here (the terminal's own output
     // goes straight to the screen, where the operator reads it anyway).
     let mut refused = false;
-    let run = if structured {
+    let mut run = if structured {
         run_streaming(c, "pull the image", |line| {
             refused |= registry_refused(line);
             match serde_json::from_str::<docker::PullEvent>(line) {
@@ -2323,6 +2323,24 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     } else {
         run_inherited(c, "pull the image")
     };
+    // The probe can say yes where `pull` says no: Compose 2.20 takes
+    // `--progress json` on `version` and refuses it on `pull` (d34dbuntu,
+    // 2026-11-15). Then the plain feed, as on any older Compose.
+    if structured
+        && run
+            .as_ref()
+            .is_err_and(|e| progress_value_refused(&format!("{e:#}")))
+    {
+        r.log("This Docker Compose has no structured progress; pulling with its plain output.");
+        let mut c = compose(stack);
+        // Run by every update scenario on a Compose before JSON progress (2.20).
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup
+        c.arg("pull");
+        run = run_streaming(c, "pull the image", |line| {
+            refused |= registry_refused(line);
+            r.log(line);
+        });
+    }
     // A pulled image is a new local digest, so the cached update check (if any)
     // now describes a machine that no longer exists — drop it rather than keep a
     // stale "update available" banner up after the update itself.
@@ -2339,6 +2357,12 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
             e
         }
     })
+}
+
+/// Whether Compose refused `--progress json` itself (older than its JSON
+/// progress: `unsupported --progress value "json"`).
+fn progress_value_refused(said: &str) -> bool {
+    said.contains("unsupported --progress value")
 }
 
 /// Whether a line of Docker's pull output says the registry refused the
@@ -8111,6 +8135,17 @@ mod tests {
             Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
         );
         assert_eq!(stack.pending_db_image_migration(), None);
+    }
+
+    #[test]
+    fn a_compose_without_json_progress_is_told_from_a_failed_pull() {
+        // Compose 2.20.2 on d34dbuntu, 2026-11-15, as the pull's error carried it.
+        assert!(super::progress_value_refused(
+            "failed to pull the image (docker exited with exit status: 1): unsupported --progress value \"json\""
+        ));
+        assert!(!super::progress_value_refused(
+            "failed to pull the image (docker exited with exit status: 1): manifest unknown"
+        ));
     }
 
     #[test]

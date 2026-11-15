@@ -643,6 +643,8 @@ impl PullEvent {
 /// Whether the local Compose plugin understands `--progress json` (Compose
 /// v2.30+). Probed with a cheap `version` call so `pull` can fall back to the
 /// plain text feed on older installs instead of failing on an unknown flag value.
+/// A yes is not final: Compose 2.20 takes the value on `version` and refuses it
+/// on `pull`, which then retries plain (`ops::pull`).
 pub fn compose_supports_json_progress() -> bool {
     quiet(docker().args(["compose", "--progress", "json", "version"]))
 }
