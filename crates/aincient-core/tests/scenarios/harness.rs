@@ -682,6 +682,24 @@ impl Site {
         self.set_env("COMPOSE_FILE", &format!("{files}:{name}"));
     }
 
+    /// compose.yaml back to exactly this Manager's [`COMPOSE_TEMPLATE`] (the
+    /// real db image line), with the scenario db image in an overlay instead.
+    /// For a scenario that runs `doctor::fix`: its first rung rewrites a
+    /// compose.yaml that differs from the template (the Scaffold repair), and
+    /// the rewritten file would name the real pgvector image. Call after
+    /// [`scaffold`](Self::scaffold), before the first boot.
+    pub fn db_image_by_overlay(&self) {
+        std::fs::write(self.stack.compose_path(), COMPOSE_TEMPLATE).expect("compose.yaml");
+        self.overlay(
+            "scn-db-image.yaml",
+            &format!("services:\n  db:\n    image: {SCN_DB_IMAGE}\n"),
+        );
+        assert!(
+            self.stack.stack_files_current(),
+            "the checkup sees current files"
+        );
+    }
+
     /// Give `service` a memory limit of `size` (`48m`), swap included
     /// (`memswap_limit` = `mem_limit`, or swap would absorb the allocation on a
     /// host that has it). The shipped restart policy stays.

@@ -18,6 +18,7 @@ mod cleanup_needed;
 mod container_gone;
 mod detached_db;
 mod disk_full;
+mod doctor_start;
 mod erased_db;
 mod oom_app;
 mod oom_db;

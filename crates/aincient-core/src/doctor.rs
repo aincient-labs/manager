@@ -372,7 +372,7 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // Docker's leftovers (a stale network endpoint), like Start and Update.
             ops::run_recovering(
                 stack,
-                // scenario: none — doctor --fix starting stopped services; scenario 8 runs --fix but it refuses before this repair
+                // scenario: doctor_fix_creates_the_removed_container_and_keeps_the_sites_image
                 &["up", "-d", "--no-recreate"],
                 "start the appliance",
                 r,
