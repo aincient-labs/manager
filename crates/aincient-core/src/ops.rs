@@ -3046,7 +3046,7 @@ pub fn start_args(action: StartAction) -> &'static [&'static str] {
     match action {
         // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         StartAction::Start => &["start"],
-        // scenario: none — Start of a site whose containers are gone; scenarios start existing containers
+        // scenario: start_recreates_only_the_removed_container_and_keeps_the_others
         StartAction::Up => &["up", "-d", "--no-recreate"],
     }
 }

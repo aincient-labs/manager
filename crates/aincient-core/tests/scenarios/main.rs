@@ -15,6 +15,7 @@ mod harness;
 
 mod boot_fatal;
 mod cleanup_needed;
+mod container_gone;
 mod detached_db;
 mod disk_full;
 mod erased_db;
