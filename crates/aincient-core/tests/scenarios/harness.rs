@@ -36,6 +36,10 @@
 //! The Manager's user home (where it finds `~/.atelier/sites.toml`, which
 //! clean-up reads) is a temp dir for the whole run ([`user_home`]): no scenario
 //! reads or writes the owner's real registry.
+//!
+//! A scenario that needs Docker to *download* an image starts a [`Registry`]
+//! (`registry:2` on a free `localhost` port, its own `atelier-scn-registry-*`
+//! project) and pushes an image it built there; nothing is published.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -98,9 +102,18 @@ RUN mkdir -p /www/user /opt/drupal/web/sites/default/files /opt/drupal/private \
 COPY entrypoint.sh /entrypoint.sh
 COPY drush /opt/drupal/vendor/bin/drush
 RUN chmod +x /entrypoint.sh /opt/drupal/vendor/bin/drush
+ARG CONVERGE=
+RUN if [ -n "$CONVERGE" ]; then \
+      printf '#!/bin/sh\n# scenario stand-in: refresh_collation_versions\necho "[converge] converge OK (scenario)"\n' \
+        > /usr/local/bin/converge.sh && chmod +x /usr/local/bin/converge.sh; \
+    fi
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/entrypoint.sh"]
 "#;
+
+/// A `db` image the harness builds (and so may remove): the scenario Postgres
+/// with this run's [`PID_LABEL`] and a mark, so two builds are two images.
+const DB_DOCKERFILE: &str = "FROM postgres:16-alpine\nARG MARK\nLABEL atelier.scn.db=$MARK\n";
 
 /// [`fail_boot`](Site::fail_boot) leaves this flag (with the build's mark
 /// appended) in the `private` volume: that build then fails its converge, as
@@ -619,32 +632,59 @@ impl Site {
     /// `mark`, so two builds are two images): `(image, image ID)`. The same
     /// `tag` again moves that tag to the new build.
     pub fn build_app(&mut self, tag: &str, mark: &str) -> (String, String) {
+        self.build_app_with(tag, mark, &[])
+    }
+
+    /// [`build_app`](Self::build_app) whose image ships
+    /// `/usr/local/bin/converge.sh` with the collation step in it, so the
+    /// Manager's database server move sees an app that rebuilds indexes. The
+    /// script only prints converge's success line; nothing else runs it in a
+    /// scenario but a restore (`has_converge`), so only builds that ask have it.
+    pub fn build_app_converging(&mut self, tag: &str, mark: &str) -> (String, String) {
+        self.build_app_with(tag, mark, &["CONVERGE=1"])
+    }
+
+    fn build_app_with(&mut self, tag: &str, mark: &str, args: &[&str]) -> (String, String) {
         let image = format!("{APP_REPO}:{}-{tag}", self.project);
         let ctx = self.stack.home.join(format!(".app-build-{mark}"));
         std::fs::create_dir_all(&ctx).expect("build context");
         std::fs::write(ctx.join("Dockerfile"), APP_DOCKERFILE).expect("Dockerfile");
         std::fs::write(ctx.join("entrypoint.sh"), APP_ENTRYPOINT).expect("entrypoint");
         std::fs::write(ctx.join("drush"), APP_DRUSH).expect("drush");
+        let id = self.build(&image, &ctx, mark, args);
+        let _ = std::fs::remove_dir_all(&ctx);
+        (image, id)
+    }
+
+    /// Build the scenario Postgres ([`DB_DOCKERFILE`]) as `image` (a name with
+    /// [`PREFIX`] in it), stamped `mark`: its image ID. Removed with the site.
+    pub fn build_db(&mut self, image: &str, mark: &str) -> String {
+        assert!(image.contains(PREFIX), "not a scenario image: {image:?}");
+        let ctx = self.stack.home.join(format!(".db-build-{mark}"));
+        std::fs::create_dir_all(&ctx).expect("build context");
+        std::fs::write(ctx.join("Dockerfile"), DB_DOCKERFILE).expect("Dockerfile");
+        let id = self.build(image, &ctx, mark, &[]);
+        let _ = std::fs::remove_dir_all(&ctx);
+        id
+    }
+
+    /// `docker build` of `ctx` as `image` with this run's [`PID_LABEL`], build
+    /// arg `MARK=<mark>` and `args`; the tag and the image go with the site.
+    fn build(&mut self, image: &str, ctx: &Path, mark: &str, args: &[&str]) -> String {
         let ctx_s = ctx.to_string_lossy().to_string();
         let mark_arg = format!("MARK={mark}");
         let owner = format!("{PID_LABEL}={}", std::process::id());
-        let id = docker(&[
-            "build",
-            "-q",
-            "--label",
-            &owner,
-            "--build-arg",
-            &mark_arg,
-            "-t",
-            &image,
-            &ctx_s,
-        ]);
-        let _ = std::fs::remove_dir_all(&ctx);
-        if !self.tags.contains(&image) {
-            self.tags.push(image.clone());
+        let mut cmd: Vec<&str> = vec!["build", "-q", "--label", &owner, "--build-arg", &mark_arg];
+        for a in args {
+            cmd.extend(["--build-arg", a]);
+        }
+        cmd.extend(["-t", image, &ctx_s]);
+        let id = docker(&cmd);
+        if !self.tags.iter().any(|t| t == image) {
+            self.tags.push(image.to_string());
         }
         self.image_ids.push(id.clone());
-        (image, id)
+        id
     }
 
     /// Write the site the way the Manager does ([`Stack::ensure_scaffold_with`]:
@@ -786,6 +826,17 @@ impl Site {
         self.inspect(service, "{{.State.StartedAt}}")
     }
 
+    /// Point `db` at `image` in compose.yaml (in place of [`SCN_DB_IMAGE`]),
+    /// as a site an older Manager wrote names the db image it shipped.
+    pub fn set_db_image(&self, image: &str) {
+        let path = self.stack.compose_path();
+        let text = std::fs::read_to_string(&path).expect("compose.yaml");
+        let from = format!("    image: {SCN_DB_IMAGE}\n");
+        assert!(text.contains(&from), "compose.yaml names {SCN_DB_IMAGE}");
+        std::fs::write(&path, text.replace(&from, &format!("    image: {image}\n")))
+            .expect("compose.yaml");
+    }
+
     pub fn running(&self, service: &str) -> bool {
         self.inspect(service, "{{.State.Running}}") == "true"
     }
@@ -888,6 +939,102 @@ impl Site {
         if !self.tags.iter().any(|t| t == tag) {
             self.tags.push(tag.to_string());
         }
+    }
+}
+
+/// The registry image [`Registry`] runs (Docker's own distribution registry).
+pub const REGISTRY_IMAGE: &str = "registry:2";
+
+/// A throwaway image registry on this computer (`localhost:<free port>`), its
+/// own compose project `atelier-scn-registry-<pid>-<n>`: a scenario can then
+/// have Docker *download* an image it built (`docker pull` needs a registry),
+/// with nothing published anywhere. Torn down with its storage on drop; it
+/// carries [`PID_LABEL`], so a killed run's sweep takes it too.
+pub struct Registry {
+    project: String,
+    dir: PathBuf,
+    /// `localhost:<port>`: an image named `<host>/atelier-scn-…:<tag>` lives here.
+    pub host: String,
+}
+
+impl Registry {
+    pub fn start() -> Self {
+        require_docker();
+        let project = project_name("registry");
+        let dir = std::env::temp_dir().join(&project);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("registry dir");
+        let port = free_port();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            format!(
+                "services:\n  registry:\n    image: {REGISTRY_IMAGE}\n    pull_policy: missing\n    \
+                 ports:\n      - \"127.0.0.1:{port}:5000\"\n    labels:\n      {PID_LABEL}: \"{}\"\n",
+                std::process::id()
+            ),
+        )
+        .expect("registry compose.yaml");
+        let reg = Registry {
+            project,
+            dir,
+            host: format!("localhost:{port}"),
+        };
+        reg.compose(&["up", "-d", "--quiet-pull"])
+            .unwrap_or_else(|e| panic!("start the scenario registry: {e}"));
+        // Up when it answers the registry API.
+        let t = std::time::Instant::now();
+        while !registry_answers(port) {
+            assert!(
+                t.elapsed() < Duration::from_secs(30),
+                "the scenario registry on {port} never answered"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        reg
+    }
+
+    fn compose(&self, args: &[&str]) -> Result<String, String> {
+        refuse_foreign(&self.project);
+        let mut c = docker::docker();
+        c.args(["compose", "-p", &self.project, "-f"])
+            .arg(self.dir.join("compose.yaml"))
+            .args(args)
+            .current_dir(&self.dir);
+        output(c)
+    }
+
+    /// `docker push <image>` (an image named `<host>/…` this run built).
+    pub fn push(&self, image: &str) {
+        assert!(
+            image.starts_with(&format!("{}/{PREFIX}", self.host)),
+            "only scenario images go to the scenario registry: {image:?}"
+        );
+        docker(&["push", "-q", image]);
+    }
+}
+
+/// Whether the registry on `port` answers `GET /v2/` with 200.
+fn registry_answers(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    if s.write_all(b"GET /v2/ HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).is_ok() && head.ends_with(b" 200")
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        if let Err(e) = self.compose(&["down", "-v", "-t", "2"]) {
+            eprintln!("cleanup: compose down of {}: {e}", self.project);
+        }
+        remove_site_dir(&self.dir);
     }
 }
 

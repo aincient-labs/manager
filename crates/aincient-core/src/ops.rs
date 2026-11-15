@@ -1902,7 +1902,7 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     // Only ever inside an update, after its gate ([`Reattach::GatedAway`]).
     run_recovering_with(
         stack,
-        // scenario: none — the database server move runs only when the shipped db image changes; no scenario moves it
+        // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
         &["up", "-d", "--force-recreate", "db", "app"],
         "move the database server",
         Reattach::GatedAway,
@@ -1936,7 +1936,7 @@ fn pull_then_move_db(
 /// `docker pull <image>` for the database move, relayed like the app pull.
 fn pull_db_image(image: &str, r: &mut dyn Reporter) -> Result<()> {
     let mut c = docker::docker();
-    // scenario: none — the database server move runs only when the shipped db image changes; no scenario moves it
+    // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
     c.args(["pull", image]);
     run_step(c, "download the database server", r)
 }

@@ -16,6 +16,7 @@ mod harness;
 mod boot_fatal;
 mod cleanup_needed;
 mod container_gone;
+mod db_image_move;
 mod detached_db;
 mod disk_full;
 mod doctor_start;

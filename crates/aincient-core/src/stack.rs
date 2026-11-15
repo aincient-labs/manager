@@ -1032,7 +1032,7 @@ impl Stack {
                 _ => line.to_string(),
             })
             .collect();
-        // scenario: none — rewriting compose.yaml's image line (db image move); no scenario moves it
+        // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
         std::fs::write(&path, rewritten)
             .with_context(|| format!("could not write {}", path.display()))
     }

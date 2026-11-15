@@ -28,8 +28,6 @@ crates/aincient-core/src/ops.rs | export_static_in | fs: remove_dir_all | static
 crates/aincient-core/src/ops.rs | install_export | fs: remove_dir_all | static export (atelier export) has no scenario; replaces the export target
 crates/aincient-core/src/ops.rs | install_export | fs: rename | static export (atelier export) has no scenario
 crates/aincient-core/src/ops.rs | mark_database_wiped | fs: write | the marker of an owner wipe (app down --wipe); no scenario
-crates/aincient-core/src/ops.rs | move_db_image | docker: up -d --force-recreate db app | the database server move runs only when the shipped db image changes; no scenario moves it
-crates/aincient-core/src/ops.rs | pull_db_image | docker: pull | the database server move runs only when the shipped db image changes; no scenario moves it
 crates/aincient-core/src/ops.rs | restore | docker: cp | restoring a plain .sql dump; the scenarios restore backup bundles
 crates/aincient-core/src/ops.rs | sweep_stale_parts | fs: remove_file | removes .part files older than the stale age; no scenario leaves one
 crates/aincient-core/src/pack.rs | dev_down | docker: down | the theme-pack dev stack (atelier pack dev) has no scenario
@@ -42,7 +40,6 @@ crates/aincient-core/src/remote.rs | fetch_backup | fs: rename | server sites: t
 crates/aincient-core/src/stack.rs | ensure_site_id | fs: remove_file | cleanup after a failed site-id rename; not reached
 crates/aincient-core/src/stack.rs | refresh_shipped_edge_conf | fs: write | refreshing a superseded edge.conf; no scenario ships an old edge.conf
 crates/aincient-core/src/stack.rs | repair_scaffold | fs: write | repair_scaffold writing a missing file; scenario 8 repairs a changed one
-crates/aincient-core/src/stack.rs | rewrite_image_line | fs: write | rewriting compose.yaml's image line (db image move); no scenario moves it
 crates/aincient-core/src/stack.rs | set_update_target | fs: write | a stepped (multi-hop) update; no scenario has hops
 crates/aincient-core/src/update_cache.rs | write | fs: remove_file | the update-check cache write; no scenario runs check_update
 crates/aincient-core/src/update_cache.rs | write | fs: rename | the update-check cache write; no scenario runs check_update
