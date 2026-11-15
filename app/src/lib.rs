@@ -71,7 +71,219 @@ fn stack(sel: &Selected) -> Result<Stack, String> {
 }
 
 /// Render an anyhow error (with its context chain) as a single string.
+/// How a start, install or update came out, for the window (M3): `ready`,
+/// `booting` (it hadn't answered when the wait ran out) or `failed` with the
+/// reason. A failed boot is an error in the core ([`aincient_core::BootFailed`]);
+/// here it is an answer, so the window shows its failure panel with that reason
+/// rather than a generic error. Every other error stays an error.
+#[derive(Serialize)]
+struct Outcome {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The way out of this failure is restarting Docker
+    /// ([`aincient_core::needs_docker_restart`]): the window offers its
+    /// Restart button next to the reason.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    docker_restart: bool,
+    /// A restore refused because the backup of the site as it is now failed
+    /// ([`ops::Overridable::RestoreWithoutSafetyBackup`]): the window offers
+    /// "Restore without a safety copy" behind a confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    safety_backup_failed: bool,
+    /// An update refused because the site couldn't be backed up first
+    /// ([`ops::Overridable::UpdateWithoutBackup`]): the window offers "Update
+    /// without a backup" behind a confirmation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    backup_failed: bool,
+    /// An update refused before any work because the site isn't ready
+    /// ([`aincient_core::gate::UpdateBlocked`]): each reason with the action
+    /// of the window's button for it, when the app has one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blockers: Vec<BlockerView>,
+    /// Refused because another operation holds the site
+    /// ([`aincient_core::oplock::SiteBusy`]): nothing was attempted, so the
+    /// window leaves no "didn't finish" line on Home. Waiting is the way out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    site_busy: bool,
+}
+
+/// One [`aincient_core::gate::Blocker`] for the window.
+#[derive(Serialize)]
+struct BlockerView {
+    text: String,
+    /// A `data-action` in `ui/main.js` ([`aincient_core::gate::WayForward::action`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'static str>,
+}
+
+impl Outcome {
+    const READY: Outcome = Outcome {
+        state: "ready",
+        reason: None,
+        docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
+        blockers: Vec::new(),
+        site_busy: false,
+    };
+    /// An update that found the site already on the newest build: nothing was
+    /// downloaded, backed up or restarted, and the window says so.
+    const CURRENT: Outcome = Outcome {
+        state: "current",
+        reason: None,
+        docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
+        blockers: Vec::new(),
+        site_busy: false,
+    };
+
+    /// An update that found the site on the newest build with changed
+    /// settings: its containers were made again on that build, and it answered.
+    const SETTINGS: Outcome = Outcome {
+        state: "settings",
+        reason: None,
+        docker_restart: false,
+        safety_backup_failed: false,
+        backup_failed: false,
+        blockers: Vec::new(),
+        site_busy: false,
+    };
+
+    fn failed(reason: String, docker_restart: bool) -> Outcome {
+        Outcome {
+            state: "failed",
+            reason: Some(reason),
+            docker_restart,
+            safety_backup_failed: false,
+            backup_failed: false,
+            blockers: Vec::new(),
+            site_busy: false,
+        }
+    }
+
+    /// Another operation holds the site ([`aincient_core::oplock::SiteBusy`],
+    /// or a server's `atelier` that ended with its exit code): a failed
+    /// answer with its words; any other error stays an error.
+    fn busy(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !aincient_core::oplock::SiteBusy::is(&e) {
+            return Err(e);
+        }
+        Ok(Outcome {
+            site_busy: true,
+            ..Outcome::failed(err_ref(&e), false)
+        })
+    }
+
+    /// An update refused because the site isn't ready: the reasons, each
+    /// with its button. A server's refusal (its exit code) carries its words
+    /// only; its buttons would act on this computer.
+    fn blocked(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !aincient_core::gate::UpdateBlocked::is(&e) {
+            return Err(e);
+        }
+        let blockers: Vec<BlockerView> = e
+            .downcast_ref::<aincient_core::gate::UpdateBlocked>()
+            .map(|b| {
+                b.blockers
+                    .iter()
+                    .map(|b| BlockerView {
+                        text: b.message(),
+                        action: b.way_forward().map(aincient_core::gate::WayForward::action),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reason = if blockers.is_empty() {
+            err_ref(&e)
+        } else {
+            aincient_core::gate::NOT_READY.to_string()
+        };
+        Ok(Outcome {
+            blockers,
+            ..Outcome::failed(reason, false)
+        })
+    }
+
+    /// An update refused because the site runs a build made on this computer
+    /// ([`ops::LocalBuild`]): nothing was changed, and the reason names the
+    /// way back to a channel. A failed answer, so the failure panel shows it.
+    fn local_build(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        if !ops::LocalBuild::is(&e) {
+            return Err(e);
+        }
+        Ok(Outcome::failed(err_ref(&e), false))
+    }
+
+    /// A refusal the owner may override ([`ops::Overridable`], told apart by
+    /// type or a server's exit code, never by its words) as a failed answer
+    /// carrying its flag; any other error stays an error.
+    fn overridable(e: anyhow::Error) -> Result<Outcome, anyhow::Error> {
+        let Some(kind) = ops::Overridable::of(&e) else {
+            return Err(e);
+        };
+        let mut out = Outcome::failed(err_ref(&e), aincient_core::needs_docker_restart(&e));
+        match kind {
+            ops::Overridable::RestoreWithoutSafetyBackup => out.safety_backup_failed = true,
+            ops::Overridable::UpdateWithoutBackup => out.backup_failed = true,
+        }
+        Ok(out)
+    }
+}
+
+/// [`outcome`] for an update, keeping "already up to date" apart from "updated".
+fn update_outcome(result: anyhow::Result<ops::Updated>) -> Result<Outcome, String> {
+    match result {
+        Ok(ops::Updated::AlreadyCurrent) => Ok(Outcome::CURRENT),
+        Ok(ops::Updated::SettingsApplied) => Ok(Outcome::SETTINGS),
+        // Before a failed boot: a site that wouldn't start for its backup is
+        // refused with the boot's failure inside.
+        Err(e) => match Outcome::busy(e)
+            .or_else(Outcome::blocked)
+            .or_else(Outcome::local_build)
+            .or_else(Outcome::overridable)
+        {
+            Ok(refused) => Ok(refused),
+            Err(e) => outcome(Err(e)),
+        },
+        other => outcome(other.map(ops::Updated::ready)),
+    }
+}
+
+fn outcome(result: anyhow::Result<bool>) -> Result<Outcome, String> {
+    let result = match result {
+        Err(e) => match Outcome::busy(e) {
+            Ok(busy) => return Ok(busy),
+            Err(e) => Err(e),
+        },
+        ok => ok,
+    };
+    match result {
+        Ok(true) => Ok(Outcome::READY),
+        Ok(false) => Ok(Outcome {
+            state: "booting",
+            ..Outcome::READY
+        }),
+        Err(e) => match e.downcast::<aincient_core::BootFailed>() {
+            Ok(failed) => {
+                let restart = failed.needs_docker_restart();
+                Ok(Outcome::failed(failed.0, restart))
+            }
+            // Not a failed boot, but restarting Docker is the way out (a start
+            // still stuck after clearing Docker's leftovers, Docker not
+            // answering): an answer too, so the panel can offer the button.
+            Err(e) if aincient_core::needs_docker_restart(&e) => Ok(Outcome::failed(err(e), true)),
+            Err(e) => Err(err(e)),
+        },
+    }
+}
+
 fn err(e: anyhow::Error) -> String {
+    err_ref(&e)
+}
+
+fn err_ref(e: &anyhow::Error) -> String {
     // The core words this one for the CLI (`atelier app start`); the window
     // has a button for it.
     if e.downcast_ref::<ops::NotRunning>().is_some() {
@@ -235,6 +447,20 @@ impl Reporter for EventReporter {
             .buttons(MessageDialogButtons::OkCancelCustom(
                 "Switch to releases".into(),
                 "Not now".into(),
+            ))
+            .blocking_show()
+    }
+
+    /// The checkup's repair asking to restart Docker: a native modal,
+    /// defaulting to Cancel, blocking for the reason [`confirm`](Self::confirm) is.
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        self.app
+            .dialog()
+            .message(detail)
+            .title(format!("Restart {runtime}?"))
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                format!("Restart {runtime}"),
+                "Cancel".into(),
             ))
             .blocking_show()
     }
@@ -452,6 +678,53 @@ async fn list_backups(sel: State<'_, Selected>) -> Result<Vec<Backup>, String> {
     blocking(move || Ok(ops::list_backups(&s))).await
 }
 
+/// What "Free up space" would remove: Atelier's unused downloads on this
+/// computer that no registered site needs (DECISIONS 0527). Machine-wide, not
+/// per site.
+#[tauri::command]
+async fn find_cleanup() -> Result<Option<aincient_core::cleanup::Report>, String> {
+    blocking(|| {
+        aincient_core::cleanup::find(aincient_core::cleanup::Scope::Everything)
+            .map(Some)
+            .map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// Remove the images the owner confirmed (`ids`, from [`find_cleanup`]) that
+/// can still go. Sites' data and backups are never touched.
+#[tauri::command]
+async fn do_cleanup(ids: Vec<String>) -> Result<aincient_core::cleanup::Report, String> {
+    blocking(move || {
+        let shown: std::collections::HashSet<String> = ids.into_iter().collect();
+        aincient_core::cleanup::free(aincient_core::cleanup::Scope::Everything, Some(&shown))
+            .map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
+/// The older automatic backups of every site on this computer: taken by a
+/// Manager before 0.17.0, never pruned. Free up space lists each site's as an
+/// item the owner can tick (unticked by default).
+#[tauri::command]
+async fn find_older_backups() -> Result<Vec<aincient_core::cleanup::OlderBackups>, String> {
+    blocking(|| aincient_core::cleanup::older_backups_everywhere().map_err(|e| format!("{e:#}")))
+        .await
+}
+
+/// Remove the older automatic backups the owner ticked (`paths`, from
+/// [`find_older_backups`]) that still are older automatic backups.
+#[tauri::command]
+async fn remove_older_backups(
+    paths: Vec<String>,
+) -> Result<aincient_core::cleanup::BackupsRemoved, String> {
+    blocking(move || {
+        let only: std::collections::HashSet<String> = paths.into_iter().collect();
+        aincient_core::cleanup::remove_older_backups_everywhere(&only).map_err(|e| format!("{e:#}"))
+    })
+    .await
+}
+
 #[tauri::command]
 async fn set_admin_password(
     app: AppHandle,
@@ -474,7 +747,7 @@ async fn do_install(
     image: Option<String>,
     port: Option<u16>,
     sel: State<'_, Selected>,
-) -> Result<(), String> {
+) -> Result<Outcome, String> {
     let s = local_stack(&sel, "Setting up")?;
     blocking(move || {
         // A registered site without a `.env` gets a port no other site claims;
@@ -496,9 +769,9 @@ async fn do_install(
         };
         // `install` reports each phase (and holds until Drupal serves) through the
         // reporter, so the UI's progress bar/log only finish on real readiness —
-        // not the instant the container starts.
-        ops::install(&s, &opts, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
+        // not the instant the container starts. The answer says whether the site
+        // answered, is still booting, or failed (and why) — an [`Outcome`].
+        outcome(ops::install(&s, &opts, &mut EventReporter { app }))
     })
     .await
 }
@@ -506,13 +779,24 @@ async fn do_install(
 /// The window has confirmed (a stepped route; a live remote site's slug).
 /// A site on a server walks its own route: the server's `app update --yes`,
 /// streamed — unless its check says there is nothing to do.
+///
+/// Returns how it came out ([`Outcome`]; always `ready` on a server, whose
+/// own run waits for it and fails as an error). `no_backup` is the owner's
+/// "Update without a backup", confirmed after an update refused for want of
+/// one (`backup_failed` on the answer).
 #[tauri::command]
-async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_update(
+    app: AppHandle,
+    no_backup: Option<bool>,
+    sel: State<'_, Selected>,
+) -> Result<Outcome, String> {
+    let opts = ops::UpdateOptions {
+        no_backup: no_backup.unwrap_or(false),
+    };
     match target(&sel)? {
         Target::Local(s) => {
             blocking(move || {
-                ops::update(&s, &mut EventReporter { app }).map_err(err)?;
-                Ok(())
+                update_outcome(ops::update_with(&s, &opts, &mut EventReporter { app }))
             })
             .await
         }
@@ -520,17 +804,23 @@ async fn do_update(app: AppHandle, sel: State<'_, Selected>) -> Result<(), Strin
             blocking(move || {
                 let session = session(&site)?;
                 if session.check_update().map_err(err)?.update_available == Some(false) {
-                    return Ok(());
+                    return Ok(Outcome::CURRENT);
                 }
-                session
-                    .run_action(
-                        &remote::Action::Update {
-                            to: None,
-                            yes: true,
-                        },
-                        &mut feed(&app),
-                    )
-                    .map_err(err)
+                let ran = session.run_action(
+                    &remote::Action::Update {
+                        to: None,
+                        yes: true,
+                        no_backup: opts.no_backup,
+                    },
+                    &mut feed(&app),
+                );
+                match ran {
+                    Ok(()) => Ok(Outcome::READY),
+                    Err(e) => Outcome::busy(e)
+                        .or_else(Outcome::blocked)
+                        .or_else(Outcome::overridable)
+                        .map_err(err),
+                }
             })
             .await
         }
@@ -548,15 +838,18 @@ async fn set_channel(
     app: AppHandle,
     channel: String,
     sel: State<'_, Selected>,
-) -> Result<String, String> {
+) -> Result<Outcome, String> {
     let target = Channel::parse(&channel)
         .filter(|c| *c != Channel::Pinned)
         .ok_or_else(|| format!("unknown channel {channel:?} — use \"stable\" or \"edge\""))?;
     let s = local_stack(&sel, "Switching the update channel")?;
     blocking(move || {
-        ops::switch_channel(&s, target, true, &mut EventReporter { app })
-            .map(|(image, _ready)| image)
-            .map_err(err)
+        // The converge onto the new channel is an update: say how it came out
+        // like one, instead of a plain "done" over a site still booting.
+        outcome(
+            ops::switch_channel(&s, target, true, &mut EventReporter { app })
+                .map(|(_image, ready)| ready.unwrap_or(true)),
+        )
     })
     .await
 }
@@ -630,39 +923,38 @@ async fn check_restore(path: String, sel: State<'_, Selected>) -> Result<Restore
     .await
 }
 
-/// Restore `path` onto the selected site, behind the identity check
-/// (`ops::restore_with`; on a server, its own `data restore` after a
-/// verified upload). `other_site` is the explicit "Restore anyway".
+/// Restore `path` onto the selected site (a listed backup or an imported
+/// file), behind the identity check (`ops::restore_with`; on a server, its own
+/// `data restore` after a verified upload). `other_site` is the explicit
+/// "Restore anyway"; `no_safety_backup` the owner's "Restore without a safety
+/// copy", confirmed after a restore refused because that copy failed
+/// (`safety_backup_failed` on the answer).
 #[tauri::command]
 async fn do_restore(
     app: AppHandle,
     path: String,
     other_site: Option<bool>,
+    no_safety_backup: Option<bool>,
     sel: State<'_, Selected>,
-) -> Result<(), String> {
-    let other_site = other_site.unwrap_or(false);
-    match target(&sel)? {
-        Target::Local(s) => {
-            blocking(move || {
-                ops::restore_with(
-                    &s,
-                    std::path::Path::new(&path),
-                    &ops::RestoreOptions { other_site },
-                    &mut EventReporter { app },
-                )
-                .map_err(err)
-            })
-            .await
+) -> Result<Outcome, String> {
+    let opts = ops::RestoreOptions {
+        other_site: other_site.unwrap_or(false),
+        no_safety_backup: no_safety_backup.unwrap_or(false),
+        ..ops::RestoreOptions::default()
+    };
+    let target = target(&sel)?;
+    blocking(move || {
+        let file = std::path::Path::new(&path);
+        let done = match &target {
+            Target::Local(s) => ops::restore_with(s, file, &opts, &mut EventReporter { app }),
+            Target::Remote(site) => session(site)?.restore_upload(file, &opts, &mut feed(&app)),
+        };
+        match done {
+            Ok(()) => Ok(Outcome::READY),
+            Err(e) => Outcome::busy(e).or_else(Outcome::overridable).map_err(err),
         }
-        Target::Remote(site) => {
-            blocking(move || {
-                session(&site)?
-                    .restore_upload(std::path::Path::new(&path), other_site, &mut feed(&app))
-                    .map_err(err)
-            })
-            .await
-        }
-    }
+    })
+    .await
 }
 
 /// Open a native "open file" dialog and return the chosen backup's path (or
@@ -719,12 +1011,11 @@ async fn export_backup(app: AppHandle, source: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_reinstall(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
     let s = local_stack(&sel, "Reinstalling")?;
     blocking(move || {
         let opts = InstallOptions::default();
-        ops::reinstall(&s, &opts, &mut EventReporter { app }).map_err(err)?;
-        Ok(())
+        outcome(ops::reinstall(&s, &opts, &mut EventReporter { app }))
     })
     .await
 }
@@ -739,24 +1030,99 @@ async fn run_remote(app: AppHandle, site: Site, action: remote::Action) -> Resul
     .await
 }
 
+/// Returns how it came out ([`Outcome`]), so the window can say "started, but
+/// not answering yet" or show why it failed rather than plain success. A site
+/// on a server reports `ready`: its own run (or the engine) does the waiting.
 #[tauri::command]
-async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_start(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
     match target(&sel)? {
         Target::Local(s) => {
-            blocking(move || {
-                ops::start(&s, &mut EventReporter { app }).map_err(err)?;
-                Ok(())
-            })
-            .await
+            blocking(move || outcome(ops::start(&s, &mut EventReporter { app }))).await
         }
         Target::Remote(site) if is_paired(&site) => {
             require_experimental()?;
             let said = blocking(move || paired::act(&site, Verb::Wake)).await?;
             say_lines(&app, &said);
-            Ok(())
+            Ok(Outcome::READY)
         }
-        Target::Remote(site) => run_remote(app, site, remote::Action::Start).await,
+        Target::Remote(site) => run_remote(app, site, remote::Action::Start)
+            .await
+            .map(|()| Outcome::READY),
     }
+}
+
+/// Which program runs Docker here, for the Restart button and its
+/// confirmation (a restart stops everything in Docker, not only the site, so the
+/// window says what else is running first).
+#[derive(Serialize)]
+struct DockerRuntimeInfo {
+    /// "OrbStack", "Docker Desktop", … ("Docker" when we can't tell).
+    name: &'static str,
+    /// The Manager can restart it (else `manual_steps` say how).
+    can_restart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_steps: Option<String>,
+    /// The command to copy, for a manual restart that has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy: Option<String>,
+    /// Running containers that aren't the selected site's; `None` when
+    /// Docker didn't answer.
+    others: Option<Vec<String>>,
+    /// The confirmation's text, naming `others`.
+    stops: String,
+}
+
+/// The selected site's compose project, when it is a site on this computer.
+fn own_project(sel: &Selected) -> Option<String> {
+    match target(sel).ok()? {
+        Target::Local(s) => Some(s.project_name()),
+        Target::Remote(_) => None,
+    }
+}
+
+#[tauri::command]
+async fn docker_runtime(sel: State<'_, Selected>) -> Result<DockerRuntimeInfo, String> {
+    use aincient_core::docker_runtime::{self as rt, RestartPlan};
+    let own = own_project(&sel);
+    blocking(move || {
+        let found = rt::detect();
+        let others = rt::other_running_containers(own.as_deref());
+        let stops = rt::stops_what(others.as_deref());
+        let (manual_steps, copy) = match found.plan {
+            RestartPlan::Steps(_) => (None, None),
+            RestartPlan::Manual { steps, copy } => (Some(steps), copy),
+        };
+        Ok(DockerRuntimeInfo {
+            name: found.runtime.name(),
+            can_restart: manual_steps.is_none(),
+            manual_steps,
+            copy,
+            others,
+            stops,
+        })
+    })
+    .await
+}
+
+/// Restart Docker, then start the selected site (one on this computer, set
+/// up) the way Start does; the same answer as [`do_start`]. The window asked
+/// first ([`docker_runtime`]'s `stops`).
+#[tauri::command]
+async fn do_restart_docker(app: AppHandle, sel: State<'_, Selected>) -> Result<Outcome, String> {
+    let stack = match target(&sel)? {
+        Target::Local(s) => Some(s),
+        Target::Remote(_) => None,
+    };
+    blocking(move || {
+        let mut r = EventReporter { app };
+        let found = aincient_core::docker_runtime::detect();
+        aincient_core::docker_runtime::restart(&found, &mut r).map_err(err)?;
+        match stack.filter(Stack::exists) {
+            Some(s) => outcome(ops::start(&s, &mut r)),
+            None => Ok(Outcome::READY),
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1006,6 +1372,8 @@ async fn engine_remove(app: AppHandle, sel: State<'_, Selected>) -> Result<(), S
                         },
                     );
                 };
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 engine_admin::remove(&mut engine_admin::LocalRemove::new(&s), &mut say)
                     .map(|_| ())
                     .map_err(err)
@@ -1050,6 +1418,8 @@ async fn engine_lockdown(
         }
         Target::Local(s) => {
             blocking(move || {
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 let info = engine_admin::probe(&s);
                 EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), verb.word())
                     .and_then(|a| a.run(verb))
@@ -1105,6 +1475,8 @@ async fn engine_rest(
         }
         Target::Local(s) => {
             blocking(move || {
+                let _op = aincient_core::oplock::hold(&s, aincient_core::oplock::Operation::Engine)
+                    .map_err(err)?;
                 let info = engine_admin::probe(&s);
                 EngineAdmin::new(&engine_admin::LocalDocker, info.as_ref(), word)
                     .and_then(|a| a.run(verb))
@@ -1163,11 +1535,12 @@ async fn engine_wake_code(
 
 /// Remove the appliance's containers. With `wipe = true` this also deletes the
 /// data volumes (database, files, admin password) — a harder teardown than a
-/// plain stop, but lighter than a full reinstall. Quick, so no progress feed.
+/// plain stop, but lighter than a full reinstall. Docker's output goes to the
+/// log feed, so a failure has its reason.
 #[tauri::command]
-async fn do_down(wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
+async fn do_down(app: AppHandle, wipe: bool, sel: State<'_, Selected>) -> Result<(), String> {
     let s = local_stack(&sel, "Removing the containers")?;
-    blocking(move || ops::down(&s, wipe).map_err(err)).await
+    blocking(move || ops::down(&s, wipe, &mut EventReporter { app }).map_err(err)).await
 }
 
 /// Read back the most recent appliance log lines for the Activity view.
@@ -1326,7 +1699,9 @@ async fn run_doctor_fix(
     sel: State<'_, Selected>,
 ) -> Result<doctor::Report, String> {
     match target(&sel)? {
-        Target::Local(s) => blocking(move || Ok(doctor::fix(&s, &mut EventReporter { app }))).await,
+        Target::Local(s) => {
+            blocking(move || doctor::fix(&s, &mut EventReporter { app }).map_err(err)).await
+        }
         Target::Remote(site) => {
             blocking(move || remote::doctor(&site, true, &mut feed(&app)).map_err(err)).await
         }
@@ -1748,6 +2123,12 @@ pub fn run() {
         .manage(paired::Joining::default())
         .manage(ConsoleTunnel::default())
         .invoke_handler(tauri::generate_handler![
+            docker_runtime,
+            do_restart_docker,
+            find_cleanup,
+            do_cleanup,
+            find_older_backups,
+            remove_older_backups,
             check_preflight,
             preflight_problem,
             get_status,

@@ -385,6 +385,7 @@ pub fn engine_image() -> Result<EngineImage> {
 /// pinned by digest.
 pub fn pull_image(image: &str) -> Result<()> {
     let mut pull = docker();
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     pull.args(["pull", "--quiet", image]);
     crate::docker::run_capture(pull, "pull the engine image")
         .with_context(|| format!("pull {image}"))?;
@@ -448,6 +449,7 @@ pub fn compose_config_json(
 /// `engine install-code` makes one later). The caller has the user's opt-in
 /// (the CLI's `--experimental`, the GUI's setting).
 pub fn enable_local(stack: &Stack) -> Result<Option<FirstPairing>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Engine)?;
     let image = engine_image()?;
     let keep = keeps_app_and_db(stack);
     engine::enable(stack, &image.pin, &|files, env| {
@@ -488,6 +490,7 @@ pub fn app_and_db_running(stack: &Stack) -> bool {
 /// they depend on, so a re-enable doesn't wake a resting or locked-down site
 /// behind the engine's back (edge depends on app, app on db).
 pub fn enable_up_args(keep_app_and_db: bool) -> Vec<&'static str> {
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     let mut args = vec!["up", "-d", "--remove-orphans"];
     if keep_app_and_db {
         args.extend(["--no-deps", "engine", "edge"]);
@@ -743,6 +746,7 @@ impl RemoveSteps for LocalRemove<'_> {
             return Ok(());
         }
         let mut c = compose(self.stack);
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         c.args(["start", "db", "app"]);
         crate::docker::run_capture(c, "start db and app").map(|_| ())
     }
@@ -753,6 +757,7 @@ impl RemoveSteps for LocalRemove<'_> {
 
     fn up(&mut self) -> Result<()> {
         let mut c = compose(self.stack);
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         c.args(["up", "-d", "--remove-orphans"]);
         crate::docker::run_capture(c, "restart the stack without the engine").map(|_| ())
     }

@@ -8,7 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use aincient_core::{
-    doctor, engine_admin, ops, remote, sites, ssh_key, ChangeGuard, Channel, InstallOptions, Stack,
+    doctor, engine_admin, gate, oplock, ops, remote, sites, ssh_key, ChangeGuard, Channel,
+    InstallOptions, Stack,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -105,12 +106,33 @@ enum Command {
     /// Serve the pack developer's MCP tools over stdio (for Claude Code,
     /// Cursor, …). Needs a running dev stack (`atelier pack dev`).
     Mcp,
+    /// Docker on this computer: restart it when it is stuck.
+    Docker {
+        #[command(subcommand)]
+        command: DockerCommand,
+    },
     /// The engine sidecar: EXPERIMENTAL, opt-in only (DECISIONS 0483).
     #[cfg(unix)]
     #[command(hide = true)]
     Engine {
         #[command(subcommand)]
         command: engine::EngineCommand,
+    },
+}
+
+/// `atelier docker …` — the Docker runtime on this computer.
+#[derive(Subcommand)]
+enum DockerCommand {
+    /// Restart Docker (Docker Desktop, OrbStack, Colima or Rancher Desktop),
+    /// then start the site again.
+    ///
+    /// Says which program runs Docker here and which other containers the
+    /// restart stops, and asks first. Docker Engine on Linux is restarted by
+    /// hand (`sudo systemctl restart docker`): this prints how.
+    Restart {
+        /// Don't ask. Required when not run in a terminal.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -321,6 +343,12 @@ enum AppCommand {
         /// Don't ask before walking a multi-step upgrade.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Update without a backup first. Without it, a stopped site that
+        /// won't start on its current version (so it can't be backed up) is
+        /// not updated. Its pages and settings as they are now can't be
+        /// brought back if the update goes wrong.
+        #[arg(long, conflicts_with = "all")]
+        no_backup: bool,
     },
     /// Check whether a newer image is available in the registry.
     #[command(visible_alias = "check")]
@@ -347,6 +375,24 @@ enum AppCommand {
         /// Also remove volumes — wipes the database, files, and admin password.
         #[arg(long)]
         wipe: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove Atelier's unused downloads (old versions, replaced database and
+    /// web-server images) to free disk space. Your sites' data and backups are
+    /// never touched (unless you add --older-backups); a removed image is
+    /// downloaded again when a site needs it.
+    Cleanup {
+        /// Only list what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove this site's older automatic backups: the ones earlier
+        /// Manager versions took before updates, restores and channel switches
+        /// and never removed. Your own backups and the newest automatic ones
+        /// are never included.
+        #[arg(long)]
+        older_backups: bool,
+        /// Remove without asking first.
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -524,6 +570,11 @@ enum DataCommand {
         /// backup is refused.
         #[arg(long)]
         other_site: bool,
+        /// Restore without first backing up the site as it is now. Without
+        /// it, a restore whose backup fails (a full disk, a read-only backups
+        /// folder) stops before anything is changed.
+        #[arg(long)]
+        no_safety_backup: bool,
         /// Remote sites: FILE is a path on the server, even if a file by that
         /// name exists here.
         #[arg(long)]
@@ -574,11 +625,27 @@ fn main() {
     if let Err(err) = run() {
         eprintln!("{} {err:#}", style::error("error:"));
         // A remote command's own exit code is the answer a script wants (m2-7).
-        let code = err
-            .downcast_ref::<remote::RemoteExit>()
-            .map_or(1, |exit| exit.code);
+        let code = exit_code(&err);
         std::process::exit(code);
     }
+}
+
+/// What `atelier` exits with for `err`: a remote command's own code (the answer
+/// a script wants, m2-7), a refusal the Manager can override
+/// ([`ops::Overridable::exit_code`]: 3, 4), an update refused because the site
+/// isn't ready ([`gate::UpdateBlocked::EXIT_CODE`]: 5), the site busy with
+/// another operation ([`oplock::SiteBusy::EXIT_CODE`]: 6), else 1.
+fn exit_code(err: &anyhow::Error) -> i32 {
+    if let Some(exit) = err.downcast_ref::<remote::RemoteExit>() {
+        return exit.code;
+    }
+    if err.is::<gate::UpdateBlocked>() {
+        return gate::UpdateBlocked::EXIT_CODE;
+    }
+    if err.is::<oplock::SiteBusy>() {
+        return oplock::SiteBusy::EXIT_CODE;
+    }
+    ops::Overridable::of(err).map_or(1, ops::Overridable::exit_code)
 }
 
 /// A success banner: a restrained hairline rule (when colour is on) over a mint headline and the
@@ -656,6 +723,16 @@ struct CliReporter {
     plan: Vec<ops::PlanStep>,
 }
 
+/// A wait that ends in an error leaves the booting line open; close it, so the
+/// `error:` line starts on its own.
+impl Drop for CliReporter {
+    fn drop(&mut self) {
+        if self.open_line {
+            println!();
+        }
+    }
+}
+
 /// `[2/4] message` when the fraction falls inside an announced step; the final
 /// 100% headline stays bare.
 fn numbered(plan: &[ops::PlanStep], message: &str, fraction: Option<f32>) -> String {
@@ -726,6 +803,28 @@ impl ops::Reporter for CliReporter {
         }
         confirm(&format!("\n{question}"), false).unwrap_or(false)
     }
+
+    /// `doctor --fix`'s restart: asked in a terminal, defaulting to no; never
+    /// in a script (a restart stops every container on the computer).
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        use std::io::IsTerminal;
+        if self.open_line {
+            println!();
+            self.open_line = false;
+        }
+        println!("\n{detail}");
+        if !std::io::stdin().is_terminal() {
+            println!(
+                "{}",
+                style::warn(
+                    "Not asking — this isn't an interactive terminal. Nothing was restarted; \
+                     run `atelier docker restart --yes` when you want it."
+                )
+            );
+            return false;
+        }
+        confirm(&format!("Restart {runtime} now?"), false).unwrap_or(false)
+    }
 }
 
 fn run() -> Result<()> {
@@ -764,6 +863,14 @@ fn run() -> Result<()> {
     };
 
     let resolution = sites::locate(cli.site.as_deref())?;
+    // Docker is this computer's, whatever the site: handled before a remote
+    // site's dispatch.
+    if let Command::Docker {
+        command: DockerCommand::Restart { yes },
+    } = cli.command
+    {
+        return docker_restart(resolution, yes);
+    }
     if let Some(site) = remote_site(&resolution) {
         if site.engine_url().is_some() {
             return paired::run(cli.command, site, cli.experimental);
@@ -775,6 +882,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Sites { .. } => unreachable!("handled above"),
+        Command::Docker { .. } => unreachable!("handled above"),
         Command::Doctor { fix, json } => doctor(&stack, fix, json),
         Command::App { command } => run_app(command, &stack),
         Command::Site { command } => run_site(command, &stack),
@@ -1156,7 +1264,7 @@ fn update_all(yes: bool) -> Result<()> {
             "\n{}",
             style::heading(&format!("== {} ({}) ==", row.slug, row.label))
         );
-        if let Err(e) = update_cmd(&row.stack(), None, yes) {
+        if let Err(e) = update_cmd(&row.stack(), None, yes, false) {
             println!("{} {e:#}", style::error("error:"));
             failed.push(row.slug.clone());
         }
@@ -1319,7 +1427,9 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
             show_login(stack);
             Ok(())
         }
-        AppCommand::Update { to, yes, .. } => update_cmd(stack, to, yes),
+        AppCommand::Update {
+            to, yes, no_backup, ..
+        } => update_cmd(stack, to, yes, no_backup),
         AppCommand::Channel { channel, now, yes } => channel_cmd(stack, channel, now, yes),
         AppCommand::CheckUpdate { json } => check_update(stack, json),
         AppCommand::Reinstall { yes } => {
@@ -1377,7 +1487,7 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            ops::down(stack, wipe)?;
+            ops::down(stack, wipe, &mut ops::Silent)?;
             println!(
                 "{}",
                 style::success(if wipe {
@@ -1386,6 +1496,115 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
                     "Removed (data kept)."
                 })
             );
+            Ok(())
+        }
+        AppCommand::Cleanup {
+            dry_run,
+            yes,
+            older_backups,
+        } => {
+            use aincient_core::cleanup::{
+                find, free, human_bytes, older_backups_of, remove_older_backups, Scope,
+            };
+            let found = find(Scope::Everything)?;
+            let backups_word = |n: usize| {
+                format!(
+                    "{n} older automatic backup{}",
+                    if n == 1 { "" } else { "s" }
+                )
+            };
+            // Offered, never assumed: only with --older-backups.
+            let older = match older_backups_of(stack) {
+                Some(o) if !older_backups => {
+                    println!(
+                        "{} of {} ({}) can go too: add --older-backups.",
+                        backups_word(o.backups.len()),
+                        o.label,
+                        human_bytes(o.total_bytes)
+                    );
+                    None
+                }
+                other => other,
+            };
+            if found.images.is_empty() && older.is_none() {
+                println!("Nothing to remove: Atelier has no unused downloads on this computer.");
+                return Ok(());
+            }
+            let count = |n: usize| format!("{n} image{}", if n == 1 { "" } else { "s" });
+            let mut what = Vec::new();
+            if !found.images.is_empty() {
+                println!("Unused downloads (each downloads again when a site needs it):");
+                for i in &found.images {
+                    let name = i
+                        .names
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("{} (old version)", i.repo));
+                    println!("  {}  {name}", human_bytes(i.size_bytes));
+                }
+                what.push(format!(
+                    "{} (up to {})",
+                    count(found.images.len()),
+                    human_bytes(found.total_bytes)
+                ));
+            }
+            if let Some(o) = &older {
+                println!(
+                    "{} of {} (they can't be brought back; your own backups and the newest \
+                     automatic ones stay):",
+                    backups_word(o.backups.len()),
+                    o.label
+                );
+                for b in &o.backups {
+                    println!("  {}  {}", human_bytes(b.size_bytes), b.name);
+                }
+                what.push(format!(
+                    "{} ({})",
+                    backups_word(o.backups.len()),
+                    human_bytes(o.total_bytes)
+                ));
+            }
+            let what = what.join(" and ");
+            let untouched = if older.is_some() {
+                "Your sites' data and other backups are untouched."
+            } else {
+                "Your sites' data and backups are untouched."
+            };
+            if dry_run {
+                println!("Would remove {what}. {untouched}");
+                return Ok(());
+            }
+            if !confirm(&format!("Remove {what}?"), yes)? {
+                println!("{}", style::warn("Aborted."));
+                return Ok(());
+            }
+            if !found.images.is_empty() {
+                // Only what was listed: anything that became removable since stays.
+                let shown: std::collections::HashSet<String> =
+                    found.images.iter().map(|i| i.id.clone()).collect();
+                let report = free(Scope::Everything, Some(&shown))?;
+                println!(
+                    "Removed {} (up to {}).",
+                    count(report.images.len()),
+                    human_bytes(report.total_bytes)
+                );
+                for f in &report.failed {
+                    println!("  Kept {f}: Docker says it's in use.");
+                }
+            }
+            if let Some(o) = older {
+                let shown = o.backups.iter().map(|b| b.path.clone()).collect();
+                let done = remove_older_backups(std::slice::from_ref(stack), &shown);
+                println!(
+                    "Removed {} ({}).",
+                    backups_word(done.removed.len()),
+                    human_bytes(done.total_bytes)
+                );
+                for f in &done.failed {
+                    println!("  Kept {f}.");
+                }
+            }
+            println!("{untouched}");
             Ok(())
         }
         AppCommand::Logs { follow, service } => {
@@ -1423,6 +1642,16 @@ fn run_app(command: AppCommand, stack: &Stack) -> Result<()> {
 
 /// `atelier site …` — publish the site you built.
 fn run_site(command: SiteCommand, stack: &Stack) -> Result<()> {
+    // The engine's lifecycle verbs change the site: one operation at a time.
+    let _op = matches!(
+        command,
+        SiteCommand::Lockdown { .. }
+            | SiteCommand::Unlock { .. }
+            | SiteCommand::Rest { .. }
+            | SiteCommand::Wake
+    )
+    .then(|| oplock::hold(stack, oplock::Operation::Engine))
+    .transpose()?;
     match command {
         SiteCommand::Lockdown { yes } => engine_lifecycle(
             &engine_admin::LocalDocker,
@@ -1570,6 +1799,7 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             file,
             yes,
             other_site,
+            no_safety_backup,
             ..
         } => {
             if !file.is_file() {
@@ -1598,9 +1828,25 @@ fn run_data(command: DataCommand, stack: &Stack) -> Result<()> {
             ops::restore_with(
                 stack,
                 &file,
-                &ops::RestoreOptions { other_site },
+                &ops::RestoreOptions {
+                    other_site,
+                    no_safety_backup,
+                    // Printed above, before the confirmation.
+                    identity_shown: true,
+                },
                 &mut StepLines::default(),
-            )?;
+            )
+            .inspect_err(|e| {
+                if e.is::<ops::SafetyBackupFailed>() {
+                    println!(
+                        "{}",
+                        style::warn(
+                            "Fix what stopped the backup and try again, or pass \
+                             --no-safety-backup to restore without one."
+                        )
+                    );
+                }
+            })?;
             println!("{}", style::success("Restore complete."));
             Ok(())
         }
@@ -1656,6 +1902,73 @@ fn model_list(stack: &Stack, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `atelier docker restart [--yes]`: name the runtime and what else stops, ask,
+/// restart, wait for Docker, then start the site (a local, installed one) the
+/// way `app start` does and say how it came out. A runtime the Manager can't
+/// restart prints the steps and exits non-zero.
+fn docker_restart(resolution: sites::Resolution, yes: bool) -> Result<()> {
+    use aincient_core::docker_runtime::{self, RestartPlan, Runtime};
+    use std::io::IsTerminal;
+    let found = docker_runtime::detect();
+    let name = found.runtime.name();
+    if found.runtime == Runtime::Unknown {
+        println!("Docker on this computer: couldn't tell which program runs it.");
+    } else {
+        println!("Docker on this computer runs in {}.", style::heading(name));
+    }
+    if let RestartPlan::Manual { steps, copy } = &found.plan {
+        println!("Atelier can't restart {name} for you. {steps}");
+        if let Some(cmd) = copy {
+            println!("\n  {cmd}\n");
+        }
+        anyhow::bail!("{name} was not restarted");
+    }
+    let remote = remote_site(&resolution).cloned();
+    let stack = remote.is_none().then(|| resolution.into_stack());
+    let own = stack.as_ref().map(Stack::project_name);
+    let others = docker_runtime::other_running_containers(own.as_deref());
+    println!("{}", docker_runtime::stops_what(others.as_deref()));
+    if !yes && !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "not restarting {name} — this isn't an interactive terminal. Pass --yes to restart \
+             it. Nothing was changed."
+        );
+    }
+    if !confirm(&format!("Restart {name} now?"), yes)? {
+        println!("{}", style::warn("Aborted. Nothing was restarted."));
+        return Ok(());
+    }
+    docker_runtime::restart(&found, &mut CliReporter::default())?;
+    println!(
+        "{}",
+        style::success(&format!("{name} restarted; Docker is answering."))
+    );
+    if let Some(site) = remote {
+        println!(
+            "Not starting {}: it runs on {}, not on this computer.",
+            site.label,
+            site.remote
+                .as_ref()
+                .map(|r| r.host.as_str())
+                .unwrap_or("a server")
+        );
+        return Ok(());
+    }
+    let Some(stack) = stack.filter(Stack::exists) else {
+        return Ok(());
+    };
+    if ops::start(&stack, &mut CliReporter::default())? {
+        println!(
+            "{} Console: {}",
+            style::success("Started."),
+            style::url(&stack.console_url())
+        );
+    } else {
+        pending_banner("Started — still finishing boot.", &stack.console_url());
+    }
+    Ok(())
+}
+
 /// `atelier doctor [--fix] [--json]` — the diagnose/repair front door.
 ///
 /// Exits non-zero when something is still failing after the run, so it works as
@@ -1664,7 +1977,7 @@ fn doctor(stack: &Stack, fix: bool, json: bool) -> Result<()> {
     let report = if fix {
         // The repair ladder is chatty (a converge run streams docker output), so
         // it goes through the same reporter the lifecycle ops use.
-        doctor::fix(stack, &mut CliReporter::default())
+        doctor::fix(stack, &mut CliReporter::default())?
     } else {
         doctor::diagnose(stack)
     };
@@ -1854,19 +2167,31 @@ fn parse_channel(name: &str) -> Result<Channel> {
 /// "update" is one pull and one restart — landing them in a five-minute sequence
 /// through versions they never chose, without saying so first, is how a routine
 /// update becomes a support conversation.
-fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
+fn update_cmd(stack: &Stack, to: Option<String>, yes: bool, no_backup: bool) -> Result<()> {
     // A channel update (no explicit target) can be conclusively "nothing new" — and
     // an update that always claims success can never tell the operator so. On a
     // definite answer, short-circuit; fall through when the check is inconclusive.
     // A pinned `--to` always proceeds — the operator named a specific image. So does a
     // pending edge-image move: "no new Atelier" must not keep an unpatched web server
-    // (the same image re-pulls; only `edge` is recreated).
+    // (the same image re-pulls; only `edge` is recreated), and so do changed settings.
     let plan = match &to {
         Some(target) => ops::plan_upgrade(stack, Some(target)),
         None => {
             let check = ops::check_update(stack);
+            if check.unfinished {
+                println!(
+                    "{}",
+                    style::heading(&format!(
+                        "Continuing the unfinished update to {}",
+                        check.latest_version.as_deref().unwrap_or(&check.image)
+                    ))
+                );
+            }
+            // Changed settings (.env, compose.yaml) are applied on the same
+            // version by the run below ("Applied your changed settings").
             if check.update_available == Some(false)
                 && stack.pending_edge_image_migration().is_none()
+                && !ops::settings_pending(stack)
             {
                 let at = check.current_version.unwrap_or_else(|| stack.image());
                 println!("{}", style::success(&format!("Already up to date ({at}).")));
@@ -1875,6 +2200,13 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
             check.plan.unwrap_or_else(|| ops::plan_upgrade(stack, None))
         }
     };
+
+    // A build made on this computer has nothing to download: say so before the
+    // plan's own registry lookup ("Couldn't reach the registry … pull access
+    // denied") is printed. The update itself refuses it too.
+    if let Some(local) = ops::plan_local_build(stack, &plan) {
+        return Err(local.into());
+    }
 
     // A site's database only migrates forward: an older release run against a schema
     // a newer one already migrated breaks the site with no visible cause. Refuse a
@@ -1940,13 +2272,29 @@ fn update_cmd(stack: &Stack, to: Option<String>, yes: bool) -> Result<()> {
     }
 
     let pinned_to = to.is_some();
-    if ops::apply_upgrade(stack, &plan, &mut CliReporter::default())? {
-        done_banner("Update complete.", &stack.console_url());
-    } else {
-        pending_banner(
+    let opts = ops::UpdateOptions { no_backup };
+    let done = ops::apply_upgrade_with(stack, &plan, &opts, &mut CliReporter::default())
+        .inspect_err(|e| {
+            if ops::Overridable::of(e) == Some(ops::Overridable::UpdateWithoutBackup) {
+                println!(
+                    "{}",
+                    style::warn(
+                        "Fix what stopped it and try again, or pass --no-backup to update \
+                         without a backup (your site as it is now can't be brought back if \
+                         the update goes wrong)."
+                    )
+                );
+            }
+        })?;
+    match done {
+        ops::Updated::Ready => done_banner("Update complete.", &stack.console_url()),
+        ops::Updated::Booting => pending_banner(
             "Update applied — still finishing boot.",
             &stack.console_url(),
-        );
+        ),
+        // The run itself said "Already up to date" (and, with changed
+        // settings, that they were applied) as its last step.
+        ops::Updated::AlreadyCurrent | ops::Updated::SettingsApplied => {}
     }
     if pinned_to {
         println!(
@@ -2136,13 +2484,17 @@ enum Route {
     /// `app check-update [--json]`.
     CheckUpdate { json: bool },
     /// `app update`: plan + confirm here, then the server walks it.
-    Update { to: Option<String>, yes: bool },
+    Update {
+        to: Option<String>,
+        yes: bool,
+        no_backup: bool,
+    },
     /// `data restore`: confirm here, then the server restores its own file,
     /// or one uploaded from here.
     Restore {
         file: String,
         yes: bool,
-        other_site: bool,
+        opts: ops::RestoreOptions,
         on_server: bool,
     },
     /// `data backup`: on the server, then (unless `copy` is off) home.
@@ -2288,11 +2640,14 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
     };
     Ok(match command {
         Command::Sites { .. } => unreachable!("handled before resolving a site"),
+        Command::Docker { .. } => unreachable!("handled before a remote site's dispatch"),
         Command::Doctor { fix, json } => Route::Doctor { fix, json },
         Command::App { command } => match command {
             AppCommand::Status { json } => Route::Status { json },
             AppCommand::CheckUpdate { json } => Route::CheckUpdate { json },
-            AppCommand::Update { to, yes, .. } => Route::Update { to, yes },
+            AppCommand::Update {
+                to, yes, no_backup, ..
+            } => Route::Update { to, yes, no_backup },
             AppCommand::Start => Route::Run(Action::Start),
             AppCommand::Stop { yes } => Route::Change {
                 action: Action::Stop,
@@ -2317,6 +2672,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
             AppCommand::Down { .. } => return Err(on_server("app down")),
             AppCommand::Channel { .. } => return Err(on_server("app channel")),
             AppCommand::Logs { .. } => return Err(on_server("app logs")),
+            AppCommand::Cleanup { .. } => return Err(on_server("app cleanup")),
             AppCommand::Password { .. } => return Err(on_server("app password")),
         },
         Command::Site { command } => match command {
@@ -2401,6 +2757,7 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
                 file,
                 yes,
                 other_site,
+                no_safety_backup,
                 on_server,
             } => Route::Restore {
                 file: file
@@ -2408,7 +2765,11 @@ fn remote_route(command: Command, host: &str, slug: &str, experimental: bool) ->
                     .context("the backup path isn't valid UTF-8")?
                     .to_string(),
                 yes,
-                other_site,
+                opts: ops::RestoreOptions {
+                    other_site,
+                    no_safety_backup,
+                    ..ops::RestoreOptions::default()
+                },
                 on_server,
             },
         },
@@ -2596,11 +2957,11 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
             }
             Ok(())
         }
-        Route::Update { to, yes } => remote_update(&session, site, to, yes),
+        Route::Update { to, yes, no_backup } => remote_update(&session, site, to, yes, no_backup),
         Route::Restore {
             file,
             yes,
-            other_site,
+            opts,
             on_server,
         } => {
             let local = PathBuf::from(&file);
@@ -2608,7 +2969,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                 // A backup on this machine (m2-6): refused before a byte moves
                 // if it is another site's; then uploaded, verified, restored.
                 if let Some(note) = session
-                    .check_restore_identity(&local, other_site)?
+                    .check_restore_identity(&local, opts.other_site)?
                     .message()
                 {
                     println!("{}", style::warn(note));
@@ -2622,7 +2983,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                     return Ok(());
                 }
                 // The server's restore prints its own "Restore complete.".
-                session.restore_upload(&local, other_site, &mut relay)?;
+                session.restore_upload(&local, &opts, &mut relay)?;
                 return Ok(());
             }
             println!(
@@ -2636,7 +2997,7 @@ fn run_remote(command: Command, site: &sites::Site, experimental: bool) -> Resul
                 println!("{}", style::warn("Aborted."));
                 return Ok(());
             }
-            session.run_action(&remote::Action::Restore { file, other_site }, &mut relay)
+            session.run_action(&remote::Action::Restore { file, opts }, &mut relay)
         }
         Route::Change {
             action,
@@ -2713,6 +3074,7 @@ fn remote_update(
     site: &sites::Site,
     to: Option<String>,
     yes: bool,
+    no_backup: bool,
 ) -> Result<()> {
     let mut confirmed = yes;
     let mut asked = false;
@@ -2751,7 +3113,14 @@ fn remote_update(
             confirmed = true;
         }
     }
-    session.run_action(&remote::Action::Update { to, yes: confirmed }, &mut relay)
+    session.run_action(
+        &remote::Action::Update {
+            to,
+            yes: confirmed,
+            no_backup,
+        },
+        &mut relay,
+    )
 }
 
 /// `app open` on a remote site (m2-4, D-02): the recorded domain, or an SSH
@@ -2905,6 +3274,15 @@ fn print_check_update(check: &ops::UpdateCheck, channel: Channel, json: bool) ->
     // rolling tag like `:edge` the digest alone tells the user nothing.
     let from = check.current_version.as_deref().unwrap_or("unknown");
     match check.update_available {
+        // A stepped update stopped at a waypoint: say so, not "a new version".
+        Some(true) if check.unfinished => {
+            println!(
+            "{} It stopped at {}; {} is where it was going.\nRun `atelier app update` to continue.",
+            style::heading("An update didn't finish."),
+            from,
+            check.latest_version.as_deref().unwrap_or("the newest version"),
+        )
+        }
         Some(true) => {
             println!(
                 "{} for {}.\n{} → {}",
@@ -3175,9 +3553,20 @@ mod tests {
             }
         ));
         match route(&["app", "update", "--to", "0.21.0"]).unwrap() {
-            Route::Update { to, yes } => {
+            Route::Update { to, yes, no_backup } => {
                 assert_eq!(to.as_deref(), Some("0.21.0"));
-                assert!(!yes);
+                assert!(!yes && !no_backup);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Forwarded only when set, like --no-safety-backup.
+        match route(&["app", "update", "--no-backup"]).unwrap() {
+            Route::Update { to, yes, no_backup } => {
+                assert!(no_backup);
+                let sent = remote::Action::Update { to, yes, no_backup }
+                    .argv()
+                    .join(" ");
+                assert_eq!(sent, "app update --no-backup");
             }
             other => panic!("{other:?}"),
         }
@@ -3185,16 +3574,25 @@ mod tests {
             Route::Restore {
                 file,
                 yes,
-                other_site,
+                opts,
                 on_server,
             } => {
                 assert_eq!(file, "/srv/b.tar.gz");
-                assert!(yes && !other_site && !on_server);
+                assert!(yes && !opts.other_site && !opts.no_safety_backup && !on_server);
                 // What the server then runs: always non-interactive.
-                let sent = remote::Action::Restore { file, other_site }
-                    .argv()
-                    .join(" ");
+                let sent = remote::Action::Restore { file, opts }.argv().join(" ");
                 assert_eq!(sent, "data restore --yes -- /srv/b.tar.gz");
+            }
+            other => panic!("{other:?}"),
+        }
+        match route(&["data", "restore", "/srv/b.tar.gz", "--no-safety-backup"]).unwrap() {
+            Route::Restore { file, opts, .. } => {
+                assert!(opts.no_safety_backup && !opts.other_site);
+                let sent = remote::Action::Restore { file, opts }.argv().join(" ");
+                assert_eq!(
+                    sent,
+                    "data restore --yes --no-safety-backup -- /srv/b.tar.gz"
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -3439,10 +3837,8 @@ mod tests {
         ));
         match route(&["data", "restore", "b.tar.gz", "--other-site", "--on-server"]).unwrap() {
             Route::Restore {
-                other_site,
-                on_server,
-                ..
-            } => assert!(other_site && on_server),
+                opts, on_server, ..
+            } => assert!(opts.other_site && on_server),
             other => panic!("{other:?}"),
         }
         assert!(matches!(route(&["app", "open"]).unwrap(), Route::Open));
@@ -3645,6 +4041,89 @@ mod tests {
         .unwrap();
         assert_eq!(cli.confirm_slug.as_deref(), Some("prod"));
         assert!(restore_detail("/srv/b.tar.gz").contains("/srv/b.tar.gz"));
+    }
+
+    #[test]
+    fn docker_restart_takes_yes() {
+        for (argv, want) in [
+            (&["atelier", "docker", "restart"][..], false),
+            (&["atelier", "docker", "restart", "--yes"], true),
+            (&["atelier", "docker", "restart", "-y"], true),
+            (
+                &["atelier", "--site", "blog", "docker", "restart", "--yes"],
+                true,
+            ),
+        ] {
+            match Cli::try_parse_from(argv).unwrap().command {
+                Command::Docker {
+                    command: DockerCommand::Restart { yes },
+                } => assert_eq!(yes, want, "{argv:?}"),
+                _ => panic!("{argv:?}: not docker restart"),
+            }
+        }
+        assert!(Cli::try_parse_from(["atelier", "docker"]).is_err());
+        assert!(Cli::try_parse_from(["atelier", "docker", "restart", "now"]).is_err());
+    }
+
+    #[test]
+    fn update_takes_no_backup_and_cleanup_takes_older_backups() {
+        match Cli::try_parse_from(["atelier", "app", "update", "--no-backup", "-y"])
+            .unwrap()
+            .command
+        {
+            Command::App {
+                command: AppCommand::Update { no_backup, yes, .. },
+            } => assert!(no_backup && yes),
+            _ => panic!("not app update"),
+        }
+        // Each site's own refusal decides: not one flag for all of them.
+        assert!(Cli::try_parse_from(["atelier", "app", "update", "--all", "--no-backup"]).is_err());
+        match Cli::try_parse_from(["atelier", "app", "cleanup", "--dry-run", "--older-backups"])
+            .unwrap()
+            .command
+        {
+            Command::App {
+                command:
+                    AppCommand::Cleanup {
+                        dry_run,
+                        older_backups,
+                        yes,
+                    },
+            } => assert!(dry_run && older_backups && !yes),
+            _ => panic!("not app cleanup"),
+        }
+    }
+
+    #[test]
+    fn refusals_with_an_override_exit_with_their_own_code() {
+        let e = anyhow::Error::new(ops::BackupBeforeUpdateFailed {
+            cause: "The site is stopped, and it didn't finish starting in time to back it up \
+                    first"
+                .into(),
+        });
+        assert_eq!(exit_code(&e), 4);
+        let e = anyhow::Error::new(ops::SafetyBackupFailed {
+            cause: "No space left on device".into(),
+        });
+        assert_eq!(exit_code(&e), 3);
+        assert_eq!(exit_code(&anyhow::anyhow!("anything else")), 1);
+        let blocked = anyhow::Error::new(gate::UpdateBlocked {
+            blockers: vec![gate::Blocker::DockerNotAnswering],
+        });
+        assert_eq!(exit_code(&blocked), 5);
+        let busy = anyhow::Error::new(oplock::SiteBusy {
+            operation: Some("an update".into()),
+            since: None,
+            pid: None,
+        });
+        assert_eq!(exit_code(&busy), 6);
+        // A server's own code passes through, these included.
+        let remote = anyhow::Error::new(remote::RemoteExit {
+            host: "deploy@example.com".into(),
+            what: "`atelier app update`".into(),
+            code: 4,
+        });
+        assert_eq!(exit_code(&remote), 4);
     }
 
     #[test]

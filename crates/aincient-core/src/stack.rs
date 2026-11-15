@@ -222,7 +222,58 @@ pub const LEGACY_DB_IMAGE: &str = "pgvector/pgvector:pg16";
 /// the tag a manager or `install.sh` wrote. A digest, another tag or another image
 /// is the operator's choice and stays.
 pub fn db_image_upgrade(image: &str) -> Option<String> {
+    #[cfg(feature = "scenario-seams")]
+    if let Some(to) = scenario_seams::db_image_upgrade(image) {
+        return Some(to);
+    }
     (image == LEGACY_DB_IMAGE).then(|| DB_IMAGE.to_string())
+}
+
+/// Seams for the real-Docker scenario tests (umbrella DECISIONS 0528), compiled
+/// only with the `scenario-seams` feature, which nothing but this crate's own
+/// tests turns on (its dev-dependency on itself): the CLI and the app never
+/// have it.
+#[cfg(feature = "scenario-seams")]
+pub mod scenario_seams {
+    use std::sync::Mutex;
+
+    /// Only scenario images may stand in.
+    const PREFIX: &str = "atelier-scn-";
+
+    static DB_MOVE: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+    /// While held, [`super::db_image_upgrade`] also moves `legacy` to `current`,
+    /// as it moves [`super::LEGACY_DB_IMAGE`] to [`super::DB_IMAGE`]. A
+    /// scenario can't pull or tag the real pgvector images, so it moves a site
+    /// between two images it built and serves from its own registry; the rest of
+    /// the move (the download, the `compose.yaml` rewrite, the recreate) is the
+    /// product's. Both names must be scenario images.
+    #[must_use = "the stand-in ends when the guard drops"]
+    pub fn stand_in_db_move(legacy: &str, current: &str) -> DbMove {
+        assert!(
+            legacy.contains(PREFIX) && current.contains(PREFIX),
+            "only scenario images stand in for the db move: {legacy:?} -> {current:?}"
+        );
+        *DB_MOVE.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((legacy.to_string(), current.to_string()));
+        DbMove(())
+    }
+
+    /// Ends the stand-in on drop.
+    pub struct DbMove(());
+
+    impl Drop for DbMove {
+        fn drop(&mut self) {
+            *DB_MOVE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn db_image_upgrade(image: &str) -> Option<String> {
+        let held = DB_MOVE.lock().unwrap_or_else(|p| p.into_inner());
+        held.as_ref()
+            .filter(|(legacy, _)| legacy == image)
+            .map(|(_, current)| current.clone())
+    }
 }
 
 /// The Compose stack written into the stack directory. Kept byte-for-byte in
@@ -246,6 +297,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U aincient -d aincient"]
       interval: 10s
       retries: 10
+    restart: unless-stopped
   app:
     image: ${AINCIENT_IMAGE:-ghcr.io/aincient-labs/atelier-cms:latest}
     depends_on:
@@ -425,8 +477,68 @@ fn is_shipped_edge_conf(s: &str) -> bool {
     s == EDGE_CONF_TEMPLATE || SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&s)
 }
 
+/// Every `compose.yaml` an earlier manager (or `install.sh`) shipped, as the
+/// release that first wrote it had it. [`Stack::refresh_shipped_compose`]
+/// rewrites a stack still holding one to [`COMPOSE_TEMPLATE`]. When the
+/// template changes, add the outgoing text here as
+/// `templates/compose-<first version>.yaml`. Templates before 0.14.1 differ from
+/// it only in their `db` / `edge` image lines, which the refresh carries over
+/// (those move on their own migrations), so they need no entry.
+pub const SUPERSEDED_COMPOSE_TEMPLATES: &[&str] =
+    &[include_str!("../templates/compose-0.14.1.yaml")];
+
+/// True for the current compose template or a superseded shipped one, exactly
+/// as shipped (the same rule as [`is_shipped_edge_conf`]).
+fn is_shipped_compose(s: &str) -> bool {
+    s == COMPOSE_TEMPLATE || SUPERSEDED_COMPOSE_TEMPLATES.contains(&s)
+}
+
+/// `template` with its `db` and `edge` images swapped for `db` and `edge`.
+fn compose_with_images(template: &str, db: &str, edge: &str) -> String {
+    template
+        .replace(
+            &format!("    image: {DB_IMAGE}\n"),
+            &format!("    image: {db}\n"),
+        )
+        .replace(
+            &format!("    image: {EDGE_IMAGE}\n"),
+            &format!("    image: {edge}\n"),
+        )
+}
+
+/// The `compose.yaml` to write over `current`, when `current` is a superseded
+/// shipped template (with whatever `db` / `edge` images it runs now): the
+/// current template with those same images. `None` for anything else — the
+/// current template, a hand-edited file, one with more or fewer services.
+fn refreshed_compose(current: &str) -> Option<String> {
+    let images: Vec<&str> = current
+        .lines()
+        .filter_map(|l| l.strip_prefix("    image: "))
+        .collect();
+    let [db, _app, edge] = images.as_slice() else {
+        return None;
+    };
+    SUPERSEDED_COMPOSE_TEMPLATES
+        .iter()
+        .any(|t| compose_with_images(t, db, edge) == current)
+        .then(|| compose_with_images(COMPOSE_TEMPLATE, db, edge))
+}
+
 /// The file in a stack directory holding the site's identity (m2-6, D-04).
 pub const SITE_ID_FILE: &str = "site-id";
+
+/// The marker an owner's own wipe (`app down --wipe`, "Remove and erase")
+/// leaves in a stack directory: the database volume is gone on purpose, so the
+/// next start sets up a fresh site instead of refusing as if it were lost. It
+/// goes once the database volume exists again.
+pub const DATABASE_WIPED_FILE: &str = ".database-wiped";
+
+/// Where a stepped update keeps the image its route ends on while it walks the
+/// hops: each hop rewrites `.env` to the version it lands on, so without this a
+/// route that stopped halfway would leave the site pinned to a waypoint, and
+/// the next update would see nothing newer than it. Written before the first
+/// hop, removed once the final one answers.
+pub const UPDATE_TARGET_FILE: &str = ".update-target";
 
 /// Whether `id` looks like an identity [`new_site_id`] makes: a lowercase
 /// 8-4-4-4-12 hex UUID.
@@ -547,11 +659,14 @@ impl Stack {
         self.home.join("edge.conf")
     }
 
-    /// True when both stack files are exactly this manager's templates. False
-    /// for a stack laid down by an older manager (pre-`edge`) or hand-edited —
+    /// True when both stack files are exactly this manager's templates, or an
+    /// untouched superseded one the next start or update refreshes. False for a
+    /// stack laid down by an older manager (pre-`edge`) or hand-edited —
     /// `doctor` reports it and `--fix` rewrites them (keeping the originals).
     pub fn stack_files_current(&self) -> bool {
-        std::fs::read_to_string(self.compose_path()).ok().as_deref() == Some(COMPOSE_TEMPLATE)
+        std::fs::read_to_string(self.compose_path())
+            .ok()
+            .is_some_and(|s| is_shipped_compose(&s))
             && std::fs::read_to_string(self.edge_conf_path())
                 .ok()
                 .is_some_and(|s| is_shipped_edge_conf(&s))
@@ -568,7 +683,26 @@ impl Stack {
         if !SUPERSEDED_EDGE_CONF_TEMPLATES.contains(&current.as_str()) {
             return Ok(false);
         }
+        // scenario: none — refreshing a superseded edge.conf; no scenario ships an old edge.conf
         std::fs::write(&path, EDGE_CONF_TEMPLATE)
+            .with_context(|| format!("could not write {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Replace a `compose.yaml` that is a superseded shipped template (see
+    /// [`SUPERSEDED_COMPOSE_TEMPLATES`]) with the current one, keeping its `db`
+    /// and `edge` images. Anything else is left alone. Returns whether the file
+    /// changed: the containers only take it on their next `up`.
+    pub fn refresh_shipped_compose(&self) -> Result<bool> {
+        let path = self.compose_path();
+        let Ok(current) = std::fs::read_to_string(&path) else {
+            return Ok(false);
+        };
+        let Some(refreshed) = refreshed_compose(&current) else {
+            return Ok(false);
+        };
+        // scenario: start_after_the_shared_tag_moved_keeps_the_sites_image
+        std::fs::write(&path, refreshed)
             .with_context(|| format!("could not write {}", path.display()))?;
         Ok(true)
     }
@@ -640,6 +774,46 @@ impl Stack {
         is_site_id(id).then(|| id.to_string())
     }
 
+    /// Where the owner's-wipe marker lives: `<home>/.database-wiped`.
+    pub fn database_wiped_path(&self) -> PathBuf {
+        self.home.join(DATABASE_WIPED_FILE)
+    }
+
+    /// Where an unfinished update's final image is kept:
+    /// `<home>/.update-target` ([`UPDATE_TARGET_FILE`]).
+    pub fn update_target_path(&self) -> PathBuf {
+        self.home.join(UPDATE_TARGET_FILE)
+    }
+
+    /// The image an unfinished stepped update is heading for, when one stopped
+    /// before its last hop answered. `None` when no update is under way.
+    pub fn update_target(&self) -> Option<String> {
+        let raw = std::fs::read_to_string(self.update_target_path()).ok()?;
+        let image = raw.trim();
+        (!image.is_empty()).then(|| image.to_string())
+    }
+
+    /// Record the image a stepped update is heading for, before its first hop.
+    pub fn set_update_target(&self, image: &str) -> Result<()> {
+        let path = self.update_target_path();
+        // scenario: none — a stepped (multi-hop) update; no scenario has hops
+        std::fs::write(&path, format!("{image}\n"))
+            .with_context(|| format!("could not write {}", path.display()))
+    }
+
+    /// The route is finished (or abandoned for another channel): forget it.
+    /// Best effort: a leftover only makes the next update head for it again.
+    pub fn clear_update_target(&self) {
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
+        let _ = std::fs::remove_file(self.update_target_path());
+    }
+
+    /// Whether the owner wiped this site's database on purpose and it hasn't
+    /// been started again since (see [`DATABASE_WIPED_FILE`]).
+    pub fn database_wiped(&self) -> bool {
+        self.database_wiped_path().is_file()
+    }
+
     /// [`site_id`](Self::site_id), minting and saving one when there is none.
     pub fn ensure_site_id(&self) -> Result<String> {
         if let Some(id) = self.site_id() {
@@ -652,9 +826,12 @@ impl Stack {
         let tmp = self
             .home
             .join(format!(".{SITE_ID_FILE}.tmp-{}", std::process::id()));
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         std::fs::write(&tmp, format!("{id}\n"))
             .with_context(|| format!("could not write {}", tmp.display()))?;
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
         if let Err(e) = std::fs::rename(&tmp, &path) {
+            // scenario: none — cleanup after a failed site-id rename; not reached
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("could not write {}", path.display()));
         }
@@ -855,6 +1032,7 @@ impl Stack {
                 _ => line.to_string(),
             })
             .collect();
+        // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
         std::fs::write(&path, rewritten)
             .with_context(|| format!("could not write {}", path.display()))
     }
@@ -930,6 +1108,7 @@ impl Stack {
     /// Serialize the env map back to `.env`, keeping its `0600` perms.
     fn write_env(&self, env: &BTreeMap<String, String>) -> Result<()> {
         let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
         write_private(&self.env_path(), &body)
     }
 
@@ -980,16 +1159,19 @@ impl Stack {
 
         let compose = self.compose_path();
         if !compose.is_file() {
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             std::fs::write(&compose, COMPOSE_TEMPLATE)
                 .with_context(|| format!("could not write {}", compose.display()))?;
         }
         // compose.yaml mounts it: a stack without it cannot start `edge`.
         let edge = self.edge_conf_path();
         if !edge.is_file() {
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             std::fs::write(&edge, EDGE_CONF_TEMPLATE)
                 .with_context(|| format!("could not write {}", edge.display()))?;
         }
         done.edge_conf_refreshed = self.refresh_shipped_edge_conf()?;
+        self.refresh_shipped_compose()?;
 
         let env_path = self.env_path();
 
@@ -1018,6 +1200,7 @@ impl Stack {
                 Some(true) => done.existing_db_without_env = true,
                 None => {}
             }
+            // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
             write_private(&env_path, &contents)?;
         } else {
             // Reconcile only the tunables the caller explicitly chose this run;
@@ -1090,9 +1273,11 @@ impl Stack {
                         "{name}.replaced-{}",
                         chrono::Local::now().format("%Y%m%d-%H%M%S")
                     ));
+                    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
                     std::fs::rename(&path, &aside).with_context(|| {
                         format!("could not move the old {name} to {}", aside.display())
                     })?;
+                    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
                     std::fs::write(&path, template)
                         .with_context(|| format!("could not write {}", path.display()))?;
                     changes.push(format!(
@@ -1101,6 +1286,7 @@ impl Stack {
                     ));
                 }
             } else {
+                // scenario: none — repair_scaffold writing a missing file; scenario 8 repairs a changed one
                 std::fs::write(&path, template)
                     .with_context(|| format!("could not write {}", path.display()))?;
                 changes.push(format!("wrote a fresh {name}"));
@@ -1857,6 +2043,32 @@ mod tests {
         assert_eq!(stack.migrate_edge_image().unwrap(), None);
     }
 
+    #[cfg(feature = "scenario-seams")]
+    #[test]
+    fn a_scenario_db_move_stands_in_only_while_held() {
+        let (legacy, current) = (
+            "atelier-scn-x-db:legacy",
+            "localhost:1/atelier-scn-x-db:new",
+        );
+        assert_eq!(db_image_upgrade(legacy), None);
+        {
+            let _held = scenario_seams::stand_in_db_move(legacy, current);
+            assert_eq!(db_image_upgrade(legacy).as_deref(), Some(current));
+            // The real pair still moves; nothing else does.
+            assert_eq!(db_image_upgrade(LEGACY_DB_IMAGE).as_deref(), Some(DB_IMAGE));
+            assert_eq!(db_image_upgrade(current), None);
+            assert_eq!(db_image_upgrade("postgres:16"), None);
+        }
+        assert_eq!(db_image_upgrade(legacy), None, "dropped: gone");
+    }
+
+    #[cfg(feature = "scenario-seams")]
+    #[test]
+    #[should_panic(expected = "only scenario images")]
+    fn a_scenario_db_move_refuses_real_images() {
+        let _held = scenario_seams::stand_in_db_move(LEGACY_DB_IMAGE, DB_IMAGE);
+    }
+
     #[test]
     fn the_template_runs_the_trixie_db_image() {
         assert!(COMPOSE_TEMPLATE.contains(&format!("    image: {DB_IMAGE}\n")));
@@ -1989,6 +2201,98 @@ mod tests {
                 .unwrap()
                 .edge_conf_refreshed
         );
+    }
+
+    /// The `db` service's block of a compose file, up to the next service.
+    fn db_block(compose: &str) -> &str {
+        let start = compose.find("  db:\n").unwrap();
+        let end = compose[start..].find("  app:\n").unwrap();
+        &compose[start..start + end]
+    }
+
+    #[test]
+    fn db_restarts_with_docker() {
+        // Without it a Docker Desktop restart leaves db stopped while app and
+        // edge come back, and the site answers "starting" for good.
+        assert!(db_block(COMPOSE_TEMPLATE).contains("    restart: unless-stopped\n"));
+        assert!(!db_block(SUPERSEDED_COMPOSE_TEMPLATES[0]).contains("restart:"));
+    }
+
+    #[test]
+    fn superseded_compose_is_rewritten_with_the_db_restart_policy() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        std::fs::write(stack.compose_path(), SUPERSEDED_COMPOSE_TEMPLATES[0]).unwrap();
+        // An untouched older template is not a doctor warning…
+        assert!(stack.stack_files_current());
+
+        assert!(stack.refresh_shipped_compose().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE
+        );
+        assert!(stack.stack_files_current());
+        assert!(!stack.refresh_shipped_compose().unwrap(), "only once");
+
+        // A scaffold (install / sites add over an existing stack) does it too.
+        std::fs::write(stack.compose_path(), SUPERSEDED_COMPOSE_TEMPLATES[0]).unwrap();
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            COMPOSE_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn older_compose_keeps_its_images_when_rewritten() {
+        // The 0.10.0 – 0.12.0 file as shipped: bookworm db, nginx 1.28. Its
+        // images move on their own migrations (the db one only once the app
+        // can rebuild indexes), so the rewrite must not move them.
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let old = SUPERSEDED_COMPOSE_TEMPLATES[0]
+            .replace(DB_IMAGE, LEGACY_DB_IMAGE)
+            .replace(EDGE_IMAGE, "nginx:1.28-alpine");
+        std::fs::write(stack.compose_path(), &old).unwrap();
+
+        assert!(stack.refresh_shipped_compose().unwrap());
+        let now = std::fs::read_to_string(stack.compose_path()).unwrap();
+        assert_eq!(
+            now,
+            COMPOSE_TEMPLATE
+                .replace(DB_IMAGE, LEGACY_DB_IMAGE)
+                .replace(EDGE_IMAGE, "nginx:1.28-alpine")
+        );
+        assert!(db_block(&now).contains("    restart: unless-stopped\n"));
+        assert_eq!(
+            stack.pending_db_image_migration(),
+            Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
+        );
+        assert!(stack.pending_edge_image_migration().is_some());
+    }
+
+    #[test]
+    fn hand_edited_compose_is_never_rewritten() {
+        let ts = TempStack::new();
+        let stack = &ts.0;
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        let edited = SUPERSEDED_COMPOSE_TEMPLATES[0].replace(
+            "    restart: unless-stopped\nvolumes:",
+            "    restart: unless-stopped\n    # mine\nvolumes:",
+        );
+        assert_ne!(edited, SUPERSEDED_COMPOSE_TEMPLATES[0]);
+        std::fs::write(stack.compose_path(), &edited).unwrap();
+
+        assert!(!stack.refresh_shipped_compose().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            edited
+        );
+        // The current file is left as is too.
+        std::fs::write(stack.compose_path(), COMPOSE_TEMPLATE).unwrap();
+        assert!(!stack.refresh_shipped_compose().unwrap());
     }
 
     #[test]

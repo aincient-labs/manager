@@ -12,17 +12,18 @@
 //! worst case is lost time, never lost data:
 //!
 //! 1. re-scaffold a missing/incomplete `compose.yaml` + `.env`
-//! 2. `docker compose up -d` — bring the containers back
-//! 3. `drush cache:rebuild` — the Drupal reflex, and the floor of any repair
-//! 4. `drush updatedb -y` — finish a half-applied upgrade
-//! 5. re-assert `www-data` ownership of the files tree
-//! 6. re-run `converge.sh` — the appliance's own self-heal, which snapshots
+//! 2. restart Docker, then start the site — when Docker isn't answering or
+//!    left the site's network half attached, and only once the owner said yes
+//!    (it stops everything running in Docker on the computer)
+//! 3. `docker compose up -d` — bring the containers back
+//! 4. `drush cache:rebuild` — the Drupal reflex, and the floor of any repair
+//! 5. `drush updatedb -y` — finish a half-applied upgrade
+//! 6. re-assert `www-data` ownership of the files tree
+//! 7. re-run `converge.sh` — the appliance's own self-heal, which snapshots
 //!    first and rolls back on failure, so even the hammer is reversible
 //!
 //! Deliberately NOT in the ladder, at any flag: `down -v`, reinstall, restore.
 //! Those destroy data, so doctor only ever *names* them as the next step.
-
-use std::process::Command;
 
 use std::borrow::Cow;
 
@@ -196,6 +197,11 @@ impl Check {
 pub enum Repair {
     /// Write back a missing `compose.yaml` / `.env` key.
     Scaffold,
+    /// Restart Docker (it isn't answering, or left the site's network half
+    /// attached), then start the site. Stops every container on this
+    /// computer, so it is only run once the owner said yes
+    /// ([`Reporter::confirm_docker_restart`]).
+    RestartDocker,
     /// `docker compose up -d`.
     StartContainers,
     /// `drush cache:rebuild` — the Drupal reflex.
@@ -213,6 +219,7 @@ impl Repair {
     pub fn describe(self) -> &'static str {
         match self {
             Repair::Scaffold => "Restore the stack files (compose.yaml + edge.conf + .env)",
+            Repair::RestartDocker => "Restart Docker, then start the site",
             Repair::StartContainers => "Start the appliance containers",
             Repair::CacheRebuild => "Rebuild Drupal's caches",
             Repair::RunUpdates => "Run the pending database updates",
@@ -296,7 +303,12 @@ pub fn diagnose(stack: &Stack) -> Report {
 /// achieve: the returned report is a fresh reading of the state the user is
 /// actually left in, not an assumption that the repairs worked. `actions`
 /// records every attempt either way, including the ones that failed.
-pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> Report {
+///
+/// Repairs change the site, so they hold it ([`crate::oplock`]): while another
+/// operation runs, the checkup's repairs are refused with
+/// [`crate::oplock::SiteBusy`] (a diagnosis alone needs no lock).
+pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> anyhow::Result<Report> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Repair)?;
     let mut report = diagnose(stack);
     let mut actions = Vec::new();
     // Each repair is attempted at most once, so the loop is bounded by the
@@ -332,7 +344,7 @@ pub fn fix(stack: &Stack, r: &mut dyn Reporter) -> Report {
     }
 
     report.actions = actions;
-    report
+    Ok(report)
 }
 
 /// Perform one repair. `Ok(Some(detail))` carries anything worth showing.
@@ -342,23 +354,42 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             .repair_scaffold()
             .map(|changes| (!changes.is_empty()).then(|| changes.join("; ")))
             .map_err(|e| format!("{e:#}")),
+        Repair::RestartDocker => restart_docker_then_start(stack, r),
         Repair::StartContainers => {
-            let mut c = compose(stack);
-            c.args(["up", "-d"]);
-            // Not a probe: `up` may pull and recreate, so it gets no deadline.
-            docker::probe_unbounded(c)?;
+            // A locked engine site stays down until its owner unlocks it.
+            ops::refuse_locked(ops::engine_state_of(stack).as_deref())
+                .map_err(|e| format!("{e:#}"))?;
+            // `up` would create an empty database and install a fresh site over
+            // an erased one; the way back is a restore, as Start says.
+            ops::refuse_erased_database(stack).map_err(|e| format!("{e:#}"))?;
+            // A container that lost its network: reconnect it (and reboot the
+            // app that booted without it); `up` alone never would.
+            ops::reconnect_site(stack, r).map_err(|e| format!("{e:#}"))?;
+            // `--no-recreate`: a repair creates what is missing and starts what is
+            // stopped, never rebuilds a container on whatever image a shared tag
+            // now names (that would be an update without its backup).
+            // No deadline: `up` may pull and recreate. Recovers once from
+            // Docker's leftovers (a stale network endpoint), like Start and Update.
+            ops::run_recovering(
+                stack,
+                // scenario: doctor_fix_creates_the_removed_container_and_keeps_the_sites_image
+                &["up", "-d", "--no-recreate"],
+                "start the appliance",
+                r,
+            )
+            .map_err(|e| format!("{e:#}"))?;
             // Containers report "running" the instant they start, but the
             // entrypoint then runs converge (site install or migrations) for up
             // to minutes. Re-diagnosing immediately would ask a half-booted
             // Drupal whether it bootstraps, get "no", and escalate to a repair
             // the site never needed. Wait for it to actually serve first.
-            if ops::wait_until_ready(stack, ops::READY_TIMEOUT, r) {
-                Ok(None)
-            } else {
-                Ok(Some(
+            match ops::wait_until_ready(stack, ops::READY_TIMEOUT, r) {
+                crate::Boot::Ready => Ok(None),
+                crate::Boot::Booting => Ok(Some(
                     "started, but the console hasn't answered yet — it may still be booting"
                         .to_string(),
-                ))
+                )),
+                crate::Boot::Failed(why) => Err(why),
             }
         }
         Repair::CacheRebuild => drush(stack, &["cache:rebuild"]).map(Some),
@@ -382,11 +413,44 @@ fn apply(stack: &Stack, repair: Repair, r: &mut dyn Reporter) -> Result<Option<S
             // health gate) — relay it line by line rather than leaving the user
             // staring at nothing.
             let mut c = compose(stack);
-            c.args(["exec", "-T", "app", CONVERGE]);
+            c.args(converge_args());
             docker::run_streaming(c, "re-converge the site", |line| r.log(line))
                 .map(|_| None)
                 .map_err(|e| format!("{e:#}"))
         }
+    }
+}
+
+/// [`Repair::RestartDocker`]: ask first (it stops everything running in
+/// Docker here, not only this site), restart, then start the site the way
+/// Start does. A runtime the Manager can't restart, or a "no", is a failed
+/// action that says how to do it by hand.
+fn restart_docker_then_start(
+    stack: &Stack,
+    r: &mut dyn Reporter,
+) -> Result<Option<String>, String> {
+    use crate::docker_runtime::{self, RestartPlan};
+    let found = docker_runtime::detect();
+    let name = found.runtime.name();
+    if let RestartPlan::Manual { steps, .. } = &found.plan {
+        return Err(format!("Atelier can't restart {name} for you. {steps}"));
+    }
+    let others = docker_runtime::other_running_containers(Some(&stack.project_name()));
+    if !r.confirm_docker_restart(name, &docker_runtime::stops_what(others.as_deref())) {
+        return Err(format!(
+            "Not restarted. Restart {name} when it suits you (`atelier docker restart`)."
+        ));
+    }
+    docker_runtime::restart(&found, r).map_err(|e| format!("{e:#}"))?;
+    if !stack.exists() {
+        return Ok(None);
+    }
+    match ops::start(stack, r) {
+        Ok(true) => Ok(None),
+        Ok(false) => Ok(Some(
+            "started, but the console hasn't answered yet — it may still be booting".to_string(),
+        )),
+        Err(e) => Err(format!("{e:#}")),
     }
 }
 
@@ -417,14 +481,7 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
     // (a remote context, OrbStack, colima, or a Desktop mid-upgrade), which is
     // precisely the sort of skew a report needs to name.
     out.push(with_version(
-        flag(
-            "docker.running",
-            Tier::Host,
-            "Docker running",
-            pf.docker_running,
-            Severity::Fail,
-            "Start Docker, then run doctor again.",
-        ),
+        docker_running_verdict(pf.docker_installed, pf.docker_running),
         pf.docker_running.then(docker_engine_version).flatten(),
     ));
     out.push(with_version(
@@ -474,6 +531,8 @@ fn check_host(stack: &Stack, out: &mut Vec<Check>) -> bool {
 
     out.push(check_port(stack, pf.docker_running));
     out.push(check_disk(stack));
+    out.push(check_docker_disk(stack, pf.docker_running));
+    out.push(check_docker_memory(pf.docker_running));
 
     pf.ok()
 }
@@ -629,70 +688,182 @@ fn port_verdict(
     Check::ok(ID, Tier::Host, LABEL).detail(format!("port {port}"))
 }
 
-/// Free space where the stack (and Docker's volumes, on Linux) lives. The image
-/// is ~1 GB and a converge takes a database snapshot, so a nearly-full disk is a
-/// real and confusing failure mode — an upgrade dies mid-migration.
-fn check_disk(stack: &Stack) -> Check {
-    const ID: &str = "host.disk";
-    const LABEL: &str = "Free disk space";
-    const NEEDED_MB: u64 = 4096;
+const DISK_LABEL: &str = "Free disk space on this computer";
+const DOCKER_DISK_LABEL: &str = "Free disk space for Docker";
 
-    let Some(free_mb) = free_space_mb(&stack.home) else {
+/// Free space in the two places a site writes (M2c): this computer's disk
+/// where its backups are saved (`host.disk`), and Docker's own disk
+/// (`host.docker_disk`: on a Mac a virtual machine's disk, which a roomy
+/// computer disk says nothing about). Warn below [`disk::WARN_BELOW`], fail
+/// below [`disk::BLOCK_BELOW`], where an update is refused.
+fn check_disk(stack: &Stack) -> Check {
+    disk_verdict(
+        "host.disk",
+        DISK_LABEL,
+        crate::disk::host_free(stack),
+        || "Couldn't read free space on this platform.".into(),
+    )
+}
+
+fn check_docker_disk(stack: &Stack, docker_running: bool) -> Check {
+    if !docker_running {
         return Check::skipped(
-            ID,
+            "host.docker_disk",
             Tier::Host,
-            LABEL,
-            "Couldn't read free space on this platform.",
+            DOCKER_DISK_LABEL,
+            "Docker isn't answering.",
+        );
+    }
+    disk_verdict(
+        "host.docker_disk",
+        DOCKER_DISK_LABEL,
+        crate::disk::docker_free(stack),
+        || "Unknown: it is read inside a running container, and this site isn't running.".into(),
+    )
+}
+
+fn disk_verdict(
+    id: &'static str,
+    label: &'static str,
+    free: Option<crate::disk::Free>,
+    unknown: impl FnOnce() -> String,
+) -> Check {
+    use crate::disk::Level;
+    let Some(free) = free else {
+        return Check::skipped(id, Tier::Host, label, unknown());
+    };
+    let detail = format!("{} free", crate::disk::human(free.bytes));
+    let severity = match free.level() {
+        Level::Ok => return Check::ok(id, Tier::Host, label).detail(detail),
+        Level::Low => Severity::Warn,
+        Level::TooLow => Severity::Fail,
+    };
+    Check::bad(id, Tier::Host, label, severity, free.remedy(false)).detail(detail)
+}
+
+const DOCKER_MEMORY_ID: &str = "host.docker_memory";
+const DOCKER_MEMORY_LABEL: &str = "Memory for Docker";
+
+/// How much memory Docker has (`docker info` MemTotal: the VM's on a Mac or
+/// Windows, the computer's on Linux), with the runtime's own words for where
+/// to raise it. Colima's VM has 2 GiB unless told otherwise.
+fn check_docker_memory(docker_running: bool) -> Check {
+    if !docker_running {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker isn't answering.",
+        );
+    }
+    let mut c = docker::docker();
+    c.args([
+        "info",
+        "--format",
+        "{{.MemTotal}}|{{.CgroupVersion}}|{{.OperatingSystem}}|{{.Name}}",
+    ]);
+    let info = probe(c).ok();
+    docker_memory_verdict(info.as_deref(), crate::docker_runtime::HostOs::current())
+}
+
+/// The floor below which a site's converge (Drupal + Postgres + nginx) is
+/// likely to be killed for lack of memory. A starting point, not a measured
+/// peak (the M3 state set measures it).
+const DOCKER_MEMORY_FLOOR_MIB: u64 = 4096;
+
+/// [`check_docker_memory`] on `docker info`'s answer
+/// (`MemTotal|CgroupVersion|OperatingSystem|Name`).
+fn docker_memory_verdict(info: Option<&str>, os: crate::docker_runtime::HostOs) -> Check {
+    use crate::docker_runtime::{colima_profile, detect_from, memory_remedy, Signals};
+    let Some(info) = info else {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker didn't say how much memory it has.",
         );
     };
-    let detail = format!("{:.1} GB free", free_mb as f64 / 1024.0);
-    if free_mb >= NEEDED_MB {
-        return Check::ok(ID, Tier::Host, LABEL).detail(detail);
+    let mut parts = info.trim().splitn(4, '|');
+    let bytes = parts.next().and_then(|b| b.trim().parse::<u64>().ok());
+    let cgroup = parts.next().unwrap_or("").trim().to_string();
+    let signals = Signals {
+        operating_system: parts.next().map(str::to_string),
+        name: parts.next().map(str::to_string),
+        ..Signals::default()
+    };
+    let Some(bytes) = bytes else {
+        return Check::skipped(
+            DOCKER_MEMORY_ID,
+            Tier::Host,
+            DOCKER_MEMORY_LABEL,
+            "Docker didn't say how much memory it has.",
+        );
+    };
+    let runtime = detect_from(&signals, os);
+    let mib = bytes / (1024 * 1024);
+    let mut detail = format!("{:.1} GiB", mib as f64 / 1024.0);
+    // cgroup v1: whether a kill by the VM's own out-of-memory killer sets
+    // Docker's flag is unverified, so a start may miss saying why.
+    if cgroup == "1" {
+        detail.push_str(
+            "; cgroup v1, so Atelier may not see when Docker stops a site for lack of memory",
+        );
     }
+    if mib >= DOCKER_MEMORY_FLOOR_MIB {
+        return Check::ok(DOCKER_MEMORY_ID, Tier::Host, DOCKER_MEMORY_LABEL).detail(detail);
+    }
+    let profile = colima_profile(&signals);
     Check::bad(
-        ID,
+        DOCKER_MEMORY_ID,
         Tier::Host,
-        LABEL,
+        DOCKER_MEMORY_LABEL,
         Severity::Warn,
         format!(
-            "Less than {} GB free. The appliance image plus a pre-upgrade database snapshot need \
-             room — free some space before updating.",
-            NEEDED_MB / 1024
+            "Docker has less than {} GiB of memory, so a site may run out while it starts or \
+             updates. {} (4 GiB or more), or run fewer sites at once.",
+            DOCKER_MEMORY_FLOOR_MIB / 1024,
+            memory_remedy(runtime, profile.as_deref())
         ),
     )
     .detail(detail)
 }
 
-/// Free megabytes on the filesystem holding `path`, via POSIX `df -Pk`. Walks up
-/// to the nearest existing ancestor, since the stack directory may not exist yet.
-#[cfg(unix)]
-fn free_space_mb(path: &std::path::Path) -> Option<u64> {
-    let mut probe_path = path;
-    while !probe_path.exists() {
-        probe_path = probe_path.parent()?;
+/// A service Docker stopped for lack of memory: `State.OOMKilled` now, or an
+/// `oom` event in the last day (Docker keeps its last 256 events, and a
+/// restart clears the flag). `None`: Docker didn't answer.
+fn memory_verdict(
+    oom: Option<std::collections::BTreeSet<String>>,
+    remedy: impl FnOnce() -> String,
+) -> Check {
+    const ID: &str = "stack.memory";
+    const LABEL: &str = "Enough memory for the site";
+    let Some(oom) = oom else {
+        return Check::skipped(ID, Tier::Stack, LABEL, "Docker didn't answer.");
+    };
+    if oom.is_empty() {
+        return Check::ok(ID, Tier::Stack, LABEL);
     }
-    let out = Command::new("df")
-        .arg("-Pk")
-        .arg(probe_path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_df_available_kb(&String::from_utf8_lossy(&out.stdout)).map(|kb| kb / 1024)
-}
-
-#[cfg(not(unix))]
-fn free_space_mb(_path: &std::path::Path) -> Option<u64> {
-    None
-}
-
-/// The "Available" column (4th) of `df -Pk`'s data row, in KB. POSIX output mode
-/// guarantees one row per filesystem on a single line, so no continuation
-/// handling is needed.
-fn parse_df_available_kb(out: &str) -> Option<u64> {
-    let row = out.lines().nth(1)?;
-    row.split_whitespace().nth(3)?.parse().ok()
+    let parts: Vec<&str> = oom
+        .iter()
+        .map(|s| match s.as_str() {
+            "db" => "the database",
+            "app" => "the app",
+            "edge" => "the web server",
+            other => other,
+        })
+        .collect();
+    Check::bad(
+        ID,
+        Tier::Stack,
+        LABEL,
+        Severity::Warn,
+        format!(
+            "Docker stopped part of your site because it ran out of memory. {}, or stop \
+             other sites.",
+            remedy()
+        ),
+    )
+    .detail(format!("out of memory: {}", parts.join(", ")))
 }
 
 // --- tier 2: the stack -------------------------------------------------------
@@ -764,6 +935,7 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             .fixable(Repair::Scaffold),
         });
         out.push(db_password_verdict(stack.env_get("DB_PASSWORD").as_deref()));
+        out.push(backups_verdict(ops::backups_writable(stack)));
     } else {
         out.push(Check::skipped(
             "stack.env",
@@ -884,6 +1056,8 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
             ("stack.files_current", "Stack files match this manager"),
             ("stack.db", "Database container healthy"),
             ("stack.app", "Appliance container running"),
+            ("stack.network", NETWORK_LABEL),
+            ("stack.memory", "Enough memory for the site"),
         ] {
             out.push(Check::skipped(id, Tier::Stack, label, why));
         }
@@ -931,21 +1105,138 @@ fn check_stack(stack: &Stack, host_ok: bool, out: &mut Vec<Check>) -> bool {
         .fixable(Repair::Scaffold)
     });
 
-    if crate::engine::is_enabled(stack) {
+    // A resting or locked engine site stops its app and db on purpose.
+    let engine_state = if crate::engine::is_enabled(stack) {
         out.extend(check_engine(stack));
-    }
+        ops::engine_state_of(stack)
+    } else {
+        None
+    };
+    let engine_state = engine_state.as_deref();
 
     out.push(check_container(
         stack,
         "db",
         "stack.db",
         "Database container healthy",
+        engine_state,
     ));
 
-    let app = check_container(stack, "app", "stack.app", "Appliance container running");
+    let app = check_container(
+        stack,
+        "app",
+        "stack.app",
+        "Appliance container running",
+        engine_state,
+    );
     let app_up = app.severity.is_ok();
     out.push(app);
+    out.push(network_verdict(
+        crate::boot::half_attached_now(stack),
+        crate::boot::detached_now(stack),
+    ));
+    out.push(memory_verdict(
+        crate::boot::out_of_memory_now(stack),
+        crate::docker_runtime::memory_remedy_here,
+    ));
     app_up
+}
+
+/// The verdict on a container that exists but isn't running. The engine's
+/// Rest stops `app` and `db` on purpose (visitors see the snapshot), so a
+/// resting site is fine; a locked one stays down until its owner unlocks it,
+/// so it is said, not repaired. Anything else is a site that should be up.
+fn stopped_container(
+    id: &'static str,
+    label: &'static str,
+    status: &str,
+    engine_state: Option<&str>,
+) -> Check {
+    match engine_state {
+        Some("resting") => Check::ok(id, Tier::Stack, label)
+            .detail("resting: the engine stopped it; visitors see the snapshot"),
+        Some("locked") => Check::bad(
+            id,
+            Tier::Stack,
+            label,
+            Severity::Warn,
+            "The site is locked down, so its containers stay stopped. Unlock it first \
+             (System → Experimental features, or `atelier site unlock --experimental`).",
+        )
+        .detail(format!("state: {status}")),
+        _ => Check::bad(
+            id,
+            Tier::Stack,
+            label,
+            Severity::Fail,
+            "The container isn't running. Start it with `atelier app start`.",
+        )
+        .detail(format!("state: {status}"))
+        .fixable(Repair::StartContainers),
+    }
+}
+
+const NETWORK_LABEL: &str = "Containers attached to the site's network";
+
+/// What the checkup says for a [`crate::boot::Detached`] container.
+pub(crate) const NETWORK_LOST: &str = "Part of your site has lost its connection to the site's \
+     network, so the site can't reach its database. Start your site again (or run \
+     `atelier doctor --fix`): Atelier reconnects it. Your site's data is safe.";
+
+/// Docker's half-attached network (review-tmp, 2026-11-14): a running container
+/// the site's network lists has no address on it, or the reverse. Only
+/// restarting Docker cleared it, so that is the repair ([`Repair::RestartDocker`],
+/// asked first), in the same words a start that runs into it uses.
+fn network_verdict(
+    half_attached: Option<Vec<(String, String)>>,
+    detached: Option<Vec<crate::boot::Detached>>,
+) -> Check {
+    // Lost its network entirely: reconnecting fixes it, no Docker restart.
+    if let Some(lost) = detached.filter(|d| !d.is_empty()) {
+        return Check::bad(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            Severity::Fail,
+            NETWORK_LOST,
+        )
+        .fixable(Repair::StartContainers)
+        .detail(
+            lost.iter()
+                .map(|d| {
+                    format!(
+                        "{} ({}) has no connection to {}",
+                        d.container, d.service, d.network
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    match half_attached {
+        None => Check::skipped(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            "Docker didn't answer.",
+        ),
+        Some(found) if found.is_empty() => Check::ok("stack.network", Tier::Stack, NETWORK_LABEL),
+        Some(found) => Check::bad(
+            "stack.network",
+            Tier::Stack,
+            NETWORK_LABEL,
+            Severity::Fail,
+            crate::boot::NETWORK_STUCK,
+        )
+        .fixable(Repair::RestartDocker)
+        .detail(
+            found
+                .iter()
+                .map(|(network, container)| format!("{container} is half attached to {network}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+    }
 }
 
 /// The EXPERIMENTAL engine (DECISIONS 0483), only on a stack that opted in:
@@ -1112,26 +1403,65 @@ fn engine_port_verdict(ports_json: Option<&str>) -> Check {
     }
 }
 
+const BACKUPS_LABEL: &str = "Backups folder is writable";
+
+/// Whether a backup could be saved now ([`ops::backups_writable`]): found
+/// here rather than by a backup, or the backup an update or restore takes
+/// first, failing after its dump. A warning: the site runs either way.
+fn backups_verdict(writable: Result<(), ops::BackupsNotWritable>) -> Check {
+    match writable {
+        Ok(()) => Check::ok("stack.backups", Tier::Stack, BACKUPS_LABEL),
+        Err(e) => Check::bad(
+            "stack.backups",
+            Tier::Stack,
+            BACKUPS_LABEL,
+            Severity::Warn,
+            e.to_string(),
+        )
+        .detail(e.dir.display().to_string()),
+    }
+}
+
+/// The container `compose ps -a -q <service>` lists, if any: one id per line,
+/// nothing at all when the service has no container (running or stopped).
+fn first_container(ps_out: &str) -> Option<String> {
+    ps_out
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 /// Inspect one compose service: is its container up, and (if it declares a
 /// healthcheck) healthy? A container stuck in a restart loop reports "running"
 /// on any single glance, so the restart count is read too — that's the state
 /// that otherwise looks fine and never serves.
-fn check_container(stack: &Stack, service: &str, id: &'static str, label: &'static str) -> Check {
+fn check_container(
+    stack: &Stack,
+    service: &str,
+    id: &'static str,
+    label: &'static str,
+    engine_state: Option<&str>,
+) -> Check {
+    // `-a`: a stopped container is there too. Without it a stopped site read
+    // as "no container" and was told its container isn't there (zoo, 0.17).
     let mut ps = compose(stack);
-    ps.args(["ps", "-q", service]);
+    ps.args(["ps", "-a", "-q", service]);
     let container = match probe(ps) {
-        Ok(out) if !out.trim().is_empty() => out.trim().lines().next().unwrap_or("").to_string(),
-        Ok(_) => {
-            return Check::bad(
-                id,
-                Tier::Stack,
-                label,
-                Severity::Fail,
-                "The container isn't there. Start the appliance with `atelier app start`.",
-            )
-            .detail(format!("no `{service}` container"))
-            .fixable(Repair::StartContainers)
-        }
+        Ok(out) => match first_container(&out) {
+            Some(cid) => cid,
+            None => {
+                return Check::bad(
+                    id,
+                    Tier::Stack,
+                    label,
+                    Severity::Fail,
+                    "The container isn't there. Start the appliance with `atelier app start`.",
+                )
+                .detail(format!("no `{service}` container"))
+                .fixable(Repair::StartContainers)
+            }
+        },
         Err(e) => {
             return Check::bad(
                 id,
@@ -1167,15 +1497,7 @@ fn check_container(stack: &Stack, service: &str, id: &'static str, label: &'stat
     let state = ContainerState::parse(&raw);
 
     if !state.running {
-        return Check::bad(
-            id,
-            Tier::Stack,
-            label,
-            Severity::Fail,
-            "The container isn't running. Start it with `atelier app start`.",
-        )
-        .detail(format!("state: {}", state.status))
-        .fixable(Repair::StartContainers);
+        return stopped_container(id, label, &state.status, engine_state);
     }
     // A handful of restarts is a crash loop, not a hiccup: compose's
     // `restart: unless-stopped` means it will keep going forever.
@@ -1246,6 +1568,30 @@ impl ContainerState {
 /// into `/usr/local/bin`).
 const CONVERGE: &str = "/usr/local/bin/converge.sh";
 const HEALTHCHECK: &str = "/usr/local/bin/healthcheck.sh";
+
+/// The re-converge repair's `compose` arguments. Its output also goes into the
+/// app's own log (PID 1's stdout, what `docker logs` reads), so the log the
+/// next Start reads ends on this run's `converge OK` rather than on the FATAL
+/// of the boot it repaired ([`crate::boot`] reads failures after the last
+/// success). `pipefail` keeps converge's own exit code; a log that can't be
+/// written to only loses the copy.
+fn converge_args() -> Vec<String> {
+    let mut args: Vec<String> = ["exec", "-T", "app", "bash", "-c"]
+        .iter()
+        .map(|a| (*a).to_string())
+        .collect();
+    args.push(mirrored(CONVERGE));
+    args
+}
+
+/// The shell line that runs `script` with its output mirrored into PID 1's
+/// stdout ([`converge_args`]).
+fn mirrored(script: &str) -> String {
+    format!(
+        "set -o pipefail; log=/proc/1/fd/1; [ -w \"$log\" ] || log=/dev/null; \
+         {script} 2>&1 | tee -a \"$log\""
+    )
+}
 
 fn check_site(stack: &Stack, app_up: bool, out: &mut Vec<Check>) {
     const SKIP: &str = "The appliance isn't running, so Drupal can't be asked.";
@@ -1473,6 +1819,25 @@ fn flag(
     }
 }
 
+/// Docker answering. Installed but not answering is fixable: a restart starts
+/// a stopped runtime and unsticks a wedged one.
+fn docker_running_verdict(installed: bool, running: bool) -> Check {
+    let check = flag(
+        "docker.running",
+        Tier::Host,
+        "Docker running",
+        running,
+        Severity::Fail,
+        "Start Docker, or restart it if it is already open (`atelier docker restart`), then run \
+         doctor again.",
+    );
+    if installed && !running {
+        check.fixable(Repair::RestartDocker)
+    } else {
+        check
+    }
+}
+
 /// `Some(s)` unless it's blank — so a tool that answered with nothing reads as
 /// "no version", not as an empty label.
 fn non_empty(s: &str) -> Option<String> {
@@ -1500,7 +1865,178 @@ fn health_detail(stderr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dockers_memory_is_checked_against_the_floor_with_the_runtimes_words() {
+        use crate::docker_runtime::HostOs;
+        // OrbStack on the owner's Mac, 2026-11-14.
+        let ok = super::docker_memory_verdict(Some("10490122240|2|OrbStack|orbstack"), HostOs::Mac);
+        assert_eq!(ok.severity, Severity::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("9.8 GiB"));
+        // Colima's default VM: 2 GiB.
+        let colima =
+            super::docker_memory_verdict(Some("2063835136|2|Ubuntu 24.04 LTS|colima"), HostOs::Mac);
+        assert_eq!(colima.severity, Severity::Warn);
+        let remedy = colima.remedy.unwrap();
+        assert!(
+            remedy.contains("`colima stop`, then `colima start --memory 4`"),
+            "{remedy}"
+        );
+        let desktop = super::docker_memory_verdict(
+            Some("3000000000|2|Docker Desktop|docker-desktop"),
+            HostOs::Mac,
+        );
+        assert!(desktop
+            .remedy
+            .unwrap()
+            .contains("Settings → VM resources → Advanced → Memory limit"));
+        let linux =
+            super::docker_memory_verdict(Some("2000000000|1|Ubuntu 24.04 LTS|box"), HostOs::Linux);
+        assert!(linux.remedy.unwrap().contains("this computer"));
+        assert!(linux.detail.unwrap().contains("cgroup v1"));
+        for bad in [None, Some(""), Some("x|2|OrbStack|orbstack")] {
+            assert_eq!(
+                super::docker_memory_verdict(bad, HostOs::Mac).severity,
+                Severity::Skipped
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_stopped_for_lack_of_memory_is_reported() {
+        use std::collections::BTreeSet;
+        let remedy = || "Give Docker more memory in OrbStack's settings".to_string();
+        assert_eq!(
+            super::memory_verdict(Some(BTreeSet::new()), remedy).severity,
+            Severity::Ok
+        );
+        assert_eq!(
+            super::memory_verdict(None, remedy).severity,
+            Severity::Skipped
+        );
+        let hit = super::memory_verdict(
+            Some(BTreeSet::from(["db".to_string(), "app".to_string()])),
+            remedy,
+        );
+        assert_eq!(hit.severity, Severity::Warn);
+        assert_eq!(
+            hit.detail.as_deref(),
+            Some("out of memory: the app, the database")
+        );
+        assert_eq!(
+            hit.remedy.as_deref(),
+            Some(
+                "Docker stopped part of your site because it ran out of memory. Give Docker more \
+                  memory in OrbStack's settings, or stop other sites."
+            )
+        );
+    }
     use super::*;
+
+    #[test]
+    fn the_reconverge_repair_keeps_converge_s_exit_code_and_output() {
+        // A stand-in for converge.sh that fails the way it does (`die`).
+        let dir = std::env::temp_dir().join(format!("atelier-mirror-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("converge.sh");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\nprintf '[converge] database is reachable\\n'\n\
+             printf '[converge] FATAL: post-install health check failed\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let out = std::process::Command::new("bash")
+            .args(["-c", &mirrored(&format!("bash {}", script.display()))])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.status.success(), "converge's failure is the repair's");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("[converge] database is reachable"), "{said}");
+        assert!(
+            said.contains("[converge] FATAL: post-install"),
+            "stderr relayed too: {said}"
+        );
+        let args = converge_args();
+        assert_eq!(&args[..5], ["exec", "-T", "app", "bash", "-c"]);
+        assert!(args[5].contains("/usr/local/bin/converge.sh 2>&1 | tee -a"));
+    }
+
+    #[test]
+    fn docker_not_answering_is_fixed_by_a_restart_only_when_installed() {
+        let c = docker_running_verdict(true, false);
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(c.fix, Some(Repair::RestartDocker));
+        assert!(c.remedy.unwrap().contains("`atelier docker restart`"));
+        assert_eq!(docker_running_verdict(false, false).fix, None);
+        assert_eq!(docker_running_verdict(true, true).severity, Severity::Ok);
+        assert_eq!(docker_running_verdict(true, true).fix, None);
+    }
+
+    /// A reporter that answers the restart question and records it.
+    struct Declines(Vec<String>);
+    impl Reporter for Declines {
+        fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+            self.0.push(format!("{runtime}: {detail}"));
+            false
+        }
+    }
+
+    #[test]
+    fn the_restart_repair_is_never_run_without_a_yes() {
+        // Silent (and any reporter that can't ask, e.g. a remote doctor) says no.
+        assert!(!crate::ops::Silent.confirm_docker_restart("OrbStack", "x"));
+        let mut r = Declines(Vec::new());
+        assert!(!r.confirm_docker_restart("OrbStack", "This stops everything…"));
+        assert_eq!(r.0, ["OrbStack: This stops everything…"]);
+    }
+
+    #[test]
+    fn a_container_that_lost_its_network_is_fixed_by_starting_not_by_restarting_docker() {
+        let lost = crate::boot::Detached {
+            network: "atelier-review-tmp_default".into(),
+            container: "atelier-review-tmp-db-1".into(),
+            service: "db".into(),
+            running: true,
+        };
+        // Takes precedence over a half-attached reading of the same site.
+        let c = network_verdict(Some(vec![("n".into(), "c".into())]), Some(vec![lost]));
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(c.fix, Some(Repair::StartContainers));
+        assert_eq!(c.remedy.as_deref(), Some(NETWORK_LOST));
+        assert!(!NETWORK_LOST.contains("Restart Docker"));
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("atelier-review-tmp-db-1 (db) has no connection to atelier-review-tmp_default")
+        );
+    }
+
+    #[test]
+    fn a_half_attached_network_fails_the_checkup_with_the_restart_docker_remedy() {
+        let c = network_verdict(
+            Some(vec![(
+                "atelier-review-tmp_default".into(),
+                "atelier-review-tmp-db-1".into(),
+            )]),
+            Some(Vec::new()),
+        );
+        assert_eq!(c.severity, Severity::Fail);
+        assert_eq!(
+            c.fix,
+            Some(Repair::RestartDocker),
+            "repaired by a restart, asked first"
+        );
+        assert_eq!(c.remedy.as_deref(), Some(crate::boot::NETWORK_STUCK));
+        assert_eq!(
+            c.detail.as_deref(),
+            Some("atelier-review-tmp-db-1 is half attached to atelier-review-tmp_default")
+        );
+        assert_eq!(
+            network_verdict(Some(Vec::new()), Some(Vec::new())).severity,
+            Severity::Ok
+        );
+        assert_eq!(network_verdict(None, None).severity, Severity::Skipped);
+    }
 
     #[test]
     fn default_db_password_warns_without_a_fix() {
@@ -1642,6 +2178,46 @@ mod tests {
     }
 
     #[test]
+    fn an_unwritable_backups_folder_warns_with_the_way_forward() {
+        assert_eq!(backups_verdict(Ok(())).severity, Severity::Ok);
+        let c = backups_verdict(Err(ops::BackupsNotWritable {
+            dir: "/sites/x/backups".into(),
+        }));
+        assert_eq!(c.severity, Severity::Warn);
+        assert_eq!(
+            c.remedy.as_deref(),
+            Some(
+                "Atelier can't save backups in /sites/x/backups: it isn't writable. Fix the \
+                 folder's permissions (or free it up), then try again."
+            )
+        );
+        assert_eq!(c.fix, None);
+    }
+
+    #[test]
+    fn a_stopped_container_is_found_and_only_no_container_reads_as_missing() {
+        // `compose ps -a -q app`, verbatim: a stopped site lists its exited
+        // container (the zoo's stopped site read "isn't there" without `-a`);
+        // a service with no container prints nothing at all.
+        let stopped = "3f0c1a9e2b7d4c58a6e1f0b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a\n";
+        assert_eq!(
+            first_container(stopped).as_deref(),
+            Some("3f0c1a9e2b7d4c58a6e1f0b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e4f5a")
+        );
+        assert_eq!(first_container(""), None);
+        assert_eq!(first_container("\n"), None);
+        // A stopped one is then inspected and told to start, not "isn't there".
+        let c = stopped_container("stack.app", "Appliance container running", "exited", None);
+        assert!(
+            c.remedy
+                .as_deref()
+                .is_some_and(|r| r.contains("isn't running")),
+            "{c:?}"
+        );
+        assert_eq!(c.fix, Some(Repair::StartContainers));
+    }
+
+    #[test]
     fn exited_containers_are_not_running() {
         let s = ContainerState::parse("exited|1|");
         assert!(!s.running);
@@ -1705,17 +2281,32 @@ mod tests {
     }
 
     #[test]
-    fn df_available_column_is_the_fourth() {
-        // Verbatim `df -Pk /` on macOS 15.
-        let out = "Filesystem 1024-blocks      Used Available Capacity  Mounted on\n\
-                   /dev/disk3s1s1 971350180 10485760 123456789    8%    /\n";
-        assert_eq!(parse_df_available_kb(out), Some(123_456_789));
-    }
-
-    #[test]
-    fn df_garbage_is_not_a_number() {
-        assert_eq!(parse_df_available_kb(""), None);
-        assert_eq!(parse_df_available_kb("Filesystem 1024-blocks\n"), None);
+    fn disk_space_warns_below_five_and_fails_below_two() {
+        use crate::disk::{Free, Place, BLOCK_BELOW, WARN_BELOW};
+        let free = |bytes| {
+            Some(Free {
+                place: Place::Docker,
+                bytes,
+            })
+        };
+        let unknown = || "unknown".to_string();
+        let ok = disk_verdict("host.docker_disk", "x", free(WARN_BELOW), unknown);
+        assert_eq!(ok.severity, Severity::Ok);
+        assert_eq!(ok.detail.as_deref(), Some("5.0 GB free"));
+        let low = disk_verdict("host.docker_disk", "x", free(WARN_BELOW - 1), unknown);
+        assert_eq!(low.severity, Severity::Warn);
+        assert!(low.remedy.unwrap().contains("below 2.0 GB it is refused"));
+        let too_low = disk_verdict("host.docker_disk", "x", free(BLOCK_BELOW - 1), unknown);
+        assert_eq!(too_low.severity, Severity::Fail);
+        let remedy = too_low.remedy.unwrap();
+        assert!(
+            remedy.contains("updates are refused below 2.0 GB")
+                && remedy.contains("Free up space (System → Disk space"),
+            "{remedy}"
+        );
+        let skipped = disk_verdict("host.docker_disk", "x", None, unknown);
+        assert_eq!(skipped.severity, Severity::Skipped);
+        assert_eq!(skipped.detail.as_deref(), Some("unknown"));
     }
 
     #[test]
@@ -1800,5 +2391,34 @@ mod tests {
         // "it's broken" with nothing to do about it.
         let bad = Check::bad("x", Tier::Site, "x", Severity::Fail, "do the thing");
         assert!(bad.remedy.is_some());
+    }
+
+    #[test]
+    fn a_resting_site_is_fine_and_a_locked_one_is_not_started() {
+        // `docker inspect --format {{.State.Status}}` of a rested app container.
+        let resting = stopped_container(
+            "stack.app",
+            "Appliance container running",
+            "exited",
+            Some("resting"),
+        );
+        assert_eq!(resting.severity, Severity::Ok);
+        assert!(resting.fix.is_none());
+
+        let locked = stopped_container(
+            "stack.app",
+            "Appliance container running",
+            "exited",
+            Some("locked"),
+        );
+        assert_eq!(locked.severity, Severity::Warn);
+        assert!(locked.fix.is_none(), "doctor must not start a locked site");
+
+        for state in [None, Some("awake"), Some("stopped")] {
+            let down =
+                stopped_container("stack.app", "Appliance container running", "exited", state);
+            assert_eq!(down.severity, Severity::Fail);
+            assert_eq!(down.fix, Some(Repair::StartContainers));
+        }
     }
 }

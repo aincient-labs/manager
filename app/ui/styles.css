@@ -705,6 +705,43 @@ main {
 .help-line {
   font-size: 14px;
 }
+
+/* Home's quiet status lines under the hero: where updates stand, and a start
+   or update that didn't finish. A text button keeps the next step in the line. */
+.hero .update-line,
+.hero .home-notice {
+  margin-top: 12px;
+}
+.hero .home-notice + .update-line {
+  margin-top: 4px;
+}
+#starting-slow {
+  margin-top: 12px;
+  padding-top: 0;
+  gap: 16px;
+}
+.text-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--text-2);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+.text-btn:not(:disabled):hover {
+  color: var(--text);
+  text-decoration-color: currentColor;
+}
+.text-btn:disabled {
+  color: var(--text-faint);
+  text-decoration: none;
+  cursor: default;
+}
 .quiet-row + .help-line {
   margin-top: -12px;
 }
@@ -1311,6 +1348,11 @@ select {
   font-family: var(--font-mono);
   font-weight: 600;
 }
+.confirm-checks {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
 #confirm-msg {
   white-space: pre-line;
 }
@@ -1528,6 +1570,10 @@ select {
   margin-top: 7px;
   background: var(--danger);
 }
+.error .docker-slot {
+  flex: none;
+  color: var(--text-2);
+}
 .error .x {
   margin-left: auto;
   border: 0;
@@ -1558,4 +1604,41 @@ select {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* ------------------------------------------------------ restart docker ---- */
+
+/* The Restart button (or, for a runtime the Manager can't restart, the steps
+   and a Copy button) next to a failure whose way out is restarting Docker. */
+.docker-slot {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.home-notice .docker-slot,
+.doctor-remedy .docker-slot {
+  margin-left: 8px;
+}
+.progress-docker {
+  display: flex;
+  margin-top: 12px;
+}
+/* An update refused because the site isn't ready: one row per reason, its
+   button (or the Docker slot) under the words. */
+.progress-blockers {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 12px;
+}
+.progress-blockers li {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  color: var(--text-2);
+}
+.docker-slot .docker-manual {
+  color: var(--text-2);
 }

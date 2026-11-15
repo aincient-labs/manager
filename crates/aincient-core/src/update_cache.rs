@@ -125,8 +125,11 @@ pub fn write(stack: &Stack, cached: &CachedUpdate) -> std::io::Result<()> {
         .home
         .join(format!(".{UPDATE_CACHE_FILE}.{}.tmp", std::process::id()));
     let body = serde_json::to_vec_pretty(cached).map_err(std::io::Error::other)?;
+    // scenario: none — the update-check cache write; no scenario runs check_update
     std::fs::write(&tmp, body)?;
+    // scenario: none — the update-check cache write; no scenario runs check_update
     std::fs::rename(&tmp, &path).inspect_err(|_| {
+        // scenario: none — the update-check cache write; no scenario runs check_update
         let _ = std::fs::remove_file(&tmp);
     })
 }
@@ -134,6 +137,7 @@ pub fn write(stack: &Stack, cached: &CachedUpdate) -> std::io::Result<()> {
 /// Forget the cached check (just the one file — never anything else in the stack
 /// directory). Called after every successful image pull.
 pub fn invalidate(stack: &Stack) {
+    // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
     let _ = std::fs::remove_file(cache_path(stack));
 }
 
@@ -315,6 +319,7 @@ mod tests {
                 .then(|| "You're offline — couldn't reach the registry.".into()),
             plan: None,
             offline: update_available.is_none(),
+            unfinished: false,
         }
     }
 

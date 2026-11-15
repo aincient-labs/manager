@@ -25,6 +25,15 @@ let managerVersion = ""; // this app's own version, shown in the chrome
 let siteRows = []; // list_sites rows, for the header switcher
 let selectedSlug = null; // the site this window operates on (registry slug)
 let startingRecheck = null; // timer that re-reads status while "Starting up…"
+let startingSince = null; // when this "Starting up…" began (ms), for the slow note
+// The last start/update in words when it didn't finish (or finished without
+// the site answering) — one Home line until the next successful one. In memory.
+let homeNotice = null;
+// Which program runs Docker here (docker_runtime: name, can_restart,
+// manual_steps, copy, others, stops) — for the Restart button's label, or the
+// steps when the Manager can't restart it. Asked when a failure first offers it.
+let dockerRt = null;
+let dockerRtAsked = false;
 // Sites on a server (M2): what each one's server last said (probe_site /
 // get_status), by slug — {state: running|frozen|stopped|unreachable, …}.
 const remoteStates = {};
@@ -65,8 +74,10 @@ function showTab(tab) {
   if (tab === "settings") loadSettings();
 }
 
-function showError(msg) {
+// `opts.dockerRestart`: the way out is restarting Docker — the banner offers it.
+function showError(msg, opts = {}) {
   $("error-text").textContent = msg;
+  showDockerSlot($("error-docker"), !!opts.dockerRestart);
   $("error").classList.remove("hidden");
 }
 
@@ -82,6 +93,8 @@ function confirmModal(msg, opts = {}) {
   return new Promise((resolve) => {
     const requireText = opts.requireText || null;
     const yes = $("confirm-yes");
+    // { yes } names the confirm button ("Restart").
+    yes.textContent = opts.yes || "Confirm";
     const input = $("confirm-input");
     if (opts.title) $("confirm-site").classList.add("hidden");
     else showSiteLine($("confirm-site"));
@@ -89,6 +102,21 @@ function confirmModal(msg, opts = {}) {
     $("confirm-title").classList.toggle("hidden", !opts.title);
     $("confirm-msg").textContent = msg || "";
     $("confirm-lead").textContent = opts.lead || "";
+    // { checks: ["label", …] } adds unticked checkboxes under the message; what
+    // was ticked comes back in opts.checked (one boolean each).
+    const checks = $("confirm-checks");
+    checks.innerHTML = "";
+    for (const text of opts.checks || []) {
+      const label = document.createElement("label");
+      label.className = "check";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      const span = document.createElement("span");
+      span.textContent = text;
+      label.append(box, span);
+      checks.append(label);
+    }
+    checks.classList.toggle("hidden", !(opts.checks && opts.checks.length));
     if (requireText) {
       $("confirm-word").textContent = requireText;
       input.value = "";
@@ -106,7 +134,9 @@ function confirmModal(msg, opts = {}) {
     $("confirm").classList.remove("hidden");
     if (requireText) setTimeout(() => input.focus(), 0);
     const done = (val) => {
+      opts.checked = [...checks.querySelectorAll("input")].map((b) => val && b.checked);
       $("confirm").classList.add("hidden");
+      yes.textContent = "Confirm";
       yes.onclick = null;
       $("confirm-no").onclick = null;
       input.oninput = null;
@@ -148,9 +178,10 @@ async function confirmChange(question, detail, opts = {}) {
       requireText: slug,
       exact: true,
       lead: `${label} is live ${place}. `,
+      yes: opts.yes,
     });
   }
-  return confirmModal(detail, { title, requireText: opts.requireText || null });
+  return confirmModal(detail, { title, requireText: opts.requireText || null, yes: opts.yes });
 }
 
 // Another site's backup (m2-6, D-04): name both, and make "Restore anyway" a
@@ -193,7 +224,23 @@ async function restoreFlow(path, what) {
     `Restoring replaces the current pages, images, and settings with this ${what}.` +
     (note ? `\n\n${note}` : "");
   if (!(await confirmChange("Restore {site}?", detail, { always: true }))) return;
-  return runProgressOp("Restoring your backup", () => invoke("do_restore", { path, otherSite }));
+  const restore = (noSafetyBackup) =>
+    runProgressOp("Restoring your backup", () =>
+      invoke("do_restore", { path, otherSite, noSafetyBackup })
+    );
+  if (await restore(false)) return true;
+  // The copy of the site as it is now failed (a full disk, a damaged database):
+  // nothing was restored. The way past it costs that copy, so it is asked.
+  if (!(lastOpOutcome && lastOpOutcome.safety_backup_failed)) return false;
+  const go = await confirmChange(
+    "Restore {site} without a safety copy?",
+    "Atelier couldn't save a copy of your site as it is now, so nothing was restored.\n\n" +
+      "Restoring without that copy replaces your current pages, images, and settings for " +
+      "good: they can't be brought back afterwards.",
+    { always: true, yes: "Restore without a copy" }
+  );
+  if (!go) return false;
+  return restore(true);
 }
 
 // --- progress panel (DECISIONS 0515) ---------------------------------------
@@ -263,6 +310,7 @@ function progressReset(title) {
   pm.entered = [];
   pm.current = -1;
   pm.log = [];
+  pm.tidied = null;
   $("progress-title").textContent = title;
   $("progress-stage").textContent = pm.stageText;
   $("progress-stage").classList.remove("failed");
@@ -270,6 +318,9 @@ function progressReset(title) {
   setDetails(false);
   $("progress-copy").classList.add("hidden");
   $("progress-close").classList.add("hidden");
+  showDockerSlot($("progress-docker"), false);
+  showBlockers(null);
+  pm.afterClose = null;
   resetPull();
   buildBusy();
 }
@@ -654,6 +705,9 @@ function progressUpdate(p) {
   }
   if (p.kind === "log") {
     if (p.message.trim()) appendLog(p.message, logClass(p.message));
+    // The after-update clean-up's one line ("Removed N old download(s), …"):
+    // the finished panel says it, not only the Details log.
+    if (/^Removed \d+ old download/.test(p.message)) pm.tidied = p.message.trim();
     return;
   }
   pm.stageText = p.message;
@@ -670,7 +724,9 @@ function progressUpdate(p) {
 
 // Keep the panel open on the step that broke: brick block, the error in the
 // stage line, the log open, and a report to copy. Resolves on Close / Escape.
-function progressFail(message) {
+// `dockerRestart`: the way out is restarting Docker — the panel offers it.
+function progressFail(message, dockerRestart = false) {
+  showDockerSlot($("progress-docker"), dockerRestart);
   pm.failed = true;
   pm.error = message;
   pm.failedAt = Date.now();
@@ -699,6 +755,47 @@ function progressFail(message) {
     $("progress-close").onclick = done;
     document.addEventListener("keydown", onKey);
   });
+}
+
+// An update refused because the site isn't ready (gate.rs): each reason in its
+// own words, with the button for its way forward when the app has one. The
+// actions are the window's own; a Restart Docker reason gets the Docker slot
+// (the button, or the steps for a runtime the Manager can't restart).
+const BLOCKER_BUTTONS = {
+  "free-space-open": "Free up space",
+  "backups-open": "Open Backups",
+  "startstop-from-publish": "Start your site",
+  "checkup-now": "Run a checkup",
+  "engine-unlock": "Unlock",
+};
+
+function showBlockers(blockers) {
+  const list = $("progress-blockers");
+  list.textContent = "";
+  list.classList.toggle("hidden", !(blockers && blockers.length));
+  if (!blockers) return;
+  for (const b of blockers) {
+    const li = document.createElement("li");
+    const text = document.createElement("span");
+    text.textContent = b.text;
+    li.append(text);
+    if (b.action === "restart-docker") {
+      const slot = document.createElement("span");
+      slot.className = "docker-slot";
+      slot.dataset.dockerSlot = "button";
+      li.append(slot);
+      showDockerSlot(slot, true);
+    } else if (BLOCKER_BUTTONS[b.action]) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn small";
+      btn.dataset.action = "blocker";
+      btn.dataset.next = b.action;
+      btn.textContent = BLOCKER_BUTTONS[b.action];
+      li.append(btn);
+    }
+    list.append(li);
+  }
 }
 
 function fmtSecs(ms) {
@@ -745,45 +842,231 @@ $("progress-copy").addEventListener("click", () => copyText(progressReport(), $(
 // released (progressReset), and its runProgressOp then resumes while the new one
 // is running: it must not hide the panel or stop the new op's render loop.
 let progressOwner = 0;
+// The last op's answer object ({state, reason, …}), so a flow can offer what
+// its failure allows (safety_backup_failed, backup_failed); null when the op
+// answered with anything else.
+let lastOpOutcome = null;
 
-async function runProgressOp(title, fn) {
+// `opts.lifecycle` names a start-or-update kind of op ("start" | "update" |
+// "setup"; "repair" and "clear" only clear): its failure leaves a line on Home, its
+// success clears it, and a result of `false` (the site didn't answer before
+// the wait ran out) is said as "not yet", not success.
+const NOT_READY_TEXT =
+  "Atelier started, but your site hasn't answered yet. It may still be finishing — " +
+  "if it doesn't come up in a few minutes, run a checkup.";
+const DIDNT_FINISH = {
+  start: "Your website didn't finish starting last time.",
+  update: "The last update didn't finish.",
+  setup: "The last setup didn't finish.",
+};
+
+// While the progress panel is up the page behind it is inert: Enter on a
+// focused button there must not start a second operation (the panel is a modal
+// in markup only; focus could still sit on a control underneath).
+function setProgressOpen(open) {
+  for (const el of document.querySelectorAll(".topbar, .shell")) el.inert = open;
+  $("progress").classList.toggle("hidden", !open);
+  if (open) {
+    const panel = document.querySelector("#progress .progress-panel");
+    panel.tabIndex = -1;
+    panel.focus({ preventScroll: true });
+  }
+}
+
+const ALREADY_CURRENT_TEXT = "Already up to date. Nothing was downloaded or restarted.";
+// The same build, but its settings (.env, compose.yaml) had changed: the
+// containers were made again on it, nothing was backed up.
+const SETTINGS_APPLIED_TEXT = "Already up to date. Applied your changed settings.";
+
+async function runProgressOp(title, fn, opts = {}) {
   const me = ++progressOwner;
   // A new attempt supersedes the previous failure — leaving the old banner up
   // makes a retry that succeeds look like it failed.
   hideError();
   progressReset(title);
-  $("progress").classList.remove("hidden");
+  setProgressOpen(true);
   startMatrixLoop();
   const unlisten = await listen("op-progress", (e) => progressUpdate(e.payload));
   let failure = null;
+  let dockerRestart = false;
+  let result;
+  lastOpOutcome = null;
   try {
-    await fn();
+    result = await fn();
   } catch (e) {
     failure = String(e);
   }
+  if (result && typeof result === "object" && typeof result.state === "string") {
+    lastOpOutcome = result;
+  }
+  // A start, setup or update says how it came out: {state: ready|booting|failed,
+  // reason}. Failed gets the failure panel (Close / Copy / Details) with its
+  // reason; booting is the "not answering yet" notice, already past the point
+  // where "a few seconds" would be true; current is an update that found the
+  // site already on the newest build (nothing downloaded, backed up or restarted),
+  // or on it with changed settings it then applied (state "settings").
+  let current = null;
+  if (result && typeof result === "object" && typeof result.state === "string") {
+    if (result.state === "current") current = ALREADY_CURRENT_TEXT;
+    else if (result.state === "settings") current = SETTINGS_APPLIED_TEXT;
+    if (result.state === "failed") {
+      failure = result.reason || "Your website couldn't finish starting.";
+      // The core marked it (a typed error, not this text): restarting Docker
+      // is the way out, so every place showing it offers the button.
+      dockerRestart = !!result.docker_restart;
+      if (result.blockers) {
+        showBlockers(result.blockers);
+        // The banner left after Close keeps every reason; the panel lists them.
+        failure = [failure, ...result.blockers.map((b) => b.text)].join(" ");
+      }
+    } else if (result.state === "booting") {
+      result = false;
+      startingSince = Date.now() - STARTING_SLOW_MS;
+    } else {
+      result = true;
+    }
+  }
   try {
     if (failure !== null) {
-      await progressFail(failure);
+      // A busy site (another operation holds it, oplock.rs) attempted
+      // nothing: no "didn't finish" line, the panel says to wait.
+      if (DIDNT_FINISH[opts.lifecycle] && !(lastOpOutcome && lastOpOutcome.site_busy)) {
+        setHomeNotice(DIDNT_FINISH[opts.lifecycle], { dockerRestart });
+      }
+      await progressFail(failure, dockerRestart);
+      // Close means closed, now: the refresh below asks Docker about the site
+      // and can take seconds, and a panel left open over it (its Close already
+      // spent) read as "Close needs two clicks". The `finally` below still runs
+      // pm.afterClose once the refresh is done.
+      if (progressOwner === me) {
+        cancelAnimationFrame(pm.raf);
+        setProgressOpen(false);
+      }
       // Closing the panel must not erase the failure: the banner stays until the
       // next action (unless a newer op already took over the screen).
-      if (progressOwner === me) showError(failure);
+      if (progressOwner === me) showError(failure, { dockerRestart });
+      // The failed op may have left the site somewhere new (stopped, half
+      // updated): show where it is now, not where it was. When a panel button
+      // (Restart Docker, a blocker's way forward) closed it, that action runs
+      // straight away from the `finally` below and refreshes when it's done, so
+      // this one runs in the background rather than holding the button for it.
+      if (pm.afterClose) {
+        refresh().catch(() => {});
+      } else {
+        try {
+          await refresh();
+        } catch {
+          /* the failure above is the message that matters */
+        }
+      }
       return false;
     }
+    if (opts.lifecycle) setHomeNotice(result === false ? NOT_READY_TEXT : null);
     const settled = progressFinish();
+    if (opts.lifecycle && result === false) $("progress-stage").textContent = NOT_READY_TEXT;
+    else if (current) $("progress-stage").textContent = current;
+    else if (pm.tidied) $("progress-stage").textContent = `Done. ${pm.tidied}`;
     try {
       await refresh();
     } catch (e) {
       showError(String(e));
     }
     await settled; // let the blocks finish their run before the panel closes
+    // Long enough to read the clean-up line before the panel goes.
+    if ((current || pm.tidied) && result !== false) await new Promise((r) => setTimeout(r, 2500));
+    // An update, setup or channel switch changes what "up to date" means: ask
+    // again rather than leave the line on a stale or empty answer.
+    if (opts.lifecycle === "update" || opts.lifecycle === "setup") backgroundUpdateRefresh(false);
     return true;
   } finally {
     unlisten();
     if (progressOwner === me) {
       cancelAnimationFrame(pm.raf);
-      $("progress").classList.add("hidden");
+      setProgressOpen(false);
+      // The failure panel's Restart button closed it: run that once it's gone.
+      const next = pm.afterClose;
+      pm.afterClose = null;
+      if (next) setTimeout(next, 0);
     }
   }
+}
+
+// --- restart Docker ---------------------------------------------------------
+// Several failures end with "Restart Docker" (a half-attached network, a start
+// still stuck after clearing Docker's leftovers, Docker not answering). The core
+// marks them (docker_restart on the answer); each place that shows one carries a
+// slot ([data-docker-slot]) for the button, or — for a runtime the Manager can't
+// restart (Docker Engine on Linux) — the steps and a Copy button.
+
+function dockerSlotHtml(kind) {
+  const name = dockerRt ? dockerRt.name : "Docker";
+  if (dockerRt && !dockerRt.can_restart) {
+    let html = `<span class="docker-manual">${esc(dockerRt.manual_steps || "")}</span>`;
+    if (dockerRt.copy) {
+      html +=
+        `<button type="button" class="btn ghost small" data-action="copy-docker-cmd">` +
+        `<svg class="ic" aria-hidden="true"><use href="#i-copy" /></svg><span>Copy the command</span></button>`;
+    }
+    return html;
+  }
+  if (kind === "text") {
+    return `<button type="button" class="text-btn" data-action="restart-docker">Restart ${esc(name)}</button>`;
+  }
+  return (
+    `<button type="button" class="btn small" data-action="restart-docker">` +
+    `<svg class="ic" aria-hidden="true"><use href="#i-refresh" /></svg><span>Restart ${esc(name)}</span></button>`
+  );
+}
+
+// Fill every slot with the button (or the steps) for what we know so far.
+function fillDockerSlots() {
+  for (const el of document.querySelectorAll("[data-docker-slot]")) {
+    el.innerHTML = dockerSlotHtml(el.dataset.dockerSlot);
+  }
+}
+
+// Show (or hide) one slot; the first one shown asks which runtime this is, so
+// the button can name it ("Restart OrbStack").
+function showDockerSlot(el, on) {
+  el.classList.toggle("hidden", !on);
+  if (!on) return;
+  el.innerHTML = dockerSlotHtml(el.dataset.dockerSlot);
+  if (dockerRtAsked) return;
+  dockerRtAsked = true;
+  invoke("docker_runtime")
+    .then((info) => {
+      dockerRt = info;
+      fillDockerSlots();
+    })
+    .catch(() => {
+      dockerRtAsked = false; // ask again next time; the plain label stands
+    });
+}
+
+// The button: ask afresh (what else is running changes), confirm naming it,
+// then restart and start the site again in the progress panel.
+async function restartDockerFlow() {
+  let info;
+  document.body.classList.add("busy");
+  try {
+    info = await invoke("docker_runtime");
+  } catch (e) {
+    return showError(String(e));
+  } finally {
+    document.body.classList.remove("busy");
+  }
+  dockerRt = info;
+  dockerRtAsked = true;
+  fillDockerSlots();
+  if (!info.can_restart) return; // the slots now show the steps instead
+  const ok = await confirmModal(info.stops, {
+    title: `Restart ${info.name}?`,
+    yes: "Restart",
+  });
+  if (!ok) return;
+  await runProgressOp(`Restarting ${info.name}`, () => invoke("do_restart_docker"), {
+    lifecycle: "start",
+  });
 }
 
 // --- status -----------------------------------------------------------------
@@ -1020,6 +1303,14 @@ function resetSiteUi() {
   $("publish-result").classList.add("hidden");
   $("update-status").classList.add("hidden");
   $("update-banner").classList.add("hidden");
+  $("update-line").classList.add("hidden");
+  lastCachedUpdate = null;
+  updateCheckProblem = null;
+  updateAttempted = false;
+  updateChecks = 0;
+  siteGen++;
+  startingSince = null;
+  setHomeNotice(null);
   $("doctor-summary").classList.add("hidden");
   $("doctor-results").classList.add("hidden");
   $("doctor-fix").classList.add("hidden");
@@ -1338,6 +1629,22 @@ function renderStatus(status) {
   urlLink.classList.toggle("hidden", !status.reachable || !url);
   const place = sitePlace(currentSite());
 
+  // "Starting up…" is timed from when it began; any other state ends it.
+  const starting = status.running && !status.reachable;
+  if (!starting) startingSince = null;
+  else if (startingSince === null) startingSince = Date.now();
+  const slow = starting && Date.now() - startingSince >= STARTING_SLOW_MS;
+  $("starting-slow").classList.toggle("hidden", !slow);
+  // A site that answers settles any "not answering yet" line.
+  // ...and so does a start that failed once the site is up again; a "still
+  // starting" line is wrong the moment nothing is running.
+  if (status.running && status.reachable && (homeNotice === NOT_READY_TEXT || homeNotice === DIDNT_FINISH.start)) {
+    setHomeNotice(null);
+  } else if (!status.running && homeNotice === NOT_READY_TEXT) {
+    setHomeNotice(null);
+  }
+  syncCheckupButtons();
+
   if (status.running && status.reachable) {
     dot.className = "dot up";
     headline.textContent = "Your website is running";
@@ -1364,7 +1671,9 @@ function renderStatus(status) {
     }
     dot.className = "dot warn"; // waiting = ochre (0501), not yet running
     headline.textContent = "Starting up…";
-    sub.textContent = "Almost there — this usually takes a few seconds.";
+    sub.textContent = slow
+      ? "This is taking longer than usual."
+      : "Almost there — this usually takes a few seconds.";
     primary.disabled = true;
     primary.dataset.action = "edit";
     primaryIcon.setAttribute("href", "#i-open");
@@ -1401,26 +1710,231 @@ function renderStatus(status) {
 
   // Keep any open panels honest about the new state.
   if (currentTab === "publish") updatePublishGate();
+  if (currentTab === "backups") updateBackupsGate();
   if (currentTab === "settings") {
     $("image-tag").textContent = applianceName(status);
     renderChannel();
   }
 }
 
-// Show/hide the Home update banner from a cache status ({fresh, checked_at,
-// check}) or null (never checked) — hidden unless the check says yes.
+// How long "Starting up…" may last before Home says so and offers a way on.
+const STARTING_SLOW_MS = 3 * 60 * 1000;
+
+// The Home line about the last start or update (null clears it).
+function setHomeNotice(text, opts = {}) {
+  homeNotice = text || null;
+  $("home-notice-text").textContent = homeNotice || "";
+  $("home-notice").classList.toggle("hidden", !homeNotice);
+  showDockerSlot($("home-notice-docker"), !!(homeNotice && opts.dockerRestart));
+  syncCheckupButtons();
+}
+
+// One "Run a checkup" at a time: the slow-start row has its own, so the notice
+// under it drops its button while both are up.
+function syncCheckupButtons() {
+  $("home-notice-checkup").classList.toggle("hidden", !$("starting-slow").classList.contains("hidden"));
+}
+
+// "just now", "12 minutes ago", "3 hours ago", "yesterday", "on 12 Nov 2026".
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function fmtDay(d) {
+  return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function timeAgo(unixSecs) {
+  const then = new Date(unixSecs * 1000);
+  const mins = Math.floor(Math.max(0, Date.now() - then.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins === 1 ? "1 minute ago" : `${mins} minutes ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours === 1 ? "1 hour ago" : `${hours} hours ago`;
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (then.toDateString() === yesterday.toDateString()) return "yesterday";
+  return `on ${fmtDay(then)}`;
+}
+
+// The update answer Home last painted from: the cache status ({fresh,
+// checked_at, check}) or null (never checked). Kept so the "checked … ago"
+// words can be repainted every minute without asking anything.
+let lastCachedUpdate = null;
+// Checks in flight for the open site (a count: Check now can overlap the
+// background poll, and the first to finish must not say "done" for both).
+let updateChecks = 0;
+// Bumped when the open site changes, so a slow check for the previous site
+// can't paint its answer onto this one.
+let siteGen = 0;
+let updateAttempted = false; // a check has run for this site since it was opened
+// A live check that couldn't answer ({text, since: checked_at it saw}). The
+// cache keeps an older conclusive answer, so this says what the attempt found
+// until a newer answer lands.
+let updateCheckProblem = null;
+
+// Release tags are `v<semver>`; the image label may or may not carry the `v`.
+// Only a plain X.Y.Z names a tag (build metadata after `+` is cut); anything
+// else ("edge", a digest, a prerelease) links the releases list instead of a 404.
+const RELEASES_URL = "https://github.com/aincient-labs/atelier-cms/releases";
+const releaseNotesUrl = (version) => {
+  const v = String(version).split("+")[0].replace(/^v/, "");
+  return /^\d+\.\d+\.\d+$/.test(v) ? `${RELEASES_URL}/tag/v${v}` : RELEASES_URL;
+};
+
+// Paint Home's update banner and line, and the System tab's "Last checked",
+// from a cache status. Nothing shows for a site on a server: its check is the
+// server's own (the cache is always null there).
 function renderUpdateBanner(cached) {
-  $("update-banner").classList.toggle("hidden", !(cached && cached.check.update_available === true));
+  lastCachedUpdate = cached || null;
+  const row = currentSite();
+  const remote = !!(row && row.host);
+  const check = cached && cached.check;
+  if (updateCheckProblem && cached && cached.checked_at > updateCheckProblem.since) {
+    updateCheckProblem = null;
+  }
+  const available = !remote && !!check && check.update_available === true;
+  $("update-banner").classList.toggle("hidden", !available);
+
+  const ago = cached ? `checked ${timeAgo(cached.checked_at)}` : "";
+  $("update-last-checked").textContent = cached
+    ? `Last checked ${timeAgo(cached.checked_at)}.`
+    : "It hasn't checked yet.";
+
+  if (available) {
+    // A stepped update that stopped at a waypoint: continue it, not "a new version".
+    const unfinished = !!check.unfinished;
+    $("update-banner-title").textContent = unfinished
+      ? "An update didn't finish."
+      : "A new version of Atelier is ready.";
+    $("update-banner-sub").textContent = unfinished
+      ? "Your site is safe on the version it reached. Continue to finish the update."
+      : "Updating keeps all your pages and settings.";
+    $("update-banner-action").textContent = unfinished ? "Continue update" : "Update";
+    const parts = [];
+    if (check.current_version && check.latest_version) {
+      parts.push(esc(`${check.current_version} → ${check.latest_version}`));
+    }
+    parts.push(esc(ago));
+    if (check.latest_version) {
+      const url = releaseNotesUrl(check.latest_version);
+      parts.push(`<a href="${esc(url)}">What's new</a>`);
+    }
+    setHtml($("update-banner-meta"), parts.join(" · "));
+  }
+
+  const line = $("update-line");
+  if (remote || available) {
+    line.classList.add("hidden");
+    return;
+  }
+  // Text and button are updated in place (never rebuilt), so the 60 s repaint
+  // can't drop focus from "Check now".
+  let text;
+  let label = null; // the button's label, or null for none
+  let title = "";
+  if (updateCheckProblem || (check && check.update_available !== false && check.update_available !== true)) {
+    const why = (updateCheckProblem && updateCheckProblem.text) || (check && check.problem) || "try again later";
+    text = `Couldn't check for updates: ${shortProblem(why)}`;
+    title = why;
+    label = "Try again";
+  } else if (check && check.update_available === false) {
+    const v = check.current_version ? ` (${check.current_version})` : "";
+    text = `Up to date${v} · ${ago}`;
+    label = "Check now";
+  } else if (updateChecks > 0 || !updateAttempted) {
+    text = "Checking for updates…";
+  } else {
+    // Nothing cached and nothing running: not a failure, just not asked yet
+    // (a fresh site, or one changed by an update or setup).
+    text = "Not checked since the last change";
+    label = "Check now";
+  }
+  const parts = updateLineParts(line);
+  parts.text.textContent = label ? `${text} · ` : text;
+  line.title = title;
+  parts.button.classList.toggle("hidden", !label);
+  if (label) {
+    parts.button.textContent = updateChecks > 0 ? "Checking…" : label;
+    parts.button.disabled = updateChecks > 0;
+  }
+  line.classList.remove("hidden");
+}
+
+// The update line's two stable children (text, button), made on first use.
+function updateLineParts(line) {
+  if (!line.firstElementChild) {
+    const text = document.createElement("span");
+    const button = document.createElement("button");
+    button.className = "text-btn";
+    button.dataset.action = "update-check-now";
+    line.replaceChildren(text, button);
+  }
+  return { text: line.children[0], button: line.children[1] };
+}
+
+// Set innerHTML only when it changed, so a repaint doesn't replace a focused link.
+function setHtml(el, html) {
+  if (el.dataset.html !== html) {
+    el.innerHTML = html;
+    el.dataset.html = html;
+  }
+}
+
+// Registry and Docker trouble in one short sentence; the full text stays in the
+// line's title. Anything else is shown as it came.
+function shortProblem(why) {
+  const w = String(why);
+  if (/docker|buildx/i.test(w)) return "Docker isn't ready.";
+  if (/offline|registry|reach|resolve|timed? ?out|network/i.test(w)) return "couldn't reach the update server.";
+  return w;
 }
 
 // Paint the banner from the on-disk cache — a file read, never the network.
 async function refreshUpdate() {
+  const gen = siteGen;
   try {
-    renderUpdateBanner(await invoke("get_cached_update"));
+    const cached = await invoke("get_cached_update");
+    if (gen === siteGen) renderUpdateBanner(cached);
   } catch {
+    if (gen !== siteGen) return;
     $("update-banner").classList.add("hidden");
+    $("update-line").classList.add("hidden");
   }
 }
+
+// A live check (Check now / Try again, and the System tab's button): asks the
+// registry, records what this attempt found, then repaints from the cache.
+// Returns the check, or throws what went wrong.
+async function liveUpdateCheck() {
+  const since = lastCachedUpdate ? lastCachedUpdate.checked_at : 0;
+  const gen = siteGen;
+  updateChecks++;
+  renderUpdateBanner(lastCachedUpdate);
+  try {
+    const u = await invoke("get_update");
+    if (gen !== siteGen) return u;
+    const answered = u.update_available === true || u.update_available === false;
+    updateCheckProblem = answered ? null : { text: u.problem || "try again later", since };
+    return u;
+  } catch (e) {
+    if (gen === siteGen) updateCheckProblem = { text: String(e), since };
+    throw e;
+  } finally {
+    if (gen === siteGen) {
+      updateChecks--;
+      updateAttempted = true;
+      await refreshUpdate();
+    }
+  }
+}
+
+// "checked 12 minutes ago" must not go stale while the window sits open.
+setInterval(() => {
+  if (!$("update-line").classList.contains("hidden") || !$("update-banner").classList.contains("hidden")) {
+    renderUpdateBanner(lastCachedUpdate);
+  } else if (lastCachedUpdate) {
+    $("update-last-checked").textContent = `Last checked ${timeAgo(lastCachedUpdate.checked_at)}.`;
+  }
+}, 60 * 1000);
 
 // Background registry checks (manager#6). One forced check shortly after first
 // paint, then a cheap poll: the backend only re-asks the registry once its cache
@@ -1431,10 +1945,27 @@ const UPDATE_POLL_MS = 30 * 60 * 1000;
 let updateRefreshStarted = false;
 
 async function backgroundUpdateRefresh(force) {
+  // Only a call that will ask the registry says "Checking…"; a fresh cache is
+  // a file read and repaints without a flicker.
+  const asks = force || !lastCachedUpdate || !lastCachedUpdate.fresh;
+  const gen = siteGen;
+  if (asks) {
+    updateChecks++;
+    renderUpdateBanner(lastCachedUpdate);
+  }
   try {
-    renderUpdateBanner(await invoke("refresh_update_cache", { force }));
+    const cached = await invoke("refresh_update_cache", { force });
+    if (gen === siteGen) renderUpdateBanner(cached);
   } catch {
     /* offline / no stack / Docker down — the banner simply stays as it was. */
+  } finally {
+    if (gen === siteGen) {
+      updateAttempted = true;
+      if (asks) {
+        updateChecks--;
+        renderUpdateBanner(lastCachedUpdate);
+      }
+    }
   }
 }
 
@@ -1594,17 +2125,76 @@ async function copyText(text, button) {
 
 // --- Backups panel ----------------------------------------------------------
 
+let hasBackups = false; // the list holds at least one backup
+
+// Backing up and restoring both need the site up: offer the start, as Publish
+// does, rather than letting either fail with "isn't running". Saving a copy of
+// an existing backup is only a file copy, so it stays available. A site whose
+// database was removed from Docker can't start (Start refuses and points here),
+// so it may restore while stopped: the restore starts it on an empty database
+// and loads the backup into it.
+const BACKUPS_NEEDS_RUNNING = "Your website needs to be running to make a backup or restore one.";
+
+function updateBackupsGate() {
+  const up = !!(lastStatus && lastStatus.running);
+  // Running isn't answering: a backup of a site still booting fails or is
+  // partial, so Back up now waits. A restore only needs the containers up (it
+  // runs inside them), and a site that runs but errors — broken by a
+  // migration, say — is exactly the one that needs it (review 2026-11-14).
+  const answering = up && !!lastStatus.reachable;
+  const notAnswering = up && !answering;
+  const erased = !up && !!(lastStatus && lastStatus.database_erased);
+  const canRestore = up || erased;
+  $("backups-needs-running").classList.toggle("hidden", answering || erased);
+  $("backups-needs-running-text").textContent = notAnswering
+    ? "Your website isn't answering yet (still starting, or it has a problem), so it can't " +
+      "be backed up until it does. You can restore a backup now."
+    : BACKUPS_NEEDS_RUNNING;
+  document.querySelector('#backups-needs-running [data-action="startstop-from-publish"]').classList.toggle("hidden", notAnswering);
+  $("backups-database-erased").classList.toggle("hidden", !erased);
+  $("backup-now").classList.toggle("hidden", !answering);
+  document.querySelector('[data-action="restore"]').disabled = !(canRestore && hasBackups);
+  $("btn-import").disabled = !canRestore;
+}
+
+// What a backup's file name says it was taken for, in words.
+const BACKUP_LABELS = {
+  "before-update": "Before update",
+  "before-stepped-upgrade": "Before update",
+  "before-restore": "Before restore",
+  "before-channel-switch": "Before switching versions",
+};
+
+// "14 Nov 2026, 10:15 · 12 MB", led by why it was taken when the name says
+// ("Before update · …"). Names are `aincient-[label-]YYYYMMDD-HHMMSS[-N].tar.gz`
+// (the `aincient-` prefix is not part of the label: it read "Aincient before
+// update"); any other file (an imported one) keeps its name so it can still be
+// told apart.
+function backupText(b) {
+  const d = new Date(b.modified_unix * 1000);
+  const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const parts = [`${fmtDay(d)}, ${time}`, fmtBytes(b.size_bytes)];
+  const m = /^(?:aincient-)?(?:(.+?)-)?\d{8}-\d{6}(?:-\d+)?\.(?:tar\.gz|tgz)$/i.exec(b.name);
+  if (!m) parts.push(b.name);
+  else if (m[1]) {
+    const words = m[1].replace(/-/g, " ");
+    parts.unshift(BACKUP_LABELS[m[1]] || words.charAt(0).toUpperCase() + words.slice(1));
+  }
+  return parts.join(" · ");
+}
+
 async function refreshBackups() {
   const select = $("backup-select");
   const empty = $("backups-empty");
-  const restoreBtn = document.querySelector('[data-action="restore"]');
   const exportBtn = $("btn-export");
   const setEnabled = (on) => {
-    restoreBtn.disabled = !on;
+    hasBackups = on;
     exportBtn.disabled = !on;
     empty.classList.toggle("hidden", on);
     select.classList.toggle("hidden", !on);
+    updateBackupsGate();
   };
+  updateBackupsGate();
   try {
     const backups = await invoke("list_backups");
     select.innerHTML = "";
@@ -1615,8 +2205,8 @@ async function refreshBackups() {
     for (const b of backups) {
       const opt = document.createElement("option");
       opt.value = b.path;
-      const mb = (b.size_bytes / 1048576).toFixed(1);
-      opt.textContent = `${b.name}  (${mb} MB)`;
+      opt.textContent = backupText(b);
+      opt.title = b.name;
       select.appendChild(opt);
     }
     setEnabled(true);
@@ -1637,7 +2227,66 @@ function applianceName(st) {
   return st.image || "—";
 }
 
+// System → Disk space (DECISIONS 0527): what Atelier can remove because it can
+// download it again. Machine-wide; refreshed whenever the System tab opens.
+function decimalBytes(n) {
+  const mb = n / 1e6;
+  return mb >= 1000 ? `${(mb / 1000).toFixed(1)} GB` : `${Math.max(1, Math.round(mb))} MB`;
+}
+
+// While a clean-up runs, a refresh (the System tab reopening) must not turn
+// the button back on.
+let cleaning = false;
+// The last list shown, so the confirmation names exactly what will go.
+let cleanupFound = null;
+// Each local site's older automatic backups (taken by a Manager before 0.17,
+// never pruned): offered as unticked items in the confirmation.
+let olderFound = [];
+
+function olderBackupsLabel(o) {
+  const n = o.backups.length;
+  return `${n} older automatic backup${n === 1 ? "" : "s"} of ${o.label}, ${decimalBytes(o.total_bytes)}`;
+}
+
+function cleanupLabel(i) {
+  return i.names[0] || `${i.repo} (old version)`;
+}
+
+async function loadCleanup() {
+  const btn = $("free-space");
+  if (cleaning) return;
+  try {
+    const [r, older] = await Promise.all([
+      invoke("find_cleanup"),
+      invoke("find_older_backups").catch(() => []),
+    ]);
+    if (cleaning) return;
+    cleanupFound = r;
+    olderFound = older || [];
+    $("cleanup-summary").title = "";
+    if (!r) {
+      $("cleanup-summary").textContent = "Docker isn't answering";
+      btn.disabled = true;
+      return;
+    }
+    const n = r.images.length;
+    const olderBytes = olderFound.reduce((sum, o) => sum + o.total_bytes, 0);
+    const parts = [];
+    if (n) parts.push(`${decimalBytes(r.total_bytes)} can be freed (${n} download${n === 1 ? "" : "s"})`);
+    if (olderFound.length) parts.push(`${decimalBytes(olderBytes)} in older backups`);
+    $("cleanup-summary").textContent = parts.length ? parts.join(" · ") : "Nothing to free";
+    btn.disabled = n === 0 && !olderFound.length;
+  } catch (e) {
+    if (cleaning) return;
+    cleanupFound = null;
+    $("cleanup-summary").textContent = "—";
+    $("cleanup-summary").title = String(e);
+    btn.disabled = true;
+  }
+}
+
 function loadSettings() {
+  loadCleanup();
   $("image-tag").textContent = applianceName(lastStatus);
   $("manager-version-row").textContent = managerVersion || "—";
   renderChannel();
@@ -1923,6 +2572,7 @@ async function refreshLogs() {
 }
 
 // --- Troubleshoot (doctor) --------------------------------------------------
+let doctorRunning = false;
 
 // Tier headings, in the order the core reports them: outward-in, from the
 // machine to the site. Plain words — the core's tier ids are the stable handle,
@@ -1965,7 +2615,14 @@ function renderDoctor(report) {
       html += `<span class="doctor-mark" aria-hidden="true">${DOCTOR_MARK[c.severity] || "?"}</span>`;
       html += `<span class="doctor-body"><span class="doctor-label">${esc(c.label)}</span>`;
       if (c.detail) html += `<span class="doctor-detail">${esc(firstLine(c.detail))}</span>`;
-      if (c.remedy) html += `<span class="doctor-remedy">${esc(c.remedy)}</span>`;
+      if (c.remedy) {
+        html += `<span class="doctor-remedy">${esc(c.remedy)}`;
+        // Restarting Docker is the repair: offer it here too, asked first.
+        if (c.fix === "restart_docker" && c.severity === "fail") {
+          html += `<span class="docker-slot" data-docker-slot="text"></span>`;
+        }
+        html += "</span>";
+      }
       html += "</span></li>";
     }
     html += "</ul>";
@@ -1988,6 +2645,8 @@ function renderDoctor(report) {
 
   results.innerHTML = html;
   results.classList.remove("hidden");
+  const slot = results.querySelector("[data-docker-slot]");
+  if (slot) showDockerSlot(slot, true);
 
   if (failures === 0) {
     summary.textContent = warnings
@@ -2059,6 +2718,37 @@ const actions = {
 
   "dismiss-error": () => hideError(),
 
+  // From the failure panel: close it first, then ask (runProgressOp runs
+  // pm.afterClose once the panel is gone).
+  "restart-docker": () => {
+    if (pm.release) {
+      pm.afterClose = restartDockerFlow;
+      pm.release();
+      return;
+    }
+    restartDockerFlow();
+  },
+  "copy-docker-cmd": (el) => copyText(dockerRt && dockerRt.copy, el),
+
+  // A refused update's way forward (showBlockers): close the failure panel,
+  // then run the window's own action for it.
+  blocker: (el) => {
+    const next = actions[el.dataset.next];
+    if (!next) return;
+    if (pm.release) {
+      pm.afterClose = () => next(el);
+      pm.release();
+      return;
+    }
+    next(el);
+  },
+  "free-space-open": () => {
+    showTab("settings");
+    $("free-space").scrollIntoView({ block: "center" });
+    $("free-space").focus({ preventScroll: true });
+  },
+  "backups-open": () => showTab("backups"),
+
   // "Edit my site" — drop the operator into the console signed in. A fresh
   // appliance's admin password is never shown, so a plain /atelier link would
   // access-deny; open_console_authed mints a one-time login link instead.
@@ -2095,7 +2785,9 @@ const actions = {
     // port it was registered on, or a free one.
     const typed = parseInt($("install-port").value, 10) || null;
     const port = typed === installPortDefault ? null : typed;
-    return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }));
+    return runProgressOp("Setting up Atelier", () => invoke("do_install", { image: null, port }), {
+      lifecycle: "setup",
+    });
   },
 
   // A very old site can't always reach the newest release in one move: a release
@@ -2140,7 +2832,23 @@ const actions = {
     }
     // A stepped route always asks; a live site on a server always asks for its slug.
     if (!(await confirmChange("Update {site}?", detail, { always: stepped }))) return;
-    return runProgressOp("Updating Atelier", () => invoke("do_update"));
+    const update = (noBackup) =>
+      runProgressOp("Updating Atelier", () => invoke("do_update", { noBackup }), {
+        lifecycle: "update",
+      });
+    if (await update(false)) return true;
+    // The site couldn't be backed up first (stopped, and it won't start on the
+    // version it runs — often why it is being updated): nothing was updated.
+    if (!(lastOpOutcome && lastOpOutcome.backup_failed)) return false;
+    const go = await confirmChange(
+      "Update {site} without a backup?",
+      "Atelier couldn't back up your site before the update, so it wasn't updated.\n\n" +
+        "Updating without a backup means that if the update goes wrong, your pages, images, " +
+        "and settings as they are now can't be brought back.",
+      { always: true, yes: "Update without a backup" }
+    );
+    if (!go) return false;
+    return update(true);
   },
 
   // Start or stop, decided by the live status rather than a label.
@@ -2169,12 +2877,34 @@ const actions = {
       : engine
         ? "Waking the site"
         : "Starting your website";
-    await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"));
+    await runProgressOp(label, () => invoke(running ? "do_stop" : "do_start"), {
+      lifecycle: running ? "clear" : "start",
+    });
     if (engine) refreshEngine();
   },
 
-  "startstop-from-publish": () =>
-    runProgressOp("Starting your website", () => invoke("do_start")),
+  "startstop-from-publish": async () => {
+    await runProgressOp("Starting your website", () => invoke("do_start"), { lifecycle: "start" });
+  },
+
+  // "Run a checkup" from Home (a slow start, a start or update that didn't
+  // finish): the System tab's checkup, started for you.
+  "checkup-now": () => {
+    showTab("settings");
+    const run = actions.doctor(); // shows the summary line before it awaits
+    $("doctor-summary").scrollIntoView({ block: "center" });
+    return run;
+  },
+
+  // "View activity" from a slow start: the System tab's log, loaded.
+  "view-activity": () => {
+    showTab("settings");
+    $("logs-view").scrollIntoView({ block: "center" });
+    return refreshLogs();
+  },
+
+  // Home's "Check now" / "Try again": the same live check as the System tab.
+  "update-check-now": () => liveUpdateCheck().catch(() => {}),
 
   // ---- Publish ----
   "pick-export-dir": async () => {
@@ -2264,15 +2994,23 @@ const actions = {
   "refresh-logs": () => refreshLogs(),
 
   doctor: async () => {
+    // One checkup at a time, and one that belongs to the open site: a slow run
+    // for the site just left must not paint its report onto this one.
+    if (doctorRunning) return;
+    const gen = siteGen;
     const summary = $("doctor-summary");
     summary.classList.remove("hidden");
     summary.textContent = "Checking…";
     $("doctor-results").classList.add("hidden");
     $("doctor-fix").classList.add("hidden");
+    doctorRunning = true;
     try {
-      renderDoctor(await invoke("run_doctor"));
+      const report = await invoke("run_doctor");
+      if (gen === siteGen) renderDoctor(report);
     } catch (e) {
-      summary.textContent = String(e);
+      if (gen === siteGen) summary.textContent = String(e);
+    } finally {
+      doctorRunning = false;
     }
   },
 
@@ -2280,10 +3018,82 @@ const actions = {
     // Repairs can take minutes (a self-heal run streams its own output), so this
     // goes through the shared progress overlay rather than a silent button.
     let report = null;
-    await runProgressOp("Repairing your website", async () => {
-      report = await invoke("run_doctor_fix");
-    });
+    await runProgressOp(
+      "Repairing your website",
+      async () => {
+        report = await invoke("run_doctor_fix");
+      },
+      { lifecycle: "repair" }
+    );
     if (report) renderDoctor(report);
+  },
+
+  "free-space": async () => {
+    const btn = $("free-space");
+    const status = $("cleanup-status");
+    const found = cleanupFound;
+    const older = olderFound;
+    if (cleaning || !found || (!found.images.length && !older.length)) return;
+    const n = found.images.length;
+    const parts = [];
+    if (n) {
+      const lines = found.images
+        .map((i) => `${decimalBytes(i.size_bytes)}  ${cleanupLabel(i)}`)
+        .join("\n");
+      parts.push(`${lines}\n\nEach downloads again when a site needs it.`);
+    }
+    if (older.length) {
+      parts.push(
+        "Earlier versions of the Manager kept every automatic backup (before updates, " +
+          "restores and version switches). Tick any you want removed too; they can't be " +
+          "brought back. Your own backups and the newest automatic ones always stay."
+      );
+    }
+    parts.push("Your sites' data is untouched.");
+    const opts = {
+      title: n
+        ? `Remove ${n} download${n === 1 ? "" : "s"} (up to ${decimalBytes(found.total_bytes)})?`
+        : "Remove older automatic backups?",
+      yes: "Remove",
+      checks: older.map(olderBackupsLabel),
+    };
+    const ok = await confirmModal(parts.join("\n\n"), opts);
+    if (!ok) return;
+    const paths = older
+      .filter((_, i) => opts.checked[i])
+      .flatMap((o) => o.backups.map((b) => b.path));
+    if (!n && !paths.length) return;
+    cleaning = true;
+    btn.disabled = true;
+    status.classList.remove("hidden");
+    status.textContent = "Freeing up space…";
+    const said = [];
+    try {
+      if (n) {
+        const r = await invoke("do_cleanup", { ids: found.images.map((i) => i.id) });
+        const m = r.images.length;
+        said.push(
+          m
+            ? `Freed up to ${decimalBytes(r.total_bytes)} (${m} download${m === 1 ? "" : "s"}).`
+            : "No downloads to remove."
+        );
+        if (r.failed.length) said.push(`Kept ${r.failed.length} that Docker says are in use.`);
+      }
+      if (paths.length) {
+        const r = await invoke("remove_older_backups", { paths });
+        const m = r.removed.length;
+        said.push(`Removed ${m} older backup${m === 1 ? "" : "s"} (${decimalBytes(r.total_bytes)}).`);
+        if (r.failed.length) said.push(`Couldn't remove ${r.failed.length}.`);
+      }
+      said.push("Your sites' data is untouched.");
+      status.textContent = said.join(" ");
+    } catch (e) {
+      status.textContent = [...said, String(e)].join(" ");
+    } finally {
+      cleaning = false;
+    }
+    loadCleanup();
+    if (paths.length && currentTab === "backups") refreshBackups();
   },
 
   "check-update": async () => {
@@ -2291,7 +3101,7 @@ const actions = {
     s.classList.remove("hidden");
     s.textContent = "Checking…";
     try {
-      const u = await invoke("get_update");
+      const u = await liveUpdateCheck();
       // Name the versions when the image says what it is — on a rolling tag the
       // digest changes every build, so "an update is available" alone is noise.
       const from = u.current_version ? ` (you're on ${u.current_version})` : "";
@@ -2310,7 +3120,6 @@ const actions = {
         // Say which of the four causes it was, not a guess at two of them.
         s.textContent = u.problem || "Couldn't check for updates right now.";
       }
-      refreshUpdate();
     } catch (e) {
       s.textContent = String(e);
     }
@@ -2436,13 +3245,17 @@ const actions = {
       { always: true }
     );
     if (!ok) return;
-    await runProgressOp("Putting the site to rest", () => invoke("engine_rest", { rest: true }));
+    await runProgressOp("Putting the site to rest", () => invoke("engine_rest", { rest: true }), {
+      lifecycle: "clear",
+    });
     refreshEngine();
     refresh().catch((e) => showError(String(e)));
   },
 
   "engine-wake": async () => {
-    await runProgressOp("Waking the site", () => invoke("engine_rest", { rest: false }));
+    await runProgressOp("Waking the site", () => invoke("engine_rest", { rest: false }), {
+      lifecycle: "clear",
+    });
     refreshEngine();
     refresh().catch((e) => showError(String(e)));
   },
@@ -2512,7 +3325,9 @@ const actions = {
       { always: true, requireText: "confirm" }
     );
     if (!ok) return;
-    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"));
+    return runProgressOp("Reinstalling from scratch", () => invoke("do_reinstall"), {
+      lifecycle: "setup",
+    });
   },
 };
 
@@ -2567,7 +3382,9 @@ $("channel-select").addEventListener("change", async (e) => {
   }
   // runProgressOp refreshes the status itself (and reports failures), so the row
   // is re-rendered from what the appliance now reports, not from the click.
-  await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }));
+  await runProgressOp("Switching update channel", () => invoke("set_channel", { channel: target }), {
+    lifecycle: "update",
+  });
   renderChannel();
 });
 

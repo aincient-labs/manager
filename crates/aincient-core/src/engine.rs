@@ -832,7 +832,9 @@ pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     if !trusted.is_empty() {
         refuse_unless_loopback_only(stack, &compose_text, &home, image, config)?;
     }
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     write_atomic(&edge_path(stack), &edge_conf(&trusted), 0o644)?;
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
     write_atomic(&compose_path(stack), &compose_text, 0o644)?;
     let mut text = env_without_ours(stack);
     if !text.is_empty() && !text.ends_with('\n') {
@@ -848,7 +850,40 @@ pub fn enable(stack: &Stack, image: &str, config: ComposeConfig) -> Result<()> {
     ] {
         text.push_str(&format!("{k}={v}\n"));
     }
-    write_atomic(&stack.env_path(), &text, 0o600)
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario
+    write_atomic(&stack.env_path(), &text, 0o600)?;
+    protect_image(stack, image);
+    Ok(())
+}
+
+/// The local name that keeps a site's pinned engine image from being pruned:
+/// `atelier-engine:pinned-<project>`. Tag characters only, at most 128.
+pub fn pinned_tag(project: &str) -> String {
+    let safe: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let tag: String = format!("pinned-{safe}").chars().take(128).collect();
+    format!("{ENGINE_IMAGE_REPO}:{tag}")
+}
+
+/// Give the pinned engine image a local name. Pulled by digest alone it has no
+/// tag, so Docker counts it as dangling and any `docker image prune` deletes it
+/// once no container uses it (2026-11-14: the Engine POC lost its engine that
+/// way). A name doesn't change what runs: it points at the same image, and the
+/// compose file still runs the pin. Best effort: an untagged image only costs a
+/// re-download at the next start.
+pub fn protect_image(stack: &Stack, image: &str) {
+    let mut c = crate::docker::docker();
+    // scenario: clean_up_counts_every_image_a_registered_site_needs
+    c.args(["tag", image, &pinned_tag(&stack.project_name())]);
+    let _ = crate::docker::try_capture(c);
 }
 
 /// Runs `docker compose -f <files…> config --format json` in the stack
@@ -870,6 +905,7 @@ fn refuse_unless_loopback_only(
         ".{ENGINE_COMPOSE_FILE}.check-{}",
         std::process::id()
     ));
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (loopback check writes a candidate file)
     write_atomic(&candidate, compose_text, 0o644)?;
     let merged = config(
         &[stack.compose_path(), candidate.clone()],
@@ -879,6 +915,7 @@ fn refuse_unless_loopback_only(
             ("ATELIER_PROJECT", stack.project_name()),
         ],
     );
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (loopback check removes its candidate file)
     let _ = std::fs::remove_file(&candidate);
     let refuse = |why: String| {
         anyhow::anyhow!(
@@ -929,16 +966,70 @@ pub fn disable(stack: &Stack) -> Result<()> {
     }
     let text = env_without_ours(stack);
     if read(&stack.env_path()).as_deref() != Some(text.as_str()) {
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         write_atomic(&stack.env_path(), &text, 0o600)?;
     }
     for p in [compose_path(stack), edge_path(stack)] {
+        // scenario: none — engine mode (the experimental engine sidecar) has no scenario
         match std::fs::remove_file(&p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("remove {}", p.display())),
         }
     }
+    // Drop the local name protect_image gave the engine, so a prune can clean
+    // the image up once the engine is off: only when the image can be
+    // downloaded again or keeps another name. Best effort.
+    let tag = pinned_tag(&stack.project_name());
+    let mut inspect = crate::docker::docker();
+    inspect.args(["image", "inspect", &tag]);
+    if let Some(json) = crate::docker::try_capture(inspect) {
+        match pinned_name_can_go(&json, crate::image_origin::store()) {
+            Ok(()) => {
+                let mut c = crate::docker::docker();
+                // scenario: engine_off_keeps_a_local_engine_build_that_cant_be_downloaded_again
+                c.args(["image", "rm", &tag]);
+                let _ = crate::docker::try_capture(c);
+            }
+            Err(why) => eprintln!("Kept the engine image's local name {tag}: {why}."),
+        }
+    }
     Ok(())
+}
+
+/// Whether [`disable`] may remove the pinned name, from `docker image inspect
+/// <pinned name>`'s output and the image store; why not, otherwise. Removing
+/// an image's last name deletes the image: fine for one pulled from a registry
+/// (it downloads again), never for a local build known by that name alone,
+/// which would be lost for good. "Pulled" is read by
+/// [`crate::image_origin`], right under both image stores: on the containerd
+/// store a local build has a `RepoDigests` entry too.
+fn pinned_name_can_go(
+    inspect_json: &str,
+    store: Option<crate::image_origin::Store>,
+) -> std::result::Result<(), String> {
+    let images = crate::image_origin::parse(inspect_json)
+        .map_err(|e| format!("couldn't read `docker image inspect` ({e})"))?;
+    let image = images
+        .first()
+        .ok_or("`docker image inspect` listed no image")?;
+    if image.tags().len() > 1 {
+        return Ok(());
+    }
+    match image.downloadable(store) {
+        Some(true) => Ok(()),
+        Some(false) => Err(
+            "it is a local build with no other name, which can't be downloaded again; remove \
+             it yourself (`docker image rm`) when you no longer need it"
+                .into(),
+        ),
+        None => Err(
+            "Docker can't say whether it can be downloaded again (an older Docker on the \
+             containerd image store); remove it yourself (`docker image rm`) when you no \
+             longer need it"
+                .into(),
+        ),
+    }
 }
 
 /// Write `path` through a fresh temp file in the same directory, renamed over
@@ -967,6 +1058,20 @@ fn write_atomic(path: &Path, contents: &str, _mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pinned_tag_is_a_valid_local_name_per_site() {
+        assert_eq!(
+            super::pinned_tag("atelier-engine-poc"),
+            "ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"
+        );
+        assert_eq!(
+            super::pinned_tag("my site/x"),
+            "ghcr.io/aincient-labs/atelier-engine:pinned-my-site-x"
+        );
+        let long = super::pinned_tag(&"a".repeat(300));
+        assert_eq!(long.rsplit(':').next().unwrap().len(), 128);
+    }
+
     use super::*;
     use crate::stack::{InstallOptions, COMPOSE_TEMPLATE};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1076,6 +1181,48 @@ mod tests {
         assert!(!names.iter().any(|n| n.contains(".tmp-")), "{names:?}");
         enable(s, ID, &fake).unwrap();
         assert!(files_current(s), "idempotent");
+    }
+
+    // `docker image inspect` output (Docker 29.4 on OrbStack, 2026-11-14),
+    // trimmed to the fields around the names.
+    const PULLED: &str = r#"[{"Id":"sha256:bece2626a42ce7764ac03f94358cc1951fe89b5bf48890e51419a22631495110","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":["ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f"],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-10-31T20:18:51.559631057Z"}]"#;
+    const LOCAL_ONLY: &str = r#"[{"Id":"sha256:e75719a4a4e9bb18c4f644cc8193e441d9a7630470736aefa3d2301d8578b9fd","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":[],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-11-14T01:21:56.997664847+01:00"}]"#;
+    const CD_LOCAL_ONLY: &str = r#"[{"Id":"sha256:4f7e751fef6b0e8b5e97e05cb2003b6bef01aaeb73753df7517e12c40674cea1","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":["ghcr.io/aincient-labs/atelier-engine@sha256:4f7e751fef6b0e8b5e97e05cb2003b6bef01aaeb73753df7517e12c40674cea1"],"Descriptor":{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:4f7e751fef6b0e8b5e97e05cb2003b6bef01aaeb73753df7517e12c40674cea1","size":855},"Identity":{"Build":[{"Ref":"x"}]}}]"#;
+    const CD_PULLED: &str = r#"[{"Id":"sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f","RepoTags":["ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":["ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f"],"Descriptor":{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f","size":9535},"Identity":{"Pull":[{"Repository":"ghcr.io/aincient-labs/atelier-engine"}]}}]"#;
+    const LOCAL_TWO_NAMES: &str = r#"[{"Id":"sha256:e75719a4a4e9bb18c4f644cc8193e441d9a7630470736aefa3d2301d8578b9fd","RepoTags":["atelier-engine:dev","ghcr.io/aincient-labs/atelier-engine:pinned-atelier-engine-poc"],"RepoDigests":[],"Parent":"","Comment":"buildkit.dockerfile.v0","Created":"2026-11-14T01:21:56.997664847+01:00"}]"#;
+
+    #[test]
+    fn disable_keeps_a_local_engine_build_known_only_by_its_pinned_name() {
+        // Pulled from the registry: downloads again, the name can go.
+        use crate::image_origin::Store::{Classic, Containerd};
+        assert_eq!(pinned_name_can_go(PULLED, Some(Classic)), Ok(()));
+        // A local build with another name: removing ours only untags it.
+        assert_eq!(pinned_name_can_go(LOCAL_TWO_NAMES, Some(Classic)), Ok(()));
+        // A local build whose only name is ours: removing it would delete it.
+        let why = pinned_name_can_go(LOCAL_ONLY, Some(Classic)).unwrap_err();
+        assert!(why.contains("can't be downloaded again"), "{why}");
+        // Docker may write `null` for an empty list; unreadable output keeps it.
+        assert!(pinned_name_can_go(
+            &LOCAL_ONLY.replace("\"RepoDigests\":[]", "\"RepoDigests\":null"),
+            Some(Classic)
+        )
+        .is_err());
+        assert!(pinned_name_can_go("[]", Some(Classic)).is_err());
+        assert!(pinned_name_can_go("not json", Some(Classic)).is_err());
+
+        // The containerd store (Docker 29): the local build lists a
+        // RepoDigests entry under the pinned name; only `Identity` tells.
+        assert!(pinned_name_can_go(CD_LOCAL_ONLY, Some(Containerd)).is_err());
+        assert!(
+            pinned_name_can_go(CD_LOCAL_ONLY, None).is_err(),
+            "Descriptor says"
+        );
+        assert_eq!(pinned_name_can_go(CD_PULLED, None), Ok(()));
+        // A containerd store without `Identity` (Docker before 29) can't tell.
+        let no_identity = CD_LOCAL_ONLY.replace(r#","Identity":{"Build":[{"Ref":"x"}]}"#, "");
+        assert_ne!(no_identity, CD_LOCAL_ONLY);
+        let why = pinned_name_can_go(&no_identity, Some(Containerd)).unwrap_err();
+        assert!(why.contains("can't say"), "{why}");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::boot::{self, Boot};
 use crate::docker::{
     self, compose, preflight, run_capture, run_inherited, run_streaming, try_capture,
 };
@@ -92,6 +93,15 @@ pub trait Reporter {
     /// running site to a different build, which is how the 2026-08-06 incident
     /// started (`plans/converge-branch-guard.md`).
     fn confirm(&mut self, _question: &str) -> bool {
+        false
+    }
+
+    /// Ask the owner whether to restart Docker (`runtime` names it, "OrbStack")
+    /// — `detail` says what else that stops. `true` means go ahead. The default
+    /// is NO for the same reason as [`confirm`](Self::confirm): a restart stops
+    /// every container on the computer, and a reporter that can't ask (a script,
+    /// a remote doctor) must not answer for the owner.
+    fn confirm_docker_restart(&mut self, _runtime: &str, _detail: &str) -> bool {
         false
     }
 }
@@ -247,6 +257,12 @@ pub struct Status {
     /// whose CLI predates it (the Manager then uses the host CLI, m3-7).
     #[serde(default)]
     pub engine: Option<crate::engine_admin::EngineInfo>,
+    /// The site is stopped and its database was removed from Docker by
+    /// accident ([`DatabaseErased`]): Start refuses, and a restore is the way
+    /// back, so the window offers Restore though the site isn't running.
+    /// `false` from a server whose CLI predates it.
+    #[serde(default)]
+    pub database_erased: bool,
 }
 
 /// The result of comparing the local image against the registry.
@@ -282,6 +298,11 @@ pub struct UpdateCheck {
     /// the field existed still reads.
     #[serde(default)]
     pub offline: bool,
+    /// A stepped update stopped before its last hop ([`Stack::update_target`])
+    /// and there is still a way to go: offer "Continue update", not "a new
+    /// version". `default` for caches and servers that predate it.
+    #[serde(default)]
+    pub unfinished: bool,
 }
 
 /// A released version, as a comparable triple.
@@ -444,7 +465,7 @@ pub struct BackupInfo {
 }
 
 /// A backup file on the host.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Backup {
     pub name: String,
     pub path: String,
@@ -472,11 +493,13 @@ impl ModelRole {
 }
 
 #[derive(Deserialize)]
-struct PsEntry {
+pub(crate) struct PsEntry {
+    #[serde(rename = "Name", default)]
+    pub(crate) name: String,
     #[serde(rename = "Service", default)]
-    service: String,
+    pub(crate) service: String,
     #[serde(rename = "State", default)]
-    state: String,
+    pub(crate) state: String,
 }
 
 /// Current appliance status. Cheap probes only; never mutates the stack.
@@ -501,6 +524,8 @@ pub fn status(stack: &Stack) -> Status {
             .then(|| crate::engine_admin::probe(stack))
             .flatten()
             .map(with_engine_state),
+        // One `volume inspect`, asked only of a stopped site.
+        database_erased: installed && !running && preflight().ok() && stack_database_erased(stack),
     }
 }
 
@@ -540,15 +565,26 @@ pub fn is_running(stack: &Stack) -> bool {
 }
 
 /// Poll the console until it serves a healthy response, or `timeout` elapses,
-/// reporting boot progress as it goes. Returns `true` once it's ready.
+/// reporting boot progress as it goes.
 ///
 /// This is what holds the manager's "ready" signal back until Drupal has
 /// actually finished booting (site install, `converge.sh` migrations) instead of
-/// the moment the container reports "running".
-pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> bool {
+/// the moment the container reports "running". Every [`boot::LOOK_EVERY`] it
+/// also looks at the containers and the app's log since it last started, so a
+/// boot that has already failed, or a site or Docker that went away, ends the
+/// wait with the reason instead of running out the clock; and it reads the log
+/// once more before calling an answering site ready, because the entrypoint
+/// starts the web server even after a failed converge ([`Boot`]).
+pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) -> Boot {
     let port = stack.http_port();
     let started = Instant::now();
     let deadline = started + timeout;
+    let mut next_look = started + boot::LOOK_EVERY;
+    // What every service's restart count was before the wait: a restart
+    // policy that starts a killed container again within a second hides the
+    // death from a look that only asks "is it running?".
+    let wait_started = std::time::SystemTime::now();
+    let mut strikes = boot::Strikes::from_baseline(&boot::services_now(stack));
     r.stage(
         Stage::Booting,
         "Waiting for the console to finish booting…",
@@ -556,16 +592,35 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
     );
     loop {
         if http_ready(port) {
+            let look = boot::look(stack, false);
+            if let Some(why) = look.log.as_deref().and_then(boot::boot_failure) {
+                let why = memory_or(stack, wait_started, &strikes, why, r);
+                return boot_failed(r, &look, why);
+            }
             r.stage(Stage::Ready, "The console is up.", Some(1.0));
-            return true;
+            return Boot::Ready;
+        }
+        let now = Instant::now();
+        if now >= next_look {
+            let look = boot::look(stack, true);
+            if let Some(why) = boot::judge(&look, &mut strikes) {
+                let why = memory_or(stack, wait_started, &strikes, why, r);
+                return boot_failed(r, &look, why);
+            }
+            next_look = Instant::now() + boot::LOOK_EVERY;
         }
         if Instant::now() >= deadline {
+            // Ran out of time: memory may be why (a container Docker keeps
+            // restarting between looks), and that is worth saying.
+            if let Some(why) = boot::memory_verdict(stack, wait_started, &strikes) {
+                return Boot::Failed(why);
+            }
             r.stage(
                 Stage::Booting,
                 "Still booting — this is taking longer than usual.",
                 Some(0.95),
             );
-            return false;
+            return Boot::Booting;
         }
         // Creep the bar across the boot window (0.72 → 0.95) and tick the timer.
         let elapsed = started.elapsed();
@@ -577,6 +632,48 @@ pub fn wait_until_ready(stack: &Stack, timeout: Duration, r: &mut dyn Reporter) 
         );
         std::thread::sleep(Duration::from_millis(750));
     }
+}
+
+/// The reason a failed wait gives: out of memory when Docker's own record
+/// says so ([`boot::memory_verdict`]: the flag, an `oom` event, a killed
+/// Postgres process), since a converge that failed or a service that stopped
+/// is then only the symptom; `why` otherwise. Docker going away and a
+/// half-attached network keep theirs: the owner's step there is restarting
+/// Docker, and Docker's record can't be read.
+fn memory_or(
+    stack: &Stack,
+    started: std::time::SystemTime,
+    strikes: &boot::Strikes,
+    why: String,
+    r: &mut dyn Reporter,
+) -> String {
+    if why == boot::NETWORK_STUCK || why == boot::DOCKER_STOPPED {
+        return why;
+    }
+    match boot::memory_verdict(stack, started, strikes) {
+        Some(memory) => {
+            r.log(&format!("The wait saw: {why}"));
+            memory
+        }
+        None => why,
+    }
+}
+
+/// End a wait as failed: the app's own failure lines go to the log (a bug
+/// report wants them), the reason to the caller.
+fn boot_failed(r: &mut dyn Reporter, look: &boot::Look, why: String) -> Boot {
+    for line in look
+        .log
+        .iter()
+        .flat_map(|l| boot::after_last_success(l).lines())
+        .filter(|l| l.contains("[converge] FATAL") || l.contains("converge FAILED"))
+    {
+        r.log(line);
+    }
+    for (network, container) in &look.half_attached {
+        r.log(&format!("Half attached: {container} in {network}"));
+    }
+    Boot::Failed(why)
 }
 
 /// Run a chatty step, relaying its output to the reporter (GUI) or letting it
@@ -604,10 +701,9 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     // What the registry gets asked about is where an update would *come from*, which
     // on a legacy install is not what `.env` says — see `Stack::prospective_image`.
     // The local probe below keeps using `image`, because that is what is on this
-    // machine. Digests compare across the rename regardless: `parse_local_probe`
+    // machine. Digests compare across the rename regardless: `local_probe`
     // keeps only the `sha256:…`, and the rename moved the package rather than
     // republishing it.
-    let target_image = stack.prospective_image();
     let mut check = UpdateCheck {
         image: image.clone(),
         current: None,
@@ -618,6 +714,7 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         problem: None,
         plan: None,
         offline: false,
+        unfinished: false,
     };
 
     // Docker itself is the floor: without it neither probe can say anything, and
@@ -651,6 +748,11 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
         }
     }
 
+    // An unfinished stepped update heads for the image its route ends on: the
+    // `.env` now names the waypoint it stopped at, which has nothing newer. One
+    // the site has since moved past is dropped ([`live_update_target`]).
+    let resumes = live_update_target(stack, check.current_version.as_deref());
+    let target_image = resumes.clone().unwrap_or_else(|| stack.prospective_image());
     let mut target = None;
     match remote_probe(&target_image) {
         Ok(probe) => {
@@ -681,10 +783,91 @@ pub fn check_update(stack: &Stack) -> UpdateCheck {
     if check.update_available == Some(true) {
         if let Some(target) = target {
             let from = check.current_version.as_deref().and_then(Version::parse);
-            check.plan = Some(plan_route(from, target_image, target, None));
+            let mut plan = plan_route(from, target_image, target, None);
+            // A resumed route must write its target, or a last single hop
+            // would pull the waypoint `.env` names again.
+            plan.explicit_target = resumes.is_some();
+            check.plan = Some(plan);
         }
+        check.unfinished = resumes.is_some();
     }
     check
+}
+
+/// The image an update heads for and whether the route must write it into
+/// `.env` (see [`UpgradePlan::explicit_target`]): the one the operator named,
+/// else an unfinished update's target ([`Stack::update_target`]), else the
+/// channel's. A resumed target counts as named: the hops before it rewrote
+/// `.env` to a waypoint, so nothing else would bring the channel image back.
+fn route_target(
+    named: Option<String>,
+    unfinished: Option<String>,
+    prospective: impl FnOnce() -> String,
+) -> (String, bool) {
+    match (named, unfinished) {
+        (Some(image), _) | (None, Some(image)) => (image, true),
+        (None, None) => (prospective(), false),
+    }
+}
+
+/// The version an image reference names by its tag (`…/atelier-cms:v0.21.0`,
+/// as [`waypoint_image`] writes it); `None` for a moving tag or a digest.
+fn tag_version(image: &str) -> Option<Version> {
+    let name = image.split('@').next()?;
+    let (_, tag) = name.rsplit_once(':').filter(|(_, t)| !t.contains('/'))?;
+    Version::parse(tag)
+}
+
+/// Whether an unfinished update's target is stale: the site already runs that
+/// version or a newer one (an install, a restore, or another route moved it
+/// past). Unknown on either side is not stale, the way it always was.
+fn update_target_is_stale(target: Option<Version>, running: Option<Version>) -> bool {
+    matches!((target, running), (Some(t), Some(r)) if t <= r)
+}
+
+/// [`Stack::update_target`], unless it is stale ([`update_target_is_stale`])
+/// next to the version the site runs (`running`): then it is deleted, so check
+/// stops saying "update unfinished" and Update stops heading for an older
+/// image (review 2026-11-14). A target with no version in its tag is asked of
+/// the registry.
+fn live_update_target(stack: &Stack, running: Option<&str>) -> Option<String> {
+    live_update_target_with(stack, running, |image| {
+        remote_probe(image)
+            .ok()?
+            .version
+            .as_deref()
+            .and_then(Version::parse)
+    })
+}
+
+fn live_update_target_with(
+    stack: &Stack,
+    running: Option<&str>,
+    registry_version: impl FnOnce(&str) -> Option<Version>,
+) -> Option<String> {
+    let target = stack.update_target()?;
+    // Unknown is never stale: keep the route without asking the registry.
+    let Some(running) = running.and_then(Version::parse) else {
+        return Some(target);
+    };
+    let version = tag_version(&target).or_else(|| registry_version(&target));
+    if update_target_is_stale(version, Some(running)) {
+        stack.clear_update_target();
+        return None;
+    }
+    Some(target)
+}
+
+/// After an install or a restore: drop an unfinished update's target the site
+/// has moved past ([`live_update_target`]). One still ahead is kept: its hops
+/// pinned `.env` to a waypoint, and without the target the next update would
+/// find nothing newer than that waypoint.
+fn drop_stale_update_target(stack: &Stack) {
+    if stack.update_target().is_none() {
+        return;
+    }
+    let running = site_probe(stack).ok().and_then(|p| p.version);
+    let _ = live_update_target(stack, running.as_deref());
 }
 
 /// How many waypoints a route may contain before we call it broken rather than
@@ -701,21 +884,25 @@ const MAX_WAYPOINTS: usize = 8;
 /// Reads floors from the registry, so it costs one `imagetools inspect` per hop
 /// considered and pulls nothing. See [`UpgradePlan`] for why this exists at all.
 pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
-    let target_image = match to {
-        Some(v) => match Version::parse(v) {
-            Some(v) => waypoint_image(v),
-            // Not a version — take it as a literal image reference, which is how
-            // an operator pins a fork or a local build.
-            None => v.to_string(),
-        },
-        // The image an update is heading for is the one that will be configured when
-        // it runs — so the pending legacy repairs count (a `:edge` → stable move, a
-        // retired repository name), or the route would be planned against a tag the
-        // operator is about to leave, or against a repository that cannot answer.
-        None => stack.prospective_image(),
-    };
+    let named = to.map(|v| match Version::parse(v) {
+        Some(v) => waypoint_image(v),
+        // Not a version — take it as a literal image reference, which is how
+        // an operator pins a fork or a local build.
+        None => v.to_string(),
+    });
+    // The image an update is heading for is the one that will be configured when
+    // it runs — so the pending legacy repairs count (a `:edge` → stable move, a
+    // retired repository name), or the route would be planned against a tag the
+    // operator is about to leave, or against a repository that cannot answer.
+    // An unfinished stepped update continues to where it was going.
+    let probe = site_probe(stack);
+    let running = probe.as_ref().ok().and_then(|p| p.version.as_deref());
+    let (target_image, explicit_target) =
+        route_target(named, live_update_target(stack, running), || {
+            stack.prospective_image()
+        });
 
-    let (from, from_problem) = match site_probe(stack) {
+    let (from, from_problem) = match probe {
         Ok(p) => (
             p.version.as_deref().and_then(Version::parse),
             p.version.is_none().then(|| {
@@ -746,7 +933,7 @@ pub fn plan_upgrade(stack: &Stack, to: Option<&str>) -> UpgradePlan {
             plan
         }
     };
-    plan.explicit_target = to.is_some();
+    plan.explicit_target = explicit_target;
     plan
 }
 
@@ -892,6 +1079,7 @@ fn registry_problem(image: &str, error: &str) -> String {
 /// and auto-rolls-back on failure. Returns whether the console came up before
 /// the readiness timeout (`false` = started but still booting).
 pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Install)?;
     lifecycle_plan().announce(r);
     r.stage(Stage::Preflight, "Checking Docker…", Some(0.04));
     preflight().require()?;
@@ -903,16 +1091,59 @@ pub fn install(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Re
         announce_legacy_migrations(stack, r)?;
     }
     pull(stack, r)?;
-    up(stack, r)?;
-    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+    // Exempt from the erased-database refusal: an install lays the site down
+    // (and a reinstall has just wiped it on purpose).
+    up_unguarded(stack, r)?;
+    // An unfinished update's target (review 2026-11-14): an image the owner
+    // named replaces the route; otherwise only one the site is past goes.
+    if opts.image.is_some() {
+        stack.clear_update_target();
+    } else {
+        drop_stale_update_target(stack);
+    }
+    wait_until_ready(stack, READY_TIMEOUT, r).ready()
 }
 
 /// Pull a newer image and recreate the stack — the upgrade path. Plans the route
 /// itself and walks every hop it needs; see [`apply_upgrade`] to show the operator
-/// the route first. Returns whether the console came up before the timeout.
-pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+/// the route first. Says how it came out ([`Updated`]).
+pub fn update(stack: &Stack, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
     let plan = plan_upgrade(stack, None);
     apply_upgrade(stack, &plan, r)
+}
+
+/// How an update came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Updated {
+    /// The site answered on the new version.
+    Ready,
+    /// Updated, but the console hadn't answered by the readiness timeout.
+    Booting,
+    /// The download was the build the site already runs and nothing else was
+    /// due: no backup was taken and nothing restarted.
+    AlreadyCurrent,
+    /// The download was the build the site already runs, but its settings
+    /// (`.env`, `compose.yaml`) had changed since its containers were made: the
+    /// containers were made again on the same build, without a backup (the
+    /// version didn't change), and the site answered.
+    SettingsApplied,
+}
+
+impl Updated {
+    /// Whether the site is serving: an update that found nothing to do left a
+    /// site that was serving still serving.
+    pub fn ready(self) -> bool {
+        self != Updated::Booting
+    }
+
+    fn from_ready(ready: bool) -> Self {
+        if ready {
+            Updated::Ready
+        } else {
+            Updated::Booting
+        }
+    }
 }
 
 /// Apply a route, hop by hop. Returns whether the console came up before the
@@ -951,6 +1182,22 @@ fn refresh_edge_conf(stack: &Stack) {
     }
 }
 
+/// Swap an untouched older shipped `compose.yaml` for the current one (the db
+/// restart policy, 0.17.0), keeping its images. Returns whether it changed; the
+/// containers take it on their next `up`. Best-effort like
+/// [`refresh_edge_conf`]: a failed write is logged and the stack runs as it is.
+fn refresh_compose(stack: &Stack, r: &mut dyn Reporter) -> bool {
+    match stack.refresh_shipped_compose() {
+        Ok(changed) => changed,
+        Err(e) => {
+            r.log(&format!(
+                "Couldn't update compose.yaml ({e:#}); carrying on with it as it is."
+            ));
+            false
+        }
+    }
+}
+
 /// Where a stepped route's first hop starts the bar (the pre-route backup fills
 /// the slice before it).
 const ROUTE_START: f32 = 0.05;
@@ -984,26 +1231,332 @@ fn upgrade_plan(plan: &UpgradePlan) -> Plan {
     Plan { steps }
 }
 
-pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<bool> {
+pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
+    apply_upgrade_with(stack, plan, &UpdateOptions::default(), r)
+}
+
+/// How [`apply_upgrade_with`] treats the backup before an update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateOptions {
+    /// Update without a backup first (`--no-backup`, "Update without a backup"):
+    /// a stopped site is not started for one, a running one is not backed up.
+    /// Without it, a stopped site that won't start refuses the update with
+    /// [`BackupBeforeUpdateFailed`].
+    pub no_backup: bool,
+}
+
+/// An update was refused because the site couldn't be backed up first: it is
+/// stopped and wouldn't start (or didn't finish starting) on the version it
+/// runs. Carried as an error's context, so the cause (a [`boot::BootFailed`] that
+/// needs Docker restarted, say) can still be told apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupBeforeUpdateFailed {
+    /// What stopped the backup, in words.
+    pub cause: String,
+}
+
+impl std::fmt::Display for BackupBeforeUpdateFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, so it wasn't updated", self.cause)
+    }
+}
+
+impl std::error::Error for BackupBeforeUpdateFailed {}
+
+/// An update refused before anything was done: the image it would download is
+/// a build made on this computer (a developer build, a local tag such as
+/// `atelier-cms:zoo-shared`), which no registry has, so `compose pull` could
+/// only fail with Docker's "pull access denied". The way forward is following
+/// a channel again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBuild {
+    /// The image reference the site names (`AINCIENT_IMAGE`, or `--to`).
+    pub image: String,
+}
+
+impl std::fmt::Display for LocalBuild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "This site runs a build made on this computer ({}), so there is nothing to \
+             download, and nothing was changed. To follow released versions: `atelier app \
+             channel stable` (in the app: System → Updates → Released versions), then \
+             update again.",
+            self.image
+        )
+    }
+}
+
+impl std::error::Error for LocalBuild {}
+
+impl LocalBuild {
+    /// Whether `e` is this refusal.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.is::<LocalBuild>()
+    }
+}
+
+/// Whether `image` names a build only this computer has: its reference names
+/// no registry host (so a pull asks Docker Hub, which has no Atelier image)
+/// and the local image was never pulled under that name (`pulled_from`, the
+/// repositories it was pulled from: [`crate::image_origin`], which reads them
+/// right under both image stores; a retag of a downloaded image, such as
+/// `atelier-cms:zoo-shared`, was pulled under the source's name only).
+/// `pull_policy: never` on `app` is the owner telling compose to use the local
+/// image as it is (the scenario harness's local builds), so a pull takes
+/// nothing and the update goes ahead. An image that isn't here, or whose
+/// origin Docker can't tell (`pulled_from` `None`), is left to the pull. A
+/// digest reference is never local-only. Pure: [`local_build`] feeds it what
+/// Docker says.
+fn is_local_only(
+    image: &str,
+    app_pull_policy: Option<&str>,
+    pulled_from: Option<&[String]>,
+) -> bool {
+    if app_pull_policy == Some("never") || image.contains('@') {
+        return false;
+    }
+    let Some(pulled_from) = pulled_from else {
+        return false;
+    };
+    // The repository: the reference without its tag (a `:` after the last `/`).
+    let repo = match image.rsplit_once(':') {
+        Some((r, tag)) if !tag.contains('/') => r,
+        _ => image,
+    };
+    let host = repo.split_once('/').map(|(first, _)| first);
+    if host.is_some_and(|h| h.contains('.') || h.contains(':') || h == "localhost") {
+        return false;
+    }
+    let same_repo = |r: &String| {
+        let name = r.split('@').next().unwrap_or_default();
+        crate::image_origin::same_repository(name, repo)
+    };
+    !pulled_from.iter().any(same_repo)
+}
+
+/// `pull_policy` of the `app` service in `compose config --format json`.
+fn parse_app_pull_policy(config_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(config_json).ok()?;
+    v.get("services")?
+        .get("app")?
+        .get("pull_policy")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// [`LocalBuild`] when an update would download `image` for `stack` and no
+/// registry has it ([`is_local_only`]). Reads only; `None` when Docker
+/// doesn't answer (the pull says what's wrong then).
+fn local_build(stack: &Stack, image: &str) -> Option<LocalBuild> {
+    let mut config = compose(stack);
+    config.args(["config", "--format", "json"]);
+    let policy = docker::try_capture(config).and_then(|j| parse_app_pull_policy(&j));
+    let pulled_from = crate::image_origin::inspect(image)
+        .and_then(|i| i.pulled_from(crate::image_origin::store()));
+    is_local_only(image, policy.as_deref(), pulled_from.as_deref()).then(|| LocalBuild {
+        image: image.to_string(),
+    })
+}
+
+/// [`LocalBuild`] when applying `plan` would download a build only this
+/// computer has (a single hop onto it: a stepped route's hops are registry
+/// releases). Reads only; the CLI asks before printing the plan, whose
+/// registry lookup of such an image fails with Docker's own words.
+pub fn plan_local_build(stack: &Stack, plan: &UpgradePlan) -> Option<LocalBuild> {
+    if plan.is_stepped() {
+        return None;
+    }
+    let pulls = if plan.explicit_target {
+        plan.target_image.clone()
+    } else {
+        stack.image()
+    };
+    local_build(stack, &pulls)
+}
+
+/// The before-update backup of a running site, or the refusal: an update that
+/// migrates with no way back is worse than no update (a full disk is the usual
+/// cause, and the same disk would fail the migration's own snapshot). The owner
+/// can go on without one ([`UpdateOptions::no_backup`]). Was "Continuing" until
+/// the prior-art review (2026-11-14).
+fn backup_or_refuse<T>(outcome: Result<T>) -> Result<T> {
+    outcome.map_err(|e| {
+        let cause = match e.downcast_ref::<BackupsNotWritable>() {
+            Some(folder) => format!(
+                "Couldn't back up your site first: {} (fix the folder's permissions or free \
+                 it up, then try again)",
+                folder.cause()
+            ),
+            None => format!("Couldn't back up your site first ({e:#})"),
+        };
+        anyhow::Error::new(BackupBeforeUpdateFailed { cause })
+    })
+}
+
+/// [`update`] with [`UpdateOptions`].
+pub fn update_with(stack: &Stack, opts: &UpdateOptions, r: &mut dyn Reporter) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
+    let plan = plan_upgrade(stack, None);
+    apply_upgrade_with(stack, &plan, opts, r)
+}
+
+/// [`apply_upgrade`] with [`UpdateOptions`].
+pub fn apply_upgrade_with(
+    stack: &Stack,
+    plan: &UpgradePlan,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Update)?;
+    let done = run_upgrade(stack, plan, opts, r)?;
+    if done == Updated::Ready {
+        // Only after the site answered on the new version: a failed attempt
+        // keeps every backup, so retrying can never prune the last good one.
+        prune_automatic_backups(stack, None, r);
+        tidy_after_update(r);
+    }
+    Ok(done)
+}
+
+/// After an update the site answered on: remove the old Atelier versions and
+/// replaced database/web-server images no container uses (DECISIONS 0527).
+/// Best effort and quiet: a leftover only costs disk, never the update.
+fn tidy_after_update(r: &mut dyn Reporter) {
+    if let Ok(done) = crate::cleanup::free(crate::cleanup::Scope::AfterUpdate, None) {
+        if !done.images.is_empty() {
+            r.log(&format!(
+                "Removed {} old download{}, up to {} freed.",
+                done.images.len(),
+                if done.images.len() == 1 { "" } else { "s" },
+                crate::cleanup::human_bytes(done.total_bytes)
+            ));
+        }
+    }
+}
+
+fn run_upgrade(
+    stack: &Stack,
+    plan: &UpgradePlan,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
     ensure_installed(stack)?;
+    // Set once `up` has touched the containers: a failure from then on saves
+    // every service's log before anything restarts them ([`keep_logs`]).
+    let touched = std::cell::Cell::new(false);
     // One source for the groups the front end draws and the slices the hops
     // report into (review 2026-11-12: these were computed twice).
     let route = upgrade_plan(plan);
     route.announce(r);
-    r.stage(Stage::Preflight, "Checking Docker…", Some(0.02));
-    preflight().require()?;
-    announce_legacy_migrations(stack, r)?;
+    r.stage(
+        Stage::Preflight,
+        "Checking your site is ready to update…",
+        Some(0.02),
+    );
+    // Docker missing, or its compose plugin: preflight's own words (an install
+    // problem, not a site that isn't ready).
+    let pf = preflight();
+    if !pf.docker_installed || !pf.compose_available {
+        pf.require()?;
+    }
+    // A build made on this computer has nothing to download: `compose pull`
+    // would fail with Docker's "pull access denied". Refused before anything
+    // is touched (the zoo's shared-tag sites, a developer build). A stepped
+    // route's hops are registry releases.
+    if let Some(local) = plan_local_build(stack, plan) {
+        return Err(anyhow::Error::new(local));
+    }
+    // Refuse before any work while the site isn't ready (M2c, the HA model):
+    // Docker not answering, too little disk, an erased database, a container
+    // off its network, a service out of memory or crash-looping, a locked
+    // engine site. Nothing below repairs those mid-update.
+    let facts = crate::gate::gather(stack, &pf);
+    crate::gate::require_ready(&facts)?;
+    let engine_state = facts.engine_state;
+    let files_before = stack_files(stack);
+    let snapshot_taken = announce_legacy_migrations(stack, r)?;
     refresh_edge_conf(stack);
+    // Every route ends in `up`, which hands the containers the new file.
+    refresh_compose(stack, r);
+    let files_changed = stack_files(stack) != files_before;
 
     if !plan.is_stepped() {
         retarget_single_hop(stack, plan)?;
+        // Download first: the backup and the restart are only worth their time
+        // when the download brought something new.
+        let running = running_image_id(stack);
         pull(stack, r)?;
-        up(stack, r)?;
-        let ready = wait_until_ready(stack, READY_TIMEOUT, r);
-        if ready {
-            return move_db_image(stack, r);
+        let need = update_need(
+            running.as_deref(),
+            image_id(&stack.image()).as_deref(),
+            settings_changed_now(stack),
+            files_changed,
+            stack.pending_db_image_migration().is_some(),
+        );
+        if need == UpdateNeed::Nothing {
+            // The site runs the route's target: nothing is unfinished.
+            stack.clear_update_target();
+            r.stage(
+                Stage::Ready,
+                "Already up to date: the download is the version your site runs, so nothing \
+                 was backed up or restarted.",
+                Some(1.0),
+            );
+            return Ok(Updated::AlreadyCurrent);
         }
-        return Ok(false);
+        if need == UpdateNeed::Settings {
+            stack.clear_update_target();
+            // A stopped site starts (a resting one wakes, and rests again
+            // after), as for an update; there is nothing to back up for.
+            let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+            let done = (|| -> Result<Updated> {
+                r.stage(
+                    Stage::Starting,
+                    "Already up to date. Applying your changed settings…",
+                    Some(UP_FROM),
+                );
+                touched.set(true);
+                up_updating(stack, r)?;
+                let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+                if ready {
+                    r.stage(Stage::Ready, SETTINGS_APPLIED, Some(1.0));
+                    return Ok(Updated::SettingsApplied);
+                }
+                Ok(Updated::Booting)
+            })();
+            let done = keep_logs(stack, &touched, done, r);
+            return settle_woken(stack, woke, done, r);
+        }
+        let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+        let done = (|| -> Result<Updated> {
+            // The banner promises "Updating keeps all your pages and settings": a
+            // one-step update took no backup until 0.17.0, so a failed migration had
+            // nothing to go back to. Best effort, like the stepped route's snapshot;
+            // skipped when the channel move above just took one, or when the owner
+            // said to go without.
+            if !snapshot_taken && !opts.no_backup {
+                backup_or_refuse(safety_backup(
+                    stack,
+                    "before-update",
+                    "Backing up before the update…",
+                    0.03,
+                    PULL_FROM - 0.04,
+                    r,
+                ))?;
+            }
+            touched.set(true);
+            up_updating(stack, r)?;
+            let mut ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+            if ready {
+                stack.clear_update_target();
+                ready = move_db_image(stack, r)?;
+            }
+            Ok(Updated::from_ready(ready))
+        })();
+        let done = keep_logs(stack, &touched, done, r);
+        return settle_woken(stack, woke, done, r);
     }
 
     // A stepped route is the case where a snapshot is least optional: it is longer,
@@ -1012,83 +1565,399 @@ pub fn apply_upgrade(stack: &Stack, plan: &UpgradePlan, r: &mut dyn Reporter) ->
     // running the old image again. Best effort, like the channel-switch snapshot —
     // converge's own per-hop rollback is the guarantee; this is the belt.
     let total = plan.steps.len();
-    if status(stack).running {
-        r.stage(
-            Stage::Working,
-            "Backing up before the first step…",
-            Some(0.03),
-        );
-        // The backup's own steps land inside this slice; its plan is dropped.
-        let mut snap = ScaledReporter {
-            inner: r,
-            base: 0.03,
-            span: ROUTE_START - 0.03,
-            prefix: String::new(),
-        };
-        match backup(stack, Some("before-stepped-upgrade"), &mut snap) {
-            Ok(path) => r.stage(
+    let woke = wake_for_update(stack, engine_state.as_deref(), opts, r)?;
+    let done = (|| -> Result<Updated> {
+        if !opts.no_backup && status(stack).running {
+            r.stage(
+                Stage::Working,
+                "Backing up before the first step…",
+                Some(0.03),
+            );
+            // The backup's own steps land inside this slice; its plan is dropped.
+            let mut snap = ScaledReporter {
+                inner: r,
+                base: 0.03,
+                span: ROUTE_START - 0.03,
+                prefix: String::new(),
+            };
+            let path = backup_or_refuse(backup(stack, Some("before-stepped-upgrade"), &mut snap))?;
+            r.stage(
                 Stage::Working,
                 &format!("Snapshot saved: {}", path.display()),
                 Some(0.05),
-            ),
-            Err(e) => r.stage(
-                Stage::Working,
-                &format!(
-                    "Couldn't take a snapshot first ({e:#}) — continuing; each step \
-                     rolls its own database back if it fails."
-                ),
-                Some(0.05),
-            ),
-        }
-    }
-
-    // Hops share the bar after the Prep slice, each rescaling the stage fractions
-    // the shared pull/up/wait helpers report so a five-minute route doesn't look
-    // like five separate runs that each finish at 100%. Slice and label come from
-    // the announced plan (step 0 is Prep); the prefix names the hop's version only,
-    // since the plan already numbers the steps (`[2/4]` in the terminal).
-    for (i, step) in plan.steps.iter().enumerate() {
-        let slice = &route.steps()[i + 1];
-        let label = match step.version {
-            Some(v) => v.to_string(),
-            None => step.image.clone(),
-        };
-        let mut hop = ScaledReporter {
-            inner: r,
-            base: slice.from,
-            span: slice.to - slice.from,
-            prefix: format!("{}: ", slice.label),
-        };
-        hop.stage(
-            Stage::Scaffold,
-            &format!("switching to {}…", step.image),
-            Some(0.0),
-        );
-        stack.set_image(&step.image)?;
-        pull(stack, &mut hop)?;
-        up(stack, &mut hop)?;
-        let ready = wait_until_ready(stack, READY_TIMEOUT, &mut hop);
-
-        if !ready {
-            // Deliberately an error, not a `false`: on a multi-hop route "still
-            // booting" and "this step refused or rolled back" look identical from
-            // out here, and the difference decides whether the operator should
-            // wait or read the logs. Only the LAST hop can honestly report
-            // still-booting, and it returns below.
-            if step.is_target {
-                return Ok(false);
-            }
-            bail!(
-                "step {} of {total} ({label}) didn't finish coming up, so the rest of \
-                 the upgrade was not attempted. Your site is on {label} — its own \
-                 migration either succeeded or rolled itself back, so it is not \
-                 half-upgraded. Check `atelier app logs` for what happened, then run \
-                 `atelier app update` again to continue.",
-                i + 1
             );
         }
+
+        // Each hop rewrites `.env` to the version it lands on, so a route that
+        // stops halfway must remember where it was going, or the next update would
+        // find nothing newer than the waypoint ([`Stack::update_target`]).
+        stack.set_update_target(&plan.target_image)?;
+
+        // Hops share the bar after the Prep slice, each rescaling the stage fractions
+        // the shared pull/up/wait helpers report so a five-minute route doesn't look
+        // like five separate runs that each finish at 100%. Slice and label come from
+        // the announced plan (step 0 is Prep); the prefix names the hop's version only,
+        // since the plan already numbers the steps (`[2/4]` in the terminal).
+        for (i, step) in plan.steps.iter().enumerate() {
+            let slice = &route.steps()[i + 1];
+            let label = match step.version {
+                Some(v) => v.to_string(),
+                None => step.image.clone(),
+            };
+            let mut hop = ScaledReporter {
+                inner: r,
+                base: slice.from,
+                span: slice.to - slice.from,
+                prefix: format!("{}: ", slice.label),
+            };
+            hop.stage(
+                Stage::Scaffold,
+                &format!("switching to {}…", step.image),
+                Some(0.0),
+            );
+            stack.set_image(&step.image)?;
+            pull(stack, &mut hop)?;
+            touched.set(true);
+            up_updating(stack, &mut hop)?;
+            let ready = match wait_until_ready(stack, READY_TIMEOUT, &mut hop) {
+                Boot::Ready => true,
+                Boot::Booting => false,
+                // Failed is never "carry on": the next hop would meet a database
+                // this one didn't migrate.
+                Boot::Failed(why) if step.is_target => {
+                    return Boot::Failed(why).ready().map(Updated::from_ready)
+                }
+                Boot::Failed(why) => {
+                    return Err(boot::BootFailed(format!(
+                        "Step {} of {total} ({label}) failed, so the rest of the update was not \
+                         attempted. {why} Once that is fixed, run the update again: it \
+                         continues from {label}.",
+                        i + 1
+                    ))
+                    .into())
+                }
+            };
+
+            if !ready {
+                // Deliberately an error, not a `false`: on a multi-hop route "still
+                // booting" and "this step refused or rolled back" look identical from
+                // out here, and the difference decides whether the operator should
+                // wait or read the logs. Only the LAST hop can honestly report
+                // still-booting, and it returns below.
+                if step.is_target {
+                    return Ok(Updated::Booting);
+                }
+                bail!(
+                    "step {} of {total} ({label}) didn't finish coming up, so the rest of \
+                     the upgrade was not attempted. Your site is on {label} — its own \
+                     migration either succeeded or rolled itself back, so it is not \
+                     half-upgraded. Check `atelier app logs` for what happened, then run \
+                     `atelier app update` again (Continue update in the Manager): it \
+                     continues from {label} to {}.",
+                    i + 1,
+                    plan.target_image
+                );
+            }
+        }
+        stack.clear_update_target();
+        let ready = move_db_image(stack, r)?;
+        Ok(Updated::from_ready(ready))
+    })();
+    let done = keep_logs(stack, &touched, done, r);
+    settle_woken(stack, woke, done, r)
+}
+
+/// A failed update that had touched the containers saves every service's
+/// log first ([`crate::update_logs`]), before [`settle_woken`] (or the owner's
+/// next click) can restart them, and its error names the file.
+fn keep_logs(
+    stack: &Stack,
+    touched: &std::cell::Cell<bool>,
+    done: Result<Updated>,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    match done {
+        Err(e) if touched.get() => Err(crate::update_logs::save_after_failure(stack, e, r)),
+        other => other,
     }
-    move_db_image(stack, r)
+}
+
+/// What an update found to do once the download was in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateNeed {
+    /// The site runs the download, with the settings it has now.
+    Nothing,
+    /// The site runs the download, but its containers were made from other
+    /// settings: `up` on the same build, no backup.
+    Settings,
+    /// A new build, or a database move: the full update.
+    Update,
+}
+
+/// What the owner reads when an update only applied changed settings.
+pub const SETTINGS_APPLIED: &str = "Already up to date. Applied your changed settings.";
+
+/// [`UpdateNeed`]: an update unless the image just pulled is the one the site's
+/// `app` container was made from and no database move is due (unknown on
+/// either side is an update, the way it always was). On the same build,
+/// `settings_changed` ([`settings_changed`]) decides; when that couldn't be
+/// read, whether this run rewrote `compose.yaml`/`.env` does.
+fn update_need(
+    running: Option<&str>,
+    pulled: Option<&str>,
+    settings_changed: Option<bool>,
+    files_changed: bool,
+    db_move_pending: bool,
+) -> UpdateNeed {
+    let same = matches!((running, pulled), (Some(a), Some(b)) if a == b);
+    if !same || db_move_pending {
+        UpdateNeed::Update
+    } else if settings_changed.unwrap_or(files_changed) {
+        UpdateNeed::Settings
+    } else {
+        UpdateNeed::Nothing
+    }
+}
+
+/// `service hash` lines (`docker compose config --hash '*'`, or the
+/// [`RUNNING_HASHES`] inspect) as a map.
+fn service_hashes(out: &str) -> std::collections::HashMap<&str, &str> {
+    out.lines()
+        .filter_map(|l| l.trim().split_once(' '))
+        .map(|(s, h)| (s.trim(), h.trim()))
+        .filter(|(s, _)| !s.is_empty())
+        .collect()
+}
+
+/// Whether any service's settings differ from the container it runs as: the
+/// container's `com.docker.compose.config-hash` label (what compose itself
+/// compares to decide on a recreate) against `docker compose config --hash
+/// '*'` now. A declared service with no container counts as changed. `None`
+/// when the declared hashes couldn't be read.
+fn settings_changed(declared: &str, running: &str) -> Option<bool> {
+    let declared = service_hashes(declared);
+    if declared.is_empty() {
+        return None;
+    }
+    let running = service_hashes(running);
+    Some(
+        declared
+            .iter()
+            .any(|(service, hash)| running.get(service) != Some(hash)),
+    )
+}
+
+/// Whether the site's containers were made from other settings than its
+/// `.env`/`compose.yaml` hold now ([`settings_changed`]): an update with no
+/// newer version still has something to apply. `false` when it can't be told.
+pub fn settings_pending(stack: &Stack) -> bool {
+    settings_changed_now(stack) == Some(true)
+}
+
+/// `docker inspect` format: each container's service and config hash.
+const RUNNING_HASHES: &str = "{{index .Config.Labels \"com.docker.compose.service\"}} \
+     {{index .Config.Labels \"com.docker.compose.config-hash\"}}";
+
+/// [`settings_changed`] for `stack`, asking compose and Docker; `None` when
+/// either didn't answer.
+fn settings_changed_now(stack: &Stack) -> Option<bool> {
+    let mut declared = compose(stack);
+    declared.args(["config", "--hash", "*"]);
+    let declared = try_capture(declared)?;
+    let mut ids = compose(stack);
+    ids.args(["ps", "-aq"]);
+    let ids = docker::try_capture_empty_ok(ids)?;
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    let running = if ids.is_empty() {
+        String::new()
+    } else {
+        let mut c = docker::docker();
+        c.args(["inspect", "-f", RUNNING_HASHES]).args(&ids);
+        try_capture(c)?
+    };
+    settings_changed(&declared, &running)
+}
+
+/// The image ID (`sha256:…`) `image` names on this computer, if it is here.
+fn image_id(image: &str) -> Option<String> {
+    let mut c = docker::docker();
+    c.args(["image", "inspect", "--format", "{{.Id}}", image]);
+    let id = try_capture(c)?.trim().to_string();
+    id.starts_with("sha256:").then_some(id)
+}
+
+/// The two files an `up` reads, as they stand: compared before and after the
+/// pre-update repairs to tell whether the containers need recreating.
+fn stack_files(stack: &Stack) -> (Option<String>, Option<String>) {
+    (
+        std::fs::read_to_string(stack.compose_path()).ok(),
+        std::fs::read_to_string(stack.env_path()).ok(),
+    )
+}
+
+/// The refusal for a locked engine site (the engine's `locked` state): an
+/// update or a repair must not start it while its owner has it locked down.
+pub(crate) const SITE_LOCKED: &str = "This site is locked. Unlock it first (System → \
+     Experimental features, or `atelier site unlock --experimental`).";
+
+/// Refuse when the engine says the site is locked.
+pub(crate) fn refuse_locked(engine_state: Option<&str>) -> Result<()> {
+    if engine_state == Some("locked") {
+        bail!(SITE_LOCKED);
+    }
+    Ok(())
+}
+
+/// How a stopped site was brought up for its before-update backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Woke {
+    /// It was running already.
+    No,
+    /// A stopped site, started; it stays up after the update.
+    Started,
+    /// A resting engine site, woken through the engine; it rests again after.
+    FromRest,
+}
+
+/// Whether a site has to be started to be backed up before an update: only
+/// when every container is there and stopped. A missing one makes Start an
+/// `up`, which would already run the new image, so that site goes without a
+/// backup, as it did before 0.17.0.
+fn start_for_backup_needed(state: ContainerState) -> bool {
+    state == ContainerState::Stopped
+}
+
+/// A stopped site has no backup to take, so start it first (a resting engine
+/// site through its Wake). If it won't start, refuse with
+/// [`BackupBeforeUpdateFailed`]: an update with no way back is worse than no
+/// update, unless the owner said to go without one (`opts.no_backup`). Then a
+/// stopped site is left for the update's own `up` to start, and a resting one
+/// still counts as woken, so it rests again after.
+fn wake_for_update(
+    stack: &Stack,
+    engine_state: Option<&str>,
+    opts: &UpdateOptions,
+    r: &mut dyn Reporter,
+) -> Result<Woke> {
+    if opts.no_backup {
+        r.log("Updating without a backup first (--no-backup).");
+        return Ok(woke_without_start(observe_container(stack), engine_state));
+    }
+    start_for_backup(stack, engine_state, r)
+}
+
+/// What an update that doesn't start the site first ([`UpdateOptions::no_backup`])
+/// counts as having woken: its `up` starts a stopped site, and a resting one
+/// must go back to rest after, as it would had it been woken for a backup.
+fn woke_without_start(state: ContainerState, engine_state: Option<&str>) -> Woke {
+    if !start_for_backup_needed(state) {
+        Woke::No
+    } else if engine_state == Some("resting") {
+        Woke::FromRest
+    } else {
+        Woke::Started
+    }
+}
+
+fn start_for_backup(
+    stack: &Stack,
+    engine_state: Option<&str>,
+    r: &mut dyn Reporter,
+) -> Result<Woke> {
+    if !start_for_backup_needed(observe_container(stack)) {
+        return Ok(Woke::No);
+    }
+    // A stopped site is started only to be backed up: when the backup can't
+    // be saved, refuse before starting it.
+    backup_or_refuse(backups_writable(stack).map_err(anyhow::Error::new))?;
+    let resting = engine_state == Some("resting");
+    r.stage(
+        Stage::Starting,
+        if resting {
+            "Waking the site to back it up before the update…"
+        } else {
+            "Starting the site to back it up before the update…"
+        },
+        None,
+    );
+    // Start's own steps report inside this one; its plan is dropped.
+    let mut quiet = ScaledReporter {
+        inner: r,
+        base: 0.0,
+        span: 0.0,
+        prefix: String::new(),
+    };
+    let started = start(stack, &mut quiet).context(BackupBeforeUpdateFailed {
+        cause: "The site is stopped and couldn't be started to back it up first".into(),
+    })?;
+    if !started {
+        return Err(anyhow::Error::new(BackupBeforeUpdateFailed {
+            cause: "The site is stopped, and it didn't finish starting in time to back it up \
+                    first"
+                .into(),
+        }));
+    }
+    Ok(if resting {
+        Woke::FromRest
+    } else {
+        Woke::Started
+    })
+}
+
+/// What happens to a site the update woke, once the update has come out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterWake {
+    /// It wasn't resting before: leave it as it is.
+    Leave,
+    /// Put it back to rest.
+    Rest,
+    /// It is still booting: resting it now would cut its converge short.
+    StayAwake,
+}
+
+/// [`AfterWake`] for a site `woke` describes and how the update came out
+/// (`Ok(ready)`, or failed). A failed update rests the site again too (review
+/// 2026-11-14: it stayed awake); a site that wasn't resting is never rested.
+fn after_wake(woke: Woke, outcome: Result<bool, ()>) -> AfterWake {
+    match (woke, outcome) {
+        (Woke::No | Woke::Started, _) => AfterWake::Leave,
+        (Woke::FromRest, Ok(false)) => AfterWake::StayAwake,
+        (Woke::FromRest, Ok(true) | Err(())) => AfterWake::Rest,
+    }
+}
+
+/// Hand back the update's result `done`, after putting a site it woke from rest
+/// back to rest ([`after_wake`]), whether the update worked or not. Best effort:
+/// a site left awake is still a working site.
+fn settle_woken(
+    stack: &Stack,
+    woke: Woke,
+    done: Result<Updated>,
+    r: &mut dyn Reporter,
+) -> Result<Updated> {
+    match after_wake(woke, done.as_ref().map(|u| u.ready()).map_err(|_| ())) {
+        AfterWake::Leave => {}
+        AfterWake::StayAwake => {
+            r.log("The site stays awake until it has finished booting; Stop puts it back to rest.")
+        }
+        AfterWake::Rest => rest_now(stack, r),
+    }
+    done
+}
+
+/// Put an engine site to rest through its engine.
+fn rest_now(stack: &Stack, r: &mut dyn Reporter) {
+    let Some(info) = ready_engine(stack) else {
+        r.log("Couldn't reach the engine to put the site back to rest; Stop does it.");
+        return;
+    };
+    r.stage(Stage::Working, "Putting the site back to rest…", None);
+    match engine_verb(&info, AdminVerb::Rest, "rest") {
+        Ok(said) => say(r, &said),
+        Err(e) => r.log(&format!(
+            "Couldn't put the site back to rest ({e:#}); it's awake. Stop puts it to rest."
+        )),
+    }
 }
 
 /// Where the appliance image keeps its converge script.
@@ -1137,11 +2006,15 @@ fn converge_cmd(stack: &Stack) -> Command {
 /// glibc and reindexes before the site serves. Returns whether the console came
 /// back up. Nothing to do (or an app too old to reindex, or not running) is
 /// `Ok(true)`: the move waits for the next update.
+///
+/// The new image is downloaded BEFORE `compose.yaml` names it: a failed
+/// download then leaves the file as it was, so the site still starts on the
+/// old one and the move is tried again on the next update.
 fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
     if stack.pending_db_image_migration().is_none() || !app_rebuilds_indexes(stack) {
         return Ok(true);
     }
-    let Some((from, to)) = stack.migrate_db_image()? else {
+    let Some((from, to)) = pull_then_move_db(stack, pull_db_image, r)? else {
         return Ok(true);
     };
     r.stage(
@@ -1154,11 +2027,46 @@ fn move_db_image(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
         ),
         Some(0.9),
     );
-    pull(stack, r)?;
-    let mut c = compose(stack);
-    c.args(["up", "-d", "--force-recreate", "db", "app"]);
-    run_step(c, "move the database server", r)?;
-    Ok(wait_until_ready(stack, READY_TIMEOUT, r))
+    // Only ever inside an update, after its gate ([`Reattach::GatedAway`]).
+    run_recovering_with(
+        stack,
+        // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
+        &["up", "-d", "--force-recreate", "db", "app"],
+        "move the database server",
+        Reattach::GatedAway,
+        r,
+    )?;
+    wait_until_ready(stack, READY_TIMEOUT, r).ready()
+}
+
+/// Download the pending database image with `pull_image`, and only then
+/// rewrite `compose.yaml` to it. `Ok(None)` when nothing is pending, or when
+/// the download failed (logged as a warning): the file is untouched, so the
+/// next update tries again.
+fn pull_then_move_db(
+    stack: &Stack,
+    pull_image: impl FnOnce(&str, &mut dyn Reporter) -> Result<()>,
+    r: &mut dyn Reporter,
+) -> Result<Option<(String, String)>> {
+    let Some((_, to)) = stack.pending_db_image_migration() else {
+        return Ok(None);
+    };
+    if let Err(e) = pull_image(&to, r) {
+        r.log(&format!(
+            "Warning: couldn't download the database server {to} ({e:#}). Your site keeps \
+             its current one; the move is tried again on the next update."
+        ));
+        return Ok(None);
+    }
+    stack.migrate_db_image()
+}
+
+/// `docker pull <image>` for the database move, relayed like the app pull.
+fn pull_db_image(image: &str, r: &mut dyn Reporter) -> Result<()> {
+    let mut c = docker::docker();
+    // scenario: update_moves_the_db_image_once_it_downloads_and_keeps_the_data
+    c.args(["pull", image]);
+    run_step(c, "download the database server", r)
 }
 
 /// Whether the running `app` container's converge carries the collation step.
@@ -1194,7 +2102,8 @@ impl Reporter for ScaledReporter<'_> {
         self.inner.stage(
             stage,
             &format!("{}{message}", self.prefix),
-            fraction.map(|f| self.base + f * self.span),
+            // A zero span means "no slice of the outer bar": indeterminate.
+            fraction.and_then(|f| (self.span > 0.0).then_some(self.base + f * self.span)),
         );
     }
 
@@ -1212,6 +2121,10 @@ impl Reporter for ScaledReporter<'_> {
 
     fn confirm(&mut self, question: &str) -> bool {
         self.inner.confirm(question)
+    }
+
+    fn confirm_docker_restart(&mut self, runtime: &str, detail: &str) -> bool {
+        self.inner.confirm_docker_restart(runtime, detail)
     }
 }
 
@@ -1236,7 +2149,9 @@ impl Reporter for ScaledReporter<'_> {
 /// a full portable snapshot (database + files) first, while the *old* image is still
 /// the one running. Best effort: if the snapshot can't be taken the switch still
 /// proceeds, since converge's own rollback is the real safety net.
-fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+/// Returns whether it saved a snapshot, so the update doesn't take a second one.
+fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let mut saved = false;
     // The repository rename first, and unconditionally: it is a dead pointer rather
     // than a preference (see `Stack::migrate_image_repo`), it needs no snapshot
     // because it changes no version, and the channel migration below reads its output
@@ -1267,7 +2182,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
         );
     }
     if !stack.pending_default_channel_migration() {
-        return Ok(());
+        return Ok(saved);
     }
     // ASK FIRST. This is the one place the manager changes, on its own initiative,
     // which build somebody's existing site runs on — it fires on ADOPTION of an
@@ -1292,7 +2207,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
              `atelier app channel stable` moves it to released versions whenever you want.",
             Some(0.09),
         );
-        return Ok(());
+        return Ok(saved);
     }
     if status(stack).running {
         r.stage(
@@ -1309,11 +2224,14 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             prefix: String::new(),
         };
         match backup(stack, Some("before-channel-switch"), &mut snap) {
-            Ok(path) => r.stage(
-                Stage::Working,
-                &format!("Snapshot saved: {}", path.display()),
-                Some(0.1),
-            ),
+            Ok(path) => {
+                saved = true;
+                r.stage(
+                    Stage::Working,
+                    &format!("Snapshot saved: {}", path.display()),
+                    Some(0.1),
+                )
+            }
             Err(e) => r.stage(
                 Stage::Working,
                 &format!(
@@ -1335,7 +2253,7 @@ fn announce_legacy_migrations(stack: &Stack, r: &mut dyn Reporter) -> Result<()>
             Some(0.11),
         );
     }
-    Ok(())
+    Ok(saved)
 }
 
 /// Point the install at a different channel and, unless `apply` is false, pull it
@@ -1350,18 +2268,24 @@ pub fn switch_channel(
     apply: bool,
     r: &mut dyn Reporter,
 ) -> Result<(String, Option<bool>)> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::ChannelSwitch)?;
     ensure_installed(stack)?;
     let image = stack.set_channel(channel)?;
+    // Another stream of images: an unfinished route to the old one is moot.
+    stack.clear_update_target();
     if !apply {
         return Ok((image, None));
     }
     preflight().require()?;
     pull(stack, r)?;
     up(stack, r)?;
-    Ok((image, Some(wait_until_ready(stack, READY_TIMEOUT, r))))
+    let ready = wait_until_ready(stack, READY_TIMEOUT, r).ready()?;
+    Ok((image, Some(ready)))
 }
 
-/// `docker compose pull`, with a registry-login hint for the private image.
+/// `docker compose pull`, with a registry-login hint when the registry refused
+/// the credentials (and only then: a network error or a missing tag is not a
+/// login problem).
 fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     guard_missing_extensions(stack, r)?;
     r.stage(
@@ -1378,17 +2302,45 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
     if structured {
         c.args(["--progress", "json"]);
     }
+    // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
     c.arg("pull");
-    let run = if structured {
+    // What Docker said, when it passes through here (the terminal's own output
+    // goes straight to the screen, where the operator reads it anyway).
+    let mut refused = false;
+    let mut run = if structured {
         run_streaming(c, "pull the image", |line| {
+            refused |= registry_refused(line);
             match serde_json::from_str::<docker::PullEvent>(line) {
                 Ok(ev) => r.pull_progress(&ev),
                 Err(_) => r.log(line),
             }
         })
+    } else if r.captures_output() {
+        run_streaming(c, "pull the image", |line| {
+            refused |= registry_refused(line);
+            r.log(line);
+        })
     } else {
-        run_step(c, "pull the image", r)
+        run_inherited(c, "pull the image")
     };
+    // The probe can say yes where `pull` says no: Compose 2.20 takes
+    // `--progress json` on `version` and refuses it on `pull` (d34dbuntu,
+    // 2026-11-15). Then the plain feed, as on any older Compose.
+    if structured
+        && run
+            .as_ref()
+            .is_err_and(|e| progress_value_refused(&format!("{e:#}")))
+    {
+        r.log("This Docker Compose has no structured progress; pulling with its plain output.");
+        let mut c = compose(stack);
+        // Run by every update scenario on a Compose before JSON progress (2.20).
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup
+        c.arg("pull");
+        run = run_streaming(c, "pull the image", |line| {
+            refused |= registry_refused(line);
+            r.log(line);
+        });
+    }
     // A pulled image is a new local digest, so the cached update check (if any)
     // now describes a machine that no longer exists — drop it rather than keep a
     // stale "update available" banner up after the update itself.
@@ -1396,7 +2348,7 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
         crate::update_cache::invalidate(stack);
     }
     run.map_err(|e| {
-        if stack.image().starts_with("ghcr.io/") {
+        if refused && stack.image().starts_with("ghcr.io/") {
             e.context(
                 "If this is an authentication error, log in to the registry first:\n  \
                  echo \"<TOKEN>\" | docker login ghcr.io -u aincient-labs --password-stdin",
@@ -1405,6 +2357,21 @@ fn pull(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
             e
         }
     })
+}
+
+/// Whether Compose refused `--progress json` itself (older than its JSON
+/// progress: `unsupported --progress value "json"`).
+fn progress_value_refused(said: &str) -> bool {
+    said.contains("unsupported --progress value")
+}
+
+/// Whether a line of Docker's pull output says the registry refused the
+/// credentials: `denied` (GHCR's word for a package you can't read) or
+/// `unauthorized`. Not the Docker socket's "permission denied", which is no
+/// registry's doing.
+fn registry_refused(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("unauthorized") || l.replace("permission denied", "").contains("denied")
 }
 
 // --- The pre-pull extension guard --------------------------------------------
@@ -1603,19 +2570,557 @@ fn parse_serialized_extensions(blob: &str) -> Vec<String> {
     out
 }
 
-/// `docker compose up -d`.
+/// `docker compose up -d`, refused when the site's database was erased
+/// ([`refuse_erased_database`]).
 fn up(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
+    up_unguarded(stack, r)
+}
+
+/// [`up`] inside an update, after [`crate::gate`] said the site was ready: it
+/// doesn't reconnect a detached container first ([`Reattach::GatedAway`]).
+/// The erased-database refusal stays: a refusal changes nothing, and it is
+/// the last word before `up` would create an empty database.
+fn up_updating(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
     r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
-    let mut c = compose(stack);
-    c.args(["up", "-d"]);
-    run_step(c, "start the appliance", r)
+    run_recovering_with(
+        stack,
+        // scenario: update_applies_changed_settings_on_the_same_image_without_a_backup, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
+        &["up", "-d"],
+        "start the appliance",
+        Reattach::GatedAway,
+        r,
+    )?;
+    clear_database_wiped(stack);
+    Ok(())
+}
+
+/// `docker compose up -d`, for the paths that may start an empty database: an
+/// install, and a restore into a site whose database was erased.
+fn up_unguarded(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
+    // scenario: start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
+    run_recovering(stack, &["up", "-d"], "start the appliance", r)?;
+    // The database exists again, so an owner's wipe has been acted on.
+    clear_database_wiped(stack);
+    Ok(())
+}
+
+/// Drop the owner's-wipe marker ([`crate::stack::DATABASE_WIPED_FILE`]) once
+/// the database is back, so a later accidental loss is refused again.
+fn clear_database_wiped(stack: &Stack) {
+    // Best effort: a marker left behind only lets one more fresh start through.
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
+    let _ = std::fs::remove_file(stack.database_wiped_path());
+}
+
+/// A start was refused: this site has been backed up before (it has a
+/// `site-id`), yet Docker no longer has its database volume. `compose up` would
+/// create an empty one and the appliance would install a blank site over the
+/// lost one, so nothing starts until the owner restores a backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseErased {
+    /// The newest backup of this site on this computer, if any.
+    pub latest_backup: Option<Backup>,
+}
+
+impl std::fmt::Display for DatabaseErased {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.latest_backup {
+            Some(b) => write!(
+                f,
+                "Your site's database was removed from Docker. Restore your latest backup \
+                 (Backups tab): {}. On the command line: `atelier data restore {}`.",
+                b.name, b.path
+            ),
+            None => f.write_str(
+                "Your site's database was removed from Docker, and there is no backup of this \
+                 site on this computer. Restore a backup you saved elsewhere (Backups tab), \
+                 or `atelier data restore <file>`.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseErased {}
+
+/// Whether to refuse a start: `site_id` is set and Docker answered that the
+/// database volume is gone. A site never backed up (a first install), an
+/// unanswered probe, and a database the owner wiped on purpose (`wiped`, see
+/// [`crate::stack::DATABASE_WIPED_FILE`]) are let through.
+fn database_erased(site_id: Option<&str>, db_volume: Option<bool>, wiped: bool) -> bool {
+    site_id.is_some() && db_volume == Some(false) && !wiped
+}
+
+/// [`database_erased`] for `stack`, asking Docker. A database volume that
+/// exists again also clears a leftover owner's-wipe marker.
+pub(crate) fn stack_database_erased(stack: &Stack) -> bool {
+    let volume = docker::db_volume_exists(stack);
+    if volume == Some(true) {
+        clear_database_wiped(stack);
+    }
+    database_erased(stack.site_id().as_deref(), volume, stack.database_wiped())
+}
+
+/// Refuse with [`DatabaseErased`] when this site's database volume is gone.
+pub(crate) fn refuse_erased_database(stack: &Stack) -> Result<()> {
+    if stack_database_erased(stack) {
+        return Err(DatabaseErased {
+            latest_backup: list_backups(stack).into_iter().next(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// What the owner reads when a start fails even after clearing Docker's
+/// leftovers: the one step they can always take, and that their data is safe.
+/// Docker's own lines follow in brackets for a bug report.
+const START_STUCK: &str = "Docker couldn't start your site, even after clearing what it had left \
+     behind and trying again. Restart Docker (`atelier docker restart`), then try again. Your \
+     site's data is safe.";
+
+/// [`START_STUCK`] with what Docker said each time, as the error the app
+/// offers its Restart button for.
+fn start_stuck(first: &anyhow::Error, then: &anyhow::Error) -> anyhow::Error {
+    crate::docker_runtime::NeedsDockerRestart(format!("{START_STUCK} ({first:#}; then {then:#})"))
+        .into()
+}
+
+/// Run a compose start step (`up …`, `start`), and recover once from Docker's
+/// own leftovers.
+///
+/// Docker Desktop sometimes keeps a stopped container's network endpoint after
+/// a sleep, restart or crash. The container then can't start again ("endpoint
+/// with name atelier-db-1 already exists in network atelier_default") and
+/// compose reports only "dependency failed to start: container atelier-db-1
+/// exited (1)" — an update stopped there on 2026-11-14. Only that exact state
+/// is recovered: a container of the site (any service) that isn't running but
+/// still holds an endpoint. Its endpoint is force-disconnected (what fixed it by hand; no
+/// container, volume or data is touched) and the same step runs again. Any
+/// other failure keeps its own error.
+pub(crate) fn run_recovering(
+    stack: &Stack,
+    args: &[&str],
+    action: &str,
+    r: &mut dyn Reporter,
+) -> Result<()> {
+    run_recovering_with(stack, args, action, Reattach::First, r)
+}
+
+/// Whether [`run_recovering_with`] reconnects a container that lost its
+/// network before it runs the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reattach {
+    /// Every start, repair and channel move: compose never reconnects one.
+    First,
+    /// An update's `up`: [`crate::gate`] refused the update while any container
+    /// was detached, and nothing the update does before `up` detaches one, so
+    /// it never repairs that mid-update (M2c).
+    GatedAway,
+}
+
+fn run_recovering_with(
+    stack: &Stack,
+    args: &[&str],
+    action: &str,
+    reattach: Reattach,
+    r: &mut dyn Reporter,
+) -> Result<()> {
+    ensure_engine_image(stack, r)?;
+    if reattach == Reattach::First {
+        reattach_detached(stack, r);
+    }
+    // Docker's stale endpoint (the 2026-11-14 incident) appears only when
+    // the step itself fails to start a container, so no gate can see it
+    // first: this recovery stays on every path, the update's included.
+    let mut cmd = compose(stack);
+    cmd.args(args);
+    let first = match run_step(cmd, action, r) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let stale = stale_endpoints(stack);
+    if stale.is_empty() {
+        return Err(first);
+    }
+    clear_stale_endpoints(stack, &stale, r);
+    let mut again = compose(stack);
+    again.args(args);
+    run_step(again, action, r).map_err(|e| start_stuck(&first, &e))
+}
+
+/// Force-disconnect each `(network, container)` leftover [`stale_endpoints`]
+/// found, saying so, then connect each one back as a fresh endpoint under the
+/// names it had there. No container, volume or data is touched.
+fn clear_stale_endpoints(stack: &Stack, stale: &[(String, String)], r: &mut dyn Reporter) {
+    r.stage(
+        Stage::Starting,
+        "Docker left part of your site half-started. Clearing that and starting again (your data stays)…",
+        None,
+    );
+    // Read before the disconnect, which drops the network (and its aliases)
+    // from a stopped container's own settings: it would start without it, and
+    // stay that way. Every network counts, not only the one it was created on
+    // (an engine site's edge is on two).
+    let mut names: Vec<&str> = stale.iter().map(|(_, c)| c.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let restore = crate::boot::endpoints_to_restore(stale, &crate::boot::inspect(&names));
+    for (network, container) in stale {
+        let mut c = docker::docker();
+        // scenario: start_clears_a_held_endpoint_keeps_every_network_and_then_asks_for_a_docker_restart
+        c.args(["network", "disconnect", "-f", network, container]);
+        match docker::probe_unbounded(c) {
+            Ok(_) => r.log(&format!(
+                "Cleared a leftover network entry: {container} in {network}"
+            )),
+            Err(e) => r.log(&format!("Couldn't clear {container} from {network}: {e}")),
+        }
+    }
+    for back in &restore {
+        let mut c = docker::docker();
+        c.args(reconnect_args(back));
+        match docker::probe_unbounded(c) {
+            Ok(_) => r.log(&format!(
+                "Reconnected {} to {}",
+                back.container, back.network
+            )),
+            // Still connected (the disconnect failed): nothing lost.
+            Err(e) => r.log(&format!(
+                "Couldn't reconnect {} to {}: {e}",
+                back.container, back.network
+            )),
+        }
+    }
+    // Anything else that lost a network it declares.
+    reattach_detached(stack, r);
+}
+
+/// `docker network connect` for `back`, under each name it had there.
+fn reconnect_args(back: &crate::boot::Reconnect) -> Vec<String> {
+    // scenario: start_clears_a_held_endpoint_keeps_every_network_and_then_asks_for_a_docker_restart
+    let mut args = vec!["network".to_string(), "connect".to_string()];
+    for alias in &back.aliases {
+        args.push("--alias".into());
+        args.push(alias.clone());
+    }
+    args.push(back.network.clone());
+    args.push(back.container.clone());
+    args
+}
+
+/// Reconnect each of the site's containers that lost its network
+/// ([`crate::boot::Detached`]), under its service name so the others reach it
+/// again. No container, volume or data is touched. The ones reconnected.
+pub(crate) fn reattach_detached(stack: &Stack, r: &mut dyn Reporter) -> Vec<crate::boot::Detached> {
+    let Some(found) = crate::boot::detached_now(stack) else {
+        return Vec::new();
+    };
+    let mut done = Vec::new();
+    for d in found {
+        let mut c = docker::docker();
+        c.args(reattach_args(&d));
+        match docker::probe_unbounded(c) {
+            Ok(_) => {
+                r.log(&format!("Reconnected {} to {}", d.container, d.network));
+                done.push(d);
+            }
+            Err(e) => r.log(&format!(
+                "Couldn't reconnect {} to {}: {e}",
+                d.container, d.network
+            )),
+        }
+    }
+    done
+}
+
+/// `docker network connect` for `d`: by its service name, the alias compose
+/// gave it, so `db` resolves again.
+fn reattach_args(d: &crate::boot::Detached) -> Vec<String> {
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
+    [
+        "network",
+        "connect",
+        "--alias",
+        &d.service,
+        &d.network,
+        &d.container,
+    ]
+    .iter()
+    .map(|a| (*a).to_string())
+    .collect()
+}
+
+/// [`reattach_detached`], and when something was reconnected while the app
+/// runs, restart the app: its boot ran without what it needed (the database)
+/// and stays failed until it boots again. Whether anything was reconnected.
+pub(crate) fn reconnect_site(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let fixed = reattach_detached(stack, r);
+    if fixed.is_empty() {
+        return Ok(false);
+    }
+    if is_running(stack) {
+        r.stage(
+            Stage::Starting,
+            "Part of your site had lost its network connection. Reconnected it; restarting the site (your data stays)…",
+            None,
+        );
+        let mut c = compose(stack);
+        // scenario: start_reconnects_a_running_db_and_restarts_the_app_that_lost_it
+        c.args(["restart", "app"]);
+        run_step(c, "restart the site", r)?;
+    }
+    Ok(true)
+}
+
+/// The steps of [`wake_recovering`], so its order is tested against a fake.
+/// [`LocalWake`] is the real one.
+trait WakeSteps {
+    /// The engine's Wake (`admin wake`: `compose start db app`); its answer.
+    fn wake(&mut self) -> Result<String>;
+    /// Docker's leftover endpoints ([`stale_endpoints`]).
+    fn stale_endpoints(&mut self) -> Vec<(String, String)>;
+    /// Force-disconnect them ([`clear_stale_endpoints`]).
+    fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter);
+    /// The containers as `compose ps -a` sees them ([`observe_container`]).
+    fn containers(&mut self) -> ContainerState;
+    /// Create the missing containers, recovering once ([`up_missing`]: never
+    /// recreates an existing one).
+    fn up(&mut self, r: &mut dyn Reporter) -> Result<()>;
+}
+
+/// The engine's Wake with the same recovery a plain start gets (M6):
+///
+/// - Refused while locked down: nothing is recovered, the refusal stands.
+/// - Docker kept a stopped container's endpoint: clear it, Wake once more.
+/// - A container is gone (`compose start`, the engine's Wake, can't create
+///   one): `compose up -d --no-recreate` creates it (and only it), then Wake
+///   once more. The failed Wake
+///   put the engine's resting mark back on, so edge would keep serving the
+///   resting copy over a running site; the Wake now (the containers exist)
+///   takes the mark off, and the engine's state is the site's again.
+///
+/// Any other failure keeps the engine's own error.
+fn wake_recovering(steps: &mut dyn WakeSteps, r: &mut dyn Reporter) -> Result<()> {
+    let first = match steps.wake() {
+        Ok(said) => {
+            say(r, &said);
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    if format!("{first:#}").contains("locked down") {
+        return Err(first);
+    }
+    let stale = steps.stale_endpoints();
+    let mut last = None;
+    if !stale.is_empty() {
+        steps.clear(&stale, r);
+        match steps.wake() {
+            Ok(said) => {
+                say(r, &said);
+                return Ok(());
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    if steps.containers() == ContainerState::Missing {
+        r.stage(
+            Stage::Starting,
+            "Part of your site's containers are gone. Creating them again (your data stays)…",
+            None,
+        );
+        steps.up(r)?;
+        let said = steps
+            .wake()
+            .context("the site's containers were created again, but the engine couldn't wake it")?;
+        say(r, &said);
+        return Ok(());
+    }
+    match last {
+        Some(e) => Err(start_stuck(&first, &e)),
+        None => Err(first),
+    }
+}
+
+/// [`WakeSteps`] for a site on this computer.
+struct LocalWake<'a> {
+    stack: &'a Stack,
+    info: &'a crate::engine_admin::EngineInfo,
+}
+
+impl WakeSteps for LocalWake<'_> {
+    fn wake(&mut self) -> Result<String> {
+        engine_verb(self.info, AdminVerb::Wake, "wake")
+    }
+    fn stale_endpoints(&mut self) -> Vec<(String, String)> {
+        stale_endpoints(self.stack)
+    }
+    fn clear(&mut self, stale: &[(String, String)], r: &mut dyn Reporter) {
+        clear_stale_endpoints(self.stack, stale, r);
+    }
+    fn containers(&mut self) -> ContainerState {
+        observe_container(self.stack)
+    }
+    fn up(&mut self, r: &mut dyn Reporter) -> Result<()> {
+        up_missing(self.stack, r)
+    }
+}
+
+/// Read `docker image inspect`'s answer about the engine's image: there, or
+/// "No such image" (gone: fetch it). Any other failure (Docker not answering, a
+/// timeout) is an error: fetching on it would download for nothing and then
+/// fail on the same Docker.
+fn engine_image_present(inspect: std::result::Result<String, String>) -> Result<bool> {
+    match inspect {
+        Ok(_) => Ok(true),
+        Err(e) if e.to_lowercase().contains("no such image") => Ok(false),
+        Err(e) => bail!("Couldn't check your site's engine image with Docker ({e})"),
+    }
+}
+
+/// What a start needs to do about the engine's pinned image (0487).
+#[derive(Debug, PartialEq, Eq)]
+enum EngineImage {
+    /// No engine, or its image is on this computer.
+    Ready,
+    /// Pinned by digest but gone from this computer: fetch exactly that digest.
+    Fetch(String),
+    /// A local developer build (a bare image ID) that is gone: nothing to fetch.
+    LocalBuildGone,
+}
+
+fn engine_image_need(pinned: Option<&str>, present: bool) -> EngineImage {
+    match pinned {
+        None => EngineImage::Ready,
+        Some(_) if present => EngineImage::Ready,
+        Some(p) if crate::engine::is_image_id(p) => EngineImage::LocalBuildGone,
+        Some(p) => EngineImage::Fetch(p.to_string()),
+    }
+}
+
+const LOCAL_ENGINE_GONE: &str = "This site's engine was a local build that is no longer on this \
+     computer, so it can't start. Turn the engine off and on again (System → Experimental \
+     features, or `atelier engine enable`).";
+
+/// Before a start: make sure the engine's pinned image is on this computer.
+///
+/// `compose.engine.yaml` sets `pull_policy: never` so only `atelier engine
+/// enable` decides what the engine runs. An image prune or a Docker reset can
+/// still remove that image, and the start then dies on "No such image"
+/// (owner's test, 2026-11-14). Fetching the pinned digest again brings back the
+/// same bytes `enable` chose, so the rule holds. A local build can't be fetched:
+/// say so before Docker does.
+fn ensure_engine_image(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    if !crate::engine::is_enabled(stack) {
+        return Ok(());
+    }
+    let pinned = crate::engine::pinned_image(stack);
+    let present = match pinned.as_deref() {
+        None => false,
+        Some(p) => {
+            let mut c = docker::docker();
+            c.args(["image", "inspect", "--format", "{{.Id}}", p]);
+            engine_image_present(docker::probe(c))?
+        }
+    };
+    match engine_image_need(pinned.as_deref(), present) {
+        EngineImage::Ready => {
+            // Sites pinned before 0.17.0 have no local name yet: add it, so the
+            // next prune can't take the image.
+            if let Some(p) = pinned.as_deref() {
+                crate::engine::protect_image(stack, p);
+            }
+            Ok(())
+        }
+        EngineImage::LocalBuildGone => bail!(LOCAL_ENGINE_GONE),
+        EngineImage::Fetch(image) => {
+            r.stage(
+                Stage::Pull,
+                "Downloading your site's engine again (it was removed from this computer)…",
+                None,
+            );
+            let mut c = docker::docker();
+            // scenario: none — engine sites only; engine mode (the experimental engine sidecar) has no scenario
+            c.args(["pull", &image]);
+            run_step(c, "download the site's engine", r).map_err(|e| {
+                anyhow::anyhow!(
+                    "Couldn't download your site's engine, which is no longer on this computer. \
+                     If you're offline, connect and try again. ({e:#})"
+                )
+            })?;
+            crate::engine::protect_image(stack, &image);
+            Ok(())
+        }
+    }
+}
+
+/// `(network, container)` for each of this site's containers (any service:
+/// db, app, edge, the engine) that isn't running yet still holds an endpoint in one of its networks — Docker's
+/// leftover that [`run_recovering`] clears. Best effort: any failed probe
+/// counts as "none found", so the original error stands.
+fn stale_endpoints(stack: &Stack) -> Vec<(String, String)> {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let Some(out) = docker::try_capture_empty_ok(ps) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for name in stopped_service_containers(&out) {
+        let mut nets = docker::docker();
+        nets.args([
+            "inspect",
+            "-f",
+            "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}\n{{end}}",
+            &name,
+        ]);
+        let Some(nets) = docker::try_capture(nets) else {
+            continue;
+        };
+        for network in nets.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            let mut members = docker::docker();
+            members.args([
+                "network",
+                "inspect",
+                "-f",
+                "{{range .Containers}}{{.Name}}\n{{end}}",
+                network,
+            ]);
+            if docker::try_capture(members).is_some_and(|m| holds_endpoint(&m, &name)) {
+                found.push((network.to_string(), name.clone()));
+            }
+        }
+    }
+    found
+}
+
+/// Names of the containers `compose ps -a` lists as not running, whatever
+/// their service: Docker leaves an `edge` or engine endpoint behind as readily
+/// as a `db` one.
+fn stopped_service_containers(ps_json: &str) -> Vec<String> {
+    parse_ps(ps_json)
+        .into_iter()
+        .filter(|e| !e.state.to_lowercase().contains("running") && !e.name.is_empty())
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Whether `network inspect`'s endpoint names (one per line) include `name`.
+fn holds_endpoint(members: &str, name: &str) -> bool {
+    members.lines().any(|l| l.trim() == name)
 }
 
 /// Stop the site. With the engine up, Stop is its Rest (DECISIONS 0488):
 /// freeze, then stop `app` and `db`, edge serving the snapshot; returns the
 /// engine's answer. Without it, [`stop_containers`].
 pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Stop)?;
     ensure_installed(stack)?;
+    // Docker first: without it, the engine probe and `compose stop` fail with
+    // Docker's own words instead of "Start Docker".
+    preflight().require()?;
     if let Some(info) = ready_engine(stack) {
         r.stage(Stage::Working, "Putting the site to rest…", None);
         let said = engine_verb(&info, AdminVerb::Rest, "rest")?;
@@ -1630,9 +3135,11 @@ pub fn stop(stack: &Stack, r: &mut dyn Reporter) -> Result<Option<String>> {
 /// keep data. For freeing the port (a site leaving the list), not the owner's
 /// Stop ([`stop`]).
 pub fn stop_containers(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Stop)?;
     ensure_installed(stack)?;
     r.stage(Stage::Working, "Stopping the appliance…", None);
     let mut c = compose(stack);
+    // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
     c.arg("stop");
     run_step(c, "stop the appliance", r)
 }
@@ -1659,14 +3166,15 @@ fn say(r: &mut dyn Reporter, said: &str) {
     }
 }
 
-/// What was observed of the stack's `app` container before starting it.
+/// What was observed of the stack's containers before starting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerState {
     /// The container exists and is running.
     Running,
     /// The container exists but is stopped.
     Stopped,
-    /// No container exists (e.g. `pack down` / `down` removed it).
+    /// A `db`, `app` or `edge` container doesn't exist (e.g. `pack down` /
+    /// `down` removed them, or one was removed by hand).
     Missing,
     /// The probe itself failed — nothing is known.
     Unknown,
@@ -1677,13 +3185,89 @@ pub enum ContainerState {
 pub enum StartAction {
     /// `compose start` — revive existing containers.
     Start,
-    /// `compose up -d` — (re)create the containers from the compose file.
+    /// `compose up -d --no-recreate` — create the missing containers and leave
+    /// the existing ones as they are ([`start_args`]).
     Up,
 }
 
-/// Pure decision: `compose start` only works on containers that exist, so a
-/// removed container needs `up -d`. When the probe failed, keep the old
-/// behaviour (`start`).
+/// The `compose` arguments for `action`. A Start never recreates a container:
+/// sites share moving tags (`atelier-cms:latest`), so after another site's
+/// update a plain `up` would recreate this site's app on the new image — an
+/// update with no backup and no stepped route. Only an update does that.
+pub fn start_args(action: StartAction) -> &'static [&'static str] {
+    match action {
+        // scenario: start_reconnects_a_db_the_stale_endpoint_clear_left_without_networks, checkup_names_a_detached_db_and_start_reconnects_it
+        StartAction::Start => &["start"],
+        // scenario: start_recreates_only_the_removed_container_and_keeps_the_others, app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
+        StartAction::Up => &["up", "-d", "--no-recreate"],
+    }
+}
+
+/// What a Start does: the compose verb, and whether the existing `db`
+/// container is handed the restart policy of a `compose.yaml` this start just
+/// rewrote ([`refresh_compose`]) with `docker update`, since neither verb
+/// recreates it to pick the new file up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartPlan {
+    pub action: StartAction,
+    pub set_db_restart: bool,
+}
+
+/// [`StartPlan`] from the containers as found and whether the compose file was
+/// just rewritten. The rewrite never turns a start into an `up` (it once did,
+/// and recreated containers on whatever image the shared tag named by then).
+pub fn start_plan(state: ContainerState, compose_refreshed: bool) -> StartPlan {
+    StartPlan {
+        action: start_action(state),
+        set_db_restart: compose_refreshed,
+    }
+}
+
+/// The restart policy the current [`crate::stack::COMPOSE_TEMPLATE`] gives `db`.
+const DB_RESTART: &str = "unless-stopped";
+
+/// Give the site's existing `db` container [`DB_RESTART`] in place (`docker
+/// update`): no restart, no recreate. Best effort: without it the database
+/// only doesn't come back by itself after Docker restarts, as before.
+fn apply_db_restart_policy(stack: &Stack, r: &mut dyn Reporter) {
+    let mut ps = compose(stack);
+    ps.args(["ps", "-a", "--format", "json"]);
+    let Some(out) = docker::try_capture_empty_ok(ps) else {
+        return;
+    };
+    let Some(db) = parse_ps(&out)
+        .into_iter()
+        .find(|e| e.service == "db" && !e.name.is_empty())
+    else {
+        return;
+    };
+    let mut c = docker::docker();
+    // scenario: start_after_the_shared_tag_moved_keeps_the_sites_image
+    c.args(["update", "--restart", DB_RESTART, &db.name]);
+    match docker::probe(c) {
+        Ok(_) => r.log(&format!(
+            "The database now restarts with Docker ({} → {DB_RESTART}).",
+            db.name
+        )),
+        Err(e) => r.log(&format!(
+            "Couldn't set the database's restart policy ({e}); it applies at the next update."
+        )),
+    }
+}
+
+/// [`StartAction::Up`]: create the containers that are missing, refused when
+/// the site's database was erased ([`refuse_erased_database`]).
+fn up_missing(stack: &Stack, r: &mut dyn Reporter) -> Result<()> {
+    refuse_erased_database(stack)?;
+    r.stage(Stage::Starting, "Starting the containers…", Some(UP_FROM));
+    run_recovering(stack, start_args(StartAction::Up), "start the appliance", r)?;
+    clear_database_wiped(stack);
+    Ok(())
+}
+
+/// Pure decision: `compose start` only works on containers that exist (and
+/// starts only those), so a removed container needs `up -d`. When the probe
+/// failed, keep the old behaviour (`start`).
 pub fn start_action(state: ContainerState) -> StartAction {
     match state {
         ContainerState::Missing => StartAction::Up,
@@ -1693,12 +3277,25 @@ pub fn start_action(state: ContainerState) -> StartAction {
     }
 }
 
-/// Classify `compose ps -a --format json` output for the `app` service.
+/// The services every site has; `compose start` can't bring back one whose
+/// container is gone.
+const CORE_SERVICES: [&str; 3] = ["db", "app", "edge"];
+
+/// Classify `compose ps -a --format json` output: [`Missing`](ContainerState::Missing)
+/// when any of [`CORE_SERVICES`] has no container (a `docker rm` of `db` alone
+/// left `compose start` starting app and edge against no database), otherwise
+/// by the `app` container's state.
 fn container_state_from_ps(out: &str) -> ContainerState {
-    match parse_ps(out).iter().find(|e| e.service == "app") {
-        None => ContainerState::Missing,
+    let entries = parse_ps(out);
+    if CORE_SERVICES
+        .iter()
+        .any(|s| !entries.iter().any(|e| e.service == *s))
+    {
+        return ContainerState::Missing;
+    }
+    match entries.iter().find(|e| e.service == "app") {
         Some(e) if e.state.to_lowercase().contains("running") => ContainerState::Running,
-        Some(_) => ContainerState::Stopped,
+        _ => ContainerState::Stopped,
     }
 }
 
@@ -1717,17 +3314,30 @@ fn observe_container(stack: &Stack) -> ContainerState {
 /// `docker compose up -d` when none exist (after `pack down`). Returns whether
 /// the console came up before the readiness timeout.
 pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Start)?;
     ensure_installed(stack)?;
+    // Docker first, so a stopped Docker reads "Start Docker", not a probe's error.
+    preflight().require()?;
+    // Before anything starts a container: an erased database must not come
+    // back empty (the engine's Wake starts db too).
+    refuse_erased_database(stack)?;
+    // Before the engine's Wake too: a resting engine site starts that way, and
+    // its pinned image needs its local name as much as on a cold start.
+    ensure_engine_image(stack, r)?;
     Plan::ranged(&[
         ("start", "Start", START_FROM, BOOT_FROM),
         ("boot", "Boot", BOOT_FROM, 1.0),
     ])
     .announce(r);
+    // A container that lost its network (Docker's leftovers, an earlier
+    // recovery) never gets it back from `compose start`/`up` or a Docker
+    // restart: reconnect it first, and reboot an app that booted without it.
+    reconnect_site(stack, r)?;
     // DECISIONS 0488: with the engine up, Start is its Wake (refused while
     // locked down), so the engine's state stays the site's state.
     if let Some(info) = ready_engine(stack) {
         r.stage(Stage::Starting, "Waking the site…", Some(START_FROM));
-        let said = engine_verb(&info, AdminVerb::Wake, "wake").map_err(|e| {
+        wake_recovering(&mut LocalWake { stack, info: &info }, r).map_err(|e| {
             if format!("{e:#}").contains("locked down") {
                 anyhow::anyhow!(
                     "the site is locked down, so it can't be started. Unlock it first \
@@ -1737,42 +3347,70 @@ pub fn start(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
                 e
             }
         })?;
-        say(r, &said);
-        return Ok(wait_until_ready(stack, START_READY_TIMEOUT, r));
+        return wait_until_ready(stack, START_READY_TIMEOUT, r).ready();
     }
     r.stage(Stage::Starting, "Starting the appliance…", Some(START_FROM));
-    match start_action(observe_container(stack)) {
+    // An untouched older compose.yaml gets this manager's (the db restart
+    // policy). The containers keep running what they were made from: the new
+    // file reaches them at the next update, and the one setting it adds is
+    // handed to `db` in place ([`start_plan`]).
+    let plan = start_plan(observe_container(stack), refresh_compose(stack, r));
+    match plan.action {
         StartAction::Start => {
-            let mut c = compose(stack);
-            c.arg("start");
-            run_step(c, "start the appliance", r)?;
+            run_recovering(stack, start_args(plan.action), "start the appliance", r)?;
         }
-        StartAction::Up => up(stack, r)?,
+        StartAction::Up => up_missing(stack, r)?,
     }
-    Ok(wait_until_ready(stack, START_READY_TIMEOUT, r))
+    if plan.set_db_restart {
+        apply_db_restart_policy(stack, r);
+    }
+    wait_until_ready(stack, START_READY_TIMEOUT, r).ready()
 }
 
 /// `docker compose down`. With `wipe_data`, also removes the volumes — a
 /// destructive reset (database, files, and the saved admin password). Callers
 /// must confirm with the user first.
-pub fn down(stack: &Stack, wipe_data: bool) -> Result<()> {
+///
+/// A wipe first leaves [`crate::stack::DATABASE_WIPED_FILE`], so the next
+/// start sets up a fresh site rather than refusing with [`DatabaseErased`]: the
+/// owner erased it, it wasn't lost. Written before `down -v`, so a wipe that
+/// fails halfway still counts; a database that survives clears it again.
+///
+/// Runs through [`run_step`] like stop and start, so the GUI gets Docker's
+/// output in its feed and a failure says why.
+pub fn down(stack: &Stack, wipe_data: bool, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Remove)?;
     ensure_installed(stack)?;
     let mut c = compose(stack);
+    // scenario: app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
     c.arg("down");
     if wipe_data {
+        mark_database_wiped(stack)?;
         c.arg("-v");
     }
-    run_inherited(c, "stop and remove the appliance")
+    run_step(c, "stop and remove the appliance", r)
+}
+
+/// Leave the owner's-wipe marker in `stack`'s directory.
+fn mark_database_wiped(stack: &Stack) -> Result<()> {
+    let path = stack.database_wiped_path();
+    // scenario: app_down_keeps_the_data_and_down_wipe_starts_a_fresh_site
+    std::fs::write(
+        &path,
+        "The database was wiped on purpose; the next start sets up a fresh site.\n",
+    )
+    .with_context(|| format!("could not write {}", path.display()))
 }
 
 /// Wipe everything and install from scratch. Destructive — confirm first.
 /// Returns whether the console came up before the readiness timeout.
 pub fn reinstall(stack: &Stack, opts: &InstallOptions, r: &mut dyn Reporter) -> Result<bool> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Reinstall)?;
     preflight().require()?;
     if stack.exists() {
         lifecycle_plan().announce(r);
         r.stage(Stage::Scaffold, "Removing the old appliance…", Some(0.02));
-        down(stack, true)?;
+        down(stack, true, r)?;
     }
     install(stack, opts, r)
 }
@@ -1787,6 +3425,7 @@ pub(crate) const FILES_DIR: &str = "/opt/drupal/web/sites/default/files";
 /// archive can be shared over the wire and [`restore`]d onto another host.
 /// Returns the path to the created archive.
 pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Result<PathBuf> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Backup)?;
     let plan = Plan::weighted(&[
         ("check", "Check", 1.0),
         ("dump", "Database", 4.0),
@@ -1796,26 +3435,26 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
     plan.announce(r);
     let site_id = plan.run(r, "check", "Checking the site…", |_| {
         ensure_running(stack)?;
-        std::fs::create_dir_all(stack.backups_dir())?;
+        // Before the dump: a folder the copy can't land in fails here in
+        // plain words, not as Docker's "permission denied" after the dump.
+        std::fs::create_dir_all(stack.backups_dir()).map_err(|_| BackupsNotWritable {
+            dir: stack.backups_dir(),
+        })?;
+        backups_writable(stack)?;
         sweep_stale_parts(&stack.backups_dir());
         // Which site this is (m2-6, D-04): restore refuses another site's archive.
         stack.ensure_site_id()
     })?;
 
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let stem = match label {
-        Some(l) if !l.is_empty() => format!("{}-{ts}", sanitize(l)),
-        _ => ts.clone(),
-    };
+    let stem = backup_stem(label, &ts);
     // Per-run paths: two backups at once (the GUI and the CLI, or a stepped
     // upgrade's own snapshot) must never pack each other's staging or write the
     // same file. The copy lands in a hidden `.part` the backup list ignores; the
     // final name is only claimed once the archive is complete (see [`claim_name`]).
     let run = run_id();
     let stage = format!("/tmp/aincient-snapshot-{run}");
-    let part = stack
-        .backups_dir()
-        .join(format!(".aincient-{stem}-{run}.part"));
+    let part = stack.backups_dir().join(format!(".{stem}-{run}.part"));
     let archive = format!("{stage}.tar.gz");
 
     let drush = DRUSH.join(" ");
@@ -1880,32 +3519,108 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
             |_| {
                 let mut cp = compose(stack);
                 cp.args(["cp", &format!("app:{archive}"), &part.to_string_lossy()]);
-                run_capture(cp, "copy the snapshot out of the container")?;
+                // The docker CLI writes this copy on this computer: a full
+                // disk here is the computer's, not Docker's.
+                crate::docker::run_capture_writing_to(
+                    cp,
+                    "copy the snapshot out of the container",
+                    &stack.backups_dir(),
+                )?;
                 // A backup that isn't on disk in full is no backup: never report one.
                 let size = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
                 if size == 0 {
                     bail!("the backup copied out of the container came out empty");
                 }
-                claim_name(
-                    &part,
-                    &stack.backups_dir(),
-                    &format!("aincient-{stem}"),
-                    ".tar.gz",
-                )
+                claim_name(&part, &stack.backups_dir(), &stem, ".tar.gz")
             },
         )
         .inspect_err(|_| {
             remove_in_container(stack, &[&stage, &archive]);
             // Never leave a partial archive behind.
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, update_of_a_running_site_whose_backup_fails_is_refused_then_proceeds_without_a_backup
             let _ = std::fs::remove_file(&part);
         })?;
 
     // Best-effort cleanup of the in-container temp files.
     remove_in_container(stack, &[&stage, &archive]);
+    // The first automatic backup this version takes starts the count of the
+    // ones kept ([`AUTOMATIC_SINCE_FILE`]); older ones are never pruned.
+    let name = host_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if let Some(stamp) = automatic_backup_stamp(name) {
+        note_automatic_backups_since(stack, stamp);
+    }
 
     r.log(&format!("Snapshot written to {}", host_path.display()));
     plan.finish(r, "Backup saved.");
     Ok(host_path)
+}
+
+/// A backup refused before any work: Atelier can't write in the site's backups
+/// folder (its permissions, a read-only or locked-up disk). Found by trying,
+/// before the dump, rather than by the copy out failing with Docker's
+/// "permission denied" once the dump is done (state zoo, `ro-backups`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupsNotWritable {
+    /// The backups folder.
+    pub dir: PathBuf,
+}
+
+impl BackupsNotWritable {
+    /// The cause alone, for a sentence that goes on ([`backup_or_refuse`]).
+    pub fn cause(&self) -> String {
+        format!(
+            "Atelier can't save backups in {}: it isn't writable",
+            self.dir.display()
+        )
+    }
+}
+
+impl std::fmt::Display for BackupsNotWritable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}. Fix the folder's permissions (or free it up), then try again.",
+            self.cause()
+        )
+    }
+}
+
+impl std::error::Error for BackupsNotWritable {}
+
+/// Whether a backup could be saved in `stack`'s backups folder right now: a
+/// file is created there (and removed) as the copy out would. A folder not
+/// made yet is judged by the site's folder it would be made in; nothing is
+/// created then (the checkup calls this, and a diagnosis changes nothing).
+pub fn backups_writable(stack: &Stack) -> std::result::Result<(), BackupsNotWritable> {
+    let dir = stack.backups_dir();
+    let probe_in = if dir.is_dir() { &dir } else { &stack.home };
+    let probe = probe_in.join(format!(".atelier-write-check-{}", std::process::id()));
+    let made = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    match made {
+        Ok(_) => {
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        // Left by a run that died between the two lines: the folder took it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => Err(BackupsNotWritable { dir }),
+    }
+}
+
+/// A backup's file name without its extension: `aincient-[<label>-]<ts>`, the
+/// label sanitized. [`claim_name`] adds `-N` when the name is taken.
+fn backup_stem(label: Option<&str>, ts: &str) -> String {
+    match label {
+        Some(l) if !l.is_empty() => format!("aincient-{}-{ts}", sanitize(l)),
+        _ => format!("aincient-{ts}"),
+    }
 }
 
 /// Best-effort removal of an op's temp paths inside the `app` container. Every
@@ -1913,6 +3628,7 @@ pub fn backup(stack: &Stack, label: Option<&str>, r: &mut dyn Reporter) -> Resul
 /// leftover would otherwise stay (a multi-GB archive, once per failed attempt).
 fn remove_in_container(stack: &Stack, paths: &[&str]) {
     let mut rm = compose(stack);
+    // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
     rm.args(["exec", "-T", "app", "rm", "-rf"]).args(paths);
     let _ = rm.output();
 }
@@ -1949,6 +3665,7 @@ fn sweep_stale_parts(dir: &Path) {
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > STALE_PART);
         if stale {
+            // scenario: none — removes .part files older than the stale age; no scenario leaves one
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -1966,11 +3683,13 @@ fn claim_name(part: &Path, dir: &Path, stem: &str, ext: &str) -> Result<PathBuf>
     for name in candidates {
         match std::fs::hard_link(part, &name) {
             Ok(()) => {
+                // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
                 let _ = std::fs::remove_file(part);
                 return Ok(name);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) if !name.exists() => {
+                // scenario: none — the fallback when claiming the backup name by hard link fails; not reached
                 std::fs::rename(part, &name)
                     .with_context(|| format!("failed to save the backup as {}", name.display()))?;
                 return Ok(name);
@@ -2043,6 +3762,7 @@ fn install_export(staged: &Path, target: &Path) -> Result<()> {
     }
     check_export_target(target)?;
     if target.exists() {
+        // scenario: none — static export (atelier export) has no scenario; replaces the export target
         std::fs::remove_dir_all(target).with_context(|| {
             format!(
                 "failed to replace the previous export at {}",
@@ -2050,6 +3770,7 @@ fn install_export(staged: &Path, target: &Path) -> Result<()> {
             )
         })?;
     }
+    // scenario: none — static export (atelier export) has no scenario
     std::fs::rename(staged, target)
         .with_context(|| format!("failed to move the export into {}", target.display()))
 }
@@ -2205,10 +3926,12 @@ fn export_static_in(
             let mut cp = compose(stack);
             cp.args(["cp", &format!("app:{stage}"), &staged.to_string_lossy()]);
             if let Err(e) = run_capture(cp, "copy the exported site out of the container") {
+                // scenario: none — static export (atelier export) has no scenario
                 let _ = std::fs::remove_dir_all(&staged);
                 return Err(e);
             }
             if let Err(e) = install_export(&staged, host_out) {
+                // scenario: none — static export (atelier export) has no scenario
                 let _ = std::fs::remove_dir_all(&staged);
                 return Err(e);
             }
@@ -2269,6 +3992,7 @@ pub struct SnapshotList {
 /// snapshot inside the appliance and serve it to anonymous visitors; the
 /// appliance's web server does the switching, so nothing restarts.
 pub fn freeze(stack: &Stack, opts: &FreezeOptions, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Freezing the site…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -2339,6 +4063,7 @@ pub fn snapshots(stack: &Stack) -> Result<SnapshotList> {
 
 /// Serve a snapshot id, or `"live"`. The appliance validates the id.
 pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Switching what visitors see…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -2352,6 +4077,7 @@ pub fn use_snapshot(stack: &Stack, id: &str, r: &mut dyn Reporter) -> Result<()>
 
 /// Delete old snapshots; returns the ids removed.
 pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result<Vec<String>> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Snapshot)?;
     r.stage(Stage::Working, "Pruning snapshots…", None);
     ensure_running(stack)?;
     let before = snapshots(stack)?;
@@ -2378,6 +4104,7 @@ pub fn prune_snapshots(stack: &Stack, keep: u32, r: &mut dyn Reporter) -> Result
 /// database only. Both mirror converge's `restore_snapshot` for the DB: drop,
 /// load, rebuild caches.
 pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Restore)?;
     ensure_running(stack)?;
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
@@ -2445,6 +4172,7 @@ pub fn restore(stack: &Stack, file: &Path, r: &mut dyn Reporter) -> Result<()> {
         "Copying the backup into the container…",
         |_| {
             let mut cp = compose(stack);
+            // scenario: none — restoring a plain .sql dump; the scenarios restore backup bundles
             cp.args([
                 "cp",
                 &file.to_string_lossy(),
@@ -2534,6 +4262,7 @@ fn restore_bundle_in(
         "Copying the snapshot into the container…",
         |_| {
             let mut cp = compose(stack);
+            // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
             cp.args(["cp", &file.to_string_lossy(), &format!("app:{archive}")]);
             run_capture(cp, "copy the snapshot into the container")
         },
@@ -2712,6 +4441,90 @@ pub fn restore_identity(stack: &Stack, file: &Path, other_site: bool) -> Result<
 pub struct RestoreOptions {
     /// Restore another site's archive anyway (`--other-site`).
     pub other_site: bool,
+    /// Restore without first backing up the site as it is now
+    /// (`--no-safety-backup`). Without it, a backup that fails stops the restore.
+    pub no_safety_backup: bool,
+    /// The caller already showed the archive's identity note ([`restore_identity`]):
+    /// the CLI prints it before its confirmation, so the restore doesn't say
+    /// it a second time ("Restoring a backup of another site — …" twice).
+    pub identity_shown: bool,
+}
+
+/// A restore was refused because the backup of the site as it is now failed:
+/// the restore drops the database, and without that copy nothing could undo it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyBackupFailed {
+    /// Why the backup failed, as its error chain reads.
+    pub cause: String,
+}
+
+impl std::fmt::Display for SafetyBackupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "couldn't back up your site as it is now, so nothing was restored and your \
+             site is unchanged. The backup failed: {}",
+            self.cause
+        )
+    }
+}
+
+impl std::error::Error for SafetyBackupFailed {}
+
+/// A refusal the owner can override, knowing what it costs: a restore whose
+/// safety backup failed ([`SafetyBackupFailed`]; `--no-safety-backup`) or an
+/// update whose site couldn't be backed up first ([`BackupBeforeUpdateFailed`];
+/// `--no-backup`). The Manager offers the override behind a confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overridable {
+    /// Restore again without the safety backup.
+    RestoreWithoutSafetyBackup,
+    /// Update again without the backup first.
+    UpdateWithoutBackup,
+}
+
+impl Overridable {
+    /// The exit code `atelier` ends with for this refusal, so a Manager driving
+    /// it over SSH can tell it apart without reading its words.
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Overridable::RestoreWithoutSafetyBackup => 3,
+            Overridable::UpdateWithoutBackup => 4,
+        }
+    }
+
+    fn from_exit_code(code: i32) -> Option<Self> {
+        [
+            Overridable::RestoreWithoutSafetyBackup,
+            Overridable::UpdateWithoutBackup,
+        ]
+        .into_iter()
+        .find(|o| o.exit_code() == code)
+    }
+
+    /// Which refusal `e` is, if any: the typed error here, or a server's
+    /// `atelier` that ended with its exit code.
+    pub fn of(e: &anyhow::Error) -> Option<Self> {
+        if e.is::<SafetyBackupFailed>() {
+            Some(Overridable::RestoreWithoutSafetyBackup)
+        } else if e.is::<BackupBeforeUpdateFailed>() {
+            Some(Overridable::UpdateWithoutBackup)
+        } else {
+            e.downcast_ref::<crate::remote::RemoteExit>()
+                .and_then(|x| Self::from_exit_code(x.code))
+        }
+    }
+}
+
+/// The restore's safety backup must have worked, or been skipped because the
+/// site isn't running (no running database to lose): a failure stops the
+/// restore before anything is dropped.
+fn require_safety_backup(outcome: Result<Option<PathBuf>>) -> Result<Option<PathBuf>> {
+    outcome.map_err(|e| {
+        anyhow::Error::new(SafetyBackupFailed {
+            cause: format!("{e:#}"),
+        })
+    })
 }
 
 /// [`restore`] behind the site-identity check (m2-6, D-04): another site's
@@ -2723,13 +4536,107 @@ pub fn restore_with(
     opts: &RestoreOptions,
     r: &mut dyn Reporter,
 ) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Restore)?;
     if !file.is_file() {
         bail!("backup file not found: {}", file.display());
     }
-    if let Some(note) = restore_identity(stack, file, opts.other_site)?.message() {
+    // Checked either way: the refusal of another site's archive is here.
+    let identity = restore_identity(stack, file, opts.other_site)?;
+    if let Some(note) = identity.message().filter(|_| !opts.identity_shown) {
         r.log(note);
     }
-    restore(stack, file, r)
+    let erased = restore_into_erased(stack, r)?;
+    // A restore drops the database before loading the backup: without a copy of
+    // the site as it is now, a wrong pick or a failed load loses the work since.
+    // So a backup that fails stops the restore (review 2026-11-14), unless the
+    // owner said to go without one.
+    let before = if opts.no_safety_backup {
+        r.log("Restoring without backing up your site as it is now (--no-safety-backup).");
+        None
+    } else if erased {
+        r.log("Your site's database was removed, so there is nothing to back up first.");
+        None
+    } else {
+        require_safety_backup(safety_backup(
+            stack,
+            "before-restore",
+            "Backing up your site as it is now…",
+            0.0,
+            0.0,
+            r,
+        ))?
+    };
+    restore(stack, file, r).map_err(|e| match &before {
+        Some(path) => e.context(format!(
+            "the restore didn't finish. Your site as it was just before is saved in {}; restore that to go back",
+            path.display()
+        )),
+        None => e,
+    })?;
+    // The site may now run past an unfinished update's target.
+    drop_stale_update_target(stack);
+    // Only after the restore worked, and never the backup just restored.
+    prune_automatic_backups(stack, Some(file), r);
+    Ok(())
+}
+
+/// The way back from [`DatabaseErased`]: Start refuses such a site, so a
+/// restore starts it with an empty database first (what an install does) and
+/// then loads the backup into it. Returns whether it did. A running site, or one
+/// whose database is still there, is left to [`restore`]'s own checks.
+fn restore_into_erased(stack: &Stack, r: &mut dyn Reporter) -> Result<bool> {
+    ensure_installed(stack)?;
+    preflight().require()?;
+    if status(stack).running || !stack_database_erased(stack) {
+        return Ok(false);
+    }
+    r.stage(
+        Stage::Starting,
+        "Your site's database was removed from Docker. Starting the site with an empty one to restore into…",
+        None,
+    );
+    up_unguarded(stack, r)?;
+    if !wait_until_ready(stack, READY_TIMEOUT, r).ready()? {
+        bail!(
+            "The site is still setting up its empty database, so the backup wasn't restored yet. \
+             Try the restore again in a few minutes."
+        );
+    }
+    Ok(true)
+}
+
+/// A backup before a change the owner can't undo by running the old image again
+/// (a one-step update, a restore). `Ok(None)` when the site isn't running (there
+/// is nothing new to save); a failure is returned for the caller to weigh (an
+/// update goes ahead, a restore stops). Prunes nothing: older automatic backups
+/// go only after the change succeeded. `base`/`span` place the backup's own
+/// progress inside the caller's bar (`span` 0 = indeterminate).
+fn safety_backup(
+    stack: &Stack,
+    label: &str,
+    headline: &str,
+    base: f32,
+    span: f32,
+    r: &mut dyn Reporter,
+) -> Result<Option<PathBuf>> {
+    if !status(stack).running {
+        return Ok(None);
+    }
+    let at = |f: f32| (span > 0.0).then_some(f);
+    r.stage(Stage::Working, headline, at(base));
+    let mut snap = ScaledReporter {
+        inner: r,
+        base,
+        span,
+        prefix: String::new(),
+    };
+    let path = backup(stack, Some(label), &mut snap)?;
+    r.stage(
+        Stage::Working,
+        &format!("Backup saved: {}", path.display()),
+        at(base + span),
+    );
+    Ok(Some(path))
 }
 
 /// Describe a backup archive the way `data backup --json` reports it: size and
@@ -2886,7 +4793,12 @@ fn backup_dump_script(drush: &str, manifest: &str, stage: &str) -> String {
 }
 
 /// The second half of the snapshot: pack the staged dump + manifest with the
-/// files tree and frozen snapshots (see [`backup_dump_script`]).
+/// files tree, frozen snapshots and chat attachments (see [`backup_dump_script`]).
+///
+/// Chat attachments live in `private/atelier-context` (cms `ContextStore`, one
+/// ledger row each in the database): a backup without them restored chats whose
+/// images were gone. Packed only when the folder exists (a site that never had
+/// an attachment has none), so it is not created here as root.
 fn backup_pack_script(stage: &str) -> String {
     // The last two lines read the archive back: a truncated or unreadable archive,
     // or one missing the dump or manifest, fails the backup instead of being
@@ -2896,9 +4808,11 @@ fn backup_pack_script(stage: &str) -> String {
          STAGE={stage}\n\
          ARCHIVE={stage}.tar.gz\n\
          mkdir -p /opt/drupal/private/frozen\n\
+         CONTEXT=\n\
+         if [ -d /opt/drupal/private/atelier-context ]; then CONTEXT=atelier-context; fi\n\
          tar czf \"$ARCHIVE\" --exclude=files/styles -C \"$STAGE\" manifest.json database.sql.gz \
          -C /opt/drupal/web/sites/default files \
-         -C /opt/drupal/private frozen\n\
+         -C /opt/drupal/private frozen $CONTEXT\n\
          tar tzf \"$ARCHIVE\" > \"$STAGE/members\"\n\
          grep -qx database.sql.gz \"$STAGE/members\" && grep -qx manifest.json \"$STAGE/members\"\n"
     )
@@ -2946,6 +4860,11 @@ fn restore_bundle_scripts(drush: &str, work: &str) -> [String; 3] {
          \x20 cp -a \"$WORK/frozen\" /opt/drupal/private/frozen\n\
          \x20 chown -R www-data:www-data /opt/drupal/private/frozen\n\
          fi\n\
+         if [ -d \"$WORK/atelier-context\" ]; then\n\
+         \x20 rm -rf /opt/drupal/private/atelier-context\n\
+         \x20 cp -a \"$WORK/atelier-context\" /opt/drupal/private/atelier-context\n\
+         \x20 chown -R www-data:www-data /opt/drupal/private/atelier-context\n\
+         fi\n\
          {drush} cache:rebuild || true\n\
          rm -rf \"$WORK\" \"$ARCHIVE\" || true\n"
     );
@@ -2963,6 +4882,169 @@ fn is_snapshot_bundle(name: &str) -> bool {
 fn is_backup_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     is_snapshot_bundle(name) || n.ends_with(".sql.gz") || n.ends_with(".sql")
+}
+
+/// Labels Atelier gives the backups it takes by itself. Only these are ever
+/// pruned; a backup the owner made (no label, or their own) is never touched.
+const AUTOMATIC_BACKUP_LABELS: [&str; 4] = [
+    "before-update",
+    "before-restore",
+    "before-stepped-upgrade",
+    "before-channel-switch",
+];
+
+/// How many automatic backups to keep (owner, 2026-11-14).
+const AUTOMATIC_BACKUPS_KEPT: usize = 3;
+
+/// Where a site records when its automatic backups started counting toward
+/// [`AUTOMATIC_BACKUPS_KEPT`]: `<home>/.automatic-backups-since`, holding a
+/// `YYYYMMDD-HHMMSS` stamp as backup names carry it.
+///
+/// Manager versions before 0.17.0 took automatic backups and never removed
+/// any. Owner, 2026-11-14: only those taken from 0.17.0 on count toward the
+/// three kept; older ones are never removed automatically (Free up space
+/// offers them, [`older_automatic_backups`]). The stamp is that of the first
+/// automatic backup this version took, so every one it takes counts and none
+/// before it does.
+pub const AUTOMATIC_SINCE_FILE: &str = ".automatic-backups-since";
+
+/// The `YYYYMMDD-HHMMSS` stamp of a backup Atelier took by itself, as
+/// [`backup`] names it: `aincient-<label>-<YYYYMMDD>-<HHMMSS>[-N].tar.gz`.
+/// `None` for any other file. The `aincient-` prefix comes first (review
+/// 2026-11-14: matching the label against the whole name meant nothing was
+/// ever pruned).
+fn automatic_backup_stamp(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("aincient-")?;
+    AUTOMATIC_BACKUP_LABELS.iter().find_map(|l| {
+        let stamp = rest.strip_prefix(l)?.strip_prefix('-')?;
+        is_stamp(stamp.get(..15)?).then(|| &stamp[..15])
+    })
+}
+
+/// `YYYYMMDD-HHMMSS`.
+fn is_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 15
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'-'
+        && b[9..].iter().all(u8::is_ascii_digit)
+}
+
+/// The stamp in [`AUTOMATIC_SINCE_FILE`], if this site has one yet.
+pub fn automatic_backups_since(stack: &Stack) -> Option<String> {
+    let raw = std::fs::read_to_string(stack.home.join(AUTOMATIC_SINCE_FILE)).ok()?;
+    let stamp = raw.trim();
+    is_stamp(stamp).then(|| stamp.to_string())
+}
+
+/// Record `stamp` as the start of counted automatic backups, unless the site
+/// has a start already. Best effort: without it nothing is pruned.
+fn note_automatic_backups_since(stack: &Stack, stamp: &str) {
+    if automatic_backups_since(stack).is_none() {
+        // scenario: restore_refuses_when_its_safety_backup_fails_and_restores_when_told_to_go_without, start_and_doctor_refuse_an_erased_database_and_a_restore_brings_it_back
+        let _ = std::fs::write(stack.home.join(AUTOMATIC_SINCE_FILE), format!("{stamp}\n"));
+    }
+}
+
+/// The same file, however each path spells it (a relative path, `..`, a
+/// symlinked folder such as macOS's `/tmp` → `/private/tmp`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// Automatic backups that count toward the newest `keep`: those stamped at or
+/// after `since` ([`AUTOMATIC_SINCE_FILE`]), newest first. None without a
+/// `since`.
+fn counted_automatic_backups<'a>(backups: &'a [Backup], since: Option<&str>) -> Vec<&'a Backup> {
+    let Some(since) = since else {
+        return Vec::new();
+    };
+    let mut auto: Vec<&Backup> = backups
+        .iter()
+        .filter(|b| automatic_backup_stamp(&b.name).is_some_and(|s| s >= since))
+        .collect();
+    auto.sort_by(|a, b| {
+        b.modified_unix
+            .cmp(&a.modified_unix)
+            .then_with(|| automatic_backup_stamp(&b.name).cmp(&automatic_backup_stamp(&a.name)))
+            .then_with(|| b.name.cmp(&a.name))
+    });
+    auto
+}
+
+/// The counted automatic backups ([`counted_automatic_backups`]) beyond the
+/// newest `keep`, oldest last — what a prune removes. Older automatic backups
+/// are never among them, and neither is `protect` (the backup a restore just
+/// loaded), however its path is spelled.
+fn automatic_backups_to_prune<'a>(
+    backups: &'a [Backup],
+    keep: usize,
+    protect: Option<&Path>,
+    since: Option<&str>,
+) -> Vec<&'a Backup> {
+    counted_automatic_backups(backups, since)
+        .into_iter()
+        .skip(keep)
+        // Never the backup a restore loaded (review 2026-11-14: a prune after
+        // the before-restore backup could delete the owner's pick).
+        .filter(|b| !protect.is_some_and(|p| same_file(Path::new(&b.path), p)))
+        .collect()
+}
+
+/// Automatic backups older than `since` (all of them without one): taken
+/// before automatic backups counted, never pruned, and what Free up space
+/// offers to remove. Never an owner's backup, never a counted one.
+fn older_automatic_backups<'a>(backups: &'a [Backup], since: Option<&str>) -> Vec<&'a Backup> {
+    backups
+        .iter()
+        .filter(|b| {
+            automatic_backup_stamp(&b.name).is_some_and(|s| since.is_none_or(|since| s < since))
+        })
+        .collect()
+}
+
+/// [`older_automatic_backups`] for `stack`, newest first by the stamp in
+/// their names (a copied file's date says nothing).
+pub fn older_backups(stack: &Stack) -> Vec<Backup> {
+    let backups = list_backups(stack);
+    let since = automatic_backups_since(stack);
+    let mut older: Vec<Backup> = older_automatic_backups(&backups, since.as_deref())
+        .into_iter()
+        .cloned()
+        .collect();
+    older.sort_by(|a, b| {
+        automatic_backup_stamp(&b.name)
+            .cmp(&automatic_backup_stamp(&a.name))
+            .then_with(|| b.name.cmp(&a.name))
+    });
+    older
+}
+
+/// Keep the newest [`AUTOMATIC_BACKUPS_KEPT`] counted automatic backups;
+/// delete older counted ones. Runs only after the update or restore that took
+/// one succeeded, so a failed attempt (and its retries) never costs a backup. A
+/// file that won't delete is logged, not fatal. A site with no start for
+/// counting yet gets one now, and nothing goes.
+fn prune_automatic_backups(stack: &Stack, protect: Option<&Path>, r: &mut dyn Reporter) {
+    let Some(since) = automatic_backups_since(stack) else {
+        note_automatic_backups_since(
+            stack,
+            &chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
+        );
+        return;
+    };
+    let backups = list_backups(stack);
+    for b in automatic_backups_to_prune(&backups, AUTOMATIC_BACKUPS_KEPT, protect, Some(&since)) {
+        // scenario: a_restore_keeps_the_three_newest_counted_backups_and_never_prunes_older_ones
+        match std::fs::remove_file(&b.path) {
+            Ok(()) => r.log(&format!("Removed an older automatic backup: {}", b.name)),
+            Err(e) => r.log(&format!("Couldn't remove the older backup {}: {e}", b.name)),
+        }
+    }
 }
 
 /// List host backups, newest first.
@@ -3015,6 +5097,7 @@ pub fn admin_password(stack: &Stack) -> Option<String> {
 
 /// Set a new admin password.
 pub fn set_admin_password(stack: &Stack, password: &str, r: &mut dyn Reporter) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Settings)?;
     r.stage(Stage::Working, "Setting the admin password…", None);
     ensure_running(stack)?;
     let mut c = compose(stack);
@@ -3045,6 +5128,7 @@ pub fn model_list(stack: &Stack) -> Result<Vec<ModelRole>> {
 /// Shells `drush aincient:model-set <role> <provider> <model>`; drush validates
 /// the role + provider and returns a non-zero exit on a bad binding.
 pub fn model_set(stack: &Stack, role: &str, provider: &str, model: &str) -> Result<()> {
+    let _op = crate::oplock::hold(stack, crate::oplock::Operation::Settings)?;
     ensure_running(stack)?;
     let mut c = compose(stack);
     c.args(["exec", "-T", "app"])
@@ -3166,7 +5250,7 @@ fn ensure_running(stack: &Stack) -> Result<()> {
     Ok(())
 }
 
-fn parse_ps(out: &str) -> Vec<PsEntry> {
+pub(crate) fn parse_ps(out: &str) -> Vec<PsEntry> {
     let trimmed = out.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -3254,9 +5338,10 @@ struct ImageProbe {
 }
 
 /// The image id (`sha256:…`) the site's `app` container was created from, running
-/// or stopped. Survives the tag moving on: the old image stays on disk, with its
-/// `RepoDigests`, as long as a container uses it. `None` without an `app`
-/// container.
+/// or stopped. Survives the tag moving on: the old image stays on disk as long as
+/// a container uses it (with its `RepoDigests` on the classic image store; on
+/// the containerd store with none, but with its recorded origin, which
+/// [`local_probe`] reads there). `None` without an `app` container.
 fn running_image_id(stack: &Stack) -> Option<String> {
     let mut ps = compose(stack);
     ps.args(["ps", "-a", "-q", "app"]);
@@ -3294,35 +5379,36 @@ fn site_digest(stack: &Stack) -> Option<String> {
 /// `docker image inspect` — no container start needed, which is why the stamp is
 /// carried as a label and not only as a runtime env var.
 ///
-/// Both fields are guarded with `{{if}}`: a locally built image has an empty
-/// `RepoDigests` (bare `index` on it is a template error, not an empty string)
-/// and may carry no labels at all. Those are missing values, not failures — the
-/// `Err` arm means inspect itself failed, i.e. the image isn't here.
+/// Read as JSON ([`crate::image_origin`]), never with a `--format` template:
+/// the registry digest is read differently under Docker's two image stores
+/// ([`Inspected::registry_digest`](crate::image_origin::Inspected::registry_digest);
+/// on the containerd store `RepoDigests` names local builds too), and a
+/// template naming a field an older Docker lacks is an error there. A locally
+/// built image has no registry digest and may carry no labels at all: missing
+/// values, not failures. The `Err` arm means inspect itself failed, i.e. the
+/// image isn't here.
 fn local_probe(image: &str) -> std::result::Result<ImageProbe, String> {
     let mut c = docker::docker();
-    c.args([
-        "image",
-        "inspect",
-        image,
-        "--format",
-        &format!(
-            "{{{{if .RepoDigests}}}}{{{{index .RepoDigests 0}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{VERSION_LABEL}\"}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{FLOOR_LABEL}\"}}}}{{{{end}}}}|\
-             {{{{if .Config.Labels}}}}{{{{index .Config.Labels \"{EXTENSIONS_LABEL}\"}}}}{{{{end}}}}"
-        ),
-    ]);
-    Ok(parse_local_probe(&docker::probe(c)?))
+    c.args(["image", "inspect", image]);
+    let json = docker::probe(c)?;
+    let inspected = crate::image_origin::parse(&json)
+        .map_err(|e| format!("couldn't read `docker image inspect {image}` ({e})"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("`docker image inspect {image}` listed no image"))?;
+    Ok(probe_of(&inspected))
 }
 
-fn parse_local_probe(out: &str) -> ImageProbe {
-    let mut parts = out.split('|');
-    let repo_digest = parts.next().unwrap_or_default();
+/// [`local_probe`]'s reading of one inspected image. The store isn't asked:
+/// only a Docker with `Identity` reads the digest differently, and that
+/// Docker marks its containerd images itself (`Descriptor`).
+fn probe_of(image: &crate::image_origin::Inspected) -> ImageProbe {
+    let label = |key: &str| image.label(key).unwrap_or_default().trim();
     ImageProbe {
-        digest: repo_digest.split('@').nth(1).map(str::to_string),
-        version: non_empty(parts.next().unwrap_or_default().trim()),
-        floor: parts.next().and_then(|f| Version::parse(f.trim())),
-        extensions: parts.next().and_then(parse_extension_list),
+        digest: image.registry_digest(None),
+        version: non_empty(label(VERSION_LABEL)),
+        floor: Version::parse(label(FLOOR_LABEL)),
+        extensions: parse_extension_list(label(EXTENSIONS_LABEL)),
     }
 }
 
@@ -3433,6 +5519,117 @@ fn sanitize(label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // `compose config --format json` and `image inspect --format '{{json
+    // .RepoDigests}}'`, verbatim (Docker 28, compose v2).
+    const CONFIG_NEVER: &str = r#"{"name":"atelier-scn-cfgprobe","networks":{"default":{"name":"atelier-scn-cfgprobe_default","ipam":{}}},"services":{"app":{"command":null,"entrypoint":null,"image":"atelier-scn-app:x","networks":{"default":null},"pull_policy":"never"}}}"#;
+    const CONFIG_PLAIN: &str = r#"{"name":"atelier-scn-cfgprobe","networks":{"default":{"name":"atelier-scn-cfgprobe_default","ipam":{}}},"services":{"app":{"command":null,"entrypoint":null,"image":"atelier-cms:zoo","networks":{"default":null}}}}"#;
+
+    #[test]
+    fn the_app_pull_policy_is_read_from_compose_config() {
+        assert_eq!(
+            super::parse_app_pull_policy(CONFIG_NEVER).as_deref(),
+            Some("never")
+        );
+        assert_eq!(super::parse_app_pull_policy(CONFIG_PLAIN), None);
+        assert_eq!(super::parse_app_pull_policy("not json"), None);
+    }
+
+    #[test]
+    fn a_build_made_on_this_computer_has_nothing_to_download() {
+        use super::is_local_only;
+        let ghcr = "ghcr.io/aincient-labs/atelier-cms@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f".to_string();
+        // The zoo's shared tag: a retag of the downloaded release, whose only
+        // digest is under the ghcr name. `docker.io/library/atelier-cms`
+        // has none: refused.
+        assert!(is_local_only(
+            "atelier-cms:zoo-shared",
+            None,
+            Some(std::slice::from_ref(&ghcr))
+        ));
+        // A developer build: no digests at all.
+        assert!(is_local_only("atelier-cms:dev", None, Some(&[])));
+        assert!(is_local_only("atelier-scn-app:x-app", None, Some(&[])));
+        // Told to never pull (the harness's local builds): the update goes on.
+        assert!(!is_local_only(
+            "atelier-scn-app:x-app",
+            Some("never"),
+            Some(&[])
+        ));
+        // A registry reference is the registry's to answer, digests or not.
+        assert!(!is_local_only(
+            "ghcr.io/aincient-labs/atelier-cms:latest",
+            None,
+            Some(&[])
+        ));
+        assert!(!is_local_only(
+            "localhost:5000/atelier-cms:x",
+            None,
+            Some(&[])
+        ));
+        // Downloaded from Docker Hub under this very name.
+        assert!(!is_local_only(
+            "nginx:1.30-alpine-slim",
+            None,
+            Some(&[
+                "nginx@sha256:e2355aa95529a7999dad94ddcb45a8768abf6fb0b204c93b1a3ffce477d7b893"
+                    .to_string()
+            ])
+        ));
+        assert!(!is_local_only(
+            "someone/atelier-fork:1",
+            None,
+            Some(&["someone/atelier-fork@sha256:aa".to_string()])
+        ));
+        // The containerd store names the repositories it pulled from in full.
+        assert!(!is_local_only(
+            "nginx:1.30-alpine-slim",
+            None,
+            Some(&["docker.io/library/nginx".to_string()])
+        ));
+        assert!(is_local_only(
+            "atelier-cms:zoo-shared",
+            None,
+            Some(&["ghcr.io/aincient-labs/atelier-cms".to_string()])
+        ));
+        // Not here at all, or a store that can't say: left to the pull. A
+        // digest reference never.
+        assert!(!is_local_only("atelier-cms:gone", None, None));
+        assert!(!is_local_only(&ghcr, None, Some(&[])));
+    }
+
+    #[test]
+    fn the_local_build_refusal_says_why_and_the_way_back_to_a_channel() {
+        let said = super::LocalBuild {
+            image: "atelier-cms:zoo-shared".into(),
+        }
+        .to_string();
+        assert!(said.contains("build made on this computer (atelier-cms:zoo-shared)"));
+        assert!(said.contains("nothing to download"));
+        assert!(said.contains("`atelier app channel stable`"));
+        assert!(said.contains("nothing was changed"));
+    }
+
+    #[test]
+    fn a_detached_container_is_reconnected_under_its_service_name() {
+        let d = crate::boot::Detached {
+            network: "atelier-review-tmp_default".into(),
+            container: "atelier-review-tmp-db-1".into(),
+            service: "db".into(),
+            running: true,
+        };
+        assert_eq!(
+            super::reattach_args(&d),
+            [
+                "network",
+                "connect",
+                "--alias",
+                "db",
+                "atelier-review-tmp_default",
+                "atelier-review-tmp-db-1"
+            ]
+        );
+    }
+
     #[test]
     fn start_action_falls_back_to_up_only_when_no_container() {
         assert_eq!(start_action(ContainerState::Missing), StartAction::Up);
@@ -3442,34 +5639,812 @@ mod tests {
     }
 
     #[test]
+    fn a_start_never_recreates_a_container_even_after_a_compose_refresh() {
+        // A refreshed compose.yaml once turned every Start into `up -d`, which
+        // recreated app on whatever image the shared tag named by then.
+        for state in [
+            ContainerState::Running,
+            ContainerState::Stopped,
+            ContainerState::Unknown,
+        ] {
+            assert_eq!(
+                start_plan(state, true),
+                StartPlan {
+                    action: StartAction::Start,
+                    set_db_restart: true
+                },
+                "{state:?}"
+            );
+            assert!(!start_plan(state, false).set_db_restart);
+        }
+        // Only a missing container makes it an `up`, and that `up` creates the
+        // missing ones only.
+        assert_eq!(
+            start_plan(ContainerState::Missing, true).action,
+            StartAction::Up
+        );
+        assert_eq!(start_args(StartAction::Start), ["start"]);
+        assert_eq!(start_args(StartAction::Up), ["up", "-d", "--no-recreate"]);
+    }
+
+    /// `docker compose ps -a --format json` lines as Compose 5.1 prints them
+    /// (hardening-test, 2026-11-14; labels trimmed).
+    const PS_DB: &str = r#"{"Command":"\"docker-entrypoint.s…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"healthy","ID":"561110aa7976","Image":"pgvector/pgvector:pg16-trixie","LocalVolumes":"1","Name":"atelier-hardening-test-db-1","Names":"atelier-hardening-test-db-1","Networks":"atelier-hardening-test_default","Ports":"5432/tcp","Project":"atelier-hardening-test","Service":"db","State":"running","Status":"Up 6 minutes (healthy)"}"#;
+    const PS_APP: &str = r#"{"Command":"\"/usr/local/bin/entr…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"healthy","ID":"9772e359133d","Image":"ghcr.io/aincient-labs/atelier-cms:latest","LocalVolumes":"2","Name":"atelier-hardening-test-app-1","Names":"atelier-hardening-test-app-1","Networks":"atelier-hardening-test_default","Ports":"80/tcp","Project":"atelier-hardening-test","Service":"app","State":"running","Status":"Up 6 minutes (healthy)"}"#;
+    const PS_EDGE: &str = r#"{"Command":"\"/docker-entrypoint.…\"","CreatedAt":"2026-11-14 12:47:23 +0100 CET","ExitCode":0,"Health":"","ID":"3ca00c913a8c","Image":"nginx:1.30-alpine-slim","LocalVolumes":"1","Name":"atelier-hardening-test-edge-1","Names":"atelier-hardening-test-edge-1","Networks":"atelier-hardening-test_default","Ports":"0.0.0.0:41227->80/tcp, [::]:41227->80/tcp","Project":"atelier-hardening-test","Service":"edge","State":"running","Status":"Up 6 minutes"}"#;
+
+    fn stopped(line: &str) -> String {
+        line.replace(r#""State":"running""#, r#""State":"exited""#)
+    }
+
+    #[test]
     fn container_state_from_compose_ps() {
         assert_eq!(container_state_from_ps(""), ContainerState::Missing);
         assert_eq!(container_state_from_ps("[]"), ContainerState::Missing);
-        let stopped = r#"{"Service":"app","State":"exited"}"#;
-        assert_eq!(container_state_from_ps(stopped), ContainerState::Stopped);
-        let running = r#"[{"Service":"db","State":"exited"},{"Service":"app","State":"running"}]"#;
-        assert_eq!(container_state_from_ps(running), ContainerState::Running);
-        let db_only = r#"{"Service":"db","State":"running"}"#;
-        assert_eq!(container_state_from_ps(db_only), ContainerState::Missing);
+        let all = format!("{PS_APP}\n{PS_DB}\n{PS_EDGE}");
+        assert_eq!(container_state_from_ps(&all), ContainerState::Running);
+        let all_stopped = format!(
+            "{}\n{}\n{}",
+            stopped(PS_APP),
+            stopped(PS_DB),
+            stopped(PS_EDGE)
+        );
+        assert_eq!(
+            container_state_from_ps(&all_stopped),
+            ContainerState::Stopped
+        );
+        assert_eq!(container_state_from_ps(PS_DB), ContainerState::Missing);
+    }
+
+    #[test]
+    fn a_removed_db_or_edge_container_needs_up() {
+        // `docker rm -f` of db alone: `compose start` started app and edge
+        // and left the site with no database.
+        let no_db = format!("{PS_APP}\n{PS_EDGE}");
+        assert_eq!(container_state_from_ps(&no_db), ContainerState::Missing);
+        assert_eq!(
+            start_action(container_state_from_ps(&no_db)),
+            StartAction::Up
+        );
+        let no_edge = format!("{}\n{}", stopped(PS_APP), stopped(PS_DB));
+        assert_eq!(container_state_from_ps(&no_edge), ContainerState::Missing);
+        // As a JSON array (older Compose) too.
+        let array = format!("[{PS_APP},{PS_EDGE}]");
+        assert_eq!(container_state_from_ps(&array), ContainerState::Missing);
+    }
+
+    #[test]
+    fn an_erased_database_is_refused_only_for_a_site_backed_up_before() {
+        let id = Some("5f0c2a7e-3b1d-4c8e-9a6f-2d7b1e4c9a03");
+        assert!(database_erased(id, Some(false), false));
+        // A first install has no site-id yet; an unanswered probe proves nothing.
+        assert!(!database_erased(None, Some(false), false));
+        assert!(!database_erased(id, None, false));
+        assert!(!database_erased(id, Some(true), false));
+    }
+
+    #[test]
+    fn a_database_the_owner_wiped_starts_fresh_until_it_exists_again() {
+        let dir = Scratch::new("wiped-db");
+        let stack = Stack::at(dir.0.clone());
+        let id = stack.ensure_site_id().unwrap();
+        // Lost by accident: refused.
+        assert!(database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+        // `app down --wipe` / "Remove and erase" leaves the marker first (and keeps
+        // the site-id), so the next start sets up a fresh site instead.
+        super::mark_database_wiped(&stack).unwrap();
+        assert!(stack.database_wiped_path().ends_with(".database-wiped"));
+        assert_eq!(stack.site_id().as_deref(), Some(id.as_str()));
+        assert!(!database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+        // Once the database is back the marker goes, and a later loss is refused again.
+        super::clear_database_wiped(&stack);
+        assert!(!stack.database_wiped());
+        assert!(database_erased(
+            Some(&id),
+            Some(false),
+            stack.database_wiped()
+        ));
+    }
+
+    #[test]
+    fn the_erased_database_refusal_names_the_latest_backup() {
+        let dir = Scratch::new("erased-db");
+        let stack = Stack::at(dir.0.clone());
+        let backups = stack.backups_dir();
+        std::fs::create_dir_all(&backups).unwrap();
+        // Names exactly as `backup()` writes them; the newest wins whatever its label.
+        let old = backups.join("aincient-before-update-20261113-091500.tar.gz");
+        let new = backups.join("aincient-20261114-101010.tar.gz");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&new, b"x").unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+
+        let refusal = DatabaseErased {
+            latest_backup: list_backups(&stack).into_iter().next(),
+        };
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("Your site's database was removed from Docker. Restore your latest backup (Backups tab): aincient-20261114-101010.tar.gz."),
+            "{text}"
+        );
+        assert!(text.contains(&new.display().to_string()), "{text}");
+
+        let none = DatabaseErased {
+            latest_backup: None,
+        }
+        .to_string();
+        assert!(
+            none.contains("no backup of this site on this computer"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn only_no_such_image_fetches_the_engine_again() {
+        // `docker image inspect` stderr, Docker 29.4.
+        let gone = "Error response from daemon: No such image: ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert!(!engine_image_present(Err(gone.into())).unwrap());
+        assert!(engine_image_present(Ok("sha256:435e2d22".into())).unwrap());
+        let down = "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory";
+        let e = engine_image_present(Err(down.into())).unwrap_err();
+        assert!(format!("{e:#}").contains("failed to connect"), "{e:#}");
+    }
+
+    /// When the backups in the prune tests started counting: before all of them.
+    const SINCE: Option<&str> = Some("20261101-000000");
+
+    #[test]
+    fn only_automatic_backups_beyond_the_newest_three_are_pruned() {
+        // Names exactly as `backup()` writes them (review 2026-11-14: the old
+        // test used names without the `aincient-` prefix, so it passed while
+        // the real prune never matched anything).
+        let name = |label: Option<&str>, ts: &str| format!("{}.tar.gz", backup_stem(label, ts));
+        assert_eq!(
+            name(Some("before-update"), "20261101-100000"),
+            "aincient-before-update-20261101-100000.tar.gz"
+        );
+        let b = |name: String, t: u64| Backup {
+            path: format!("/b/{name}"),
+            name,
+            size_bytes: 1,
+            modified_unix: t,
+        };
+        let all = vec![
+            b(name(Some("before-update"), "20261101-100000"), 1),
+            b(name(Some("before-restore"), "20261102-100000"), 2),
+            b(name(Some("before-update"), "20261103-100000"), 3),
+            b(name(Some("before-stepped-upgrade"), "20261104-100000"), 4),
+            // A second backup in the same second, as `claim_name` names it.
+            b("aincient-before-update-20261105-100000-2.tar.gz".into(), 5),
+            b(name(Some("before-channel-switch"), "20261106-100000"), 6),
+            // The owner's own: never pruned, however old.
+            b(name(None, "20261001-090000"), 0),
+            b(name(Some("before-redesign"), "20261001-090000"), 0),
+            b(name(Some("before update notes"), "20261001-090000"), 0),
+            b("aincient-before-update-notes.tar.gz".into(), 0),
+            b("aincient-before-update-éé-20261101.tar.gz".into(), 0),
+            // A file brought in from elsewhere, named like ours without the prefix.
+            b("before-update-20261001-090000.tar.gz".into(), 0),
+        ];
+        let gone: Vec<&str> = automatic_backups_to_prune(&all, 3, None, SINCE)
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(
+            gone,
+            [
+                "aincient-before-update-20261103-100000.tar.gz",
+                "aincient-before-restore-20261102-100000.tar.gz",
+                "aincient-before-update-20261101-100000.tar.gz"
+            ]
+        );
+        assert!(automatic_backups_to_prune(&all[..3], 3, None, SINCE).is_empty());
+    }
+
+    #[test]
+    fn the_backup_a_restore_loaded_is_never_pruned_however_its_path_is_spelled() {
+        // `data restore ./backups/x` or a path through a symlinked folder names
+        // the same file as the backup list's absolute path.
+        let dir = Scratch::new("prune-protect");
+        let backups = dir.0.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let all: Vec<Backup> = (1..=4)
+            .map(|d| {
+                let name = format!(
+                    "{}.tar.gz",
+                    backup_stem(Some("before-update"), &format!("2026110{d}-100000"))
+                );
+                let path = backups.join(&name);
+                std::fs::write(&path, "x").unwrap();
+                Backup {
+                    name,
+                    path: path.to_string_lossy().into_owned(),
+                    size_bytes: 1,
+                    modified_unix: d,
+                }
+            })
+            .collect();
+        let oldest = "aincient-before-update-20261101-100000.tar.gz";
+        let spelled = backups.join("..").join("backups").join(oldest);
+        assert_ne!(spelled, Path::new(&all[0].path));
+        assert!(automatic_backups_to_prune(&all, 3, Some(&spelled), SINCE).is_empty());
+        assert_eq!(
+            automatic_backups_to_prune(&all, 3, None, SINCE)[0].name,
+            oldest,
+            "without the protect it is the one pruned"
+        );
+    }
+
+    #[test]
+    fn a_failed_safety_backup_stops_the_restore_and_names_the_cause() {
+        let err = require_safety_backup(Err(anyhow::anyhow!(
+            "failed to save the backup as /home/x/.atelier/backups/aincient-before-restore-20261114-101500.tar.gz: Permission denied (os error 13)"
+        )))
+        .unwrap_err();
+        let typed = err.downcast_ref::<SafetyBackupFailed>().expect("typed");
+        assert!(typed.cause.contains("Permission denied"));
+        let shown = format!("{err:#}");
+        assert!(shown.contains("nothing was restored"), "{shown}");
+        assert!(shown.contains("Permission denied"), "{shown}");
+        // A stopped site has no running database to lose: the restore goes on.
+        assert_eq!(require_safety_backup(Ok(None)).unwrap(), None);
+        let saved = PathBuf::from("/b/aincient-before-restore-20261114-101500.tar.gz");
+        assert_eq!(
+            require_safety_backup(Ok(Some(saved.clone()))).unwrap(),
+            Some(saved)
+        );
+    }
+
+    /// Backups as `backup()` names them, in a site's backups folder.
+    fn backups_in(stack: &Stack, names: &[&str]) {
+        let dir = stack.backups_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(dir.join(n), "x").unwrap();
+        }
+    }
+
+    fn names_left(stack: &Stack) -> Vec<String> {
+        let mut v: Vec<String> = list_backups(stack).into_iter().map(|b| b.name).collect();
+        v.sort();
+        v
+    }
+
+    // Automatic backups an earlier Manager took and never pruned (B6), and the
+    // owner's own: the same file names `backup()` writes.
+    const OLD_STEPPED: &str = "aincient-before-stepped-upgrade-20260101-120000.tar.gz";
+    const OLD_SWITCH: &str = "aincient-before-channel-switch-20260301-090000.tar.gz";
+    const OLD_UPDATE: &str = "aincient-before-update-20261020-080000.tar.gz";
+    const OWNERS: &str = "aincient-20250101-000000.tar.gz";
+    const OWNERS_LABELLED: &str = "aincient-before-redesign-20250101-000000.tar.gz";
+
+    #[test]
+    fn automatic_backups_from_before_counting_started_are_never_pruned() {
+        let dir = Scratch::new("prune-since");
+        let stack = Stack::at(dir.0.clone());
+        let new = [
+            "aincient-before-update-20261114-100000.tar.gz",
+            "aincient-before-restore-20261114-110000.tar.gz",
+            "aincient-before-update-20261114-120000.tar.gz",
+            "aincient-before-update-20261114-130000.tar.gz",
+        ];
+        backups_in(
+            &stack,
+            &[OLD_STEPPED, OLD_SWITCH, OLD_UPDATE, OWNERS, OWNERS_LABELLED],
+        );
+        backups_in(&stack, &new);
+
+        // No start recorded yet (a site whose first 0.17 update took no backup):
+        // nothing goes, and counting starts now.
+        super::prune_automatic_backups(&stack, None, &mut Silent);
+        assert_eq!(names_left(&stack).len(), 9);
+        let since = super::automatic_backups_since(&stack).expect("recorded");
+        assert!(since.as_str() > "20261114-130000", "{since}");
+
+        // As `backup()` records it: the first automatic backup's own stamp.
+        std::fs::remove_file(stack.home.join(super::AUTOMATIC_SINCE_FILE)).unwrap();
+        super::note_automatic_backups_since(&stack, "20261114-100000");
+        // Never moved by a later one.
+        super::note_automatic_backups_since(&stack, "20261114-130000");
+        assert_eq!(
+            super::automatic_backups_since(&stack).as_deref(),
+            Some("20261114-100000")
+        );
+        super::prune_automatic_backups(&stack, None, &mut Silent);
+        let left = names_left(&stack);
+        // Only the oldest of the four counted ones; every older one stays.
+        assert!(!left.contains(&new[0].to_string()), "{left:?}");
+        for keep in [OLD_STEPPED, OLD_SWITCH, OLD_UPDATE, OWNERS, OWNERS_LABELLED] {
+            assert!(left.contains(&keep.to_string()), "{keep} gone: {left:?}");
+        }
+        assert_eq!(left.len(), 8);
+    }
+
+    #[test]
+    fn free_up_space_offers_only_older_automatic_backups() {
+        let dir = Scratch::new("older-backups");
+        let stack = Stack::at(dir.0.clone());
+        backups_in(
+            &stack,
+            &[
+                OLD_STEPPED,
+                OLD_SWITCH,
+                OLD_UPDATE,
+                OWNERS,
+                OWNERS_LABELLED,
+                "aincient-before-update-20261114-100000.tar.gz",
+                "aincient-before-update-20261114-100000-2.tar.gz",
+            ],
+        );
+        let names = |v: Vec<Backup>| {
+            let mut n: Vec<String> = v.into_iter().map(|b| b.name).collect();
+            n.sort();
+            n
+        };
+        // Before counting started, every automatic backup is an older one.
+        assert_eq!(
+            names(super::older_backups(&stack)),
+            [
+                "aincient-before-channel-switch-20260301-090000.tar.gz",
+                "aincient-before-stepped-upgrade-20260101-120000.tar.gz",
+                "aincient-before-update-20261020-080000.tar.gz",
+                "aincient-before-update-20261114-100000-2.tar.gz",
+                "aincient-before-update-20261114-100000.tar.gz",
+            ]
+        );
+        // Once it has, only those before it: never a counted one.
+        super::note_automatic_backups_since(&stack, "20261114-100000");
+        assert_eq!(
+            names(super::older_backups(&stack)),
+            [OLD_SWITCH, OLD_STEPPED, OLD_UPDATE]
+        );
+    }
+
+    #[test]
+    fn an_update_target_the_site_has_moved_past_is_dropped() {
+        use super::{live_update_target_with, tag_version, waypoint_image};
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert_eq!(tag_version(&waypoint_image(v("0.21.0"))), Some(v("0.21.0")));
+        assert_eq!(
+            tag_version("ghcr.io/aincient-labs/atelier-cms:latest"),
+            None
+        );
+        assert_eq!(tag_version("localhost:5000/atelier-cms"), None);
+        assert_eq!(
+            tag_version("ghcr.io/aincient-labs/atelier-cms@sha256:0f93c730bf54a025610ea0c4fafb1a80012773152cd22ce5227bd968e6e96bae"),
+            None
+        );
+
+        let dir = Scratch::new("stale-target");
+        let stack = Stack::at(dir.0.clone());
+        let no_registry = |_: &str| -> Option<Version> { panic!("tag says it") };
+        // A route to 0.20.0, and the site now runs 0.21.0 (a restore, an install).
+        stack
+            .set_update_target(&waypoint_image(v("0.20.0")))
+            .unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), no_registry),
+            None
+        );
+        assert!(stack.update_target().is_none(), "deleted");
+        // Reached exactly: done.
+        stack
+            .set_update_target(&waypoint_image(v("0.21.0")))
+            .unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("v0.21.0"), no_registry),
+            None
+        );
+        // Still ahead: kept.
+        let ahead = waypoint_image(v("0.22.0"));
+        stack.set_update_target(&ahead).unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), no_registry),
+            Some(ahead.clone())
+        );
+        // Unknown running version (an `edge+sha` build, no container): kept.
+        assert_eq!(
+            live_update_target_with(&stack, Some("edge+1a2b3c4"), no_registry),
+            Some(ahead.clone())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, None, no_registry),
+            Some(ahead)
+        );
+        // A channel target: its version comes from the registry.
+        let channel = "ghcr.io/aincient-labs/atelier-cms:latest";
+        stack.set_update_target(channel).unwrap();
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| Some(v("0.22.0"))),
+            Some(channel.to_string())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| None),
+            Some(channel.to_string())
+        );
+        assert_eq!(
+            live_update_target_with(&stack, Some("0.21.0"), |_| Some(v("0.21.0"))),
+            None
+        );
+        assert!(stack.update_target().is_none());
+    }
+
+    #[test]
+    fn a_site_woken_from_rest_rests_again_whether_the_update_worked_or_not() {
+        use super::{after_wake, AfterWake, Woke};
+        assert_eq!(after_wake(Woke::FromRest, Ok(true)), AfterWake::Rest);
+        // The failed update (review 2026-11-14: it stayed awake).
+        assert_eq!(after_wake(Woke::FromRest, Err(())), AfterWake::Rest);
+        // Still converging: resting it now would cut that short.
+        assert_eq!(after_wake(Woke::FromRest, Ok(false)), AfterWake::StayAwake);
+        // A site that wasn't resting is never rested.
+        for outcome in [Ok(true), Ok(false), Err(())] {
+            assert_eq!(after_wake(Woke::No, outcome), AfterWake::Leave);
+            assert_eq!(after_wake(Woke::Started, outcome), AfterWake::Leave);
+        }
+    }
+
+    #[test]
+    fn an_update_without_a_backup_does_not_start_the_site_but_rests_it_again() {
+        use super::{woke_without_start, Woke};
+        let stopped = format!(
+            "{}\n{}\n{}",
+            stopped(PS_APP),
+            stopped(PS_DB),
+            stopped(PS_EDGE)
+        );
+        let state = container_state_from_ps(&stopped);
+        assert_eq!(woke_without_start(state, Some("resting")), Woke::FromRest);
+        assert_eq!(woke_without_start(state, None), Woke::Started);
+        let running = format!("{PS_APP}\n{PS_DB}\n{PS_EDGE}");
+        assert_eq!(
+            woke_without_start(container_state_from_ps(&running), Some("awake")),
+            Woke::No
+        );
+    }
+
+    #[test]
+    fn a_running_site_whose_backup_fails_is_not_updated() {
+        let e = super::backup_or_refuse::<()>(Err(anyhow::anyhow!(
+            "failed to copy the snapshot out of the container: write /backups/x.part: no space left on device"
+        )))
+        .unwrap_err();
+        let refusal = e
+            .downcast_ref::<super::BackupBeforeUpdateFailed>()
+            .expect("a typed refusal the app offers \"Update without a backup\" for");
+        assert!(refusal.cause.contains("no space left on device"));
+        assert!(e.to_string().ends_with("so it wasn't updated"));
+        assert_eq!(super::backup_or_refuse(Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn refusals_with_an_override_are_told_apart_by_type_and_exit_code() {
+        use super::{BackupBeforeUpdateFailed, Overridable};
+        use anyhow::Context;
+        // As `start_for_backup` builds it: the cause stays readable (a failed
+        // boot that needs Docker restarted keeps its button).
+        let e = Err::<(), _>(anyhow::Error::new(crate::boot::BootFailed(
+            "The database didn't start.".into(),
+        )))
+        .context(BackupBeforeUpdateFailed {
+            cause: "The site is stopped and couldn't be started to back it up first".into(),
+        })
+        .unwrap_err();
+        assert_eq!(Overridable::of(&e), Some(Overridable::UpdateWithoutBackup));
+        assert!(e.downcast_ref::<crate::boot::BootFailed>().is_some());
+        assert_eq!(
+            format!("{e:#}"),
+            "The site is stopped and couldn't be started to back it up first, so it wasn't \
+             updated: The database didn't start."
+        );
+        let e = require_safety_backup(Err(anyhow::anyhow!("No space left on device"))).unwrap_err();
+        assert_eq!(
+            Overridable::of(&e),
+            Some(Overridable::RestoreWithoutSafetyBackup)
+        );
+        // A server's `atelier` says it by its exit code.
+        for o in [
+            Overridable::RestoreWithoutSafetyBackup,
+            Overridable::UpdateWithoutBackup,
+        ] {
+            let remote = anyhow::Error::new(crate::remote::RemoteExit {
+                host: "deploy@example.com".into(),
+                what: "`atelier app update`".into(),
+                code: o.exit_code(),
+            });
+            assert_eq!(Overridable::of(&remote), Some(o));
+        }
+        let other = anyhow::Error::new(crate::remote::RemoteExit {
+            host: "deploy@example.com".into(),
+            what: "`atelier app update`".into(),
+            code: 1,
+        });
+        assert_eq!(Overridable::of(&other), None);
+        assert_eq!(Overridable::of(&anyhow::anyhow!("anything else")), None);
+    }
+
+    #[test]
+    fn a_missing_pinned_engine_is_fetched_by_digest_and_a_missing_local_build_is_named() {
+        // The owner's test, 2026-11-14: the Engine POC's pinned engine was gone.
+        let digest = "ghcr.io/aincient-labs/atelier-engine@sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert_eq!(
+            engine_image_need(Some(digest), false),
+            EngineImage::Fetch(digest.into())
+        );
+        assert_eq!(engine_image_need(Some(digest), true), EngineImage::Ready);
+        let local = "sha256:435e2d228cb08ba64cf622149cc6fd03a01c5d01d4242d03e2d81115c78cd41f";
+        assert_eq!(
+            engine_image_need(Some(local), false),
+            EngineImage::LocalBuildGone
+        );
+        assert_eq!(engine_image_need(Some(local), true), EngineImage::Ready);
+        assert_eq!(engine_image_need(None, false), EngineImage::Ready);
+        assert!(LOCAL_ENGINE_GONE.contains("Turn the engine off and on again"));
+    }
+
+    #[test]
+    fn only_a_stopped_container_still_holding_its_endpoint_is_recovered() {
+        // The 2026-11-14 update: db exited, its endpoint left in atelier_default,
+        // and the new app container created but not running.
+        let ps = "{\"Name\":\"atelier-db-1\",\"Service\":\"db\",\"State\":\"exited\"}\n\
+                  {\"Name\":\"atelier-app-1\",\"Service\":\"app\",\"State\":\"created\"}\n\
+                  {\"Name\":\"atelier-edge-1\",\"Service\":\"edge\",\"State\":\"exited\"}";
+        // Every service: edge (and the engine) can be left half attached too.
+        assert_eq!(
+            stopped_service_containers(ps),
+            ["atelier-db-1", "atelier-app-1", "atelier-edge-1"]
+        );
+        let engine = format!(
+            "{PS_APP}\n{}",
+            stopped(PS_EDGE)
+                .replace("edge", "engine")
+                .replace("nginx:1.30-alpine-slim", "atelier-engine")
+        );
+        assert_eq!(
+            stopped_service_containers(&engine),
+            ["atelier-hardening-test-engine-1"]
+        );
+        assert!(stopped_service_containers(
+            r#"[{"Name":"atelier-db-1","Service":"db","State":"running"}]"#
+        )
+        .is_empty());
+        // Only a container the network still lists is a leftover; a cleanly
+        // stopped one holds no endpoint, so `compose start` errors stay as they are.
+        assert!(holds_endpoint(
+            "atelier-edge-1\natelier-db-1\n",
+            "atelier-db-1"
+        ));
+        assert!(!holds_endpoint("atelier-edge-1\n", "atelier-db-1"));
+        assert!(!holds_endpoint("atelier-db-10\n", "atelier-db-1"));
+        assert!(START_STUCK.contains("Restart Docker (`atelier docker restart`)"));
+        assert!(!START_STUCK.contains("Docker Desktop"));
+        assert!(START_STUCK.contains("data is safe"));
+    }
+
+    /// A scripted engine site for [`super::wake_recovering`]: each Wake takes
+    /// the next answer; the rest is what Docker shows.
+    struct FakeWake {
+        wakes: std::collections::VecDeque<std::result::Result<&'static str, &'static str>>,
+        stale: Vec<(String, String)>,
+        ps: String,
+        up: std::result::Result<(), &'static str>,
+        calls: Vec<String>,
+    }
+
+    impl FakeWake {
+        fn new(wakes: &[std::result::Result<&'static str, &'static str>], ps: String) -> Self {
+            FakeWake {
+                wakes: wakes.iter().copied().collect(),
+                stale: Vec::new(),
+                ps,
+                up: Ok(()),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl super::WakeSteps for FakeWake {
+        fn wake(&mut self) -> Result<String> {
+            self.calls.push("wake".into());
+            match self.wakes.pop_front().expect("an unscripted wake") {
+                Ok(s) => Ok(s.to_string()),
+                Err(e) => Err(anyhow::anyhow!(e)),
+            }
+        }
+        fn stale_endpoints(&mut self) -> Vec<(String, String)> {
+            self.calls.push("stale".into());
+            self.stale.clone()
+        }
+        fn clear(&mut self, stale: &[(String, String)], _r: &mut dyn Reporter) {
+            for (n, c) in stale {
+                self.calls.push(format!("disconnect {n} {c}"));
+            }
+        }
+        fn containers(&mut self) -> ContainerState {
+            self.calls.push("ps".into());
+            container_state_from_ps(&self.ps)
+        }
+        fn up(&mut self, _r: &mut dyn Reporter) -> Result<()> {
+            self.calls.push("up -d".into());
+            self.up.map_err(|e| anyhow::anyhow!(e))
+        }
+    }
+
+    const WOKEN: &str = "Woken: db and app started.";
+    /// The engine's `compose start db app` on the 2026-11-14 leftover.
+    const WAKE_STALE: &str = "start the site: Error response from daemon: endpoint with name \
+        atelier-hardening-test-db-1 already exists in network atelier-hardening-test_default";
+    /// The engine's `compose start db app` with db's container removed.
+    const WAKE_NO_DB: &str = "start the site: service \"db\" has no container to start";
+
+    /// What a resting engine site's `compose ps -a` lists: db and app stopped.
+    fn resting_ps() -> String {
+        format!("{}\n{}\n{PS_EDGE}", stopped(PS_DB), stopped(PS_APP))
+    }
+
+    #[test]
+    fn a_wake_that_works_is_not_touched() {
+        let mut f = FakeWake::new(&[Ok(WOKEN)], resting_ps());
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(f.calls, ["wake"]);
+    }
+
+    #[test]
+    fn a_wake_stuck_on_a_leftover_endpoint_clears_it_and_wakes_again() {
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Ok(WOKEN)], resting_ps());
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-db-1".into(),
+        )];
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(
+            f.calls,
+            [
+                "wake",
+                "stale",
+                "disconnect atelier-hardening-test_default atelier-hardening-test-db-1",
+                "wake"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wake_still_stuck_after_clearing_says_restart_docker_once() {
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_STALE)], resting_ps());
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-db-1".into(),
+        )];
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.starts_with(START_STUCK), "{e}");
+        assert!(e.contains("already exists in network"), "{e}");
+        let mut again = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_STALE)], resting_ps());
+        again.stale = f.stale.clone();
+        let typed = super::wake_recovering(&mut again, &mut Silent).unwrap_err();
+        assert!(
+            crate::docker_runtime::needs_docker_restart(&typed),
+            "{typed:#}"
+        );
+        // One retry, never a loop; the containers all exist, so no `up`.
+        assert_eq!(f.calls.iter().filter(|c| *c == "wake").count(), 2);
+        assert!(!f.calls.contains(&"up -d".to_string()));
+    }
+
+    #[test]
+    fn a_wake_with_a_container_gone_creates_it_and_wakes_through_the_engine() {
+        // `docker rm` of db on a resting site: only app and edge are listed.
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_NO_DB), Ok(WOKEN)], ps);
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        // The last Wake takes the engine's resting mark off, which its failed
+        // Wake put back on, so edge stops serving the resting copy.
+        assert_eq!(f.calls, ["wake", "stale", "ps", "up -d", "wake"]);
+    }
+
+    #[test]
+    fn a_wake_with_a_leftover_and_a_container_gone_recovers_both() {
+        // db removed, app's endpoint left behind: clearing alone isn't enough.
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_STALE), Err(WAKE_NO_DB), Ok(WOKEN)], ps);
+        f.stale = vec![(
+            "atelier-hardening-test_default".into(),
+            "atelier-hardening-test-app-1".into(),
+        )];
+        super::wake_recovering(&mut f, &mut Silent).unwrap();
+        assert_eq!(
+            f.calls,
+            [
+                "wake",
+                "stale",
+                "disconnect atelier-hardening-test_default atelier-hardening-test-app-1",
+                "wake",
+                "ps",
+                "up -d",
+                "wake"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wake_with_nothing_to_recover_keeps_the_engines_error() {
+        let mut f = FakeWake::new(&[Err("start the site: timed out")], resting_ps());
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert_eq!(e, "start the site: timed out");
+        assert_eq!(f.calls, ["wake", "stale", "ps"]);
+    }
+
+    #[test]
+    fn a_locked_down_site_is_not_recovered() {
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err("locked down: unlock first")], ps);
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.contains("locked down"), "{e}");
+        assert_eq!(f.calls, ["wake"]);
+    }
+
+    #[test]
+    fn a_failed_up_after_a_failed_wake_says_why() {
+        let ps = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        let mut f = FakeWake::new(&[Err(WAKE_NO_DB)], ps);
+        f.up = Err("Your site's database was removed from Docker.");
+        let e = format!(
+            "{:#}",
+            super::wake_recovering(&mut f, &mut Silent).unwrap_err()
+        );
+        assert!(e.contains("database was removed"), "{e}");
+        assert_eq!(f.calls, ["wake", "stale", "ps", "up -d"]);
     }
 
     use super::{
-        backup_dump_script, backup_pack_script, container_state_from_ps, is_backup_file,
-        is_snapshot_bundle, list_backups, parse_extension_list, parse_http_status,
-        parse_local_probe, parse_remote_probe, parse_serialized_extensions, plan_route,
-        plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts, start_action,
-        waypoint_image, ContainerState, ImageProbe, SnapshotManifest, StartAction, Version,
-        MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        automatic_backups_to_prune, backup_dump_script, backup_pack_script,
+        container_state_from_ps, holds_endpoint, is_backup_file, is_snapshot_bundle, list_backups,
+        parse_extension_list, parse_http_status, parse_remote_probe, parse_serialized_extensions,
+        plan_route, plan_route_with, registry_problem, remote_probe_with, restore_bundle_scripts,
+        start_action, stopped_service_containers, waypoint_image, Backup, ContainerState,
+        ImageProbe, SnapshotManifest, StartAction, Version, MAX_WAYPOINTS, REGISTRY_OFFLINE,
+        START_STUCK,
     };
+    use super::{backup_stem, require_safety_backup, SafetyBackupFailed};
     use super::{
         check_identity, describe_backup, restore_identity, restore_with, BackupInfo, IdentityCheck,
         IdentityMismatch, RestoreOptions, Silent,
     };
+    use super::{database_erased, engine_image_present, DatabaseErased};
+    use super::{engine_image_need, EngineImage, LOCAL_ENGINE_GONE};
     use super::{
         lifecycle_plan, Plan, PlanStep, Reporter, ScaledReporter, Stage, BOOT_FROM, PULL_FROM,
         UP_FROM,
     };
+    use super::{
+        pull_then_move_db, refuse_locked, registry_refused, route_target, settings_changed,
+        start_for_backup_needed, switch_channel, update_need, UpdateCheck,
+    };
+    use super::{start_args, start_plan, StartPlan};
     use crate::stack::Stack;
+    use crate::stack::{Channel, InstallOptions};
     use anyhow::{bail, Result};
     use std::path::{Path, PathBuf};
 
@@ -3867,6 +6842,50 @@ mod tests {
             exclude_at < files_at,
             "exclude comes before the files member"
         );
+        // Chat attachments (cms ContextStore) are packed next to frozen
+        // snapshots when the folder exists, and the folder is never created.
+        assert!(pack.contains(
+            "if [ -d /opt/drupal/private/atelier-context ]; then CONTEXT=atelier-context; fi\n"
+        ));
+        assert!(pack.contains("-C /opt/drupal/private frozen $CONTEXT\n"));
+        assert!(!pack.contains("mkdir -p /opt/drupal/private/atelier-context"));
+    }
+
+    #[test]
+    fn the_pack_command_takes_chat_attachments_only_when_they_exist() {
+        // Run the pack's member logic for real, against a private tree with and
+        // without the attachments folder (paths rewritten into a scratch dir).
+        let dir = Scratch::new("pack-context");
+        let private = dir.0.join("private");
+        let files = dir.0.join("files");
+        let stage = dir.0.join("stage");
+        for d in [private.join("frozen"), files.clone(), stage.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(stage.join("manifest.json"), "{}").unwrap();
+        std::fs::write(stage.join("database.sql.gz"), "x").unwrap();
+        let script = backup_pack_script(&stage.to_string_lossy())
+            .replace("/opt/drupal/private", &private.to_string_lossy())
+            .replace("/opt/drupal/web/sites/default", &dir.0.to_string_lossy());
+        let members = |script: &str| {
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "pack script failed");
+            std::fs::read_to_string(stage.join("members")).unwrap()
+        };
+        assert!(!members(&script)
+            .lines()
+            .any(|l| l.starts_with("atelier-context")));
+        std::fs::create_dir_all(private.join("atelier-context")).unwrap();
+        std::fs::write(private.join("atelier-context/abc.webp"), "img").unwrap();
+        let listed = members(&script);
+        assert!(
+            listed.lines().any(|l| l == "atelier-context/abc.webp"),
+            "{listed}"
+        );
     }
 
     /// A unique scratch directory, removed on drop.
@@ -4072,6 +7091,56 @@ mod tests {
         assert_eq!(plan.steps()[3].from, BOOT_FROM);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_backups_folder_is_tried_before_a_backup_and_nothing_is_left_or_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("backups-writable");
+        let stack = Stack::at(dir.0.clone());
+        // Not made yet: judged by the site's folder, and not created.
+        assert_eq!(super::backups_writable(&stack), Ok(()));
+        assert!(!stack.backups_dir().exists(), "a diagnosis makes nothing");
+        std::fs::create_dir_all(stack.backups_dir()).unwrap();
+        assert_eq!(super::backups_writable(&stack), Ok(()));
+        assert_eq!(
+            std::fs::read_dir(stack.backups_dir()).unwrap().count(),
+            0,
+            "the probe file is removed"
+        );
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(stack.backups_dir(), ro).unwrap();
+        if std::fs::write(stack.backups_dir().join("probe"), "").is_ok() {
+            // Root writes anywhere: nothing to tell apart.
+            std::fs::set_permissions(stack.backups_dir(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            return;
+        }
+        let refused = super::backups_writable(&stack).unwrap_err();
+        assert_eq!(refused.dir, stack.backups_dir());
+        // The update's refusal keeps its type, with the plain cause.
+        let e = super::backup_or_refuse::<()>(Err(anyhow::Error::new(refused))).unwrap_err();
+        let said = e
+            .downcast_ref::<super::BackupBeforeUpdateFailed>()
+            .expect("typed")
+            .to_string();
+        assert!(
+            said.starts_with("Couldn't back up your site first: Atelier can't save backups in ")
+                && said.contains("it isn't writable (fix the folder's permissions")
+                && said.ends_with(", so it wasn't updated"),
+            "{said}"
+        );
+        // And the restore's, through its chain.
+        let e = super::require_safety_backup(Err(anyhow::Error::new(super::BackupsNotWritable {
+            dir: stack.backups_dir(),
+        })))
+        .unwrap_err();
+        assert!(e
+            .to_string()
+            .contains("The backup failed: Atelier can't save backups in "));
+        std::fs::set_permissions(stack.backups_dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
     #[test]
     fn a_second_backup_in_the_same_second_never_overwrites_the_first() {
         let dir = Scratch::new("claim-name");
@@ -4202,6 +7271,46 @@ mod tests {
     }
 
     #[test]
+    fn the_other_site_note_is_said_once() {
+        #[derive(Default)]
+        struct Logged(Vec<String>);
+        impl Reporter for Logged {
+            fn log(&mut self, line: &str) {
+                self.0.push(line.to_string());
+            }
+        }
+        let dir = Scratch::new("restore-note");
+        // Not installed: the restore stops right after the identity check,
+        // before Docker is asked anything.
+        let stack = Stack::at(dir.0.join("site"));
+        std::fs::create_dir_all(&stack.home).unwrap();
+        std::fs::write(stack.site_id_path(), format!("{ID_B}\n")).unwrap();
+        let theirs = bundle_with(
+            &dir.0,
+            "theirs.tar.gz",
+            &format!(
+                r#"{{"format":"aincient-snapshot","version":3,"site_id":"{ID_A}","site_slug":"blog"}}"#
+            ),
+        );
+        let notes = |identity_shown| {
+            let mut r = Logged::default();
+            let opts = RestoreOptions {
+                other_site: true,
+                identity_shown,
+                ..RestoreOptions::default()
+            };
+            let _ = restore_with(&stack, &theirs, &opts, &mut r);
+            r.0.iter()
+                .filter(|l| l.starts_with("Restoring a backup of another site"))
+                .count()
+        };
+        // The app: the restore says it.
+        assert_eq!(notes(false), 1);
+        // The CLI printed it before its confirmation: not again.
+        assert_eq!(notes(true), 0);
+    }
+
+    #[test]
     fn describe_backup_reports_size_sha_and_origin() {
         let dir = Scratch::new("describe");
         let file = bundle_with(
@@ -4252,6 +7361,16 @@ mod tests {
             script.contains("chown -R www-data:www-data"),
             "re-asserts files ownership"
         );
+        // Chat attachments come back the way frozen snapshots do; an archive
+        // without them (taken before 0.17.0) leaves the folder as it is.
+        let files = &parts[2];
+        assert!(files.contains(
+            "if [ -d \"$WORK/atelier-context\" ]; then\n\
+             \x20 rm -rf /opt/drupal/private/atelier-context\n\
+             \x20 cp -a \"$WORK/atelier-context\" /opt/drupal/private/atelier-context\n\
+             \x20 chown -R www-data:www-data /opt/drupal/private/atelier-context\n\
+             fi\n"
+        ));
     }
 
     #[test]
@@ -4351,28 +7470,59 @@ mod tests {
 
     #[test]
     fn local_probe_reads_the_digest_the_version_and_the_floor() {
-        let p = parse_local_probe(
-            "ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2|edge+f8bdcb9|0.3.0",
+        let p = probe_json(
+            r#"[{"Id":"sha256:1111","RepoDigests":["ghcr.io/aincient-labs/atelier-cms@sha256:413ed726a1a2"],"Config":{"Labels":{"org.opencontainers.image.version":"edge+f8bdcb9","dev.atelier.upgrade.min-from":"0.3.0"}}}]"#,
         );
         assert_eq!(p.digest.as_deref(), Some("sha256:413ed726a1a2"));
         assert_eq!(p.version.as_deref(), Some("edge+f8bdcb9"));
         assert_eq!(p.floor, Some(Version(0, 3, 0)));
+        assert!(p.extensions.is_none());
+    }
+
+    fn probe_json(json: &str) -> super::ImageProbe {
+        super::probe_of(&crate::image_origin::parse(json).unwrap()[0])
     }
 
     #[test]
     fn local_probe_tolerates_a_locally_built_unlabelled_image() {
         // Empty RepoDigests and no labels — all three fields blank, not an error.
-        let p = parse_local_probe("||");
-        assert!(p.digest.is_none(), "no registry digest to compare");
-        assert!(p.version.is_none(), "unstamped build claims no version");
-        assert!(p.floor.is_none(), "and declares no floor");
+        for json in [
+            r#"[{"Id":"sha256:1111","RepoDigests":[],"Config":{"Labels":null}}]"#,
+            r#"[{"Id":"sha256:1111","RepoDigests":null,"Config":{}}]"#,
+        ] {
+            let p = probe_json(json);
+            assert!(p.digest.is_none(), "no registry digest to compare");
+            assert!(p.version.is_none(), "unstamped build claims no version");
+            assert!(p.floor.is_none(), "and declares no floor");
+        }
+    }
+
+    #[test]
+    fn local_probe_reads_the_containerd_store_by_origin_not_repo_digests() {
+        // Docker 29, containerd store: a local build lists a RepoDigests entry
+        // under its own name, which no registry has.
+        let built = probe_json(
+            r#"[{"Id":"sha256:4f7e","RepoDigests":["atelier-cms@sha256:4f7e"],"Descriptor":{"digest":"sha256:4f7e"},"Identity":{"Build":[{"Ref":"x"}]}}]"#,
+        );
+        assert!(
+            built.digest.is_none(),
+            "a local build has no registry digest"
+        );
+        // A pulled image whose tag moved on keeps no RepoDigests there; its ID
+        // is the digest it was pulled as.
+        let pulled = probe_json(
+            r#"[{"Id":"sha256:a7db","RepoDigests":[],"Descriptor":{"digest":"sha256:a7db"},"Identity":{"Pull":[{"Repository":"ghcr.io/aincient-labs/atelier-cms"}]}}]"#,
+        );
+        assert_eq!(pulled.digest.as_deref(), Some("sha256:a7db"));
     }
 
     #[test]
     fn a_probe_of_an_image_predating_the_floor_label_declares_no_floor() {
-        // The label is simply absent, which the template renders as empty. Read as
-        // "no floor", never as 0.0.0 — an old image makes no promise either way.
-        let p = parse_local_probe("repo@sha256:abc|v0.1.0|");
+        // The label is simply absent. Read as "no floor", never as 0.0.0 — an
+        // old image makes no promise either way.
+        let p = probe_json(
+            r#"[{"Id":"sha256:1111","RepoDigests":["repo@sha256:abc"],"Config":{"Labels":{"org.opencontainers.image.version":"v0.1.0"}}}]"#,
+        );
         assert_eq!(p.version.as_deref(), Some("v0.1.0"));
         assert!(p.floor.is_none());
     }
@@ -4745,5 +7895,276 @@ mod tests {
             problem.contains("no such host"),
             "keeps the cause: {problem}"
         );
+    }
+
+    // --- Updates (hardening M5) ---------------------------------------------
+
+    /// Image IDs as `docker image inspect --format {{.Id}}` and `docker inspect
+    /// --format {{.Image}}` print them.
+    const ID_OLD: &str = "sha256:6f1c3b0e2a9d4c7f8e5b1a2d3c4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60";
+    const ID_NEW: &str = "sha256:0a9b8c7d6e5f40312233445566778899aabbccddeeff00112233445566778899";
+
+    #[test]
+    fn an_update_whose_download_is_the_running_build_does_nothing() {
+        use super::UpdateNeed::{Nothing, Settings, Update};
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), false, false),
+            Nothing
+        );
+        // A new build, or a side that can't be read, is an update as before.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_NEW), Some(false), false, false),
+            Update
+        );
+        assert_eq!(update_need(None, Some(ID_NEW), None, false, false), Update);
+        assert_eq!(update_need(Some(ID_OLD), None, None, false, false), Update);
+        // A new build with changed settings too: the full update.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_NEW), Some(true), true, false),
+            Update
+        );
+        // The db move is due: the full update.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), false, true),
+            Update
+        );
+        // Same build, settings changed since the containers were made: `up`
+        // on that build, no backup.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(true), false, false),
+            Settings
+        );
+        // The hashes decide over the rewritten files: a rewrite compose sees no
+        // difference in changes nothing.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), Some(false), true, false),
+            Nothing
+        );
+        // Unreadable hashes: the rewritten files decide.
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), None, true, false),
+            Settings
+        );
+        assert_eq!(
+            update_need(Some(ID_OLD), Some(ID_OLD), None, false, false),
+            Nothing
+        );
+    }
+
+    /// `docker compose -p atelier-hardening-test config --hash '*'`
+    /// (Compose v5.1.2, 2026-11-14), right after install.
+    const DECLARED_HASHES: &str =
+        "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+         db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n\
+         edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b\n";
+
+    #[test]
+    fn settings_compare_each_service_s_config_hash_to_its_container() {
+        // `docker inspect -f RUNNING_HASHES` of the three containers that
+        // install made (another order than compose's).
+        let running = "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+             edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b\n\
+             db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n";
+        assert_eq!(settings_changed(DECLARED_HASHES, running), Some(false));
+        // HTTP_PORT changed in .env: edge's hash moves, the others don't.
+        let port_changed = running.replace(
+            "edge 64dee302d711303f4c03706f107a1329ac1b13a07a3e6e008876598269bbae5b",
+            "edge 1f0e37b4b44f3c6c8a3b0e3a8b4f2b0d9b8c5a7e6d4f3e2d1c0b9a8f7e6d5c4b",
+        );
+        assert_eq!(settings_changed(DECLARED_HASHES, &port_changed), Some(true));
+        // A service with no container (or a container without the label).
+        let no_edge = "app b49b0ed33609761aae262de194483bbb53cdae84a38044d8f683e5022507b722\n\
+             db 564c3ffec3746bcd7b3e5e088a27156540a2029b5ae267d04a8823699a679103\n\
+             edge \n";
+        assert_eq!(settings_changed(DECLARED_HASHES, no_edge), Some(true));
+        assert_eq!(settings_changed(DECLARED_HASHES, ""), Some(true));
+        // Compose said nothing usable: unknown.
+        assert_eq!(settings_changed("", running), None);
+        assert!(super::SETTINGS_APPLIED.starts_with("Already up to date."));
+        // Settings-only counts as a site that answered.
+        assert!(super::Updated::SettingsApplied.ready());
+    }
+
+    #[test]
+    fn an_unfinished_route_is_resumed_and_written() {
+        let channel = || "ghcr.io/aincient-labs/atelier-cms:latest".to_string();
+        let target = "ghcr.io/aincient-labs/atelier-cms:latest".to_string();
+        // A route stopped at a waypoint: `.env` names the waypoint, the file the end.
+        assert_eq!(
+            route_target(None, Some(target.clone()), || {
+                "ghcr.io/aincient-labs/atelier-cms:0.12.0".to_string()
+            }),
+            (target.clone(), true)
+        );
+        assert_eq!(route_target(None, None, channel), (target, false));
+        // A version the operator names wins over the unfinished route.
+        let named = "ghcr.io/aincient-labs/atelier-cms:0.20.0".to_string();
+        assert_eq!(
+            route_target(
+                Some(named.clone()),
+                Some("ghcr.io/aincient-labs/atelier-cms:latest".into()),
+                channel
+            ),
+            (named, true)
+        );
+    }
+
+    #[test]
+    fn the_update_target_survives_until_cleared_and_a_channel_switch_drops_it() {
+        let dir = Scratch::new("update-target");
+        let stack = Stack::at(dir.0.clone());
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        assert_eq!(stack.update_target(), None);
+        stack
+            .set_update_target("ghcr.io/aincient-labs/atelier-cms:latest")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join(".update-target")).unwrap(),
+            "ghcr.io/aincient-labs/atelier-cms:latest\n"
+        );
+        assert_eq!(
+            stack.update_target().as_deref(),
+            Some("ghcr.io/aincient-labs/atelier-cms:latest")
+        );
+        switch_channel(&stack, Channel::Edge, false, &mut Silent).unwrap();
+        assert_eq!(stack.update_target(), None);
+        // An empty file is no route.
+        std::fs::write(stack.update_target_path(), "\n").unwrap();
+        assert_eq!(stack.update_target(), None);
+    }
+
+    #[test]
+    fn an_update_check_cached_before_unfinished_existed_still_reads() {
+        let check: UpdateCheck = serde_json::from_str(
+            r#"{"image":"ghcr.io/aincient-labs/atelier-cms:latest","current":null,
+                "latest":null,"current_version":null,"latest_version":null,
+                "update_available":null,"problem":null,"plan":null}"#,
+        )
+        .unwrap();
+        assert!(!check.unfinished);
+    }
+
+    #[test]
+    fn a_stopped_site_is_started_for_its_backup_but_not_a_half_removed_one() {
+        // Resting through the engine: app and db exited, edge serving.
+        let resting = format!("{}\n{}\n{PS_EDGE}", stopped(PS_APP), stopped(PS_DB));
+        assert!(start_for_backup_needed(container_state_from_ps(&resting)));
+        let all_stopped = format!(
+            "{}\n{}\n{}",
+            stopped(PS_APP),
+            stopped(PS_DB),
+            stopped(PS_EDGE)
+        );
+        assert!(start_for_backup_needed(container_state_from_ps(
+            &all_stopped
+        )));
+        let running = format!("{PS_APP}\n{PS_DB}\n{PS_EDGE}");
+        assert!(!start_for_backup_needed(container_state_from_ps(&running)));
+        // No db container: Start would be an `up` onto the new image.
+        let no_db = format!("{}\n{PS_EDGE}", stopped(PS_APP));
+        assert!(!start_for_backup_needed(container_state_from_ps(&no_db)));
+        assert!(!start_for_backup_needed(ContainerState::Unknown));
+    }
+
+    #[test]
+    fn a_locked_site_is_refused_and_a_resting_one_is_not() {
+        let e = refuse_locked(Some("locked")).unwrap_err().to_string();
+        assert!(e.starts_with("This site is locked. Unlock it first"), "{e}");
+        for state in [None, Some("resting"), Some("awake"), Some("stopped")] {
+            assert!(refuse_locked(state).is_ok(), "{state:?}");
+        }
+    }
+
+    /// A stack on the old bookworm db image, as 0.16 installs have it.
+    fn legacy_db_stack(tag: &str) -> (Scratch, Stack) {
+        use crate::stack::{COMPOSE_TEMPLATE, DB_IMAGE, LEGACY_DB_IMAGE};
+        let dir = Scratch::new(tag);
+        let stack = Stack::at(dir.0.clone());
+        stack.ensure_scaffold(&InstallOptions::default()).unwrap();
+        std::fs::write(
+            stack.compose_path(),
+            COMPOSE_TEMPLATE.replace(DB_IMAGE, LEGACY_DB_IMAGE),
+        )
+        .unwrap();
+        (dir, stack)
+    }
+
+    #[test]
+    fn a_failed_db_image_download_leaves_compose_for_the_next_update() {
+        use crate::stack::{DB_IMAGE, LEGACY_DB_IMAGE};
+        let (_dir, stack) = legacy_db_stack("db-pull-fails");
+        let before = std::fs::read_to_string(stack.compose_path()).unwrap();
+        let mut asked = Vec::new();
+        let moved = pull_then_move_db(
+            &stack,
+            |image, _r| {
+                asked.push(image.to_string());
+                bail!("Error response from daemon: Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
+            },
+            &mut Silent,
+        )
+        .unwrap();
+        assert_eq!(moved, None);
+        assert_eq!(asked, [DB_IMAGE]);
+        assert_eq!(
+            std::fs::read_to_string(stack.compose_path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            stack.pending_db_image_migration(),
+            Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
+        );
+    }
+
+    #[test]
+    fn the_db_image_is_downloaded_before_compose_names_it() {
+        use crate::stack::{DB_IMAGE, LEGACY_DB_IMAGE};
+        let (_dir, stack) = legacy_db_stack("db-pull-first");
+        let moved = pull_then_move_db(
+            &stack,
+            |_image, _r| {
+                // compose.yaml still names the old image while it downloads.
+                assert!(stack.pending_db_image_migration().is_some());
+                Ok(())
+            },
+            &mut Silent,
+        )
+        .unwrap();
+        assert_eq!(
+            moved,
+            Some((LEGACY_DB_IMAGE.to_string(), DB_IMAGE.to_string()))
+        );
+        assert_eq!(stack.pending_db_image_migration(), None);
+    }
+
+    #[test]
+    fn a_compose_without_json_progress_is_told_from_a_failed_pull() {
+        // Compose 2.20.2 on d34dbuntu, 2026-11-15, as the pull's error carried it.
+        assert!(super::progress_value_refused(
+            "failed to pull the image (docker exited with exit status: 1): unsupported --progress value \"json\""
+        ));
+        assert!(!super::progress_value_refused(
+            "failed to pull the image (docker exited with exit status: 1): manifest unknown"
+        ));
+    }
+
+    #[test]
+    fn the_login_hint_is_only_for_a_refused_login() {
+        for refused in [
+            r#"Error response from daemon: Head "https://ghcr.io/v2/aincient-labs/atelier-cms/manifests/latest": denied"#,
+            r#"Error response from daemon: Head "https://ghcr.io/v2/aincient-labs/atelier-cms/manifests/latest": unauthorized"#,
+            "Error response from daemon: pull access denied for ghcr.io/aincient-labs/atelier-cms, repository does not exist or may require 'docker login': denied: requested access to the resource is denied",
+            r#"{"id":"app","status":"Error","text":"Error response from daemon: denied"}"#,
+        ] {
+            assert!(registry_refused(refused), "{refused}");
+        }
+        for other in [
+            r#"Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io: no such host"#,
+            "Error response from daemon: manifest unknown",
+            "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Head \"http://%2Fvar%2Frun%2Fdocker.sock/_ping\"",
+            r#"{"id":"app","status":"Pulling","text":"Pulling"}"#,
+        ] {
+            assert!(!registry_refused(other), "{other}");
+        }
     }
 }

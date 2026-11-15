@@ -188,6 +188,13 @@ pub fn run_on_host(
     confirm: Confirm,
 ) -> Result<()> {
     check_experimental(&cmd, experimental)?;
+    // Enable, disable and remove change the site: one operation at a time.
+    let _op = matches!(
+        cmd,
+        EngineCommand::Enable | EngineCommand::Disable | EngineCommand::Remove { .. }
+    )
+    .then(|| aincient_core::oplock::hold(stack, aincient_core::oplock::Operation::Engine))
+    .transpose()?;
     match cmd {
         EngineCommand::Enable => enable(stack),
         EngineCommand::Disable => disable(stack),
@@ -336,6 +343,7 @@ fn disable(stack: &Stack) -> Result<()> {
     // The engine container is now an orphan, and edge's config changed back
     // to edge.conf, so `up` removes the one and recreates the other.
     let mut c = compose(stack);
+    // scenario: none — engine mode (the experimental engine sidecar) has no scenario (disable brings the plain stack back up)
     c.args(["up", "-d", "--remove-orphans"]);
     run_inherited(c, "restart the stack without the engine")?;
     println!(

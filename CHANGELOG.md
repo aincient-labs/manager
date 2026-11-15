@@ -7,6 +7,201 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Before every update, Atelier backs up your site first (a "before-update" backup), so a one-step
+  update can be undone from **Backups** like a multi-step one. Before a restore, it saves your site
+  as it is now ("before-restore"); if the restore fails, the error names that file. If that backup
+  can't be taken (a full disk, a damaged database), the restore stops and your site is left as it
+  was. The app then offers **Restore without a safety copy**, after saying your site as it is now
+  will be lost for good; `atelier data restore --no-safety-backup` does the same.
+- Atelier keeps the newest 3 of the backups it takes by itself from this version on and removes
+  older ones, but only after an update or restore has worked: a failed attempt, and every retry,
+  keeps them all. The backup you just restored is never removed. Backups you make are never removed,
+  and neither are the automatic ones earlier versions kept: **Free up space** lists them for each
+  site, unticked, and `atelier app cleanup --older-backups` includes them.
+- **Home** always says whether you're up to date and when it last checked, with **Check now**.
+  When an update is ready, it shows both versions and a **What's new** link. **System → Updates**
+  says how often Atelier checks.
+
+- **Free up space** (System → Disk space, or `atelier app cleanup`) removes Atelier's downloads that
+  no site is using: old versions, and the database and web-server images Atelier has moved away from.
+  It lists what will go, with sizes, and asks first (`--yes` skips the question, `--dry-run` only
+  lists). After a successful update, old versions are removed automatically, along with only the
+  exact database and web-server versions Atelier itself used before (never another version of
+  those images another program may keep). Anything one of your
+  sites needs to start stays, even while that site is stopped, as do images that can't be downloaded
+  again (your own builds) and the database and web-server images other programs may share. Your
+  sites' data and other programs' images are never touched, nor are your backups unless you tick
+  the older automatic ones; anything removed downloads again when a site needs it.
+
+- **Restart Docker** for you: when a start, update or checkup ends with "Restart Docker", the app
+  shows a **Restart** button named for what runs Docker on your computer (Docker Desktop, OrbStack,
+  Colima or Rancher Desktop), and `atelier docker restart` does the same in a terminal. It first
+  lists the other containers the restart stops and asks, then restarts Docker, waits for it to
+  answer and starts your site again. **Run a checkup**'s repair (`atelier doctor --fix`) offers it
+  too, asking first. Docker Engine on Linux is restarted by hand: you get the command to copy.
+  OrbStack restarts only its Docker engine (your OrbStack Linux machines keep running), and a Colima
+  profile other than the default one is restarted by name.
+- An update first checks that your site is ready, and refuses before anything is downloaded,
+  backed up or changed when it isn't, listing each reason with its way forward: Docker isn't
+  answering (**Restart Docker**), less than 2 GB free on your computer's disk or on Docker's
+  (**Free up space**), the site's database was removed (**Backups** → restore), part of the site
+  lost its network connection (**Start your site** reconnects it), part of the site ran out of
+  memory (where to give Docker more) or keeps restarting (**Run a checkup**), or the site is
+  locked (**Unlock**). A stopped site is fine: the update starts it for its backup. In the app each
+  reason has its button; `atelier app update` lists them and exits with code 5.
+- **Run a checkup** checks free disk space in two places: your computer's disk where the site's
+  backups are saved, and Docker's own disk (read inside the running site, so "unknown" while it is
+  stopped). It warns below 5 GB and fails below 2 GB, where updates are refused.
+- **Run a checkup** says how much memory Docker has and warns below 4 GB, with where to raise it
+  for what runs Docker on your computer (Docker Desktop, OrbStack, Colima, Rancher Desktop). It also
+  warns when Docker stopped part of a site in the last day because it ran out of memory.
+- One thing at a time per site: while an update, restore, backup, start or any other change runs
+  on a site, from the app or from `atelier`, a second one on the same site waits its turn instead
+  of running alongside it: "Your site is busy: an update started 2 minutes ago is still running.
+  Wait for it to finish." `atelier` exits with code 6. Checking for updates, the site's status and
+  a checkup without repairs still work meanwhile. If the app or `atelier` is closed or crashes
+  mid-way, the site is free again straight away; there is nothing to unlock.
+- When an update fails after it restarted your site, Atelier saves every part's log (the site, its
+  database and its web server) to the site's folder (`logs/update-<date>-<time>.log`) before
+  anything restarts them, and the failure message names the file, so the reason isn't lost with
+  the next start. The newest 10 are kept. Passwords and other secrets from your settings never go
+  in.
+
+### Changed
+
+- A site that is still starting after 3 minutes says "This is taking longer than usual" and offers
+  **Run a checkup** and **View activity**, instead of waiting forever.
+- When a start, update or setup finishes but the site hasn't answered yet, the app says so instead
+  of reporting success. After a failed one, Home shows what didn't finish, with **Run a checkup**.
+- With the site stopped, **Backups** offers **Start my website** instead of failing. A site that
+  runs but doesn't answer (still starting, or broken by a failed update) can be restored right away;
+  only **Back up now** waits until it answers.
+- Backups are listed by date, size and what they're for ("Before update · 14 Nov 2026, 10:15 ·
+  12 MB") instead of by file name.
+
+### Fixed
+
+- Updating from the app works again with older Docker Compose versions (such as 2.20, shipped with
+  Ubuntu 22.04's Docker 24): the download failed with `unsupported --progress value "json"`. It
+  now falls back to Compose's plain progress output.
+- A start that failed in its first moments is no longer called ready: on Docker 24 the first lines
+  a site writes are stamped just before Docker's own start time, and Atelier read the log from that
+  start time, so it missed them.
+- On Docker's containerd image store (the default for a fresh Docker Engine 29 on Linux, and for
+  Docker Desktop), Atelier no longer mistakes a build made on this computer for one it can download
+  again. Turning the engine off kept such an engine build only on the classic store and could delete
+  it here for good; **Free up space** could list a local build tagged under Atelier's own name;
+  updating a site on a local build failed with Docker's "pull access denied" instead of saying there
+  is nothing to download; and **Home** could offer an update for a local build. Where Docker can't
+  say where an image came from (an older Docker on that store), Atelier keeps it.
+- A failure panel closes on the first click of **Close**. It stayed open (with Close already
+  spent) while the app re-read the site's status, so it took a second click.
+
+- A backup into a backups folder Atelier can't write to now stops before it starts, saying "Atelier
+  can't save backups in … : it isn't writable. Fix the folder's permissions (or free it up), then try
+  again.", instead of failing after the database dump with Docker's "permission denied". The backup an
+  update or restore takes first stops the same way (a stopped site is no longer started for it), and
+  keeps its **Update without a backup** / **Restore without a safety copy** way past. **Run a
+  checkup** warns about such a folder ("Backups folder is writable").
+- Updating a site that runs a build made on this computer (a developer build, or a local tag such as
+  `atelier-cms:dev`) no longer tries to download it and fails with Docker's "pull access denied". It
+  stops before changing anything and says there is nothing to download, and how to follow released
+  versions again (`atelier app channel stable`, or **System → Updates → Released versions**).
+- **Run a checkup** on a stopped site now says its containers aren't running, with **Start** as the
+  fix, instead of "The container isn't there".
+- A site that runs out of memory while it starts or updates now says so: "Your site ran out of
+  memory, so Docker stopped part of it (the database)…", with where to give Docker more memory, as
+  soon as it is seen, instead of "still starting" after two minutes or "couldn't finish starting".
+  The database case adds that your data is safe. A part of the site that keeps stopping and
+  starting again for another reason is named too, with **Run a checkup**.
+- A backup or update that fills the disk inside Docker says "Docker has run out of disk space" with
+  how to free it, instead of the raw "No space left on device" error. When it is your computer's
+  disk that fills while a backup is saved, it says so ("This computer's disk is full, so the backup
+  couldn't be saved in …") instead of blaming Docker.
+- An update no longer goes ahead when the backup it takes first fails (a full disk, a read-only
+  backups folder): it stops and your site stays on its version. **Update without a backup**
+  (`atelier app update --no-backup`) goes on without one.
+
+- A site whose database had lost its connection to the site's network (left behind by Docker, or by
+  an earlier start that cleared Docker's leftovers) no longer stays stuck on "can't reach its
+  database", even after restarting Docker. Start and **Run a checkup** now reconnect it and
+  restart the site; the checkup names it. An update refuses until Start has reconnected it.
+
+- When Docker fails a start, update, stop or removal, the error now says why in plain words: the
+  site's port is taken by another program (naming the port), Docker is out of disk space, or Docker
+  isn't running. Any other failure shows Docker's last line instead of only "docker exited with 1".
+  Removing a site's containers in the app now shows Docker's output while it runs.
+- The desktop app's Home is honest after updates, starts and site switches. After an update, setup
+  or version switch it checks again instead of saying "Couldn't check"; "What's new" links the
+  release (or the releases list when the version isn't a plain number); the "didn't finish starting"
+  and "still starting" lines clear once the site is up or stopped; only one "Run a checkup" shows;
+  **Back up now** waits until the site answers; the update line keeps
+  keyboard focus when it refreshes; and the page behind a running operation can't be clicked or
+  tabbed into, so a second operation can't be started by accident. The finished panel says what the
+  clean-up after an update removed.
+- Backups now include the images attached in chat, and a restore puts them back. Restoring a
+  backup taken before this version leaves the current ones as they are.
+- Starting, updating or repairing a site no longer stops at "dependency failed to start" when Docker
+  Desktop has left a stale network entry behind (after a sleep, restart or crash). Atelier removes
+  that leftover entry, connects the container again under the same names on every network it was on
+  (the web server of a site with the experimental engine stays connected to the engine), and starts
+  once more; no container or data is touched. If that also fails, it tells you to restart Docker
+  instead of showing only Docker's error.
+- A site with the experimental engine no longer fails to start with "No such image" when its engine
+  image was removed from your computer (an image clean-up or a Docker reset). Atelier downloads the
+  exact pinned version again, and names it locally (`atelier-engine:pinned-<site>`) so Docker's
+  image clean-up (`docker image prune`) no longer removes it. Turning the engine off drops that name,
+  except for an engine built locally that has no other name, which would otherwise be deleted.
+  An engine built locally can't be downloaded, so it says to turn the engine off and on again.
+- A start, setup or update whose site failed to come up now says it failed, and why ("Your site
+  can't reach its database…"), instead of reporting success or waiting minutes on "Booting…". This
+  includes a failed update that put your site back the way it was: the site answers, but the update
+  didn't happen. The app shows the failure panel with **Copy report**, `atelier` exits with an error,
+  and a failed update keeps your backups and old versions and stops a multi-step update. If Docker or
+  the site stops during the wait, it says that (one slow answer from a busy Docker doesn't count). A
+  failure that **Run a checkup** has since repaired is not reported again on the next start.
+- When Docker has left your site's network half connected, so the site can't reach its database,
+  starting it says to restart Docker, and **Run a checkup** (`atelier doctor`) reports it.
+- Switching to released versions in the app now says when the site hasn't answered yet, like an
+  update.
+- A site's database now comes back by itself when Docker restarts, like the rest of the site.
+  Existing sites get this on their next start or update (only a `compose.yaml` you haven't edited is
+  rewritten).
+- Starting a site whose database container was removed brings it back, instead of starting the
+  rest of the site without it. A web-server or engine container that Docker left half connected is
+  cleared like the database's.
+- A site whose database was removed from Docker no longer starts as a new, empty site. Start
+  (and the checkup's fix, `atelier doctor --fix`) refuses and names your latest backup; restoring it (**Backups**, which allows it while the site is
+  stopped, or `atelier data restore`) brings the site back. A database you erased yourself
+  (**Remove and erase**, `atelier app down --wipe`) still starts as a fresh site.
+- Start and Stop say "Start Docker" when Docker isn't running, instead of a Docker error.
+- A multi-step update that stopped partway no longer leaves the site stuck on the version it
+  reached. Home shows **Continue update** (`atelier app check-update` says the update didn't
+  finish), and the next update carries on to the version it was heading for. Once the site runs
+  that version or a newer one (after a restore, an install or another update), the unfinished
+  update is forgotten instead of steering the next update back to an older version.
+- An update downloads first. When the download is the version your site already runs, it says
+  "Already up to date" and takes no backup and restarts nothing, in the app as on the command line.
+  If you changed the site's settings since it started (its `.env`, such as the port or trusted
+  hosts), `atelier app update` applies them on the same version, with no backup, and says "Already
+  up to date. Applied your changed settings."
+- Updating a stopped site starts it first, so the before-update backup can be taken; if it won't
+  start, the update stops and says why. The app then offers **Update without a backup**, after
+  saying your site as it is now can't be brought back if the update goes wrong; `atelier app update
+  --no-backup` does the same. A site with the experimental engine that is resting is woken for the
+  update and put back to rest afterwards, also when the update fails. A locked site is not updated or started by
+  `atelier doctor --fix`: it says to unlock it first. `atelier doctor` reports a resting site as fine
+  instead of as stopped containers.
+- Waking a site with the experimental engine recovers like a start does: a network entry Docker
+  left behind is cleared and the wake runs once more, and a container that was removed is created
+  again before the site is woken, instead of the wake failing.
+- When the new database server can't be downloaded during an update, the site keeps its current one
+  and the move is tried again on the next update, instead of the update failing.
+- The "log in to the registry" hint after a failed download appears only when the registry refused
+  access, not for every failed download.
+
 ## [0.16.0] - 2026-11-12
 
 ### Changed

@@ -277,6 +277,7 @@ impl Transport for Ssh {
 /// whole site's database.
 fn create_private(path: &Path) -> std::io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
+    // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -471,9 +472,15 @@ pub enum Action {
     Status,
     /// `app check-update --json` — see [`Session::check_update`].
     CheckUpdate,
-    /// `app update [--to V] [--yes]`. `yes` only when the route was confirmed
-    /// here first (or there was nothing to confirm).
-    Update { to: Option<String>, yes: bool },
+    /// `app update [--to V] [--yes] [--no-backup]`. `yes` only when the route
+    /// was confirmed here first (or there was nothing to confirm);
+    /// `--no-backup` only when the owner chose to go without one, so a server
+    /// whose `atelier` predates the flag still takes every other update.
+    Update {
+        to: Option<String>,
+        yes: bool,
+        no_backup: bool,
+    },
     /// `app start`.
     Start,
     /// `app stop`.
@@ -482,9 +489,12 @@ pub enum Action {
     Backup { label: Option<String>, json: bool },
     /// `data list` — the server's backups.
     BackupList,
-    /// `data restore --yes [--other-site] -- <FILE>`, FILE being a path on the
-    /// server (an uploaded one: [`Session::restore_upload`]).
-    Restore { file: String, other_site: bool },
+    /// `data restore --yes [--other-site] [--no-safety-backup] -- <FILE>`, FILE
+    /// being a path on the server (an uploaded one: [`Session::restore_upload`]).
+    Restore {
+        file: String,
+        opts: crate::ops::RestoreOptions,
+    },
     /// `site export …` — written on the server.
     Export(ExportOptions),
     /// `site freeze …`.
@@ -534,10 +544,13 @@ impl Action {
             }
         };
         match self {
-            Action::Update { to, yes } => {
+            Action::Update { to, yes, no_backup } => {
                 opt("--to", to);
                 if *yes {
                     v.push("--yes".into());
+                }
+                if *no_backup {
+                    v.push("--no-backup".into());
                 }
             }
             Action::Backup { label, json } => {
@@ -546,10 +559,13 @@ impl Action {
                     v.push("--json".into());
                 }
             }
-            Action::Restore { file, other_site } => {
+            Action::Restore { file, opts } => {
                 v.push("--yes".into());
-                if *other_site {
+                if opts.other_site {
                     v.push("--other-site".into());
+                }
+                if opts.no_safety_backup {
+                    v.push("--no-safety-backup".into());
                 }
                 // `--` so a file named like a flag stays a file.
                 v.extend(["--".into(), file.clone()]);
@@ -1125,12 +1141,12 @@ impl<T: Transport> Session<T> {
 
     /// Restore the local archive `file` onto this site: upload it to a private
     /// temp dir on the server (`umask 077`, `mktemp -d`), check its SHA-256
-    /// there, run the server's `data restore` on it (with `--other-site` when
-    /// asked), and remove the temp dir whatever happened.
+    /// there, run the server's `data restore` on it (with `--other-site` and
+    /// `--no-safety-backup` when asked), and remove the temp dir whatever happened.
     pub fn restore_upload(
         &self,
         file: &Path,
-        other_site: bool,
+        opts: &crate::ops::RestoreOptions,
         sink: &mut dyn FnMut(Pipe, &str),
     ) -> Result<()> {
         let host = self.transport.target().to_string();
@@ -1176,7 +1192,7 @@ impl<T: Transport> Session<T> {
             self.run_action(
                 &Action::Restore {
                     file: remote_file.clone(),
-                    other_site,
+                    opts: *opts,
                 },
                 sink,
             )
@@ -1252,10 +1268,12 @@ pub fn fetch_backup<T: Transport>(transport: &T, info: &BackupInfo, dir: &Path) 
                 info.path
             );
         }
+        // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("could not move the copy into {}", dest.display()))
     })();
     if result.is_err() {
+        // scenario: none — server sites: the local copy of a server backup; no scenario has an SSH server
         let _ = std::fs::remove_file(&tmp);
     }
     result.map(|()| dest)
@@ -1763,6 +1781,7 @@ impl PrivateDir {
 
 impl Drop for PrivateDir {
     fn drop(&mut self) {
+        // scenario: none — server sites: removes its own private temp dir after a transfer; no scenario has an SSH server
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -2172,6 +2191,7 @@ fn remote_of(site: &Site) -> Result<&Remote> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::ops::RestoreOptions;
     use std::cell::RefCell;
     use std::os::unix::process::ExitStatusExt;
 
@@ -2646,6 +2666,7 @@ mod tests {
                 Action::Update {
                     to: None,
                     yes: true,
+                    no_backup: false,
                 },
                 "app update --yes",
                 UPDATE_DEADLINE,
@@ -2654,8 +2675,18 @@ mod tests {
                 Action::Update {
                     to: Some("0.21.0".into()),
                     yes: false,
+                    no_backup: false,
                 },
                 "app update --to 0.21.0",
+                UPDATE_DEADLINE,
+            ),
+            (
+                Action::Update {
+                    to: None,
+                    yes: true,
+                    no_backup: true,
+                },
+                "app update --yes --no-backup",
                 UPDATE_DEADLINE,
             ),
             (Action::Start, "app start", LIFECYCLE_DEADLINE),
@@ -2680,7 +2711,7 @@ mod tests {
             (
                 Action::Restore {
                     file: "/home/deploy/.atelier/backups/a b.tar.gz".into(),
-                    other_site: false,
+                    opts: RestoreOptions::default(),
                 },
                 "data restore --yes -- '/home/deploy/.atelier/backups/a b.tar.gz'",
                 DATA_DEADLINE,
@@ -2688,9 +2719,25 @@ mod tests {
             (
                 Action::Restore {
                     file: "/tmp/x.tar.gz".into(),
-                    other_site: true,
+                    opts: RestoreOptions {
+                        other_site: true,
+                        no_safety_backup: false,
+                        ..RestoreOptions::default()
+                    },
                 },
                 "data restore --yes --other-site -- /tmp/x.tar.gz",
+                DATA_DEADLINE,
+            ),
+            (
+                Action::Restore {
+                    file: "/tmp/x.tar.gz".into(),
+                    opts: RestoreOptions {
+                        other_site: false,
+                        no_safety_backup: true,
+                        ..RestoreOptions::default()
+                    },
+                },
+                "data restore --yes --no-safety-backup -- /tmp/x.tar.gz",
                 DATA_DEADLINE,
             ),
             (
@@ -2788,6 +2835,7 @@ mod tests {
                 &Action::Update {
                     to: None,
                     yes: true,
+                    no_backup: false,
                 },
                 &mut |_, _| {},
             )
@@ -3355,7 +3403,15 @@ mod tests {
             .on("data restore", || out(0, "Restore complete.\n", ""))
             .on("rm -rf --", || out(0, "", ""));
         session(&fake)
-            .restore_upload(&file, true, &mut |_, _| {})
+            .restore_upload(
+                &file,
+                &RestoreOptions {
+                    other_site: true,
+                    no_safety_backup: false,
+                    ..RestoreOptions::default()
+                },
+                &mut |_, _| {},
+            )
             .unwrap();
         let calls = fake.calls.borrow();
         let scripts: Vec<&str> = calls.iter().skip(1).map(|(s, _)| s.as_str()).collect();
@@ -3385,7 +3441,7 @@ mod tests {
             })
             .on("rm -rf --", || out(0, "", ""));
         let err = session(&fake)
-            .restore_upload(&file, false, &mut |_, _| {})
+            .restore_upload(&file, &RestoreOptions::default(), &mut |_, _| {})
             .unwrap_err();
         assert!(err.to_string().contains("arrived damaged"), "{err}");
         assert_eq!(last(&fake), format!("rm -rf -- {TMP_DIR}"));
@@ -3399,7 +3455,7 @@ mod tests {
             .on("data restore", || out(4, "", "error: refused\n"))
             .on("rm -rf --", || out(0, "", ""));
         let err = session(&fake)
-            .restore_upload(&file, false, &mut |_, _| {})
+            .restore_upload(&file, &RestoreOptions::default(), &mut |_, _| {})
             .unwrap_err();
         assert_eq!(err.downcast_ref::<RemoteExit>().map(|e| e.code), Some(4));
         assert_eq!(last(&fake), format!("rm -rf -- {TMP_DIR}"));

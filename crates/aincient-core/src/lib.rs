@@ -10,13 +10,20 @@
 //!
 //! [`atelier` CLI]: ../atelier/index.html
 
+pub mod boot;
+pub mod cleanup;
+pub mod disk;
 pub mod docker;
+pub mod docker_runtime;
 pub mod doctor;
 pub mod engine;
 pub mod engine_admin;
 pub mod engine_client;
+pub mod gate;
 pub mod guard;
+pub mod image_origin;
 pub mod mcp;
+pub mod oplock;
 pub mod ops;
 pub mod pack;
 pub mod pairing;
@@ -26,8 +33,11 @@ pub mod sites;
 pub mod ssh_key;
 pub mod stack;
 pub mod update_cache;
+pub mod update_logs;
 
+pub use boot::{Boot, BootFailed};
 pub use docker::{preflight, Preflight, PullEvent};
+pub use docker_runtime::{needs_docker_restart, NeedsDockerRestart};
 pub use doctor::{Check, HostTier, Repair, Report, Severity, Tier};
 pub use guard::ChangeGuard;
 pub use ops::{

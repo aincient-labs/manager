@@ -282,6 +282,7 @@ pub fn route(command: Command, site: &Site) -> Result<Route> {
             AppCommand::Install { .. } => return Err(refuse("app install")),
             AppCommand::Reinstall { .. } => return Err(refuse("app reinstall")),
             AppCommand::Down { .. } => return Err(refuse("app down")),
+            AppCommand::Cleanup { .. } => return Err(refuse("app cleanup")),
             AppCommand::Channel { .. } => return Err(refuse("app channel")),
             AppCommand::Logs { .. } => return Err(refuse("app logs")),
             AppCommand::View => return Err(refuse("app view")),
@@ -337,6 +338,7 @@ pub fn route(command: Command, site: &Site) -> Result<Route> {
         Command::Ai { .. } => return Err(refuse("ai")),
         Command::Pack { .. } => return Err(refuse("pack")),
         Command::Mcp => return Err(refuse("mcp")),
+        Command::Docker { .. } => unreachable!("handled before a paired site's dispatch"),
         Command::Sites { .. } => unreachable!("handled before resolving a site"),
         #[cfg(unix)]
         Command::Engine { command } => {

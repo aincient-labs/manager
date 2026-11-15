@@ -4,9 +4,9 @@
 //! as a user would. This keeps behaviour identical to `install.sh` and avoids a
 //! heavy API-client dependency.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -138,12 +138,21 @@ pub fn docker() -> Command {
     c
 }
 
+/// Another program that ships with a Docker runtime (`orbctl`, `colima`,
+/// `rdctl`, `osascript`), found the way [`docker`] finds `docker`: on the
+/// inherited `PATH` plus the well-known install dirs.
+pub fn tool(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env("PATH", augmented_path());
+    c
+}
+
 /// The process `PATH` with the well-known Docker install dirs appended.
 ///
 /// Existing entries keep priority (so a terminal launch resolves `docker` from the
 /// user's own `PATH` unchanged); the extras only help when a dir is otherwise
 /// missing. Non-existent dirs are harmless — the OS skips them during lookup.
-fn augmented_path() -> String {
+pub(crate) fn augmented_path() -> String {
     let mut parts: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -634,20 +643,57 @@ impl PullEvent {
 /// Whether the local Compose plugin understands `--progress json` (Compose
 /// v2.30+). Probed with a cheap `version` call so `pull` can fall back to the
 /// plain text feed on older installs instead of failing on an unknown flag value.
+/// A yes is not final: Compose 2.20 takes the value on `version` and refuses it
+/// on `pull`, which then retries plain (`ops::pull`).
 pub fn compose_supports_json_progress() -> bool {
     quiet(docker().args(["compose", "--progress", "json", "version"]))
 }
 
 /// Run to completion, streaming stdout/stderr to the inheriting process. For
 /// long, chatty operations (pull, up) where the user wants live progress.
+///
+/// Stdout inherits the terminal as is. Stderr is passed through byte for byte
+/// as it arrives (so a prompt without a newline still shows), and its last
+/// [`STDERR_TAIL`] lines are kept: a failure then says what went wrong
+/// ([`exit_message`]) instead of only "docker exited with 1". Docker Compose
+/// sees a pipe on stderr, so its progress is plain lines rather than the
+/// redrawn TTY view.
 pub fn run_inherited(mut cmd: Command, action: &str) -> Result<()> {
-    let status = cmd
-        .status()
+    let mut child = cmd
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+    let tee = child
+        .stderr
+        .take()
+        .map(|pipe| thread::spawn(move || tee_stderr(pipe, std::io::stderr())));
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+    let tail = tee.and_then(|h| h.join().ok()).unwrap_or_default();
     if !status.success() {
-        bail!("failed to {action} (docker exited with {status})");
+        return Err(exit_error(action, &status, &tail));
     }
     Ok(())
+}
+
+/// Copy `pipe` to `out` as it arrives and return its last [`STDERR_TAIL`] lines.
+fn tee_stderr<R: Read, W: Write>(mut pipe: R, mut out: W) -> Vec<String> {
+    let mut tail = StderrTail::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+                tail.feed(&buf[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    tail.finish()
 }
 
 /// Run to completion, forwarding every stdout/stderr line to `sink` as it
@@ -655,7 +701,8 @@ pub fn run_inherited(mut cmd: Command, action: &str) -> Result<()> {
 /// [`run_inherited`]: same use (long, chatty ops like pull/up) but the output is
 /// relayed line-by-line instead of inheriting the terminal — so a GUI can show a
 /// live log feed. Both pipes are drained on their own threads so neither blocks
-/// the other.
+/// the other. Stderr's last [`STDERR_TAIL`] lines go into the error, as in
+/// [`run_inherited`].
 pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str)) -> Result<()> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -663,14 +710,24 @@ pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str))
         .spawn()
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
 
-    let (tx, rx) = mpsc::channel::<String>();
-    let stdout = child.stdout.take().map(|s| spawn_reader(s, tx.clone()));
-    let stderr = child.stderr.take().map(|s| spawn_reader(s, tx.clone()));
+    let (tx, rx) = mpsc::channel::<(Pipe, String)>();
+    let stdout = child
+        .stdout
+        .take()
+        .map(|s| spawn_reader(s, Pipe::Stdout, tx.clone()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|s| spawn_reader(s, Pipe::Stderr, tx.clone()));
     // Drop our own sender so `rx` closes once both reader threads finish.
     drop(tx);
 
-    for line in rx {
+    let mut tail = StderrTail::default();
+    for (pipe, line) in rx {
         sink(&line);
+        if pipe == Pipe::Stderr {
+            tail.push(&line);
+        }
     }
     if let Some(h) = stdout {
         let _ = h.join();
@@ -683,7 +740,7 @@ pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str))
         .wait()
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
     if !status.success() {
-        bail!("failed to {action} (docker exited with {status})");
+        return Err(exit_error(action, &status, &tail.finish()));
     }
     Ok(())
 }
@@ -691,14 +748,134 @@ pub fn run_streaming(mut cmd: Command, action: &str, mut sink: impl FnMut(&str))
 /// Forward each line of a child pipe to the shared channel until it closes.
 fn spawn_reader<R: Read + Send + 'static>(
     pipe: R,
-    tx: mpsc::Sender<String>,
+    which: Pipe,
+    tx: mpsc::Sender<(Pipe, String)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
+            if tx.send((which, line)).is_err() {
                 break;
             }
         }
+    })
+}
+
+/// How many of a failed step's last stderr lines it keeps for its error.
+pub const STDERR_TAIL: usize = 20;
+
+/// The last [`STDERR_TAIL`] non-empty lines of a stream, fed in any chunking.
+/// A `\r` ends a line too, so a redrawn progress line doesn't hide the error
+/// after it.
+#[derive(Default)]
+struct StderrTail {
+    lines: std::collections::VecDeque<String>,
+    partial: Vec<u8>,
+}
+
+impl StderrTail {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' || b == b'\r' {
+                let line = std::mem::take(&mut self.partial);
+                self.push(&String::from_utf8_lossy(&line));
+            } else {
+                self.partial.push(b);
+            }
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if self.lines.len() == STDERR_TAIL {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line.to_string());
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        let rest = std::mem::take(&mut self.partial);
+        self.push(&String::from_utf8_lossy(&rest));
+        self.lines.into()
+    }
+}
+
+/// The error a failed docker step returns: `failed to <action>: <sentence>`
+/// when [`explain_failure`] knows the cause, otherwise the exit status plus
+/// Docker's last line, so the reason is never only "exited with 1".
+pub fn exit_message(action: &str, status: &dyn std::fmt::Display, tail: &[String]) -> String {
+    if let Some(why) = explain_failure(tail) {
+        return format!("failed to {action}: {why}");
+    }
+    match tail.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty()) {
+        Some(last) => format!("failed to {action} (docker exited with {status}): {last}"),
+        None => format!("failed to {action} (docker exited with {status})"),
+    }
+}
+
+/// [`exit_message`] as an error. Docker not answering is a
+/// [`NeedsDockerRestart`](crate::docker_runtime::NeedsDockerRestart), so the
+/// app can offer its Restart button.
+fn exit_error(action: &str, status: &dyn std::fmt::Display, tail: &[String]) -> anyhow::Error {
+    let message = exit_message(action, status, tail);
+    if explain_failure(tail).as_deref() == Some(DOCKER_NOT_ANSWERING) {
+        crate::docker_runtime::NeedsDockerRestart(message).into()
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+/// What a failed step says when Docker didn't answer at all.
+pub const DOCKER_NOT_ANSWERING: &str = "Docker isn't running, or isn't answering. Start Docker, \
+     or restart it if it is already open (`atelier docker restart`), then try again.";
+
+/// A plain sentence for the Docker failures an owner can fix themselves,
+/// read from the step's last stderr lines; `None` for anything else.
+///
+/// The newest line that names a known cause wins, so an old warning earlier
+/// in the output doesn't mask the error that ended the step.
+pub fn explain_failure(tail: &[String]) -> Option<String> {
+    tail.iter().rev().find_map(|line| explain_line(line))
+}
+
+fn explain_line(line: &str) -> Option<String> {
+    if line.contains("Cannot connect to the Docker daemon") {
+        return Some(DOCKER_NOT_ANSWERING.to_string());
+    }
+    // Docker (Go) writes it in lower case, libc's strerror ("pg_dump: error:
+    // could not write to file: No space left on device") capitalised.
+    if line
+        .to_ascii_lowercase()
+        .contains("no space left on device")
+    {
+        return Some(
+            "Docker has run out of disk space. Free up space (System → Disk space in the app, \
+             or `atelier app cleanup`), or give Docker more disk space in its settings, then \
+             try again."
+                .to_string(),
+        );
+    }
+    // Linux Docker: "Bind for 0.0.0.0:8080 failed: port is already allocated".
+    // Docker Desktop: "ports are not available: exposing port TCP
+    // 0.0.0.0:8080 -> 127.0.0.1:0: listen tcp 0.0.0.0:8080: bind: address
+    // already in use".
+    let before = line
+        .find(" failed: port is already allocated")
+        .or_else(|| line.find(": bind: address already in use"))?;
+    let port = line[..before]
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim().parse::<u16>().ok());
+    Some(match port {
+        Some(port) => format!(
+            "Port {port} is already in use by another program or site. Stop whatever is \
+             using it, then try again."
+        ),
+        None => "The site's port is already in use by another program or site. Stop \
+                 whatever is using it, then try again."
+            .to_string(),
     })
 }
 
@@ -709,9 +886,70 @@ pub fn run_capture(mut cmd: Command, action: &str) -> Result<String> {
         .with_context(|| format!("failed to launch docker while trying to {action}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("failed to {action}:\n{}", stderr.trim());
+        bail!("{}", capture_failure(action, stderr.trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`run_capture`] for a step that writes into `host_dir` on this computer
+/// (`docker cp` of a backup into the backups folder): a full disk there is
+/// this computer's, not Docker's, and is said so ([`host_disk_full`]).
+pub fn run_capture_writing_to(mut cmd: Command, action: &str, host_dir: &Path) -> Result<String> {
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to launch docker while trying to {action}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "{}",
+            capture_failure_at(action, stderr.trim(), Some(host_dir))
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// What a failed [`run_capture`] says: the plain sentence for a cause the
+/// owner can fix ([`explain_failure`]: a full disk inside a backup's dump, say)
+/// first, then the step's own words for a bug report.
+fn capture_failure(action: &str, stderr: &str) -> String {
+    capture_failure_at(action, stderr, None)
+}
+
+/// [`capture_failure`], telling a full disk on this computer (a line naming
+/// `host_dir`) from Docker's own.
+fn capture_failure_at(action: &str, stderr: &str, host_dir: Option<&Path>) -> String {
+    let tail: Vec<String> = stderr.lines().map(str::to_string).collect();
+    let on_host = host_dir.filter(|dir| tail.iter().any(|l| fills_host_disk(l, dir)));
+    match on_host
+        .map(host_disk_full)
+        .or_else(|| explain_failure(&tail))
+    {
+        Some(why) => format!("failed to {action}: {why}\n{stderr}"),
+        None => format!("failed to {action}:\n{stderr}"),
+    }
+}
+
+/// `line` is a full disk while writing under `dir` on this computer. The
+/// docker CLI writes what it copies out itself, and names the file it was
+/// writing (`write <dir>/.aincient-….part: no space left on device`, docker
+/// 28 / compose 2.40 on macOS, 2026-11-14); anything written inside a
+/// container names a path in there.
+fn fills_host_disk(line: &str, dir: &Path) -> bool {
+    let dir = dir.to_string_lossy();
+    !dir.is_empty()
+        && line
+            .to_ascii_lowercase()
+            .contains("no space left on device")
+        && line.contains(dir.as_ref())
+}
+
+/// What a full disk on this computer says: which disk, and the way forward.
+pub fn host_disk_full(dir: &Path) -> String {
+    format!(
+        "This computer's disk is full, so the backup couldn't be saved in {}. Delete files you \
+         don't need on this computer, or move older backups elsewhere, then try again.",
+        dir.display()
+    )
 }
 
 /// Run, capture stdout, and return the *reason* on failure instead of discarding
@@ -1038,5 +1276,242 @@ mod tests {
         assert!(image.parent_id.is_none());
         assert_eq!(image.status.as_deref(), Some("Done"));
         assert_eq!(image.to_line(), "Image alpine:3.20 Pulled");
+    }
+
+    // ---- Docker error text (M8) ----------------------------------------------
+    // Real stderr from `docker compose up` / `pull` on the failures an owner
+    // can fix: Linux Engine and Docker Desktop word a taken port differently.
+
+    const PORT_ALLOCATED: &str = "Error response from daemon: driver failed programming external \
+        connectivity on endpoint atelier-hardening-test-edge-1 \
+        (5a0c7e9f3b1d2c4e6f8a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e): Bind for \
+        0.0.0.0:41227 failed: port is already allocated";
+    const PORT_IN_USE_DESKTOP: &str = "Error response from daemon: ports are not available: \
+        exposing port TCP 0.0.0.0:41227 -> 127.0.0.1:0: listen tcp 0.0.0.0:41227: bind: \
+        address already in use";
+    const NO_SPACE: &str = "failed to register layer: write \
+        /usr/lib/x86_64-linux-gnu/libLLVM-15.so.1: no space left on device";
+    const NO_SPACE_MKDIR: &str = "Error response from daemon: mkdir \
+        /var/lib/docker/overlay2/3f1e2d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e-init: \
+        no space left on device";
+    const NO_DAEMON: &str = "Cannot connect to the Docker daemon at \
+        unix:///Users/me/.docker/run/docker.sock. Is the docker daemon running?";
+
+    fn lines(text: &[&str]) -> Vec<String> {
+        text.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn a_taken_port_is_named() {
+        for raw in [PORT_ALLOCATED, PORT_IN_USE_DESKTOP] {
+            let tail = lines(&[
+                " Container atelier-hardening-test-db-1  Running",
+                " Container atelier-hardening-test-edge-1  Starting",
+                raw,
+            ]);
+            let why = super::explain_failure(&tail).unwrap();
+            assert!(why.starts_with("Port 41227 is already in use"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_full_disk_is_named() {
+        for raw in [NO_SPACE, NO_SPACE_MKDIR] {
+            let why = super::explain_failure(&lines(&[raw])).unwrap();
+            assert!(why.starts_with("Docker has run out of disk space"), "{why}");
+        }
+    }
+
+    /// `pg_dump` inside the app container of scenario 13 (`/tmp` full),
+    /// 2026-11-14: libc's spelling, capitalised.
+    const NO_SPACE_PG_DUMP: &str =
+        "pg_dump: error: could not write to file: No space left on device";
+
+    #[test]
+    fn a_full_disk_inside_a_container_is_named_and_its_words_kept() {
+        let why = super::explain_failure(&lines(&[NO_SPACE_PG_DUMP])).unwrap();
+        assert!(why.starts_with("Docker has run out of disk space"), "{why}");
+        let said = super::capture_failure("dump the database", NO_SPACE_PG_DUMP);
+        assert!(
+            said.starts_with("failed to dump the database: Docker has run out of disk space."),
+            "{said}"
+        );
+        assert!(said.ends_with(NO_SPACE_PG_DUMP), "{said}");
+        // Anything else reads as before.
+        assert_eq!(
+            super::capture_failure("dump the database", "drush: boom"),
+            "failed to dump the database:\ndrush: boom"
+        );
+    }
+
+    /// `docker compose cp app:<archive> <backups>/.part` into a full 4 MB disk
+    /// image on macOS (docker 28, compose 2.40, OrbStack), 2026-11-14: the CLI
+    /// writes the copy itself and names the host file.
+    const NO_SPACE_HOST_CP: &str = "write /Users/me/.atelier/backups/\
+        .aincient-before-update-20261114-222400-123-456.part: no space left on device";
+
+    #[test]
+    fn a_full_disk_on_this_computer_is_told_from_dockers() {
+        let backups = std::path::Path::new("/Users/me/.atelier/backups");
+        let said = super::capture_failure_at(
+            "copy the snapshot out of the container",
+            NO_SPACE_HOST_CP,
+            Some(backups),
+        );
+        assert!(
+            said.starts_with(
+                "failed to copy the snapshot out of the container: This computer's disk is \
+                 full, so the backup couldn't be saved in /Users/me/.atelier/backups."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("Docker has run out"), "{said}");
+        assert!(
+            said.ends_with(NO_SPACE_HOST_CP),
+            "Docker's words kept: {said}"
+        );
+        // A full disk inside the container on the same step names Docker's.
+        for inside in [NO_SPACE_PG_DUMP, NO_SPACE, NO_SPACE_MKDIR] {
+            let said = super::capture_failure_at("x", inside, Some(backups));
+            assert!(
+                said.starts_with("failed to x: Docker has run out of disk space"),
+                "{said}"
+            );
+        }
+        // Without a host folder, every full disk reads as Docker's, as before.
+        let said = super::capture_failure("x", NO_SPACE_HOST_CP);
+        assert!(
+            said.starts_with("failed to x: Docker has run out of disk space"),
+            "{said}"
+        );
+        // Another folder on this computer isn't the one written to.
+        let other = std::path::Path::new("/Users/me/elsewhere");
+        let said = super::capture_failure_at("x", NO_SPACE_HOST_CP, Some(other));
+        assert!(
+            said.starts_with("failed to x: Docker has run out"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_missing_daemon_is_named() {
+        let why = super::explain_failure(&lines(&[NO_DAEMON])).unwrap();
+        assert!(why.starts_with("Docker isn't running"), "{why}");
+    }
+
+    #[test]
+    fn a_missing_daemon_offers_a_restart_and_nothing_else_does() {
+        let e = super::exit_error(
+            "start the appliance",
+            &"exit status: 1",
+            &lines(&[NO_DAEMON]),
+        );
+        assert!(crate::docker_runtime::needs_docker_restart(&e));
+        assert!(e.to_string().contains("`atelier docker restart`"), "{e}");
+        assert!(!e.to_string().contains("Docker Desktop"), "{e}");
+        for other in [NO_SPACE, PORT_ALLOCATED] {
+            let e = super::exit_error("start the appliance", &"exit status: 1", &lines(&[other]));
+            assert!(!crate::docker_runtime::needs_docker_restart(&e), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_newest_known_cause_wins() {
+        let tail = lines(&[NO_SPACE, "some later chatter", PORT_ALLOCATED]);
+        let why = super::explain_failure(&tail).unwrap();
+        assert!(why.starts_with("Port 41227"), "{why}");
+    }
+
+    #[test]
+    fn an_unknown_failure_keeps_dockers_last_line() {
+        let tail = lines(&[
+            " Container atelier-hardening-test-app-1  Starting",
+            "Error response from daemon: No such image: ghcr.io/aincient-labs/atelier-cms:9.9.9",
+        ]);
+        assert_eq!(super::explain_failure(&tail), None);
+        assert_eq!(
+            super::exit_message("start the appliance", &"exit status: 1", &tail),
+            "failed to start the appliance (docker exited with exit status: 1): Error response \
+             from daemon: No such image: ghcr.io/aincient-labs/atelier-cms:9.9.9"
+        );
+        assert_eq!(
+            super::exit_message("start the appliance", &"exit status: 1", &[]),
+            "failed to start the appliance (docker exited with exit status: 1)"
+        );
+        assert_eq!(
+            super::exit_message(
+                "start the appliance",
+                &"exit status: 1",
+                &lines(&[NO_DAEMON])
+            ),
+            format!(
+                "failed to start the appliance: {}",
+                super::explain_failure(&lines(&[NO_DAEMON])).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn the_tail_keeps_the_last_twenty_lines_across_chunks() {
+        let mut tail = super::StderrTail::default();
+        let text: String = (1..=25).map(|i| format!("line {i}\n")).collect::<String>() + "last";
+        for chunk in text.as_bytes().chunks(7) {
+            tail.feed(chunk);
+        }
+        let got = tail.finish();
+        assert_eq!(got.len(), super::STDERR_TAIL);
+        assert_eq!(got.first().map(String::as_str), Some("line 7"));
+        assert_eq!(got.last().map(String::as_str), Some("last"));
+    }
+
+    /// The tee passes stderr through untouched and still keeps its tail.
+    #[test]
+    fn the_tee_passes_stderr_through() {
+        let raw = format!("Pulling app\r{PORT_ALLOCATED}\n");
+        let mut out = Vec::new();
+        let tail = super::tee_stderr(raw.as_bytes(), &mut out);
+        assert_eq!(out, raw.as_bytes());
+        assert_eq!(tail, lines(&["Pulling app", PORT_ALLOCATED]));
+    }
+
+    /// End to end: a step that fails the way Docker does says why, in both the
+    /// terminal path (CLI) and the streaming path (GUI feed).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_step_says_what_went_wrong() {
+        let failing = || {
+            let mut c = Command::new("sh");
+            c.args([
+                "-c",
+                &format!("echo ' Container x  Starting'; echo '{PORT_IN_USE_DESKTOP}' >&2; exit 1"),
+            ]);
+            c
+        };
+        let e = super::run_inherited(failing(), "start the appliance").unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("failed to start the appliance: Port 41227 is already in use"),
+            "{e}"
+        );
+
+        let mut fed = Vec::new();
+        let e = super::run_streaming(failing(), "start the appliance", |l| {
+            fed.push(l.to_string())
+        })
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("failed to start the appliance: Port 41227 is already in use"),
+            "{e}"
+        );
+        assert!(fed.iter().any(|l| l == PORT_IN_USE_DESKTOP), "{fed:?}");
+
+        let mut other = Command::new("sh");
+        other.args([
+            "-c",
+            "echo 'first' >&2; echo 'unexpected: thing broke' >&2; exit 3",
+        ]);
+        let e = super::run_inherited(other, "pull the image").unwrap_err();
+        assert!(e.to_string().ends_with("): unexpected: thing broke"), "{e}");
     }
 }

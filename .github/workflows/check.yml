@@ -69,3 +69,112 @@ jobs:
       - name: cargo deny check advisories
         if: matrix.os == 'ubuntu-22.04'
         run: cargo deny --locked check advisories
+
+  # Real-Docker scenario tests (umbrella DECISIONS 0528): every incident in code
+  # that changes the owner's Docker, reproduced on a tiny real compose project.
+  # Linux runners ship Docker + compose; macOS runners have none, and the
+  # owner's Mac covers OrbStack/Docker Desktop.
+  #
+  # Run once per image store: Docker reads image origin differently on each
+  # (a local build lists `RepoDigests` on the containerd store, not on the
+  # classic one; `aincient_core::image_origin`). The containerd store is the
+  # default of a fresh Docker Engine 29 and of Docker Desktop; the classic
+  # (overlay2) store is OrbStack's and an upgraded engine's. Each leg sets its
+  # store explicitly, on this runner only, so a runner image changing its
+  # default can't silently drop one.
+  scenarios:
+    name: scenarios (real Docker, ${{ matrix.store }} image store${{ matrix.compose && format(', Compose {0}', matrix.compose) || '' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        store:
+          - containerd
+          - classic
+        # The runner's own Compose; an include below adds one more leg.
+        compose: ['']
+        # An older Compose (Ubuntu 22.04's Docker 24 ships 2.20): it accepts
+        # `--progress json` on `version` and refuses it on `pull`, which broke
+        # every app update there (found on a real Ubuntu box, 2026-11-15).
+        include:
+          - store: classic
+            compose: 2.20.2
+            compose_sha256: b9385dabb7931636a3afc0aee94625ebff3bb29584493a87804afb6ebaf2d916
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Docker on the ${{ matrix.store }} image store
+        env:
+          SNAPSHOTTER: ${{ matrix.store == 'containerd' }}
+        run: |
+          sudo mkdir -p /etc/docker
+          current=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          echo "$current" | jq --argjson on "$SNAPSHOTTER" '.features["containerd-snapshotter"] = $on' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version && docker compose version
+          echo "image store: $(docker info --format '{{.Driver}} {{json .DriverStatus}}')"
+          driver_status=$(docker info --format '{{json .DriverStatus}}')
+          case "$driver_status" in
+            *io.containerd.snapshotter*) got=containerd ;;
+            *) got=classic ;;
+          esac
+          if [ "$got" != "${{ matrix.store }}" ]; then
+            echo "::error::Docker is on the $got image store, not ${{ matrix.store }}"
+            exit 1
+          fi
+
+      - name: Docker Compose ${{ matrix.compose }}
+        if: matrix.compose
+        run: |
+          mkdir -p ~/.docker/cli-plugins
+          curl -fsSL -o ~/.docker/cli-plugins/docker-compose \
+            "https://github.com/docker/compose/releases/download/v${{ matrix.compose }}/docker-compose-linux-x86_64"
+          echo "${{ matrix.compose_sha256 }}  $HOME/.docker/cli-plugins/docker-compose" | sha256sum -c -
+          chmod +x ~/.docker/cli-plugins/docker-compose
+          got=$(docker compose version --short)
+          if [ "$got" != "${{ matrix.compose }}" ]; then
+            echo "::error::docker compose is $got, not ${{ matrix.compose }}"
+            exit 1
+          fi
+
+      - name: cargo test --test scenarios
+        run: cargo test -p aincient-core --test scenarios --locked -- --ignored --test-threads=1
+
+      # A cancelled or timed-out run never reaches the harness's own cleanup
+      # (Drop), and the next run's sweep is on another runner. Remove what it
+      # left: every `atelier-scn-*` compose project, image tag and site dir,
+      # and the images the harness built (label atelier.scn.pid). Nothing
+      # else on the runner is touched.
+      - name: Remove scenario leftovers
+        if: always()
+        run: |
+          projects=$( {
+            docker ps -a --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+            docker volume ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+            docker network ls --filter label=com.docker.compose.project --format '{{.Label "com.docker.compose.project"}}'
+          } | grep '^atelier-scn-' | sort -u || true)
+          for p in $projects; do
+            echo "removing project $p"
+            docker compose -p "$p" down -v --remove-orphans -t 2 || true
+          done
+          docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'atelier-scn-' | xargs -r docker image rm || true
+          docker image ls -a -q --filter label=atelier.scn.pid | sort -u | xargs -r docker image rm || true
+          tmp="${TMPDIR:-/tmp}"
+          for d in "$tmp"/atelier-scn-*; do
+            [ -e "$d" ] || continue
+            chmod -R u+w "$d" || true
+            rm -rf "$d"
+          done
+          echo "left behind:"
+          docker ps -a --filter name=atelier-scn- --format '{{.Names}}'
+          docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'atelier-scn-' || true
